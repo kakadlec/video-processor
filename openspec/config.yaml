@@ -1,0 +1,25 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  FIAP X - Processador de Vídeos: a POSTECH/FIAP hackathon deliverable.
+  Tech stack: Go 1.21, Gin web framework, ffmpeg (shelled out via os/exec).
+  Single-package app (main.go) with no internal module structure yet.
+  User-facing strings (errors, HTML UI) are in Portuguese (pt-BR) - keep new
+  ones consistent with that.
+  State model: uploads/ (transient input), temp/ (per-request ffmpeg scratch
+  dir, always cleaned up), outputs/ (durable zip results) - no database.
+  Processing is synchronous and in-request (no job queue yet).
+  No test suite or CI exists yet.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours

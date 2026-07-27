@@ -8,6 +8,15 @@ A minimal Go web service ("FIAP X - Processador de Vídeos") that accepts a vide
 
 The entire application lives in `main.go` (single package `main`, no internal packages/modules). There is no test suite, no CI config, and no linter config in the repo.
 
+## Development process: OpenSpec is mandatory
+
+This project uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-driven development, and it is the **default process for every non-trivial change** — new features, behavior changes, bug fixes with real design decisions, refactors. Do not go straight to editing `main.go` for that kind of work.
+
+- Workflow: `/opsx:propose` (creates `proposal.md` + `design.md` + `tasks.md` under `openspec/changes/<name>/`) → implement against `tasks.md` (`/opsx:apply`) → `/opsx:archive` once shipped, which folds the change into `openspec/specs/`.
+- Specs live in `openspec/specs/`; in-flight change proposals live in `openspec/changes/`; completed ones move to `openspec/changes/archive/`.
+- Project context/conventions for OpenSpec artifact generation are configured in `openspec/config.yaml` (`context:` block) — keep it in sync if the tech stack or conventions here change.
+- Skip the full flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps) — when in doubt, propose first.
+
 ## Commands
 
 ```bash
