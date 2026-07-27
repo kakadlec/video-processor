@@ -1,0 +1,11 @@
+*:Zone.Identifier
+
+/uploads/*
+/outputs/*
+/temp/*
+!/uploads/.gitkeep
+!/outputs/.gitkeep
+!/temp/.gitkeep
+
+*.exe
+/app
