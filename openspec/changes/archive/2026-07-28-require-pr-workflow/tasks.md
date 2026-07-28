@@ -8,5 +8,5 @@
 
 ## 3. Enable branch protection
 
-- [ ] 3.1 Enable branch protection on `main` via the GitHub API: require PR before merging, required status checks `Build & Test` + `SAST (gosec)` (strict/up-to-date), `enforce_admins: true`, `required_approving_review_count: 0`.
-- [ ] 3.2 Verify by attempting a direct push to `main` and confirming GitHub rejects it.
+- [x] 3.1 Enable branch protection on `main` via the GitHub API: require PR before merging, required status checks `Build & Test` + `SAST (gosec)` (strict/up-to-date), `enforce_admins: true`, `required_approving_review_count: 0`.
+- [x] 3.2 Verify by attempting a direct push to `main` and confirming GitHub rejects it.
