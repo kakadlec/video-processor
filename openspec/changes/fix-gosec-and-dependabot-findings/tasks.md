@@ -36,5 +36,5 @@
 
 ## 7. Ship
 
-- [ ] 7.1 Create feature branch, commit with a Conventional Commit message (`fix: ...`), push, open PR.
-- [ ] 7.2 Confirm `Build & Test` and `SAST (gosec)` CI checks pass on the PR.
+- [x] 7.1 Create feature branch, commit with a Conventional Commit message (`fix: ...`), push, open PR.
+- [x] 7.2 Confirm `Build & Test` and `SAST (gosec)` CI checks pass on the PR.
