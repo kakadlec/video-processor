@@ -17,6 +17,18 @@ This project uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-dr
 - Project context/conventions for OpenSpec artifact generation are configured in `openspec/config.yaml` (`context:` block) — keep it in sync if the tech stack or conventions here change.
 - Skip the full flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps) — when in doubt, propose first.
 
+## Branch protection: PRs only, no direct pushes to `main`
+
+`main` is protected: direct pushes are rejected, including for repo admins (no bypass). Every change — yours or Claude Code's — lands via a feature branch and a pull request:
+
+```bash
+git checkout -b feat/short-description   # or fix/..., chore/..., matching Conventional Commits type
+git push -u origin feat/short-description
+gh pr create --fill
+```
+
+A PR is **not mergeable** until both required status checks pass: `Build & Test` and `SAST (gosec)`, and the branch is up to date with `main`. This applies to every PR, including `release-please`'s own automated release PR — no special-casing. If `SAST (gosec)` is red because of an unrelated pre-existing finding elsewhere in the codebase, that still blocks your PR; the fix is to triage the findings (see below), not to bypass the check.
+
 ## Quality gates: tests and SAST must pass
 
 A change is **not complete** until `go test ./...` has been run and passes locally — this applies before reporting any change as done, not just before pushing. CI (`.github/workflows/ci.yml`) enforces this plus a SAST gate on every push to `main` and every pull request:
