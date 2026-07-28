@@ -45,4 +45,4 @@
 - [x] 8.2 Update `CLAUDE.md` to document the third required check and the dependency-vulnerability quality gate.
 - [x] 8.3 Sync `openspec/config.yaml` context block (stale Go 1.21 / "no CI" notes) to reflect current Go version and the three CI jobs.
 - [x] 8.4 Add a `Vulnerability Scan Gate` requirement to the `development-workflow` delta spec.
-- [ ] 8.5 Push, confirm all three checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`) pass, and confirm the PR becomes mergeable.
+- [x] 8.5 Push, confirm all three checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`) pass, and confirm the PR becomes mergeable.
