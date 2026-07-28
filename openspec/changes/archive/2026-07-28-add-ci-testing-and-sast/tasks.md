@@ -9,6 +9,6 @@
 
 ## 3. GitHub repository
 
-- [ ] 3.1 Create the public GitHub repository `kakadlec/video-processor` via `gh repo create`.
-- [ ] 3.2 Add it as the `origin` remote and push `main` with full history.
-- [ ] 3.3 Confirm the CI workflow actually ran on GitHub Actions after the push, and that the observed result matches expectations (test job green, sast job red due to the known pre-existing findings).
+- [x] 3.1 Create the public GitHub repository `kakadlec/video-processor` via `gh repo create`.
+- [x] 3.2 Add it as the `origin` remote and push `main` with full history.
+- [x] 3.3 Confirm the CI workflow actually ran on GitHub Actions after the push, and that the observed result matches expectations (test job green, sast job red due to the known pre-existing findings).
