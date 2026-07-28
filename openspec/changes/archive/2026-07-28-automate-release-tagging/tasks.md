@@ -13,5 +13,5 @@
 
 ## 4. Verification
 
-- [ ] 4.1 Commit and push this change using a Conventional Commit message.
-- [ ] 4.2 Confirm on GitHub that the `release-please` workflow ran successfully and opened (or would open) a Release PR — check real workflow output, don't just assume the config is correct.
+- [x] 4.1 Commit and push this change using a Conventional Commit message.
+- [x] 4.2 Confirm on GitHub that the `release-please` workflow ran successfully and opened (or would open) a Release PR — check real workflow output, don't just assume the config is correct.
