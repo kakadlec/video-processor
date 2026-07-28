@@ -74,7 +74,9 @@ func setupRouter() *gin.Engine {
 func createDirs() {
 	dirs := []string{"uploads", "outputs", "temp"}
 	for _, dir := range dirs {
-		os.MkdirAll(dir, 0755)
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			log.Printf("Erro ao criar diretório %s: %v", dir, err)
+		}
 	}
 }
 
@@ -98,9 +100,14 @@ func handleVideoUpload(c *gin.Context) {
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%s", timestamp, header.Filename)
+	// filepath.Base strips any directory components from the client-supplied
+	// filename, preventing path traversal outside uploads/.
+	safeFilename := filepath.Base(header.Filename)
+	filename := fmt.Sprintf("%s_%s", timestamp, safeFilename)
 	videoPath := filepath.Join("uploads", filename)
 
+	// #nosec G304 -- videoPath is server-built from a sanitized (filepath.Base) filename
+	// under the fixed "uploads" directory, not an arbitrary user-supplied path.
 	out, err := os.Create(videoPath)
 	if err != nil {
 		c.JSON(500, ProcessingResult{
@@ -123,7 +130,9 @@ func handleVideoUpload(c *gin.Context) {
 	result := processVideo(videoPath, timestamp)
 
 	if result.Success {
-		os.Remove(videoPath)
+		if err := os.Remove(videoPath); err != nil {
+			log.Printf("Erro ao remover upload original %s: %v", videoPath, err)
+		}
 	}
 
 	c.JSON(200, result)
@@ -133,11 +142,16 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 	fmt.Printf("Iniciando processamento: %s\n", videoPath)
 
 	tempDir := filepath.Join("temp", timestamp)
-	os.MkdirAll(tempDir, 0755)
+	if err := os.MkdirAll(tempDir, 0750); err != nil {
+		log.Printf("Erro ao criar diretório temporário %s: %v", tempDir, err)
+	}
 	defer os.RemoveAll(tempDir)
 
 	framePattern := filepath.Join(tempDir, "frame_%04d.png")
 
+	// #nosec G204 -- videoPath and framePattern are server-built paths (sanitized
+	// upload filename / timestamp-derived temp dir), not raw user input; invoking
+	// ffmpeg on them is this service's core purpose.
 	cmd := exec.Command("ffmpeg",
 		"-i", videoPath,
 		"-vf", "fps=1",
@@ -191,6 +205,8 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 }
 
 func createZipFile(files []string, zipPath string) error {
+	// #nosec G304 -- zipPath is built by the caller from a server-generated
+	// timestamp under the fixed "outputs" directory, not user input.
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -211,6 +227,8 @@ func createZipFile(files []string, zipPath string) error {
 }
 
 func addFileToZip(zipWriter *zip.Writer, filename string) error {
+	// #nosec G304 -- filename comes from filepath.Glob over the per-request temp
+	// dir (main.go processVideo), not from user input.
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
