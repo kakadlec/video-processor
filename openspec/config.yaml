@@ -5,14 +5,18 @@ schema: spec-driven
 # Add your tech stack, conventions, style guides, domain knowledge, etc.
 context: |
   FIAP X - Processador de Vídeos: a POSTECH/FIAP hackathon deliverable.
-  Tech stack: Go 1.21, Gin web framework, ffmpeg (shelled out via os/exec).
+  Tech stack: Go 1.25, Gin web framework, ffmpeg (shelled out via os/exec).
   Single-package app (main.go) with no internal module structure yet.
   User-facing strings (errors, HTML UI) are in Portuguese (pt-BR) - keep new
   ones consistent with that.
   State model: uploads/ (transient input), temp/ (per-request ffmpeg scratch
   dir, always cleaned up), outputs/ (durable zip results) - no database.
   Processing is synchronous and in-request (no job queue yet).
-  No test suite or CI exists yet.
+  main_test.go covers integration tests (requires ffmpeg; skips gracefully
+  without it). CI (.github/workflows/ci.yml) runs three required checks on
+  every push/PR to main: Build & Test (go vet + go test), SAST (gosec),
+  and Vulnerability Scan (govulncheck). Branch protection on main requires
+  all three to pass plus an up-to-date branch; no direct pushes to main.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.

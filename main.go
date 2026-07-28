@@ -74,7 +74,9 @@ func setupRouter() *gin.Engine {
 func createDirs() {
 	dirs := []string{"uploads", "outputs", "temp"}
 	for _, dir := range dirs {
-		os.MkdirAll(dir, 0755)
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			log.Printf("Failed to create directory %s: %v", dir, err)
+		}
 	}
 }
 
@@ -98,8 +100,16 @@ func handleVideoUpload(c *gin.Context) {
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%s", timestamp, header.Filename)
-	videoPath := filepath.Join("uploads", filename)
+	safeFilename := filepath.Base(header.Filename)
+	filename := fmt.Sprintf("%s_%s", timestamp, safeFilename)
+	videoPath := filepath.Clean(filepath.Join("uploads", filename))
+	if !strings.HasPrefix(videoPath, "uploads"+string(os.PathSeparator)) {
+		c.JSON(400, ProcessingResult{
+			Success: false,
+			Message: "Nome de arquivo inválido",
+		})
+		return
+	}
 
 	out, err := os.Create(videoPath)
 	if err != nil {
@@ -123,7 +133,9 @@ func handleVideoUpload(c *gin.Context) {
 	result := processVideo(videoPath, timestamp)
 
 	if result.Success {
-		os.Remove(videoPath)
+		if err := os.Remove(videoPath); err != nil {
+			log.Printf("Failed to remove original upload %s: %v", videoPath, err)
+		}
 	}
 
 	c.JSON(200, result)
@@ -133,12 +145,14 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 	fmt.Printf("Iniciando processamento: %s\n", videoPath)
 
 	tempDir := filepath.Join("temp", timestamp)
-	os.MkdirAll(tempDir, 0755)
+	if err := os.MkdirAll(tempDir, 0750); err != nil {
+		log.Printf("Failed to create temp directory %s: %v", tempDir, err)
+	}
 	defer os.RemoveAll(tempDir)
 
 	framePattern := filepath.Join(tempDir, "frame_%04d.png")
 
-	cmd := exec.Command("ffmpeg",
+	cmd := exec.Command("ffmpeg", // #nosec G204
 		"-i", videoPath,
 		"-vf", "fps=1",
 		"-y",
@@ -191,6 +205,11 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 }
 
 func createZipFile(files []string, zipPath string) error {
+	zipPath = filepath.Clean(zipPath)
+	if !strings.HasPrefix(zipPath, "outputs"+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid zip path: %s", zipPath)
+	}
+
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -211,6 +230,11 @@ func createZipFile(files []string, zipPath string) error {
 }
 
 func addFileToZip(zipWriter *zip.Writer, filename string) error {
+	filename = filepath.Clean(filename)
+	if !strings.HasPrefix(filename, "temp"+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid frame path: %s", filename)
+	}
+
 	file, err := os.Open(filename)
 	if err != nil {
 		return err

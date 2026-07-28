@@ -27,15 +27,16 @@ git push -u origin feat/short-description
 gh pr create --fill
 ```
 
-A PR is **not mergeable** until both required status checks pass: `Build & Test` and `SAST (gosec)`, and the branch is up to date with `main`. This applies to every PR, including `release-please`'s own automated release PR — no special-casing. If `SAST (gosec)` is red because of an unrelated pre-existing finding elsewhere in the codebase, that still blocks your PR; the fix is to triage the findings (see below), not to bypass the check.
+A PR is **not mergeable** until all three required status checks pass — `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` — and the branch is up to date with `main`. This applies to every PR, including `release-please`'s own automated release PR — no special-casing. If any of these is red because of an unrelated pre-existing finding elsewhere in the codebase, that still blocks your PR; the fix is to triage the findings (see below), not to bypass the check.
 
-## Quality gates: tests and SAST must pass
+## Quality gates: tests, SAST, and dependency vulnerabilities must pass
 
-A change is **not complete** until `go test ./...` has been run and passes locally — this applies before reporting any change as done, not just before pushing. CI (`.github/workflows/ci.yml`) enforces this plus a SAST gate on every push to `main` and every pull request:
+A change is **not complete** until `go test ./...` has been run and passes locally — this applies before reporting any change as done, not just before pushing. CI (`.github/workflows/ci.yml`) enforces this plus a SAST gate and a dependency-vulnerability gate on every push to `main` and every pull request:
 
-- **`test` job**: `go vet ./...` + `go test ./... -v` (installs `ffmpeg` on the runner first).
-- **`sast` job**: [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. If a specific finding is a false positive or an accepted risk, suppress it with an inline `#nosec G<rule-id>` comment plus a written justification; never disable the SAST job or exclude whole files/rules to make it pass.
-- As of the change that introduced this gate, `gosec` reports 9 pre-existing findings (subprocess invocation, path-derived file access, directory permissions) that have not been fixed yet — CI is expected to be red on `sast` until each is triaged. See `openspec/specs/development-workflow/spec.md`.
+- **`test` job** (`Build & Test`): `go vet ./...` + `go test ./... -v` (installs `ffmpeg` on the runner first).
+- **`sast` job** (`SAST (gosec)`): [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. **`#nosec` is a last resort, not the default response to a finding** — check the rule's own docs (e.g. `securego.io/docs/rules/g304.html`) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression; several findings that looked like they needed `#nosec` turned out to be fixable with a real containment check instead. Only suppress a finding that's genuinely a false positive or an accepted risk with no recognized fix pattern, using a bare inline `#nosec G<rule-id>` comment (no restated prose — that's what commit messages and PR descriptions are for). Never disable the SAST job or exclude whole files/rules to make it pass.
+- **`vulncheck` job** (`Vulnerability Scan (govulncheck)`): [`govulncheck`](https://go.dev/security/vuln) against the module. It only fails when a known vulnerability is reachable from code actually called by this project (not merely present in `go.sum`) — resolve a failure by upgrading the implicated dependency, generally by bumping the direct dependency that pulls it in transitively (see `go mod graph`), then `go mod tidy`.
+- All `gosec` findings and reachable `govulncheck` vulnerabilities present as of this writing have been resolved (see `openspec/changes/archive/fix-gosec-and-dependabot-findings/` once archived, or `openspec/specs/development-workflow/spec.md`). Dependabot alerts should be resolved the same way — upgrade the flagged module or the direct dependency pulling it in — as soon as they're opened, not left to accumulate.
 
 ## Commit messages and releases
 
@@ -72,9 +73,17 @@ Three directories are created at startup (`createDirs`) and used as the app's on
 
 Processing is synchronous and in-request: `handleVideoUpload` blocks on the full ffmpeg run and zip creation before responding. There is no job queue, no async/webhook flow, and no per-request concurrency limiting — large videos or concurrent uploads will hold multiple `ffmpeg` processes at once.
 
+## Language policy: English for new code (as of 2026-07-28)
+
+Code, error messages, and comments in **new or changed code** SHALL be written in English, going forward. This is a change from the project's original convention (see below) — it applies prospectively, not retroactively:
+
+- Do not translate the existing Portuguese (pt-BR) strings already in `main.go` (the HTML form in `getHTMLForm()`, existing JSON `Message`/`error` fields, existing `fmt.Printf`/`log.Printf` calls) just because you're touching a nearby line. Leave them as-is unless a change specifically asks for that.
+- Any error message, log line, or other string you add or rewrite from now on should be in English, even inside an otherwise-Portuguese function.
+- Comments: default to none. Add one only when it explains something genuinely non-obvious (a hidden constraint, a workaround, a subtle invariant) — not to restate what the code already says. When you do add one, write it in English.
+
 ## Notable constraints / gotchas
 
 - The Dockerfile is deliberately written as an anti-pattern example (see its header comment: "sem boas práticas - propositalmente!" — no multi-stage build, no non-root user, `go mod tidy` at container build time). Do not treat it as a template to copy elsewhere; if asked to fix/harden the Dockerfile, that's expected, in-scope work, not a misunderstanding of the file's intent.
-- All user-facing strings (error messages, HTML) are in Portuguese (pt-BR) — match that when adding user-visible text.
+- The app's *existing* user-facing strings (error messages, HTML) are in Portuguese (pt-BR) — this was the original convention for this pt-BR hackathon audience. It's superseded for new code by the language policy above; existing pt-BR strings are grandfathered in and not being retroactively translated.
 - File type validation (`isValidVideoFile`) is by extension only (`.mp4 .avi .mov .mkv .wmv .flv .webm`), not content sniffing.
 - `handleDownload` and `handleStatus` join user-controlled `:filename`/glob results directly into filesystem paths under `outputs/` with `filepath.Join` — there's no path-traversal check beyond that; be careful if extending this to accept arbitrary filenames.
