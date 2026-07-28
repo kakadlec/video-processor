@@ -30,6 +30,15 @@ type ProcessingResult struct {
 func main() {
 	createDirs()
 
+	r := setupRouter()
+
+	fmt.Println("🎬 Servidor iniciado na porta 8080")
+	fmt.Println("📂 Acesse: http://localhost:8080")
+
+	log.Fatal(r.Run(":8080"))
+}
+
+func setupRouter() *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -59,10 +68,7 @@ func main() {
 
 	r.GET("/api/status", handleStatus)
 
-	fmt.Println("🎬 Servidor iniciado na porta 8080")
-	fmt.Println("📂 Acesse: http://localhost:8080")
-
-	log.Fatal(r.Run(":8080"))
+	return r
 }
 
 func createDirs() {

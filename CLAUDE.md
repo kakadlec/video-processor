@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A minimal Go web service ("FIAP X - Processador de Vídeos") that accepts a video upload, extracts frames at 1fps via `ffmpeg`, zips them, and serves the zip back for download. It's the code deliverable for a POSTECH/FIAP hackathon (see `POSTECH - SOAT - Fase 5 - Hacka.pdf` for the assignment brief — a binary PDF, not readable as text).
 
-The entire application lives in `main.go` (single package `main`, no internal packages/modules). There is no test suite, no CI config, and no linter config in the repo.
+The entire application lives in `main.go` (single package `main`, no internal packages/modules), plus `main_test.go` for integration tests. There is no CI config and no linter config in the repo.
 
 ## Development process: OpenSpec is mandatory
 
@@ -23,17 +23,18 @@ This project uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-dr
 go run main.go          # run the server directly (listens on :8080)
 go build -o app .       # build a binary
 go mod tidy             # sync go.mod/go.sum after dependency changes
+go test ./... -v        # run the integration test suite (requires ffmpeg on PATH; skips with a message if absent)
 docker build -t video-processor .
 docker run -p 8080:8080 video-processor
 ```
 
-`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. There are no test files (`*_test.go`) currently in the repo.
+`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside the Docker image instead: `docker build -t video-processor . && docker run --rm video-processor go test ./... -v`.
 
 ## Architecture
 
 Request flow, all in `main.go`:
 
-1. `main()` wires a single `gin` router: static file serving for `/uploads` and `/outputs`, a permissive CORS middleware (allows `*`), and routes `GET /`, `POST /upload`, `GET /download/:filename`, `GET /api/status`.
+1. `setupRouter()` wires a single `gin` router: static file serving for `/uploads` and `/outputs`, a permissive CORS middleware (allows `*`), and routes `GET /`, `POST /upload`, `GET /download/:filename`, `GET /api/status`. `main()` just calls `setupRouter()` then `.Run(":8080")` — the split exists so `main_test.go` can drive the real handlers via `httptest.NewServer` without binding the real port.
 2. `GET /` returns a hardcoded HTML page (`getHTMLForm()`) — an inline upload form with vanilla JS (fetch calls to `/upload` and `/api/status`). There is no separate frontend build; editing the UI means editing the Go string literal.
 3. `POST /upload` (`handleVideoUpload`) validates the file extension, saves the upload to `uploads/<timestamp>_<original-filename>`, then calls `processVideo`.
 4. `processVideo` is the core pipeline: creates a per-request scratch dir under `temp/<timestamp>`, runs `ffmpeg -i <video> -vf fps=1 -y temp/<timestamp>/frame_%04d.png`, globs the resulting PNGs, zips them into `outputs/frames_<timestamp>.zip` via `createZipFile`/`addFileToZip`, then removes the temp dir (`defer os.RemoveAll`). On success the original upload in `uploads/` is deleted too, so `outputs/*.zip` is the only durable artifact.
