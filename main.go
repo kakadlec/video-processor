@@ -104,7 +104,7 @@ func handleVideoUpload(c *gin.Context) {
 	filename := fmt.Sprintf("%s_%s", timestamp, safeFilename)
 	videoPath := filepath.Join("uploads", filename)
 
-	out, err := os.Create(videoPath) // #nosec G304 -- sanitized filename under fixed "uploads" dir
+	out, err := os.Create(videoPath) // #nosec G304
 	if err != nil {
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -145,7 +145,7 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 
 	framePattern := filepath.Join(tempDir, "frame_%04d.png")
 
-	cmd := exec.Command("ffmpeg", // #nosec G204 -- videoPath/framePattern are server-built, not raw user input
+	cmd := exec.Command("ffmpeg", // #nosec G204
 		"-i", videoPath,
 		"-vf", "fps=1",
 		"-y",
@@ -198,7 +198,7 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 }
 
 func createZipFile(files []string, zipPath string) error {
-	zipFile, err := os.Create(zipPath) // #nosec G304 -- server-generated path, not user input
+	zipFile, err := os.Create(zipPath) // #nosec G304
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func createZipFile(files []string, zipPath string) error {
 }
 
 func addFileToZip(zipWriter *zip.Writer, filename string) error {
-	file, err := os.Open(filename) // #nosec G304 -- from filepath.Glob over the temp dir, not user input
+	file, err := os.Open(filename) // #nosec G304
 	if err != nil {
 		return err
 	}

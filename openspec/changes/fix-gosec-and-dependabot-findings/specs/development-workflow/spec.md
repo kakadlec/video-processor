@@ -13,7 +13,7 @@ Every push to `main` and every pull request SHALL run a static application secur
 
 #### Scenario: Findings are fixed or explicitly suppressed, never silenced globally
 - **WHEN** a specific `gosec` finding is judged a false positive or an accepted risk
-- **THEN** it SHALL be suppressed with an inline `#nosec` comment referencing the specific rule ID and a written justification, not by disabling the SAST job or excluding whole files/rules project-wide
+- **THEN** it SHALL be suppressed with a bare inline `#nosec G<rule-id>` comment (no restated prose in-line; rationale belongs in the commit message/PR description), not by disabling the SAST job or excluding whole files/rules project-wide
 
 ## ADDED Requirements
 
