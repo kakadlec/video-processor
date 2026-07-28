@@ -43,6 +43,34 @@ func generateTestVideo(t *testing.T, durationSeconds int) string {
 	return path
 }
 
+// generateUndecodableVideo writes a file with a valid video extension but
+// content ffmpeg cannot decode, to reliably trigger a processing failure
+// without relying on a specific ffmpeg error message.
+func generateUndecodableVideo(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte("isso não é um vídeo de verdade"), 0644); err != nil {
+		t.Fatalf("failed to write undecodable video file: %v", err)
+	}
+	return path
+}
+
+// assertTempDirClean fails the test if temp/ has any leftover per-request
+// directories, which would mean the defer os.RemoveAll cleanup didn't run.
+func assertTempDirClean(t *testing.T) {
+	t.Helper()
+	entries, err := os.ReadDir("temp")
+	if err != nil {
+		t.Fatalf("failed to read temp dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() == ".gitkeep" {
+			continue
+		}
+		t.Fatalf("expected temp/ to have no leftover entries, found: %s", e.Name())
+	}
+}
+
 // startTestServer spins up the real router (real handlers, real ffmpeg calls,
 // real filesystem) on an in-process httptest server.
 func startTestServer(t *testing.T) *httptest.Server {
@@ -263,4 +291,56 @@ func TestDownload_NonexistentFile_Returns404(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected HTTP 404, got %d", resp.StatusCode)
 	}
+}
+
+func TestProcessing_Failure_CleansTempDir(t *testing.T) {
+	srv := startTestServer(t)
+	videoPath := generateUndecodableVideo(t, "corrupt-temp-check.mp4")
+
+	_, result := uploadVideo(t, srv.URL, videoPath, "corrupt-temp-check.mp4")
+	cleanupOutputZip(t, result.ZipPath)
+
+	if result.Success {
+		t.Fatalf("expected processing to fail for undecodable content, got success")
+	}
+
+	assertTempDirClean(t)
+}
+
+func TestProcessing_Success_CleansTempDir(t *testing.T) {
+	srv := startTestServer(t)
+	videoPath := generateTestVideo(t, 1)
+
+	_, result := uploadVideo(t, srv.URL, videoPath, "success-temp-check.mp4")
+	cleanupOutputZip(t, result.ZipPath)
+	if !result.Success {
+		t.Fatalf("setup upload failed: %s", result.Message)
+	}
+
+	assertTempDirClean(t)
+}
+
+// TestProcessing_Failure_LeavesUploadedFileBehind documents current (not
+// fixed by this change) behavior: handleVideoUpload only removes the
+// uploaded file under uploads/ when processing succeeds, so a failed run
+// leaks the original upload indefinitely. See
+// openspec/specs/video-frame-extraction/spec.md, "Uploaded File Retained On
+// Processing Failure".
+func TestProcessing_Failure_LeavesUploadedFileBehind(t *testing.T) {
+	srv := startTestServer(t)
+	videoPath := generateUndecodableVideo(t, "leftover-check.mp4")
+
+	_, result := uploadVideo(t, srv.URL, videoPath, "leftover-check.mp4")
+	if result.Success {
+		t.Fatalf("expected processing to fail for undecodable content, got success")
+	}
+
+	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_leftover-check.mp4"))
+	if err != nil {
+		t.Fatalf("failed to glob uploads dir: %v", err)
+	}
+	if len(leftovers) != 1 {
+		t.Fatalf("expected exactly one leftover upload file (known cleanup gap on failure), found: %v", leftovers)
+	}
+	t.Cleanup(func() { os.Remove(leftovers[0]) })
 }
