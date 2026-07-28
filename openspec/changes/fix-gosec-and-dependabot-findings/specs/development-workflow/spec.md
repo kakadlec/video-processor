@@ -11,8 +11,12 @@ Every push to `main` and every pull request SHALL run a static application secur
 - **WHEN** `gosec` reports zero findings against the code
 - **THEN** the CI SAST job succeeds
 
-#### Scenario: Findings are fixed or explicitly suppressed, never silenced globally
-- **WHEN** a specific `gosec` finding is judged a false positive or an accepted risk
+#### Scenario: Suppression is a last resort, checked against the rule's documented fix pattern first
+- **WHEN** a `gosec` finding is reported
+- **THEN** the rule's own documentation SHALL be checked for a validation pattern gosec recognizes as resolving the finding, and that pattern SHALL be applied and verified (re-running `gosec`) before falling back to suppression
+
+#### Scenario: Findings that remain after that are fixed or explicitly suppressed, never silenced globally
+- **WHEN** a specific `gosec` finding is judged a false positive or an accepted risk with no recognized fix pattern
 - **THEN** it SHALL be suppressed with a bare inline `#nosec G<rule-id>` comment (no restated prose in-line; rationale belongs in the commit message/PR description), not by disabling the SAST job or excluding whole files/rules project-wide
 
 ## ADDED Requirements

@@ -100,11 +100,18 @@ func handleVideoUpload(c *gin.Context) {
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	safeFilename := filepath.Base(header.Filename) // strip path components to block traversal
+	safeFilename := filepath.Base(header.Filename)
 	filename := fmt.Sprintf("%s_%s", timestamp, safeFilename)
-	videoPath := filepath.Join("uploads", filename)
+	videoPath := filepath.Clean(filepath.Join("uploads", filename))
+	if !strings.HasPrefix(videoPath, "uploads"+string(os.PathSeparator)) {
+		c.JSON(400, ProcessingResult{
+			Success: false,
+			Message: "Nome de arquivo inválido",
+		})
+		return
+	}
 
-	out, err := os.Create(videoPath) // #nosec G304
+	out, err := os.Create(videoPath)
 	if err != nil {
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -198,7 +205,12 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 }
 
 func createZipFile(files []string, zipPath string) error {
-	zipFile, err := os.Create(zipPath) // #nosec G304
+	zipPath = filepath.Clean(zipPath)
+	if !strings.HasPrefix(zipPath, "outputs"+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid zip path: %s", zipPath)
+	}
+
+	zipFile, err := os.Create(zipPath)
 	if err != nil {
 		return err
 	}
@@ -218,7 +230,12 @@ func createZipFile(files []string, zipPath string) error {
 }
 
 func addFileToZip(zipWriter *zip.Writer, filename string) error {
-	file, err := os.Open(filename) // #nosec G304
+	filename = filepath.Clean(filename)
+	if !strings.HasPrefix(filename, "temp"+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid frame path: %s", filename)
+	}
+
+	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}

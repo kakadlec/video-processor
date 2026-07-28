@@ -1,10 +1,13 @@
 ## 1. gosec: path traversal / subprocess (G204, G304)
 
 - [x] 1.1 In `handleVideoUpload`, sanitize `header.Filename` with `filepath.Base` before building `videoPath`, so the saved upload path can't escape `uploads/`.
-- [x] 1.2 Add `#nosec G304` with a justification comment on the `os.Create(videoPath)` call in `handleVideoUpload` (path now sanitized, but still gosec-flagged as variable-derived).
-- [x] 1.3 Add `#nosec G204` with a justification comment on the `exec.Command("ffmpeg", ...)` call in `processVideo`.
-- [x] 1.4 Add `#nosec G304` with a justification comment on `os.Create(zipPath)` in `createZipFile` (server-generated path, no user input).
-- [x] 1.5 Add `#nosec G304` with a justification comment on `os.Open(filename)` in `addFileToZip` (path from internal `filepath.Glob` of the temp dir, no user input).
+- [x] 1.2 (superseded by 1.2b) ~~Add `#nosec G304` on `os.Create(videoPath)`~~
+- [x] 1.2b Replace the `#nosec G304` on `os.Create(videoPath)` in `handleVideoUpload` with a real `filepath.Clean` + `strings.HasPrefix(videoPath, "uploads"+separator)` containment check (gosec's own documented G304 fix pattern) — empirically confirmed this makes gosec stop flagging the line, zero suppression needed.
+- [x] 1.3 Add a bare `#nosec G204` (no prose) on the `exec.Command("ffmpeg", ...)` call in `processVideo` — confirmed via direct testing against gosec's analyzer that this finding cannot be resolved by any validation pattern (it flags any non-literal exec.Command arg, with no recognized safe-guard exception, and additionally can't trace `videoPath` since it's a function parameter).
+- [x] 1.4 (superseded by 1.4b) ~~Add `#nosec G304` on `os.Create(zipPath)`~~
+- [x] 1.4b Replace the `#nosec G304` on `os.Create(zipPath)` in `createZipFile` with a `filepath.Clean` + `strings.HasPrefix(zipPath, "outputs"+separator)` containment check — zero suppression needed.
+- [x] 1.5 (superseded by 1.5b) ~~Add `#nosec G304` on `os.Open(filename)`~~
+- [x] 1.5b Replace the `#nosec G304` on `os.Open(filename)` in `addFileToZip` with a `filepath.Clean` + `strings.HasPrefix(filename, "temp"+separator)` containment check — zero suppression needed.
 
 ## 2. gosec: directory permissions (G301)
 

@@ -5,8 +5,8 @@ CI's `SAST (gosec)` job has been red since it was introduced, blocking every PR 
 ## What Changes
 
 - Fix all 9 `gosec` findings in `main.go`:
-  - **G204** (subprocess launched with variable, `ffmpeg` invocation): sanitize the uploaded filename so `videoPath` cannot contain path-traversal segments, then suppress with a justified `#nosec G204` comment since invoking `ffmpeg` on a server-controlled path is the app's core purpose.
-  - **G304** (potential file inclusion via variable) x3 (`os.Create` for the saved upload, `os.Create` for the zip, `os.Open` in `addFileToZip`): the zip/glob paths are already fully server-derived (timestamp + internal temp dir), so suppress with justified `#nosec G304` comments; the upload path additionally gets the filename sanitized (shared fix with G204) to remove the actual traversal risk, not just silence the linter.
+  - **G204** (subprocess launched with variable, `ffmpeg` invocation): sanitize the uploaded filename so `videoPath` cannot contain path-traversal segments, then suppress with a bare `#nosec G204` — confirmed by direct testing against gosec's analyzer that no code pattern makes it recognize this call as safe (see design.md).
+  - **G304** (potential file inclusion via variable) x3 (`os.Create` for the saved upload, `os.Create` for the zip, `os.Open` in `addFileToZip`): resolved with real `filepath.Clean` + `strings.HasPrefix(path, root+separator)` containment checks at each site — gosec's own documented fix pattern, verified to make it stop flagging the line. Zero `#nosec` needed for any of the three.
   - **G301** (directory permissions) x2 (`createDirs`, `processVideo`): change `os.MkdirAll` mode from `0755` to `0750`.
   - **G104** (unhandled errors) x3 (`os.MkdirAll` x2, `os.Remove`): log the error instead of discarding it; these are best-effort cleanup/setup calls where failure shouldn't abort the request, but must be observable.
 - Resolve all 26 open Dependabot alerts (`golang.org/x/crypto`, `golang.org/x/net`, `google.golang.org/protobuf`), all transitive via `github.com/gin-gonic/gin v1.9.1`:
