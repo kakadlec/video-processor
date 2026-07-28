@@ -16,6 +16,8 @@ This project uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-dr
 - Specs live in `openspec/specs/`; in-flight change proposals live in `openspec/changes/`; completed ones move to `openspec/changes/archive/`.
 - Project context/conventions for OpenSpec artifact generation are configured in `openspec/config.yaml` (`context:` block) — keep it in sync if the tech stack or conventions here change.
 - Skip the full flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps) — when in doubt, propose first.
+- **PRs SHALL separate spec content from code content — never bundle both in one PR.** Each change lands as up to three distinct PRs, in order: (1) a **propose** PR containing only the new `openspec/changes/<name>/` artifacts (`proposal.md`/`design.md`/`tasks.md`/delta specs), no code; merge this first. (2) An **implement** PR containing only the code diff (plus checking off `tasks.md` in that same change folder), no new spec content. (3) An **archive** PR, opened once the implement PR has merged, that folds the change's delta specs into `openspec/specs/` and moves the change folder under `openspec/changes/archive/` — also no application code. A reviewer should never have to wade through `openspec/` diffs to review a `main.go` change, or vice versa.
+- `openspec/specs/**` and `openspec/changes/**` are marked `linguist-generated=true` in `.gitattributes`, so GitHub collapses them by default in the PR diff view (still fully tracked and reviewable on demand — this is a display aid, not a substitute for the PR-splitting rule above).
 
 ## Branch protection: PRs only, no direct pushes to `main`
 
