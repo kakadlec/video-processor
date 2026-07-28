@@ -75,7 +75,7 @@ func createDirs() {
 	dirs := []string{"uploads", "outputs", "temp"}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0750); err != nil {
-			log.Printf("Erro ao criar diretório %s: %v", dir, err)
+			log.Printf("Failed to create directory %s: %v", dir, err)
 		}
 	}
 }
@@ -131,7 +131,7 @@ func handleVideoUpload(c *gin.Context) {
 
 	if result.Success {
 		if err := os.Remove(videoPath); err != nil {
-			log.Printf("Erro ao remover upload original %s: %v", videoPath, err)
+			log.Printf("Failed to remove original upload %s: %v", videoPath, err)
 		}
 	}
 
@@ -143,7 +143,7 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 
 	tempDir := filepath.Join("temp", timestamp)
 	if err := os.MkdirAll(tempDir, 0750); err != nil {
-		log.Printf("Erro ao criar diretório temporário %s: %v", tempDir, err)
+		log.Printf("Failed to create temp directory %s: %v", tempDir, err)
 	}
 	defer os.RemoveAll(tempDir)
 
