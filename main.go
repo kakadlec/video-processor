@@ -100,15 +100,11 @@ func handleVideoUpload(c *gin.Context) {
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	// filepath.Base strips any directory components from the client-supplied
-	// filename, preventing path traversal outside uploads/.
-	safeFilename := filepath.Base(header.Filename)
+	safeFilename := filepath.Base(header.Filename) // strip path components to block traversal
 	filename := fmt.Sprintf("%s_%s", timestamp, safeFilename)
 	videoPath := filepath.Join("uploads", filename)
 
-	// #nosec G304 -- videoPath is server-built from a sanitized (filepath.Base) filename
-	// under the fixed "uploads" directory, not an arbitrary user-supplied path.
-	out, err := os.Create(videoPath)
+	out, err := os.Create(videoPath) // #nosec G304 -- sanitized filename under fixed "uploads" dir
 	if err != nil {
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -149,10 +145,7 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 
 	framePattern := filepath.Join(tempDir, "frame_%04d.png")
 
-	// #nosec G204 -- videoPath and framePattern are server-built paths (sanitized
-	// upload filename / timestamp-derived temp dir), not raw user input; invoking
-	// ffmpeg on them is this service's core purpose.
-	cmd := exec.Command("ffmpeg",
+	cmd := exec.Command("ffmpeg", // #nosec G204 -- videoPath/framePattern are server-built, not raw user input
 		"-i", videoPath,
 		"-vf", "fps=1",
 		"-y",
@@ -205,9 +198,7 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 }
 
 func createZipFile(files []string, zipPath string) error {
-	// #nosec G304 -- zipPath is built by the caller from a server-generated
-	// timestamp under the fixed "outputs" directory, not user input.
-	zipFile, err := os.Create(zipPath)
+	zipFile, err := os.Create(zipPath) // #nosec G304 -- server-generated path, not user input
 	if err != nil {
 		return err
 	}
@@ -227,9 +218,7 @@ func createZipFile(files []string, zipPath string) error {
 }
 
 func addFileToZip(zipWriter *zip.Writer, filename string) error {
-	// #nosec G304 -- filename comes from filepath.Glob over the per-request temp
-	// dir (main.go processVideo), not from user input.
-	file, err := os.Open(filename)
+	file, err := os.Open(filename) // #nosec G304 -- from filepath.Glob over the temp dir, not user input
 	if err != nil {
 		return err
 	}
