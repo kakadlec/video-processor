@@ -1,7 +1,8 @@
 # development-workflow Specification
 
 ## Purpose
-TBD - created by archiving change add-ci-testing-and-sast. Update Purpose after archive.
+Defines how changes land on `main` for this repository: required CI gates (tests, SAST, dependency vulnerability scanning), the PR-only branch protection workflow, Conventional Commit conventions, and the automated release process. Contributors and AI agents working in this repo should treat these as binding constraints, not suggestions.
+
 ## Requirements
 ### Requirement: Automated Test Gate
 Every push to `main` and every pull request SHALL run the full test suite (`go test ./...`) in CI, with `ffmpeg` available in the CI environment. The CI test job SHALL fail if any test fails.
@@ -15,15 +16,34 @@ Every push to `main` and every pull request SHALL run the full test suite (`go t
 - **THEN** the CI test job succeeds
 
 ### Requirement: SAST Gate
-Every push to `main` and every pull request SHALL run a static application security testing scan (`gosec`) against the codebase in CI. The CI SAST job SHALL fail if the scan reports any finding.
+Every push to `main` and every pull request SHALL run a static application security testing scan (`gosec`) against the codebase in CI. The CI SAST job SHALL fail if the scan reports any finding. As of this change, the codebase has zero outstanding `gosec` findings; the SAST job is expected to be green.
 
 #### Scenario: CI fails on a SAST finding
 - **WHEN** `gosec` reports one or more findings against the code
 - **THEN** the CI SAST job fails and is visibly reported
 
-#### Scenario: Findings are fixed or explicitly suppressed, never silenced globally
-- **WHEN** a specific `gosec` finding is judged a false positive or an accepted risk
-- **THEN** it SHALL be suppressed with an inline `#nosec` comment referencing the specific rule ID and a written justification, not by disabling the SAST job or excluding whole files/rules project-wide
+#### Scenario: CI passes when the scan is clean
+- **WHEN** `gosec` reports zero findings against the code
+- **THEN** the CI SAST job succeeds
+
+#### Scenario: Suppression is a last resort, checked against the rule's documented fix pattern first
+- **WHEN** a `gosec` finding is reported
+- **THEN** the rule's own documentation SHALL be checked for a validation pattern gosec recognizes as resolving the finding, and that pattern SHALL be applied and verified (re-running `gosec`) before falling back to suppression
+
+#### Scenario: Findings that remain after that are fixed or explicitly suppressed, never silenced globally
+- **WHEN** a specific `gosec` finding is judged a false positive or an accepted risk with no recognized fix pattern
+- **THEN** it SHALL be suppressed with a bare inline `#nosec G<rule-id>` comment (no restated prose in-line; rationale belongs in the commit message/PR description), not by disabling the SAST job or excluding whole files/rules project-wide
+
+### Requirement: Dependency Vulnerability Hygiene
+The system's Go module dependencies SHALL NOT have open Dependabot vulnerability alerts. When a new alert is opened against a direct or transitive dependency, it SHALL be resolved by upgrading the implicated module (directly, or by upgrading the direct dependency that pulls it in transitively) to a patched version, not by ignoring or dismissing the alert.
+
+#### Scenario: A dependency vulnerability alert is resolved by upgrading
+- **WHEN** Dependabot opens an alert against a module in `go.mod`/`go.sum`
+- **THEN** the module (or the direct dependency pulling it in transitively) is upgraded to a version that resolves the advisory, and `go.sum` no longer resolves to the vulnerable version
+
+#### Scenario: Dependency upgrade preserves existing behavior
+- **WHEN** a dependency is upgraded to resolve a vulnerability alert
+- **THEN** `go test ./...` continues to pass without modification to test expectations
 
 ### Requirement: Change Completion Requires A Passing Test Run
 A code change SHALL NOT be considered complete until `go test ./...` has been run and passes, in addition to any applicable CI checks.

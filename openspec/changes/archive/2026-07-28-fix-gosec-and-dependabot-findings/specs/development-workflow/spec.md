@@ -32,13 +32,8 @@ The system's Go module dependencies SHALL NOT have open Dependabot vulnerability
 - **WHEN** a dependency is upgraded to resolve a vulnerability alert
 - **THEN** `go test ./...` continues to pass without modification to test expectations
 
-### Requirement: Vulnerability Scan Gate
-Every push to `main` and every pull request SHALL run [`govulncheck`](https://go.dev/security/vuln) against the module in CI. The CI job SHALL fail if `govulncheck` reports a vulnerability reachable from code the project actually calls.
-
-#### Scenario: CI fails on a reachable vulnerability
-- **WHEN** `govulncheck` reports a vulnerability in a symbol reachable from this project's code
-- **THEN** the CI `Vulnerability Scan (govulncheck)` job fails and is visibly reported
-
-#### Scenario: CI passes when no reachable vulnerability is found
-- **WHEN** `govulncheck` reports zero vulnerabilities reachable from this project's code (vulnerabilities present only in unused symbols of a required module do not count)
-- **THEN** the CI `Vulnerability Scan (govulncheck)` job succeeds
+<!-- Note: this change originally also added a "Vulnerability Scan Gate" requirement here
+     (the govulncheck CI job discovered mid-implementation to be required by branch
+     protection). That requirement now lands via the separately-archived
+     add-vulnerability-scanning change (openspec/changes/archive/2026-07-28-add-vulnerability-scanning/),
+     which reached main first, so it's dropped here to avoid archiving a duplicate. -->
