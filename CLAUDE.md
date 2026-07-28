@@ -35,7 +35,20 @@ A change is **not complete** until `go test ./...` has been run and passes local
 
 - **`test` job**: `go vet ./...` + `go test ./... -v` (installs `ffmpeg` on the runner first).
 - **`sast` job**: [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. If a specific finding is a false positive or an accepted risk, suppress it with an inline `#nosec G<rule-id>` comment plus a written justification; never disable the SAST job or exclude whole files/rules to make it pass.
-- As of the change that introduced this gate, `gosec` reports 9 pre-existing findings (subprocess invocation, path-derived file access, directory permissions) that have not been fixed yet — CI is expected to be red on `sast` until each is triaged. See `openspec/specs/development-workflow/spec.md`.
+- **`vulncheck` job**: [`govulncheck`](https://go.dev/security/vulncheck) against the module, its dependencies, and the Go toolchain/stdlib. Same fail-on-any-finding policy, but only for vulnerabilities the code actually reaches (not everything transitively present).
+- As of the changes that introduced these gates, `gosec` reports 9 pre-existing findings (subprocess invocation, path-derived file access, directory permissions) and `govulncheck` reports 2 (`GO-2023-2102` HTTP/2 Rapid Reset, `GO-2024-2687` HTTP/2 CONTINUATION flood, both in `golang.org/x/net@v0.10.0` pulled in via `gin`) — none fixed yet. See `openspec/specs/development-workflow/spec.md`.
+
+## Current status: `main` is merge-frozen (as of 2026-07-28)
+
+Branch protection (`require-pr-workflow`) plus the 11 known findings above combine into a hard blocker: **no PR can currently merge**, because `gosec`/`govulncheck` scan the whole codebase on every PR regardless of what that PR actually touches. This is an explicit, accepted trade-off (see `openspec/changes/archive/2026-07-28-require-pr-workflow/design.md`), not a bug to route around — the unblock path is triaging the findings, not bypassing the checks.
+
+Run `gh pr list` for the live list rather than trusting numbers written here (they'll go stale) — as of this note there are 6 open PRs, all `mergeStateStatus: BLOCKED`:
+- 3 opened by this session (release-please's version-bump PR, and two of our own feature PRs) — all blocked on `gosec`/`govulncheck` only, `Build & Test` passes.
+- 3 opened automatically by Dependabot (`golang.org/x/net`, `golang.org/x/crypto`, `google.golang.org/protobuf` bumps) within minutes of enabling it — one of which (`x/net` → `v0.55.0`) is the actual fix for the 2 `govulncheck` CVEs above.
+
+**Concrete finding worth knowing before touching this**: the Dependabot `x/net` bump fails `Build & Test`, not just SAST — `go vet` errors with `go.mod requires go >= 1.25.0 (running go 1.21.13)`. The newer `x/net` needs a newer Go than this project currently targets. Fixing the CVEs will mean bumping `go.mod`'s `go` directive and the `test` job's `go-version: '1.21'` in `ci.yml` together with the dependency — not just merging the Dependabot PR as-is.
+
+Delete this section once the findings are triaged and `main` can merge again.
 
 ## Commit messages and releases
 
