@@ -25,6 +25,14 @@ A change is **not complete** until `go test ./...` has been run and passes local
 - **`sast` job**: [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. If a specific finding is a false positive or an accepted risk, suppress it with an inline `#nosec G<rule-id>` comment plus a written justification; never disable the SAST job or exclude whole files/rules to make it pass.
 - As of the change that introduced this gate, `gosec` reports 9 pre-existing findings (subprocess invocation, path-derived file access, directory permissions) that have not been fixed yet — CI is expected to be red on `sast` until each is triaged. See `openspec/specs/development-workflow/spec.md`.
 
+## Commit messages and releases
+
+Commit messages **must** follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `ci:`, `test:`, `refactor:`, `!` after the type or a `BREAKING CHANGE:` footer for breaking changes) — this isn't just style, it's the signal [`release-please`](https://github.com/googleapis/release-please) (`.github/workflows/release-please.yml`) uses to compute the next version automatically.
+
+- Versioning is **not** manual. Nobody runs `git tag` by hand. On every push to `main`, release-please maintains a single up-to-date "Release PR" showing the next version and changelog computed from Conventional Commits since the last release.
+- Merging that PR is what actually cuts a release: it creates the git tag, publishes a GitHub Release with generated notes, and updates `CHANGELOG.md`. Until it's merged, nothing is tagged or released.
+- Config: `release-please-config.json` (`release-type: simple` — this app has no package-manager manifest to version-bump) and `.release-please-manifest.json` (tracks the current released version per path).
+
 ## Commands
 
 ```bash
