@@ -38,3 +38,11 @@
 
 - [x] 7.1 Create feature branch, commit with a Conventional Commit message (`fix: ...`), push, open PR.
 - [x] 7.2 Confirm `Build & Test` and `SAST (gosec)` CI checks pass on the PR.
+
+## 8. Vulnerability Scan gate (discovered blocking merge: branch protection requires a third check, "Vulnerability Scan (govulncheck)", that no workflow produced)
+
+- [x] 8.1 Add a `vulncheck` job to `.github/workflows/ci.yml` named `Vulnerability Scan (govulncheck)` that installs and runs `govulncheck ./...`.
+- [x] 8.2 Update `CLAUDE.md` to document the third required check and the dependency-vulnerability quality gate.
+- [x] 8.3 Sync `openspec/config.yaml` context block (stale Go 1.21 / "no CI" notes) to reflect current Go version and the three CI jobs.
+- [x] 8.4 Add a `Vulnerability Scan Gate` requirement to the `development-workflow` delta spec.
+- [ ] 8.5 Push, confirm all three checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`) pass, and confirm the PR becomes mergeable.

@@ -12,6 +12,7 @@ CI's `SAST (gosec)` job has been red since it was introduced, blocking every PR 
 - Resolve all 26 open Dependabot alerts (`golang.org/x/crypto`, `golang.org/x/net`, `google.golang.org/protobuf`), all transitive via `github.com/gin-gonic/gin v1.9.1`:
   - Upgrade `gin` to the latest `v1.12.x` and run `go mod tidy` / `go get -u` on the flagged transitive modules so `go.sum` only contains patched versions.
   - Re-run `govulncheck`/`gosec`/`go test` to confirm no regressions from the dependency bump.
+- Add a `govulncheck` CI job (`Vulnerability Scan (govulncheck)`), discovered mid-implementation to be required by branch protection on `main` but never produced by any workflow, permanently blocking merge. Wiring it up closes that gap and gives future PRs an automated dependency-vulnerability gate, matching the spirit of this change.
 
 ## Capabilities
 

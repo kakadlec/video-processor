@@ -27,15 +27,16 @@ git push -u origin feat/short-description
 gh pr create --fill
 ```
 
-A PR is **not mergeable** until both required status checks pass: `Build & Test` and `SAST (gosec)`, and the branch is up to date with `main`. This applies to every PR, including `release-please`'s own automated release PR — no special-casing. If `SAST (gosec)` is red because of an unrelated pre-existing finding elsewhere in the codebase, that still blocks your PR; the fix is to triage the findings (see below), not to bypass the check.
+A PR is **not mergeable** until all three required status checks pass — `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` — and the branch is up to date with `main`. This applies to every PR, including `release-please`'s own automated release PR — no special-casing. If any of these is red because of an unrelated pre-existing finding elsewhere in the codebase, that still blocks your PR; the fix is to triage the findings (see below), not to bypass the check.
 
-## Quality gates: tests and SAST must pass
+## Quality gates: tests, SAST, and dependency vulnerabilities must pass
 
-A change is **not complete** until `go test ./...` has been run and passes locally — this applies before reporting any change as done, not just before pushing. CI (`.github/workflows/ci.yml`) enforces this plus a SAST gate on every push to `main` and every pull request:
+A change is **not complete** until `go test ./...` has been run and passes locally — this applies before reporting any change as done, not just before pushing. CI (`.github/workflows/ci.yml`) enforces this plus a SAST gate and a dependency-vulnerability gate on every push to `main` and every pull request:
 
-- **`test` job**: `go vet ./...` + `go test ./... -v` (installs `ffmpeg` on the runner first).
-- **`sast` job**: [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. If a specific finding is a false positive or an accepted risk, suppress it with an inline `#nosec G<rule-id>` comment plus a written justification; never disable the SAST job or exclude whole files/rules to make it pass.
-- As of the change that introduced this gate, `gosec` reports 9 pre-existing findings (subprocess invocation, path-derived file access, directory permissions) that have not been fixed yet — CI is expected to be red on `sast` until each is triaged. See `openspec/specs/development-workflow/spec.md`.
+- **`test` job** (`Build & Test`): `go vet ./...` + `go test ./... -v` (installs `ffmpeg` on the runner first).
+- **`sast` job** (`SAST (gosec)`): [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. If a specific finding is a false positive or an accepted risk, suppress it with an inline `#nosec G<rule-id>` comment plus a written justification; never disable the SAST job or exclude whole files/rules to make it pass.
+- **`vulncheck` job** (`Vulnerability Scan (govulncheck)`): [`govulncheck`](https://go.dev/security/vuln) against the module. It only fails when a known vulnerability is reachable from code actually called by this project (not merely present in `go.sum`) — resolve a failure by upgrading the implicated dependency, generally by bumping the direct dependency that pulls it in transitively (see `go mod graph`), then `go mod tidy`.
+- All `gosec` findings and reachable `govulncheck` vulnerabilities present as of this writing have been resolved (see `openspec/changes/archive/fix-gosec-and-dependabot-findings/` once archived, or `openspec/specs/development-workflow/spec.md`). Dependabot alerts should be resolved the same way — upgrade the flagged module or the direct dependency pulling it in — as soon as they're opened, not left to accumulate.
 
 ## Commit messages and releases
 

@@ -39,7 +39,7 @@ jobs:
 
       - name: Set up Go
         # gosec's own minimum Go requirement moves independently of this
-        # project's go.mod (go 1.21) — use the latest stable toolchain to
+        # project's go.mod (go 1.25) — use the latest stable toolchain to
         # install/run it, since it's a dev tool, not the app itself.
         uses: actions/setup-go@v7
         with:
@@ -50,3 +50,21 @@ jobs:
 
       - name: Run gosec
         run: gosec ./...
+
+  vulncheck:
+    name: Vulnerability Scan (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
