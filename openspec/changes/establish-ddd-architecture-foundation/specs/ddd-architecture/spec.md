@@ -1,0 +1,197 @@
+# ddd-architecture Specification
+
+## Purpose
+
+Defines the tactical Domain-Driven Design model, bounded context boundaries, aggregate root invariants, package dependency rules, and the phased evolution roadmap for FIAP X. This specification is the authoritative reference for the system's domain structure; all subsequent implementation changes must be consistent with it.
+
+## ADDED Requirements
+
+### Requirement: Three Bounded Contexts With Non-Overlapping Responsibilities
+
+The system SHALL be organized into exactly three bounded contexts — `Identity`, `Video Processing`, and `Notification` — each with a clearly delimited responsibility. No domain concept SHALL be owned by more than one context.
+
+#### Scenario: Identity context owns user credentials and token issuance
+
+- **GIVEN** a user wants to authenticate
+- **WHEN** they submit credentials
+- **THEN** only the Identity context validates credentials and issues tokens; no other context stores passwords or issues tokens
+
+#### Scenario: Video Processing context owns the job lifecycle
+
+- **GIVEN** an authenticated user uploads a video
+- **WHEN** the upload is accepted
+- **THEN** the Video Processing context creates, tracks, and completes the `VideoJob`; no other context mutates job state
+
+#### Scenario: Notification context reacts to events without being called directly
+
+- **GIVEN** a `VideoJobCompleted` or `VideoJobFailed` event is emitted
+- **WHEN** the Notification context receives it
+- **THEN** it delivers the notification per the user's preferences without the Video Processing context knowing or caring how delivery works
+
+### Requirement: VideoJob as Aggregate Root With Enforced Invariants
+
+The `VideoJob` SHALL be the aggregate root of the Video Processing bounded context. Its invariants SHALL be enforced at the domain layer, not at the application or infrastructure layer.
+
+#### Scenario: VideoJob is created in pending state
+
+- **GIVEN** a valid video file has been stored
+- **WHEN** `CreateVideoJob` is invoked
+- **THEN** a `VideoJob` is created with `status: pending`, `FrameCount: 0`, and an empty `ErrorReason`
+
+#### Scenario: FrameCount is zero until job completes
+
+- **GIVEN** a `VideoJob` in any state other than `completed`
+- **WHEN** its `FrameCount` is read
+- **THEN** it SHALL be zero
+
+#### Scenario: ErrorReason is empty unless job has failed
+
+- **GIVEN** a `VideoJob` in any state other than `failed`
+- **WHEN** its `ErrorReason` is read
+- **THEN** it SHALL be empty
+
+#### Scenario: StorageKey for the result is set only on completion
+
+- **GIVEN** a `VideoJob` transitions to `completed`
+- **WHEN** the transition is applied
+- **THEN** `StorageKey` for the result and `FrameCount` MUST be set atomically in the same operation
+
+### Requirement: Valid State Machine Transitions Only
+
+The `VideoJob` status SHALL only advance through the defined state machine. Backwards transitions and undefined transitions SHALL be rejected as domain errors.
+
+#### Scenario: Job advances from pending to queued
+
+- **GIVEN** a `VideoJob` in `pending` state
+- **WHEN** `EnqueueVideoJob` is called
+- **THEN** the job transitions to `queued`
+
+#### Scenario: Job advances from queued to processing
+
+- **GIVEN** a `VideoJob` in `queued` state
+- **WHEN** the worker dequeues the job and calls `StartProcessing`
+- **THEN** the job transitions to `processing`
+
+#### Scenario: Job advances from processing to completed
+
+- **GIVEN** a `VideoJob` in `processing` state
+- **WHEN** the worker successfully extracts frames and calls `CompleteJob`
+- **THEN** the job transitions to `completed` with `FrameCount` and result `StorageKey` populated
+
+#### Scenario: Job advances from processing to failed
+
+- **GIVEN** a `VideoJob` in `processing` state
+- **WHEN** the worker encounters an unrecoverable error and calls `FailJob`
+- **THEN** the job transitions to `failed` with a non-empty `ErrorReason`
+
+#### Scenario: Backwards transition is rejected
+
+- **GIVEN** a `VideoJob` in `completed` or `failed` state
+- **WHEN** any transition command is applied
+- **THEN** the domain layer rejects the command with an error; the job state is not mutated
+
+### Requirement: Package Dependency Rules
+
+The package structure SHALL enforce a strict dependency hierarchy so that domain logic is never coupled to infrastructure concerns.
+
+#### Scenario: Domain packages have no infrastructure imports
+
+- **GIVEN** any Go file under `internal/<context>/domain/`
+- **WHEN** its imports are inspected
+- **THEN** it SHALL NOT import any package from `internal/<context>/infrastructure/`, any HTTP framework, any database driver, any message broker client, or any cache client
+
+#### Scenario: Application packages depend only on domain interfaces
+
+- **GIVEN** any Go file under `internal/<context>/application/`
+- **WHEN** its imports are inspected
+- **THEN** it SHALL NOT import any package from `internal/<context>/infrastructure/` directly; it SHALL depend only on repository and port interfaces defined in `internal/<context>/domain/`
+
+#### Scenario: Infrastructure packages implement domain interfaces
+
+- **GIVEN** any Go file under `internal/<context>/infrastructure/`
+- **WHEN** it provides a repository or port implementation
+- **THEN** the implementation type SHALL satisfy the interface declared in `internal/<context>/domain/`, not define its own contract
+
+#### Scenario: No direct cross-context domain imports
+
+- **GIVEN** any Go file in any bounded context's packages
+- **WHEN** it needs to reference a concept from another bounded context
+- **THEN** it SHALL use only the shared `UserID` value object from `pkg/` or consume integration events; it SHALL NOT import another context's `domain` or `application` packages directly
+
+#### Scenario: Composition root is the only DI boundary
+
+- **GIVEN** `cmd/api` or `cmd/worker`
+- **WHEN** it initializes the application
+- **THEN** it is the only place where `infrastructure` adapters are instantiated and injected into `application` use cases
+
+### Requirement: Domain Events as Cross-Context Integration Contracts
+
+Domain events emitted by one bounded context and consumed by another SHALL be defined with a stable, versioned schema. Event payloads SHALL be immutable once emitted.
+
+#### Scenario: VideoJobCompleted event carries required fields
+
+- **GIVEN** a `VideoJob` transitions to `completed`
+- **WHEN** a `VideoJobCompleted` integration event is emitted
+- **THEN** it SHALL contain at minimum: `type`, `job_id`, `user_id`, `frame_count`, `storage_key`, and `occurred_at`
+
+#### Scenario: VideoJobFailed event carries required fields
+
+- **GIVEN** a `VideoJob` transitions to `failed`
+- **WHEN** a `VideoJobFailed` integration event is emitted
+- **THEN** it SHALL contain at minimum: `type`, `job_id`, `user_id`, `error_reason`, and `occurred_at`
+
+#### Scenario: Notification context consumes events without coupling to Video Processing internals
+
+- **GIVEN** the Notification context receives a `VideoJobCompleted` or `VideoJobFailed` event
+- **WHEN** it processes the event
+- **THEN** it SHALL NOT import or call any package from the Video Processing bounded context to do so
+
+### Requirement: Redis Responsibilities Are Additive, Not a Replacement for PostgreSQL or RabbitMQ
+
+Redis SHALL be used as a mandatory performance and reliability layer with four defined responsibilities. It SHALL NOT replace PostgreSQL as the authoritative state store, and it SHALL NOT replace RabbitMQ as the durable job queue.
+
+#### Scenario: Idempotency key prevents duplicate job creation
+
+- **GIVEN** a client retries a `POST /upload` with the same content within the idempotency window
+- **WHEN** the API processes the retry
+- **THEN** Redis returns the existing `VideoJobID` and the handler returns the existing job without creating a duplicate or re-enqueuing
+
+#### Scenario: Rate limiting rejects excess requests
+
+- **GIVEN** a user exceeds the configured request rate
+- **WHEN** their next request arrives
+- **THEN** the rate-limiting middleware (backed by Redis) rejects it with HTTP 429 before it reaches the handler
+
+#### Scenario: Status cache absorbs repeated polling reads
+
+- **GIVEN** a client polls `GET /jobs/{id}/status` repeatedly
+- **WHEN** the job state has not changed since the last DB write
+- **THEN** the response is served from the Redis status cache without a PostgreSQL query
+
+#### Scenario: Cache invalidation is tied to state transition writes
+
+- **GIVEN** a job transitions to a new state and that transition is written to PostgreSQL
+- **WHEN** the write succeeds
+- **THEN** the Redis status cache entry for that job is invalidated or updated atomically with the DB write (or immediately after, within the same request/transaction scope)
+
+#### Scenario: PostgreSQL is authoritative on cache miss
+
+- **GIVEN** the Redis status cache has no entry for a job
+- **WHEN** a status request arrives
+- **THEN** the application falls back to PostgreSQL, returns the correct current state, and may repopulate the cache
+
+### Requirement: Monorepo Package Topology Is the Target Structure
+
+The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/worker` as separate entrypoints sharing `internal/` packages. This topology SHALL NOT require a big-bang rewrite; `main.go` MAY remain functional during incremental migration.
+
+#### Scenario: API and worker share domain and application packages
+
+- **GIVEN** `cmd/api` and `cmd/worker` both exist in the repository
+- **WHEN** they both need to work with `VideoJob`
+- **THEN** they both import from `internal/video/domain` and `internal/video/application` — the domain logic is not duplicated
+
+#### Scenario: Each cmd entrypoint produces an independent deployable binary
+
+- **GIVEN** the monorepo topology is in place
+- **WHEN** `go build ./cmd/api` and `go build ./cmd/worker` are run
+- **THEN** each produces an independent binary that can be containerized and deployed separately
