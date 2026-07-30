@@ -16,6 +16,7 @@ The hackathon requirements include: user authentication, asynchronous video proc
 - Define the monorepo package topology as the target structure.
 - Document the seven key architecture decisions (ADRs) the roadmap will encounter.
 - Produce a versioned evolution roadmap that sequences future changes.
+- Establish the frontend (inline HTML/CSS/JS in `getHTMLForm()`) as a presentation/delivery layer: document non-regression criteria, contract-compatibility rules, and the incremental extraction path to static files under `web/`.
 
 **Non-Goals:**
 
@@ -146,6 +147,10 @@ video-processor/
   cmd/
     api/        # HTTP entrypoint (replaces main.go eventually)
     worker/     # Async frame-extraction worker
+  web/
+    index.html  # Static HTML page (extracted from getHTMLForm() in Phase 3)
+    styles.css
+    app.js
   internal/
     identity/
       domain/         # User aggregate, value objects, repository interface
@@ -164,6 +169,50 @@ video-processor/
 ```
 
 **Migration path:** The current `main.go` continues to function as-is during the transition. New packages are introduced alongside it. Each feature change (`opsx:apply`) migrates one slice of the handler into the appropriate application use case, then wires it back to the HTTP layer. No "big bang" rewrite.
+
+## Frontend / Presentation Layer
+
+The current application serves a single HTML page via `getHTMLForm()` in `main.go` — an inline form with vanilla JavaScript that calls `POST /upload` and `GET /api/status`. This page is part of the product and must remain functional throughout the DDD migration.
+
+**The frontend is not a bounded context.** It is a delivery/presentation layer: it has no domain rules, no aggregate roots, and no domain events. It consumes the HTTP API surface exposed by the Video Processing context.
+
+### Extraction Direction
+
+The frontend will be incrementally extracted from the Go string literal to discrete static files under `web/` (see package topology above):
+
+- `web/index.html` — the HTML skeleton extracted from `getHTMLForm()`
+- `web/styles.css` — all inline `<style>` content
+- `web/app.js` — the vanilla JS fetch logic
+
+The Go server continues to serve these files — via `gin.Static` or equivalent pointing at `web/` (keeping the same `GET /` route, now serving `web/index.html` instead of the inline string). No separate frontend build step, no Node.js toolchain, no bundler. This extraction is scoped to **Phase 3** (`implement-videojob-persistence`), where `main.go` is already being restructured.
+
+### API Contract Compatibility During Migration
+
+When the async processing API is introduced in Phase 6, `POST /upload` becomes non-blocking and returns a job ID immediately instead of waiting for ffmpeg to complete. The frontend must adapt to this change.
+
+Compatibility strategy:
+
+- `POST /upload` SHALL remain available and SHALL continue to accept multipart form data in the same shape during Phase 6 and beyond.
+- The **response schema** of `POST /upload` will change in Phase 6: it will return a job ID and a status URL instead of a direct download link.
+- `POST /jobs` is the canonical async entrypoint introduced in Phase 6; `POST /upload` MAY eventually be deprecated in favor of it, but SHALL NOT be removed until the frontend is updated and verified working against the new endpoint.
+- `GET /jobs/{id}/status` replaces `GET /api/status` as the per-job polling endpoint. `GET /api/status` (which lists all outputs glob-style) remains available for backward compatibility through Phase 6.
+
+### Non-Regression Criteria
+
+Every phase that changes API contracts or routing SHALL verify the following before merging:
+
+| Endpoint / Flow | Criterion |
+|---|---|
+| `GET /` | Returns HTTP 200 with HTML content; page loads without JS errors |
+| Static assets | `GET /web/styles.css` and `GET /web/app.js` return HTTP 200 with correct `Content-Type` after Phase 3 extraction |
+| `POST /upload` | Accepts a valid video file; returns a usable response (download link in sync phases; job ID + status URL from Phase 6 onward) |
+| `GET /api/status` | Returns HTTP 200 with JSON listing completed outputs |
+| `GET /download/:filename` | Returns HTTP 200 with a zip file for a valid filename |
+| Full frontend flow | Uploading a video through the web UI results in a downloadable zip — verified via browser or a curl sequence simulating the complete upload → poll → download flow |
+
+### Rule: Backend Contract Changes Must Preserve or Update the Frontend
+
+Any OpenSpec change that adds, renames, or removes an HTTP endpoint consumed by the frontend SHALL include an explicit task to update `web/app.js` (or the inline JS in `getHTMLForm()`, until Phase 3 extraction) to reflect the new contract. A backend contract change is not complete if the frontend silently breaks.
 
 ## Dependency Rules
 
@@ -261,11 +310,11 @@ This roadmap sequences the evolution of FIAP X from the current flat monolith in
 
 | Phase | Change name (tentative) | Scope |
 |---|---|---|
-| **1** | `establish-ddd-architecture-foundation` *(this change)* | OpenSpec artifacts only. Bounded contexts, VideoJob aggregate, package topology, ADRs, dependency rules. No code changes. |
+| **1** | `establish-ddd-architecture-foundation` *(this change)* | OpenSpec artifacts only. Bounded contexts, VideoJob aggregate, package topology, ADRs, dependency rules. Documents frontend as presentation/delivery layer; establishes non-regression criteria and contract-compatibility rules. No code changes. |
 | **2** | `implement-identity-and-authentication` | `internal/identity/domain` and `application`; JWT token issuance and verification middleware; `RegisterUser` and `AuthenticateUser` use cases; Identity infrastructure (PostgreSQL adapter); wire into `cmd/api`. No async work yet. |
-| **3** | `implement-videojob-persistence` | `internal/video/domain` and `application`; PostgreSQL schema for `video_jobs` and `outbox`; `CreateVideoJob` and `GetJobStatus` use cases; synchronous `ffmpeg` call migrated from `main.go` into `application`; polling status endpoint. `main.go` now delegates to use cases. |
+| **3** | `implement-videojob-persistence` | `internal/video/domain` and `application`; PostgreSQL schema for `video_jobs` and `outbox`; `CreateVideoJob` and `GetJobStatus` use cases; synchronous `ffmpeg` call migrated from `main.go` into `application`; polling status endpoint. `main.go` now delegates to use cases. Frontend extracted to `web/index.html`, `web/styles.css`, `web/app.js`; Go serves them via static file handler. Non-regression for `GET /` and assets verified. |
 | **4** | `implement-redis-capabilities` | Redis infrastructure adapter; idempotency keys on `POST /upload`; rate limiting middleware; status cache for `GetJobStatus`; distributed lock for worker job pickup. PostgreSQL remains source of truth; Redis is read-through only. |
 | **5** | `implement-minio-object-storage` | MinIO storage adapter behind the `StoragePort` interface; migrate upload and result storage from local filesystem to MinIO; presigned download URLs; update `GetJobStatus` to return a presigned URL for `completed` jobs. |
-| **6** | `implement-rabbitmq-and-worker` | RabbitMQ infrastructure; `EnqueueVideoJob` use case publishes to queue; outbox relay reads PostgreSQL outbox and publishes to RabbitMQ; `cmd/worker` picks up messages, runs ffmpeg, calls `CompleteJob` or `FailJob`; `POST /upload` becomes non-blocking (returns job ID immediately). |
+| **6** | `implement-rabbitmq-and-worker` | RabbitMQ infrastructure; `EnqueueVideoJob` use case publishes to queue; outbox relay reads PostgreSQL outbox and publishes to RabbitMQ; `cmd/worker` picks up messages, runs ffmpeg, calls `CompleteJob` or `FailJob`; `POST /upload` becomes non-blocking (returns job ID immediately). `web/app.js` adapted for the async response: upload returns job ID + status URL; polling loop updated to call `GET /jobs/{id}/status`. |
 | **7** | `implement-notifications` | `internal/notification/domain` and `application`; event subscription to `VideoJobCompleted` / `VideoJobFailed` from RabbitMQ; email delivery via SMTP or transactional provider; webhook delivery with retry and HMAC signature; `NotificationPreference` per user. |
 | **8** | `implement-observability-and-delivery` | Structured logging (zerolog or slog); Prometheus metrics exposition (`/metrics`); health and readiness endpoints (`/health`, `/ready`); Dockerfile hardening (multi-stage build, non-root user); `docker-compose.yml` for local development stack (PostgreSQL, Redis, RabbitMQ, MinIO); CI image-build step. |
