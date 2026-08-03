@@ -15,12 +15,13 @@ This is a **planning-only change** — no application code, no infrastructure, n
 - **Domain events and integration contracts** between contexts.
 - **Dependency rules** (domain must not import infrastructure; application must not import HTTP).
 - **Architecture Decision Records** for the seven key decisions the roadmap will encounter: async transport (RabbitMQ vs Redis Streams), object storage (MinIO vs local volume), identity (JWT vs sessions), status delivery (polling vs webhook), repo topology (monorepo vs multi-repo), Redis responsibilities (idempotency, rate limiting, status cache, distributed locks), and PostgreSQL as source of truth.
+- **Frontend / Presentation Layer** — the existing inline HTML/CSS/JavaScript (`getHTMLForm()`) is documented as a delivery/presentation layer, not a bounded context. Non-regression criteria, backend contract-compatibility rules, and an incremental extraction path to `web/index.html`, `web/styles.css`, and `web/app.js` are established.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `ddd-architecture`: Tactical DDD model, bounded contexts, aggregate root (`VideoJob`), domain events, dependency rules, and evolution roadmap for FIAP X.
+- `ddd-architecture`: Tactical DDD model, bounded contexts, aggregate root (`VideoJob`), domain events, dependency rules, frontend presentation layer, and evolution roadmap for FIAP X.
 
 ### Modified Capabilities
 
