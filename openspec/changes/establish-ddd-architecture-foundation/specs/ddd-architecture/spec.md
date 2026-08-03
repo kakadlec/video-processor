@@ -229,3 +229,43 @@ The web frontend (HTML/CSS/JavaScript currently embedded in `getHTMLForm()`) SHA
 - **GIVEN** any phase change that modifies API contracts or routing
 - **WHEN** implementation is complete and before the PR is merged
 - **THEN** uploading a video through the web UI must result in a downloadable zip — verified via browser interaction or a curl sequence simulating the complete upload → poll → download flow
+
+### Requirement: Permanent Project Documentation Is Accurate, Current-State-Faithful, and Separate from OpenSpec Artifacts
+
+The repository SHALL include a set of permanent documentation files (`README.md`, `docs/architecture.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/development.md`, `docs/operations.md`, `docs/roadmap.md`) serving as the stable reference for contributors, evaluators, and operators. These files are distinct from OpenSpec artifacts: OpenSpec governs change proposals and implementation tasks; permanent docs describe the system as it exists and where it is going, in terms readable without knowledge of the OpenSpec workflow.
+
+#### Scenario: Documentation distinguishes current implementation from target architecture
+
+- **GIVEN** any documentation file that describes the system architecture
+- **WHEN** it references a component or pattern that does not yet exist in `main.go`
+- **THEN** it SHALL explicitly label that component as planned, future, or "Phase N" — never as currently implemented
+
+#### Scenario: Documentation does not claim unimplemented infrastructure as existing
+
+- **GIVEN** the current codebase contains only `main.go` with local filesystem state
+- **WHEN** any documentation file mentions PostgreSQL, Redis, RabbitMQ, MinIO, user authentication, async processing, or webhook notifications
+- **THEN** these MUST appear only in "planned" or "target architecture" sections, not in any section describing the current running system
+
+#### Scenario: README commands are runnable against the current codebase
+
+- **GIVEN** the `README.md` quickstart section lists commands
+- **WHEN** a reader executes those commands against the current repository
+- **THEN** each command runs successfully, or is explicitly labeled as requiring a future phase or optional prerequisite
+
+#### Scenario: OpenSpec artifacts and permanent docs serve different audiences without overlap
+
+- **GIVEN** a contributor wants to understand how to propose a change
+- **WHEN** they consult the permanent docs
+- **THEN** the docs MAY reference the OpenSpec workflow without duplicating or replacing OpenSpec artifact content; OpenSpec artifacts SHALL NOT duplicate the developer-facing content of the permanent docs
+
+#### Scenario: Documentation roadmap contains exactly eight phases
+
+- **GIVEN** `docs/roadmap.md` summarizes the evolution roadmap
+- **WHEN** a reader counts the phases
+- **THEN** exactly 8 phases are listed (1–8); no ninth or additional phase is present; the file references `openspec/changes/establish-ddd-architecture-foundation/design.md` as the canonical source
+
+#### Scenario: Documentation PR is isolated from spec and code PRs
+
+- **GIVEN** the three-PR separation policy (propose PR → implement PR → archive PR)
+- **WHEN** the documentation PR is opened
+- **THEN** it SHALL contain only `README.md` and files under `docs/` — no changes to `openspec/changes/`, `openspec/specs/`, `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, or CI workflow files

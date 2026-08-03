@@ -290,6 +290,58 @@ These rules are enforced by Go's own import system (circular imports are compile
 
 **Outbox pattern:** Rather than publishing to RabbitMQ directly inside a DB transaction (two-phase write), the application writes domain events to an `outbox` table in the same PostgreSQL transaction as the state update. A separate relay process (or polling loop in the worker) reads the outbox and publishes to RabbitMQ, marking events as published. This ensures no events are lost on crash between the DB write and the broker publish.
 
+## Permanent Project Documentation
+
+### Purpose and Distinction from OpenSpec
+
+OpenSpec artifacts (`proposal.md`, `design.md`, `tasks.md`, `specs/**`) are change-governance records: they document why a change was proposed, how it was designed, what tasks implement it, and the resulting capability specification. They are maintained by engineers proposing and reviewing changes and form the audit trail for design decisions.
+
+Permanent documentation (`README.md`, `docs/**`) is the stable operational reference for contributors, evaluators, and operators encountering the repository cold. It answers: what is this project, how do I run it today, what is the current architecture, and where is it going.
+
+The two must not blur. OpenSpec artifacts are not user-facing docs. Permanent docs are not change proposals or task lists. A reader should be able to understand how to set up and run the project from `README.md` and `docs/` without ever needing to open `openspec/`.
+
+### Documentation Artifacts
+
+This change specifies the following documentation files. They are created in a separate documentation PR that follows this spec PR. None of these files exist yet; they must not be created until that PR.
+
+| File | Required content |
+|---|---|
+| `README.md` | Project name and description; prerequisites (Go version, ffmpeg, Docker); quickstart commands (exact commands from CLAUDE.md, verified runnable); links to every file in `docs/`; explicit current-limitations callout (synchronous, no auth, no async, local filesystem only) |
+| `docs/architecture.md` | Current state description (single `main.go`, synchronous pipeline, local filesystem); target DDD structure (bounded contexts, package topology from this design); 8-phase roadmap summary; explicit labeling of current vs. target for every architecture element shown |
+| `docs/domain-model.md` | `VideoJob` aggregate root and its value objects table; state machine with valid transitions (`pending → queued → processing → completed / failed`); domain events with JSON field signatures; bounded context responsibilities (Identity, Video Processing, Notification); how `UserID` crosses context boundaries |
+| `docs/flows.md` | Current synchronous upload → ffmpeg → zip → download flow; target async flow (API → queue → worker → MinIO → notify); frontend interaction sequence (what the browser calls at each step, current and planned); explicit current-vs-target labeling |
+| `docs/development.md` | Local setup prerequisites (Go version, ffmpeg installation, Docker); step-by-step local run (`go run main.go`); test execution (`go test ./... -v`, with ffmpeg caveat and Docker fallback); Docker build and run commands; CLAUDE.md conventions summary (Conventional Commits, OpenSpec workflow, PR-separation rule) |
+| `docs/operations.md` | Docker deployment instructions; environment variables (PORT and any others); runtime directory structure (`uploads/`, `temp/`, `outputs/` and their roles); future infrastructure responsibilities (PostgreSQL, Redis, RabbitMQ, MinIO — each labeled "planned, Phase N" with a sentence on its role) |
+| `docs/roadmap.md` | 8-phase summary table with change name, scope, and current status per phase (Phase 1: specifying; Phases 2–8: planned); explicit statement that the canonical roadmap source is `openspec/changes/establish-ddd-architecture-foundation/design.md` and `openspec/specs/ddd-architecture/spec.md`; explicit "exactly 8 phases" statement |
+
+### Content Rules
+
+The following rules apply to every documentation file created in the documentation PR:
+
+1. **Distinguish current from target.** Every architecture description, infrastructure component, or feature that does not yet exist in the codebase MUST be explicitly marked as planned, future, or "Phase N." The reader MUST never confuse what is running today with what the roadmap will build.
+
+2. **Do not claim unimplemented components as existing.** PostgreSQL, Redis, RabbitMQ, MinIO, user authentication, async processing, and webhook notifications are NOT present in the current codebase. These MUST NOT appear in any documentation section as if they were implemented — only in "planned" or "target architecture" sections with clear phase labeling.
+
+3. **README commands must be runnable.** Every command shown in `README.md` and `docs/development.md` MUST be verified to work against the current codebase before the documentation PR is merged. Commands that only work in a future phase MUST be clearly labeled as such.
+
+4. **Frontend documentation is dual-state.** Any doc file that references the frontend MUST document both the current state (inline HTML/CSS/JS in `getHTMLForm()`) and the planned extraction to `web/index.html`, `web/styles.css`, `web/app.js` in Phase 3 — with explicit current-vs-planned labeling.
+
+5. **Roadmap in docs is a summary, not the source.** `docs/roadmap.md` summarizes the roadmap for human readers. It must not contradict the authoritative roadmap in this `design.md`. The canonical 8-phase roadmap lives in this change's `design.md` and `openspec/specs/ddd-architecture/spec.md`. No documentation file may introduce additional phases or a separate change for work already covered by Phases 1–8.
+
+6. **Documentation PR is isolated.** The documentation PR modifies only `README.md` and files under `docs/`. It must not touch `openspec/changes/`, `openspec/specs/`, `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, or CI workflows.
+
+### Consistency Criteria
+
+A documentation PR is not complete until:
+
+- `go run main.go` starts the server as described in `README.md`.
+- `go test ./... -v` produces the output described, or the ffmpeg caveat and Docker fallback are present.
+- `docker build -t video-processor . && docker run -p 8080:8080 video-processor` works as shown.
+- `docs/architecture.md` labels every component that requires a future phase with "Phase N" or equivalent.
+- `docs/roadmap.md` shows exactly 8 phases (1–8) and references `design.md` as the canonical source.
+- No doc file uses present-tense language ("stores in PostgreSQL", "authenticates via JWT", "enqueues to RabbitMQ") for components that are not yet in `main.go`.
+- `docs/flows.md` shows both the current synchronous flow and the target async flow, labeled separately.
+
 ## Risks / Trade-offs
 
 - **[Overhead before value]** Introducing DDD structure before the first feature is implemented adds ceremony. Mitigated by phasing: this change produces only spec artifacts; code migration happens incrementally in subsequent changes, each of which ships a visible capability.

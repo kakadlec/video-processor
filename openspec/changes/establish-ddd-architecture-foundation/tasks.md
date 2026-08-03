@@ -6,6 +6,10 @@
 - [x] 1.4 Write `specs/ddd-architecture/spec.md`: delta spec formalizing the DDD architecture requirements in OpenSpec requirement/scenario format, covering bounded context isolation, aggregate root invariants, dependency rules, and state machine transitions.
 - [x] 1.5 Write this `tasks.md`.
 - [x] 1.6 Update all artifacts to incorporate the frontend/presentation layer: `proposal.md` (What Changes + capability description), `design.md` (goals, package topology with `web/`, new "Frontend / Presentation Layer" section with extraction direction, compatibility strategy, non-regression criteria, and contract rule; roadmap phases 1, 3, and 6), `tasks.md` (this update and acceptance criteria 2.12–2.18), `specs/ddd-architecture/spec.md` (new Requirement for frontend as presentation/delivery layer).
+- [x] 1.7 Update `proposal.md` to add permanent project documentation as a new deliverable in "What Changes", a new capability (`permanent-project-documentation`) in "New Capabilities", and an updated "Impact" section that distinguishes the spec PR (only OpenSpec artifacts) from the documentation PR (creates `README.md` and `docs/**`).
+- [x] 1.8 Add "Permanent Project Documentation" section to `design.md` defining the 7 artifacts, the OpenSpec-vs-docs distinction, per-file content requirements, content rules (including prohibition on undeclared components), and consistency criteria.
+- [x] 1.9 Add section 3 (documentation PR tasks 3.1–3.7) and section 4 (documentation PR acceptance criteria 4.1–4.10) to `tasks.md`; add acceptance criteria 2.19–2.25 for the spec-level additions to section 2.
+- [x] 1.10 Add Requirement for permanent project documentation to `specs/ddd-architecture/spec.md` with scenarios covering current-vs-target distinction, prohibition on undeclared components, runnable README commands, OpenSpec–docs separation, roadmap phase count, and documentation PR isolation.
 
 ## 2. Acceptance criteria verification
 
@@ -29,3 +33,37 @@
 - [ ] 2.16 `design.md` states the rule that any change adding, renaming, or removing an HTTP endpoint consumed by the frontend must include a task to update `web/app.js` (or the inline JS until extraction) accordingly.
 - [ ] 2.17 Package topology in `design.md` includes the `web/` directory with `index.html`, `styles.css`, and `app.js`.
 - [ ] 2.18 The roadmap table still contains exactly eight phases; frontend extraction is incorporated into Phase 3 and frontend adaptation into Phase 6 — no ninth phase was added.
+- [ ] 2.19 `proposal.md` "What Changes" names permanent project documentation as a deliverable, distinguishes it from OpenSpec artifacts, and states that the documentation files will be created in a separate PR.
+- [ ] 2.20 `proposal.md` "New Capabilities" includes `permanent-project-documentation` with a one-line description covering architecture, domain model, flows, development, operations, and roadmap.
+- [ ] 2.21 `proposal.md` "Impact" distinguishes the spec PR (only files inside `openspec/changes/establish-ddd-architecture-foundation/`) from the documentation PR (creates `README.md` and `docs/**`), and states that no application code or CI is modified in either PR.
+- [ ] 2.22 `design.md` "Permanent Project Documentation" section lists all seven artifacts (`README.md`, `docs/architecture.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/development.md`, `docs/operations.md`, `docs/roadmap.md`) with their required content.
+- [ ] 2.23 `design.md` content rules explicitly prohibit describing PostgreSQL, Redis, RabbitMQ, MinIO, authentication, or async processing as implemented before they exist in the codebase, and require present-vs-target labeling throughout.
+- [ ] 2.24 `design.md` states that `docs/roadmap.md` is a summary and the canonical roadmap lives in `design.md` and `specs/ddd-architecture/spec.md`; no documentation file may introduce a ninth phase or additional phases.
+- [ ] 2.25 `specs/ddd-architecture/spec.md` contains a Requirement for permanent project documentation with at least one Scenario enforcing current-vs-target distinction, one Scenario prohibiting undeclared components as present, one Scenario for runnable README commands, and one Scenario for documentation PR isolation.
+
+## 3. Documentation PR deliverable
+
+> These tasks define what must be created in the documentation PR (separate from and following the spec PR that contains this change's OpenSpec artifacts). None of these files exist yet. Mark each task checked only after the corresponding file is created, reviewed, and passes the criteria in § 4.
+
+- [ ] 3.1 Create `README.md` at the repository root: project name and description, prerequisites section listing Go version and ffmpeg, quickstart commands (verified runnable against the current codebase), links to every file in `docs/`, and an explicit current-limitations callout (synchronous, no auth, no async, local filesystem only).
+- [ ] 3.2 Create `docs/architecture.md`: current implementation description (single `main.go`, synchronous pipeline, local filesystem); target DDD structure (bounded contexts, package topology); 8-phase roadmap summary; explicit current-vs-target labeling on every architecture element.
+- [ ] 3.3 Create `docs/domain-model.md`: `VideoJob` aggregate and value objects table; state machine diagram (`pending → queued → processing → completed / failed`); domain events with JSON field signatures; bounded context responsibilities; `UserID` cross-context contract.
+- [ ] 3.4 Create `docs/flows.md`: current synchronous request flow (upload → ffmpeg → zip → download); target async flow (upload → queue → worker → MinIO → notify); frontend interaction sequence (what the browser calls at each step, current and planned); current-vs-target labeling throughout.
+- [ ] 3.5 Create `docs/development.md`: local setup prerequisites; step-by-step local run (`go run main.go`); test execution (`go test ./... -v`) with ffmpeg caveat and Docker fallback command; Docker build/run commands; CLAUDE.md conventions summary (Conventional Commits, OpenSpec workflow, PR-separation rule).
+- [ ] 3.6 Create `docs/operations.md`: Docker deployment instructions; environment variables; runtime directory structure (`uploads/`, `temp/`, `outputs/`); future infrastructure responsibilities (PostgreSQL, Redis, RabbitMQ, MinIO — each labeled "planned, Phase N" with a one-sentence description of its role).
+- [ ] 3.7 Create `docs/roadmap.md`: 8-phase summary table with change name, scope, and current status per phase (Phase 1: specifying; Phases 2–8: planned); reference to `openspec/changes/establish-ddd-architecture-foundation/design.md` as the canonical roadmap source; explicit statement that exactly 8 phases are defined.
+
+## 4. Documentation PR acceptance criteria
+
+> These criteria verify the documentation PR content. They are checked during and after the documentation PR review — not during this spec change's PR review.
+
+- [ ] 4.1 `README.md` exists at the repository root and contains a project description, a prerequisites section naming Go and ffmpeg versions, a quickstart section with commands matching those in CLAUDE.md, and links to every file in `docs/`.
+- [ ] 4.2 Every command in `README.md` and `docs/development.md` has been verified to run successfully against the current codebase (`go run main.go` starts the server; `go test ./... -v` runs without error or has the ffmpeg-absence note; `docker build` and `docker run` complete without error).
+- [ ] 4.3 `docs/architecture.md` explicitly labels the current implementation (synchronous, single `main.go`) as distinct from the target DDD package topology; every component requiring a future phase (PostgreSQL, Redis, RabbitMQ, MinIO, async worker) is clearly marked "planned" or "Phase N."
+- [ ] 4.4 `docs/domain-model.md` contains the `VideoJob` value objects table, the state machine showing all five states and valid transitions, and the domain events table — each consistent with `design.md` in this change.
+- [ ] 4.5 `docs/flows.md` contains a description of the current synchronous flow and a description of the target async flow, labeled "current" and "target" (or "Phase 6+") respectively, plus a frontend interaction sequence covering both states.
+- [ ] 4.6 `docs/development.md` documents how to run tests locally including the ffmpeg prerequisite caveat and the Docker fallback (`docker build -t video-processor . && docker run --rm video-processor go test ./... -v`).
+- [ ] 4.7 `docs/operations.md` describes future infrastructure (PostgreSQL, Redis, RabbitMQ, MinIO) in the future tense or labeled as "planned, Phase N" — none appear as deployed or currently running.
+- [ ] 4.8 `docs/roadmap.md` shows exactly 8 phases (1–8); Phase 1 is described as specifying or complete and Phases 2–8 as planned; the file references `openspec/changes/establish-ddd-architecture-foundation/design.md` as the canonical source.
+- [ ] 4.9 No documentation file uses present-tense language implying that PostgreSQL, Redis, RabbitMQ, MinIO, JWT authentication, or async processing are currently implemented.
+- [ ] 4.10 The documentation PR modifies no files inside `openspec/changes/`, `openspec/specs/`, `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, or CI workflow files.
