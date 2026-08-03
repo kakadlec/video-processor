@@ -16,12 +16,14 @@ This is a **planning-only change** — no application code, no infrastructure, n
 - **Dependency rules** (domain must not import infrastructure; application must not import HTTP).
 - **Architecture Decision Records** for the seven key decisions the roadmap will encounter: async transport (RabbitMQ vs Redis Streams), object storage (MinIO vs local volume), identity (JWT vs sessions), status delivery (polling vs webhook), repo topology (monorepo vs multi-repo), Redis responsibilities (idempotency, rate limiting, status cache, distributed locks), and PostgreSQL as source of truth.
 - **Frontend / Presentation Layer** — the existing inline HTML/CSS/JavaScript (`getHTMLForm()`) is documented as a delivery/presentation layer, not a bounded context. Non-regression criteria, backend contract-compatibility rules, and an incremental extraction path to `web/index.html`, `web/styles.css`, and `web/app.js` are established.
+- **Permanent project documentation** — seven Markdown files (`README.md`, `docs/architecture.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/development.md`, `docs/operations.md`, `docs/roadmap.md`) specified by this change and created in a separate documentation PR. Unlike OpenSpec artifacts (which govern how changes are proposed, designed, and tracked), the permanent docs are the stable reference for contributors, evaluators, and operators encountering the project for the first time. Documentation must distinguish the current implementation state from the target DDD architecture and must not declare unimplemented infrastructure (PostgreSQL, Redis, RabbitMQ, MinIO, authentication, async processing) as existing.
 
 ## Capabilities
 
 ### New Capabilities
 
 - `ddd-architecture`: Tactical DDD model, bounded contexts, aggregate root (`VideoJob`), domain events, dependency rules, frontend presentation layer, and evolution roadmap for FIAP X.
+- `permanent-project-documentation`: Stable Markdown reference files covering project overview, architecture (current and target), domain model, request and event flows, development setup, infrastructure responsibilities, and the eight-phase evolution roadmap.
 
 ### Modified Capabilities
 
@@ -29,6 +31,7 @@ This is a **planning-only change** — no application code, no infrastructure, n
 
 ## Impact
 
-- New OpenSpec change artifacts only: `proposal.md`, `design.md`, `tasks.md`, `specs/ddd-architecture/spec.md`.
-- No changes to `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, CI workflows, or any other file outside `openspec/changes/establish-ddd-architecture-foundation/`.
+- New OpenSpec change artifacts only (spec PR): `proposal.md`, `design.md`, `tasks.md`, `specs/ddd-architecture/spec.md`. No application code, CI, or documentation files are created or modified in this PR.
+- A **documentation PR** follows this spec PR: it creates `README.md`, `docs/architecture.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/development.md`, `docs/operations.md`, and `docs/roadmap.md`. That PR contains only documentation — no OpenSpec artifacts, no application code.
+- No changes to `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, or CI workflows in either PR.
 - This change is the prerequisite for every subsequent infrastructure and feature change in the roadmap. It must be reviewed and merged before implementation begins.
