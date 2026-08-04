@@ -1,0 +1,97 @@
+# Operations
+
+## Current Deployment
+
+The application is a single Go binary (or `go run main.go`) behind a Docker container. There is no orchestration, no external services, and no environment-specific configuration beyond the port.
+
+### Docker
+
+```bash
+# Build
+docker build -t video-processor .
+
+# Run
+docker run -p 8080:8080 video-processor
+
+# Custom port
+docker run -p 9090:8080 -e PORT=8080 video-processor
+```
+
+The Dockerfile is a single-stage build using `golang:1.26-alpine` with `ffmpeg` installed. It runs as root and calls `go run main.go` as the entry point. **This is an intentional anti-pattern for study purposes** — see the Dockerfile header comment. Hardening (multi-stage build, non-root user) is planned for Phase 8.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8080` | Listening port (hardcoded in `main.go` as `:8080`; no env var read currently — listed here for future use) |
+| `GIN_MODE` | `debug` | Set to `release` to suppress Gin debug output |
+
+Currently no environment variables are required. The application runs with defaults.
+
+## Runtime Directory Structure
+
+The application creates and uses three directories relative to its working directory:
+
+```
+./
+  uploads/    Transient input: uploaded video files
+  temp/       Per-request scratch: extracted PNG frames
+  outputs/    Durable results: processed ZIP files
+```
+
+| Directory | Created by | Contents | Cleaned by |
+|---|---|---|---|
+| `uploads/` | `createDirs()` at startup | Uploaded video (named `<timestamp>_<original>`) | Deleted on successful processing |
+| `temp/` | Per request in `processVideo` | PNG frames from `ffmpeg` | Always deleted by `defer os.RemoveAll` |
+| `outputs/` | `createDirs()` at startup | `frames_<timestamp>.zip` files | Never (manual cleanup required) |
+
+> **Known gap:** If processing fails, the file in `uploads/` is NOT deleted. This is documented behavior in `main_test.go` (`TestProcessing_Failure_LeavesUploadedFileBehind`).
+
+The `outputs/` directory accumulates ZIPs indefinitely. There is no expiry, no cleanup job, and no size limit — disk space must be monitored manually in the current deployment.
+
+## CI / CD
+
+Three required checks run on every push and pull request:
+
+| Check | Tool | What it does |
+|---|---|---|
+| `Build & Test` | `go vet` + `go test ./... -v` | Compiles the application and runs integration tests (with `ffmpeg` installed on the runner) |
+| `SAST (gosec)` | [`gosec`](https://github.com/securego/gosec) | Static security analysis; fails the build on any finding |
+| `Vulnerability Scan (govulncheck)` | [`govulncheck`](https://go.dev/security/vuln) | Fails only when a known vulnerability is reachable from code actually called by this project |
+
+Releases are automated via `release-please`. On every push to `main`, it maintains a "Release PR" showing the next version computed from Conventional Commits. Merging that PR creates the git tag, publishes a GitHub Release, and updates `CHANGELOG.md`.
+
+---
+
+## Planned Infrastructure (Not Yet Implemented)
+
+> The components below are planned for future phases. They do not exist in the current deployment. Each is labeled with the phase that introduces it.
+
+### PostgreSQL — Planned (Phase 2–3)
+
+Authoritative state store for users (`User` aggregate) and video processing jobs (`VideoJob` aggregate). Also hosts the `outbox` table used for reliable domain event publishing (transactional outbox pattern). Redis is a read-through cache only; PostgreSQL is always the source of truth.
+
+### Redis — Planned (Phase 4)
+
+Four explicit responsibilities, all additive to PostgreSQL (not a replacement):
+
+1. **Idempotency keys** — Prevent duplicate job creation from client retries.
+2. **Rate limiting** — Sliding-window counter per user at the API layer.
+3. **Status cache** — Short-TTL cache for `GET /jobs/{id}/status` to reduce PostgreSQL read pressure.
+4. **Distributed locks** — Belt-and-suspenders alongside RabbitMQ acknowledgement to prevent concurrent worker pickup of the same job.
+
+### MinIO — Planned (Phase 5)
+
+S3-compatible object storage for uploaded video files and processed ZIP results. Replaces the current local `uploads/` and `outputs/` directories. Enables multiple API and worker instances to share the same storage backend. Presigned URLs are used for result downloads, removing the need to proxy ZIP content through the API server.
+
+### RabbitMQ — Planned (Phase 6)
+
+Durable async message broker for dispatching `VideoJob` processing tasks to the worker. Key properties: per-message acknowledgement, dead-letter queues, durable queues that survive broker restarts. The API publishes a job message after `CreateVideoJob`; the worker (`cmd/worker`) dequeues, runs `ffmpeg`, and calls `CompleteJob` or `FailJob`. The transactional outbox table in PostgreSQL ensures no messages are lost if the API crashes between the DB write and the broker publish.
+
+### Email / Webhook delivery — Planned (Phase 7)
+
+Notification infrastructure for `VideoJobCompleted` and `VideoJobFailed` events. Owned by the Notification bounded context. Delivery methods and preferences are per-user. Webhook delivery includes retry logic and HMAC signature verification.
+
+### Observability — Planned (Phase 8)
+
+Structured logging (zerolog or slog), Prometheus metrics at `/metrics`, health endpoint at `/health`, readiness endpoint at `/ready`. Also in Phase 8: `docker-compose.yml` for the full local development stack (API, worker, PostgreSQL, Redis, RabbitMQ, MinIO).
