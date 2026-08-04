@@ -46,10 +46,10 @@ Tests are integration tests that drive the real Gin handlers via `httptest.NewSe
 go test ./... -v
 ```
 
-If `ffmpeg` is not available, the suite exits immediately with code 1:
+If `ffmpeg` is not available, the test suite skips gracefully with a message:
 
 ```
-FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE.md for the Docker fallback.
+SKIP: ffmpeg não encontrado no PATH — pulando testes de integração ...
 ```
 
 ### Docker fallback (no local Go/ffmpeg required)
