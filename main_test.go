@@ -15,13 +15,13 @@ import (
 	"testing"
 )
 
-// TestMain requires a real ffmpeg on PATH, same as the app itself needs to
-// run at all. If it's missing, we skip the whole suite with a clear message
-// instead of failing every test with a confusing error.
+// TestMain requires a real ffmpeg on PATH — the same hard dependency the app
+// has at runtime. If ffmpeg is absent, the suite exits with code 1 rather
+// than skipping silently; use the Docker fallback documented in CLAUDE.md.
 func TestMain(m *testing.M) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		fmt.Println("SKIP: ffmpeg não encontrado no PATH — pulando testes de integração (main_test.go precisa dele, assim como o app em produção).")
-		os.Exit(0)
+		fmt.Fprintln(os.Stderr, "FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE.md for the Docker fallback.")
+		os.Exit(1)
 	}
 	createDirs()
 	os.Exit(m.Run())
