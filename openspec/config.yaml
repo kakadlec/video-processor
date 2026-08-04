@@ -12,8 +12,8 @@ context: |
   State model: uploads/ (transient input), temp/ (per-request ffmpeg scratch
   dir, always cleaned up), outputs/ (durable zip results) - no database.
   Processing is synchronous and in-request (no job queue yet).
-  main_test.go covers integration tests (requires ffmpeg; skips gracefully
-  without it). CI (.github/workflows/ci.yml) runs three required checks on
+  main_test.go covers integration tests (requires ffmpeg; exits 1 with an
+  error if absent — use Docker fallback). CI (.github/workflows/ci.yml) runs three required checks on
   every push/PR to main: Build & Test (go vet + go test), SAST (gosec),
   and Vulnerability Scan (govulncheck). Branch protection on main requires
   all three to pass plus an up-to-date branch; no direct pushes to main.

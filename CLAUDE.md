@@ -54,7 +54,7 @@ Commit messages **must** follow [Conventional Commits](https://www.conventionalc
 go run main.go          # run the server directly (listens on :8080)
 go build -o app .       # build a binary
 go mod tidy             # sync go.mod/go.sum after dependency changes
-go test ./... -v        # run the integration test suite (requires ffmpeg on PATH; skips with a message if absent)
+go test ./... -v        # run the integration test suite (requires ffmpeg on PATH; exits 1 with an error if absent)
 docker build -t video-processor .
 docker run -p 8080:8080 video-processor
 ```
