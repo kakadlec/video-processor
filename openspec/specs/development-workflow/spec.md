@@ -2,7 +2,6 @@
 
 ## Purpose
 Defines how changes land on `main` for this repository: required CI gates (tests, SAST, dependency vulnerability scanning), the PR-only branch protection workflow, Conventional Commit conventions, and the automated release process. Contributors and AI agents working in this repo should treat these as binding constraints, not suggestions.
-
 ## Requirements
 ### Requirement: Automated Test Gate
 Every push to `main` and every pull request SHALL run the full test suite (`go test ./...`) in CI, with `ffmpeg` available in the CI environment. The CI test job SHALL fail if any test fails.
@@ -129,4 +128,15 @@ The repository SHALL use Dependabot to automatically propose updates for Go modu
 #### Scenario: Dependency update PRs are subject to the same merge gate
 - **WHEN** Dependabot opens a pull request against `main`
 - **THEN** that pull request is mergeable only once it satisfies the same required status checks as any other pull request
+
+### Requirement: Missing Test Prerequisites Must Cause a Non-Zero Exit
+When a hard runtime prerequisite for the integration test suite is absent from the environment, `go test ./...` SHALL exit with a non-zero exit code and a clear, actionable error message identifying the missing prerequisite and referring to the documented fallback. Exiting with code 0 when no tests ran is not acceptable — code 0 is indistinguishable from all tests passing and constitutes a false green.
+
+#### Scenario: ffmpeg absent causes go test to exit non-zero
+- **WHEN** `go test ./...` is run in an environment where `ffmpeg` is not on `PATH`
+- **THEN** the process exits with a non-zero exit code and prints an English message identifying the missing prerequisite and pointing to the Docker fallback documented in `CLAUDE.md`
+
+#### Scenario: ffmpeg present leaves test behavior unchanged
+- **WHEN** `go test ./...` is run in an environment where `ffmpeg` is on `PATH`
+- **THEN** the suite runs and exits with the same outcome as before this change — this requirement adds no new test cases and changes no passing behavior
 
