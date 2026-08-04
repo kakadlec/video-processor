@@ -1,39 +1,47 @@
 ## Context
 
-The `development-workflow` spec already mandates that changes land via PR and that required status checks must pass before merging. What it does not specify is the internal structure of a multi-PR change sequence: which PR may contain which files, in which order, and under what conditions an agent may proceed with a merge. `CLAUDE.md` contains informal prose describing a 3-PR sequence, but prose is not machine-checkable — it does not use SHALL/SHALL NOT language and provides no scenarios an agent can verify against its own plan. Two gaps stand out: (1) task-tracking checkoffs and documentation updates are bundled into the implementation PR in the current description, polluting code review diffs with housekeeping noise; (2) merge authorization is not addressed, leaving agents free to infer permission from completion signals. This change closes both gaps as proper spec requirements.
+The `development-workflow` spec already mandates that changes land via PR and that required status checks pass before merging. It does not yet specify which files belong in each PR of a multi-step change, the required order, or when an agent may merge. Existing repository prose also allowed task-tracking updates in the implementation PR, which makes code review less precise.
+
+This change turns the workflow into auditable requirements that any agent can apply from the repository itself.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Formally specify the 4-PR delivery sequence (propose → implement → tracking/docs → archive) as `development-workflow` requirements with SHALL/SHALL NOT language and strict scenarios.
-- Enumerate what each PR type may and may not contain, so deviations are unambiguous violations, not judgment calls.
-- Specify that merge authorization requires an explicit user instruction in the current session; no agent may merge based on inferred permission.
+- Specify the delivery sequence as propose → implement → finalization/archive.
+- Require the propose PR to contain only the new change artifacts and to merge before implementation starts.
+- Require the implementation PR to contain only application source and test changes.
+- Combine task checkoffs, canonical spec promotion, and moving the change folder into one finalization/archive PR after implementation merges.
+- Require explicit user authorization before merging each designated PR.
 
 **Non-Goals:**
 - Modifying `CLAUDE.md`, `AGENTS.md`, `README`, CI configuration, application code, or canonical specs under `openspec/specs/`.
-- Adding automated tooling to enforce the sequence (the requirements are policy constraints, not GitHub Actions gates).
-- Changing any requirement already present in the `development-workflow` spec.
-- Specifying what counts as a "trivial" change or when steps may be skipped — only the policy for non-trivial, multi-PR changes is in scope.
+- Adding automated tooling to enforce the sequence.
+- Defining which changes are trivial enough to skip the full workflow.
 
 ## Decisions
 
-**4-PR sequence, not 3.**
-The existing `CLAUDE.md` prose bundles task-tracking checkoffs into the implementation PR. Extracting those and any documentation/configuration updates into a dedicated tracking/docs PR means code reviewers see only code diffs in the implementation PR. The tracking/docs PR is a natural post-implementation record: it confirms what was done (tasks checked off) and documents any resulting configuration changes. The 4 steps are propose → implement → tracking/docs → archive.
+**Three-step sequence, with finalization and archive combined.**
+The repository uses three PR roles for a non-trivial change:
+1. Propose: only the change folder under `openspec/changes/<name>/`.
+2. Implement: only application code and tests.
+3. Finalize/archive: task checkoffs, canonical spec promotion, and moving the completed change folder to `openspec/changes/archive/`.
+
+A documentation/configuration PR may be opened separately when permanent project documentation or agent instructions must change, but that is not a reason to put those files in the implementation PR.
 
 **Explicit exclusion list for the implementation PR.**
-"Code and tests only" is ambiguous in practice. The spec names what the implementation PR must not contain: `tasks.md` checkoffs, README or documentation files, `CLAUDE.md` or `AGENTS.md`, CI configuration, spec files under `openspec/`. Naming exclusions explicitly removes ambiguity that a short positive description would leave open.
+"Code and tests only" is ambiguous in practice. The requirement names task files, documentation, agent instructions, configuration, CI, and OpenSpec files as forbidden in the implementation PR.
 
-**Propose PR must be merged — not merely opened — before implementation begins.**
-This is the intent in the current prose but is not expressed as a testable scenario. Requiring the merge (not just the opening) prevents an agent from starting implementation work on a speculative proposal that may still change after review.
+**Propose PR must merge before implementation begins.**
+This prevents implementation from starting against a proposal that is still under review or may change.
 
-**Merge authorization as an explicit spec requirement.**
-An agent completing a task has access to signals that resemble implicit permission: all CI checks green, all tasks checked off, no blocking comments, review absence. Without an explicit rule, an agent following only the existing spec has no reason to pause before merging. The new requirement states that merge authorization requires an explicit user instruction in the current session, and that no combination of completion signals constitutes that authorization.
+**Finalization/archive is one PR.**
+The task checkoffs record what the merged implementation delivered, while canonical spec promotion and folder movement close the change. Keeping these operations together avoids an unnecessary extra PR and leaves one auditable closure point.
 
-**Tracking/docs PR after implementation, before archive.**
-Task checkoffs are a record of what the implementation PR accomplished; they belong after the code lands, not before. Similarly, any `CLAUDE.md` or configuration update that documents the new behavior is a post-implementation concern. Archive is last because it folds the delta into canonical specs and closes out the change — it should see the complete, checked-off state of the change.
+**Merge authorization is explicit and per PR.**
+Green checks, completed tasks, lack of comments, or prior authorization for another PR never count as authorization. The user must explicitly authorize the designated PR in the current session.
 
 ## Risks / Trade-offs
 
-- [4 PRs instead of 3 is more overhead per change] → For spec-only changes (like this one), the implementation PR and tracking/docs PR are vacuous and may be skipped. The spec does not require steps that produce no diff. The overhead applies only when there is actual code to write.
-- [Policy without automated enforcement relies on agent discipline] → Accepted. Adding automated checks (e.g., a PR title or label convention enforced in CI) would require CI changes, which are out of scope. The scenarios define what is expected; the propose PR review and the archive PR are the natural audit points.
-- [An agent may ask "is this trivial enough to skip steps?" and make the wrong call] → The scope of this change is the policy itself, not the definition of "trivial." That judgment is left to the agent and user in context. When in doubt, use the full sequence.
+- [The finalization/archive PR mixes task bookkeeping with OpenSpec archive operations] → Accepted because both are change-closure operations, contain no application code, and are reviewed together.
+- [Policy without automated enforcement relies on agent discipline] → Accepted for now. The explicit file-scope requirements and PR review provide the repository-level audit trail.
+- [Agents may misclassify trivial work] → When in doubt, use the full workflow; the definition of trivial work is outside this change.
