@@ -130,12 +130,15 @@ Skip this flow only for trivial changes (typo fixes, comment tweaks, dependency 
 
 ### PR Separation Rule
 
-PRs must separate spec content from code content:
+Non-trivial changes use three PR roles, in this order:
 
-1. **Propose PR** — only `openspec/changes/<name>/` artifacts; no code
-2. **Implement PR** — only the code diff (plus checking off `tasks.md`); no new spec content
-3. **Archive PR** — folds specs, moves change folder to `archive/`; no application code
+1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
+2. **Implementation PR** — only application source and test files. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration, CI, or any file under `openspec/`.
+3. **Finalization/archive PR** — after implementation merges, mark the completed tasks, promote the delta into `openspec/specs/`, and move the change folder into `openspec/changes/archive/`. It must not contain application source or tests.
 
+Permanent documentation or agent-instruction changes belong in a separate docs PR and must never be bundled into the implementation PR. `tasks.md` checkoffs belong in the finalization/archive PR, not in the implementation PR.
+
+Green CI does not authorize a merge. An agent may merge only when the user explicitly authorizes that specific PR in the current session; authorization for one PR does not extend to later PRs.
 ### Branch Protection
 
 `main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. A PR is not mergeable until all three pass and the branch is up to date with `main`.
