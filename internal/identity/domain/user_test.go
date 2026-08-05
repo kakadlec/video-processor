@@ -1,43 +1,68 @@
 package domain
 
 import (
-	"strings"
+	"errors"
 	"testing"
 	"time"
 )
 
-func TestParseUserIDAcceptsCanonicalV4UUID(t *testing.T) {
-	id, err := ParseUserID("550E8400-E29B-41D4-A716-446655440000")
+type fixedUserIDGenerator struct {
+	id  UserID
+	err error
+}
+
+func (g fixedUserIDGenerator) Generate() (UserID, error) { return g.id, g.err }
+
+func TestNewUserUsesInjectedIDGenerator(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 5, 1, 0, 0, 0, time.UTC)
+	user, err := NewUser(fixedUserIDGenerator{id: "uuid-from-adapter"}, " Alice@Example.COM ", "hashed-password", createdAt)
 	if err != nil {
-		t.Fatalf("ParseUserID() error = %v", err)
+		t.Fatalf("NewUser() error = %v", err)
 	}
-	if got, want := id.String(), "550e8400-e29b-41d4-a716-446655440000"; got != want {
-		t.Fatalf("ParseUserID() = %q, want %q", got, want)
+	if user.ID() != UserID("uuid-from-adapter") {
+		t.Fatalf("ID() = %q, want adapter-provided ID", user.ID())
+	}
+	if user.Email() != "alice@example.com" {
+		t.Fatalf("Email() = %q, want normalized email", user.Email())
+	}
+	if user.PasswordHash() != "hashed-password" {
+		t.Fatalf("PasswordHash() did not preserve adapter output")
+	}
+	if !user.CreatedAt().Equal(createdAt) {
+		t.Fatalf("CreatedAt() = %v, want %v", user.CreatedAt(), createdAt)
 	}
 }
 
-func TestParseUserIDRejectsNonV4OrMalformedValues(t *testing.T) {
-	cases := []string{"", "not-a-uuid", "550e8400-e29b-11d4-a716-446655440000", "550e8400-e29b-41d4-c716-446655440000"}
-	for _, value := range cases {
-		t.Run(value, func(t *testing.T) {
-			if _, err := ParseUserID(value); err != ErrInvalidUserID {
-				t.Fatalf("ParseUserID(%q) error = %v, want %v", value, err, ErrInvalidUserID)
-			}
-		})
+func TestNewUserPropagatesIDGeneratorFailure(t *testing.T) {
+	generatorError := errors.New("generator unavailable")
+	_, err := NewUser(fixedUserIDGenerator{err: generatorError}, "alice@example.com", "hash", time.Now())
+	if !errors.Is(err, generatorError) {
+		t.Fatalf("NewUser() error = %v, want %v", err, generatorError)
 	}
 }
 
-func TestNewRandomUserIDCreatesValidDistinctIDs(t *testing.T) {
-	first, err := NewRandomUserID()
-	if err != nil {
-		t.Fatalf("first NewRandomUserID() error = %v", err)
+func TestNewUserRejectsNilGenerator(t *testing.T) {
+	_, err := NewUser(nil, "alice@example.com", "hash", time.Now())
+	if err != ErrInvalidUserID {
+		t.Fatalf("NewUser() error = %v, want %v", err, ErrInvalidUserID)
 	}
-	second, err := NewRandomUserID()
+}
+
+func TestRestoreUserAcceptsPersistedID(t *testing.T) {
+	createdAt := time.Date(2026, time.August, 5, 1, 0, 0, 0, time.UTC)
+	user, err := RestoreUser("uuid-from-database", "alice@example.com", "hashed-password", createdAt)
 	if err != nil {
-		t.Fatalf("second NewRandomUserID() error = %v", err)
+		t.Fatalf("RestoreUser() error = %v", err)
 	}
-	if first == second {
-		t.Fatalf("generated duplicate IDs: %q", first)
+	if user.ID() != UserID("uuid-from-database") {
+		t.Fatalf("ID() = %q, want persisted ID", user.ID())
+	}
+}
+
+func TestRestoreUserRejectsEmptyID(t *testing.T) {
+	_, err := RestoreUser("", "alice@example.com", "hash", time.Now())
+	if err != ErrInvalidUserID {
+		t.Fatalf("RestoreUser() error = %v, want %v", err, ErrInvalidUserID)
 	}
 }
 
@@ -53,7 +78,7 @@ func TestNormalizeEmailTrimsAndLowercases(t *testing.T) {
 
 func TestNormalizeEmailRejectsInvalidValues(t *testing.T) {
 	for _, value := range []string{"", "alice", "@example.com", "alice@example", "alice @example.com", "alice@example.com@other.com"} {
-		t.Run(strings.ReplaceAll(value, "@", "_at_"), func(t *testing.T) {
+		t.Run(value, func(t *testing.T) {
 			if _, err := NormalizeEmail(value); err != ErrInvalidEmail {
 				t.Fatalf("NormalizeEmail(%q) error = %v, want %v", value, err, ErrInvalidEmail)
 			}
@@ -61,36 +86,12 @@ func TestNormalizeEmailRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestNewUserNormalizesEmailAndKeepsAggregateEncapsulated(t *testing.T) {
-	id, err := NewRandomUserID()
-	if err != nil {
-		t.Fatalf("NewRandomUserID() error = %v", err)
-	}
-	createdAt := time.Date(2026, time.August, 5, 1, 0, 0, 0, time.FixedZone("test", -3*60*60))
-	user, err := NewUser(id, " Alice@Example.COM ", "hashed-password", createdAt)
-	if err != nil {
-		t.Fatalf("NewUser() error = %v", err)
-	}
-	if user.Email() != "alice@example.com" {
-		t.Fatalf("Email() = %q, want normalized email", user.Email())
-	}
-	if user.PasswordHash() != "hashed-password" {
-		t.Fatalf("PasswordHash() did not preserve adapter output")
-	}
-	if !user.CreatedAt().Equal(createdAt.UTC()) {
-		t.Fatalf("CreatedAt() = %v, want %v", user.CreatedAt(), createdAt.UTC())
-	}
-}
-
 func TestNewUserRejectsEmptyPasswordHashAndCreationTime(t *testing.T) {
-	id, err := NewRandomUserID()
-	if err != nil {
-		t.Fatalf("NewRandomUserID() error = %v", err)
-	}
-	if _, err := NewUser(id, "alice@example.com", "", time.Now()); err != ErrInvalidPasswordHash {
+	generator := fixedUserIDGenerator{id: "generated-id"}
+	if _, err := NewUser(generator, "alice@example.com", "", time.Now()); err != ErrInvalidPasswordHash {
 		t.Fatalf("empty hash error = %v, want %v", err, ErrInvalidPasswordHash)
 	}
-	if _, err := NewUser(id, "alice@example.com", "hash", time.Time{}); err == nil {
+	if _, err := NewUser(generator, "alice@example.com", "hash", time.Time{}); err == nil {
 		t.Fatal("zero creation time unexpectedly accepted")
 	}
 }
