@@ -2,18 +2,21 @@ package domain
 
 import "strings"
 
-// NormalizeEmail defines the single lookup representation used by Identity.
+// NormalizeEmail defines Identity's application-level case-insensitive lookup policy.
+// This is a product decision, not a claim that every mail provider treats the
+// local part of an address as case-insensitive.
 func NormalizeEmail(email string) (string, error) {
-	normalized := strings.ToLower(strings.TrimSpace(email))
-	if strings.Count(normalized, "@") != 1 {
+	trimmedEmail := strings.TrimSpace(email)
+	if strings.Count(trimmedEmail, "@") != 1 {
 		return "", ErrInvalidEmail
 	}
-	at := strings.IndexByte(normalized, '@')
-	if at <= 0 || at == len(normalized)-1 || strings.ContainsAny(normalized, " \t\r\n") {
+	atIndex := strings.IndexByte(trimmedEmail, '@')
+	if atIndex <= 0 || atIndex == len(trimmedEmail)-1 || strings.ContainsAny(trimmedEmail, " 	\r\n") {
 		return "", ErrInvalidEmail
 	}
-	if !strings.Contains(normalized[at+1:], ".") {
+	normalizedEmail := strings.ToLower(trimmedEmail)
+	if !strings.Contains(normalizedEmail[atIndex+1:], ".") {
 		return "", ErrInvalidEmail
 	}
-	return normalized, nil
+	return normalizedEmail, nil
 }
