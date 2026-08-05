@@ -1,34 +1,33 @@
 package domain
 
-import (
-	"errors"
+import "errors"
 
-	"github.com/google/uuid"
-)
-
-// ErrInvalidUserID is returned when a value is not a syntactically valid UUID v4.
+// ErrInvalidUserID is returned when a value fails UserID construction —
+// either the domain's own non-empty invariant, or, via UserIDParser
+// implementations, format validation of the underlying ID scheme.
 var ErrInvalidUserID = errors.New("identity: invalid user id")
 
-// UserID is an opaque, validated identifier for a User. Parsing/format
-// validation is a pure function, so the domain delegates it directly to a
-// well-tested UUID library rather than hand-rolling it. Generation is the
-// impure part — it needs a random source — so it stays inverted behind the
-// UserIDGenerator port, keeping the domain deterministic and testable.
+// UserID is an opaque identifier for a User. The domain enforces only the
+// one invariant it owns — non-zero — and never imports a concrete ID
+// library itself. Both minting new IDs and parsing/validating existing ones
+// require a concrete scheme (UUID v4, via infrastructure), so both are
+// inverted behind ports: UserIDGenerator and UserIDParser.
 type UserID struct {
 	value string
 }
 
-// NewUserID validates and wraps an existing UUID v4 string, e.g. one loaded from storage.
-// The canonical (lowercase, hyphenated) form is stored regardless of input casing.
+// NewUserID wraps an already-known identifier value, e.g. one produced by a
+// UserIDGenerator or UserIDParser implementation. It enforces only the
+// domain's own invariant (non-empty); scheme-specific format validation is
+// the responsibility of whichever port produced the value.
 func NewUserID(value string) (UserID, error) {
-	parsed, err := uuid.Parse(value)
-	if err != nil || parsed.Version() != 4 || parsed.Variant() != uuid.RFC4122 {
+	if value == "" {
 		return UserID{}, ErrInvalidUserID
 	}
-	return UserID{value: parsed.String()}, nil
+	return UserID{value: value}, nil
 }
 
-// String returns the canonical UUID v4 representation.
+// String returns the identifier's canonical representation.
 func (id UserID) String() string {
 	return id.value
 }
@@ -44,7 +43,17 @@ func (id UserID) Equal(other UserID) bool {
 }
 
 // UserIDGenerator is the port through which new, unique UserIDs are minted.
-// The domain depends on this interface; infrastructure supplies the implementation.
+// The domain depends on this interface; infrastructure supplies the
+// concrete implementation (UUID v4 generation).
 type UserIDGenerator interface {
 	NewUserID() UserID
+}
+
+// UserIDParser is the port through which a raw, externally-supplied
+// identifier string (e.g. loaded from storage, or a path parameter) is
+// validated and converted into a UserID. The domain depends on this
+// interface; infrastructure supplies the concrete implementation (UUID v4
+// parsing) so no ID-format library is imported here.
+type UserIDParser interface {
+	ParseUserID(value string) (UserID, error)
 }
