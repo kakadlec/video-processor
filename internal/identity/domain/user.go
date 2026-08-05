@@ -18,7 +18,7 @@ var (
 // UserID identifies a user without exposing Identity's aggregate to other contexts.
 type UserID string
 
-func NewUserID(value string) (UserID, error) {
+func ParseUserID(value string) (UserID, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if !isUUID(value) {
 		return "", ErrInvalidUserID
@@ -26,14 +26,14 @@ func NewUserID(value string) (UserID, error) {
 	return UserID(value), nil
 }
 
-func NewUserIDRandom() (UserID, error) {
+func NewRandomUserID() (UserID, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", fmt.Errorf("generate user ID: %w", err)
 	}
 	raw[6] = (raw[6] & 0x0f) | 0x40
 	raw[8] = (raw[8] & 0x3f) | 0x80
-	return NewUserID(fmt.Sprintf("%s-%s-%s-%s-%s",
+	return ParseUserID(fmt.Sprintf("%s-%s-%s-%s-%s",
 		hex.EncodeToString(raw[0:4]),
 		hex.EncodeToString(raw[4:6]),
 		hex.EncodeToString(raw[6:8]),
@@ -69,7 +69,7 @@ type User struct {
 }
 
 func NewUser(id UserID, email, passwordHash string, createdAt time.Time) (User, error) {
-	normalizedID, err := NewUserID(id.String())
+	normalizedID, err := ParseUserID(id.String())
 	if err != nil {
 		return User{}, err
 	}

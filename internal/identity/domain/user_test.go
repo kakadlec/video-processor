@@ -6,35 +6,35 @@ import (
 	"time"
 )
 
-func TestNewUserIDAcceptsCanonicalV4UUID(t *testing.T) {
-	id, err := NewUserID("550E8400-E29B-41D4-A716-446655440000")
+func TestParseUserIDAcceptsCanonicalV4UUID(t *testing.T) {
+	id, err := ParseUserID("550E8400-E29B-41D4-A716-446655440000")
 	if err != nil {
-		t.Fatalf("NewUserID() error = %v", err)
+		t.Fatalf("ParseUserID() error = %v", err)
 	}
 	if got, want := id.String(), "550e8400-e29b-41d4-a716-446655440000"; got != want {
-		t.Fatalf("NewUserID() = %q, want %q", got, want)
+		t.Fatalf("ParseUserID() = %q, want %q", got, want)
 	}
 }
 
-func TestNewUserIDRejectsNonV4OrMalformedValues(t *testing.T) {
+func TestParseUserIDRejectsNonV4OrMalformedValues(t *testing.T) {
 	cases := []string{"", "not-a-uuid", "550e8400-e29b-11d4-a716-446655440000", "550e8400-e29b-41d4-c716-446655440000"}
 	for _, value := range cases {
 		t.Run(value, func(t *testing.T) {
-			if _, err := NewUserID(value); err != ErrInvalidUserID {
-				t.Fatalf("NewUserID(%q) error = %v, want %v", value, err, ErrInvalidUserID)
+			if _, err := ParseUserID(value); err != ErrInvalidUserID {
+				t.Fatalf("ParseUserID(%q) error = %v, want %v", value, err, ErrInvalidUserID)
 			}
 		})
 	}
 }
 
-func TestNewUserIDRandomCreatesValidDistinctIDs(t *testing.T) {
-	first, err := NewUserIDRandom()
+func TestNewRandomUserIDCreatesValidDistinctIDs(t *testing.T) {
+	first, err := NewRandomUserID()
 	if err != nil {
-		t.Fatalf("first NewUserIDRandom() error = %v", err)
+		t.Fatalf("first NewRandomUserID() error = %v", err)
 	}
-	second, err := NewUserIDRandom()
+	second, err := NewRandomUserID()
 	if err != nil {
-		t.Fatalf("second NewUserIDRandom() error = %v", err)
+		t.Fatalf("second NewRandomUserID() error = %v", err)
 	}
 	if first == second {
 		t.Fatalf("generated duplicate IDs: %q", first)
@@ -62,9 +62,9 @@ func TestNormalizeEmailRejectsInvalidValues(t *testing.T) {
 }
 
 func TestNewUserNormalizesEmailAndKeepsAggregateEncapsulated(t *testing.T) {
-	id, err := NewUserIDRandom()
+	id, err := NewRandomUserID()
 	if err != nil {
-		t.Fatalf("NewUserIDRandom() error = %v", err)
+		t.Fatalf("NewRandomUserID() error = %v", err)
 	}
 	createdAt := time.Date(2026, time.August, 5, 1, 0, 0, 0, time.FixedZone("test", -3*60*60))
 	user, err := NewUser(id, " Alice@Example.COM ", "hashed-password", createdAt)
@@ -83,9 +83,9 @@ func TestNewUserNormalizesEmailAndKeepsAggregateEncapsulated(t *testing.T) {
 }
 
 func TestNewUserRejectsEmptyPasswordHashAndCreationTime(t *testing.T) {
-	id, err := NewUserIDRandom()
+	id, err := NewRandomUserID()
 	if err != nil {
-		t.Fatalf("NewUserIDRandom() error = %v", err)
+		t.Fatalf("NewRandomUserID() error = %v", err)
 	}
 	if _, err := NewUser(id, "alice@example.com", "", time.Now()); err != ErrInvalidPasswordHash {
 		t.Fatalf("empty hash error = %v, want %v", err, ErrInvalidPasswordHash)
