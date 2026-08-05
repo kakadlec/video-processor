@@ -2,28 +2,30 @@ package domain
 
 import (
 	"errors"
-	"regexp"
+
+	"github.com/google/uuid"
 )
 
-// ErrInvalidUserID is returned when a value does not match the UUID v4 shape required for a UserID.
+// ErrInvalidUserID is returned when a value is not a syntactically valid UUID v4.
 var ErrInvalidUserID = errors.New("identity: invalid user id")
 
-var userIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-
-// UserID is an opaque, validated identifier for a User. The domain validates
-// its shape but never generates one itself — generation requires randomness,
-// which is supplied through the UserIDGenerator port so this package stays
-// free of infrastructure dependencies.
+// UserID is an opaque, validated identifier for a User. Parsing/format
+// validation is a pure function, so the domain delegates it directly to a
+// well-tested UUID library rather than hand-rolling it. Generation is the
+// impure part — it needs a random source — so it stays inverted behind the
+// UserIDGenerator port, keeping the domain deterministic and testable.
 type UserID struct {
 	value string
 }
 
 // NewUserID validates and wraps an existing UUID v4 string, e.g. one loaded from storage.
+// The canonical (lowercase, hyphenated) form is stored regardless of input casing.
 func NewUserID(value string) (UserID, error) {
-	if !userIDPattern.MatchString(value) {
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed.Version() != 4 || parsed.Variant() != uuid.RFC4122 {
 		return UserID{}, ErrInvalidUserID
 	}
-	return UserID{value: value}, nil
+	return UserID{value: parsed.String()}, nil
 }
 
 // String returns the canonical UUID v4 representation.

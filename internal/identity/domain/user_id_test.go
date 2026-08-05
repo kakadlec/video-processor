@@ -11,14 +11,15 @@ func TestNewUserID(t *testing.T) {
 	tests := []struct {
 		name    string
 		value   string
+		want    string
 		wantErr error
 	}{
-		{"valid v4 uuid", "3fa85f64-5717-4562-b3fc-2c963f66afa6", nil},
-		{"empty string", "", domain.ErrInvalidUserID},
-		{"not a uuid", "not-a-uuid", domain.ErrInvalidUserID},
-		{"wrong version nibble", "3fa85f64-5717-1562-b3fc-2c963f66afa6", domain.ErrInvalidUserID},
-		{"wrong variant nibble", "3fa85f64-5717-4562-0000-2c963f66afa6", domain.ErrInvalidUserID},
-		{"uppercase rejected", "3FA85F64-5717-4562-B3FC-2C963F66AFA6", domain.ErrInvalidUserID},
+		{"valid v4 uuid", "3fa85f64-5717-4562-b3fc-2c963f66afa6", "3fa85f64-5717-4562-b3fc-2c963f66afa6", nil},
+		{"uppercase normalized to lowercase", "3FA85F64-5717-4562-B3FC-2C963F66AFA6", "3fa85f64-5717-4562-b3fc-2c963f66afa6", nil},
+		{"empty string", "", "", domain.ErrInvalidUserID},
+		{"not a uuid", "not-a-uuid", "", domain.ErrInvalidUserID},
+		{"wrong version (v1, not v4)", "3fa85f64-5717-1562-b3fc-2c963f66afa6", "", domain.ErrInvalidUserID},
+		{"wrong variant", "3fa85f64-5717-4562-0000-2c963f66afa6", "", domain.ErrInvalidUserID},
 	}
 
 	for _, tt := range tests {
@@ -27,8 +28,8 @@ func TestNewUserID(t *testing.T) {
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("NewUserID(%q) error = %v, want %v", tt.value, err, tt.wantErr)
 			}
-			if tt.wantErr == nil && id.String() != tt.value {
-				t.Fatalf("NewUserID(%q).String() = %q, want %q", tt.value, id.String(), tt.value)
+			if tt.wantErr == nil && id.String() != tt.want {
+				t.Fatalf("NewUserID(%q).String() = %q, want %q", tt.value, id.String(), tt.want)
 			}
 		})
 	}
