@@ -10,6 +10,22 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Matches the image pinned in docker-compose.yml, so "works in CI"
+        # and "works locally" mean the same database.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: identity
+          POSTGRES_PASSWORD: identity
+          POSTGRES_DB: identity
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U identity"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -28,6 +44,8 @@ jobs:
         run: go vet ./...
 
       - name: Test
+        env:
+          IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
         run: go test ./... -v
 
   sast:
