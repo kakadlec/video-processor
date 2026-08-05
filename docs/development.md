@@ -60,6 +60,24 @@ docker build -t video-processor . && docker run --rm video-processor go test ./.
 
 This uses the image's bundled Go toolchain and ffmpeg. Use this if your local environment does not have Go 1.25 or ffmpeg installed.
 
+### PostgreSQL (identity persistence tests)
+
+`internal/identity/infrastructure/postgres`'s adapter tests only run against a real database — they skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, so they don't require PostgreSQL for the rest of the suite to run. To exercise them locally:
+
+```bash
+docker compose up -d postgres
+
+export IDENTITY_POSTGRES_TEST_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
+go test ./... -v
+```
+
+`docker-compose.yml` at the repo root defines this service (`postgres:16-alpine`, matching the version CI provisions). The `identity`/`identity` credentials are fixed, non-secret local-only defaults — this service is never reachable from anywhere but your machine or CI.
+
+```bash
+docker compose down       # stop
+docker compose down -v    # stop and drop the local data volume
+```
+
 ## Code Quality Gates
 
 The CI pipeline runs three checks on every push and pull request. Run them locally before pushing:
