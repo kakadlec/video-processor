@@ -22,7 +22,7 @@ func TestNewUserUsesInjectedIDGenerator(t *testing.T) {
 	if user.ID() != UserID("uuid-from-adapter") {
 		t.Fatalf("ID() = %q, want adapter-provided ID", user.ID())
 	}
-	if user.Email() != "alice@example.com" {
+	if user.Email() != "Alice@example.com" {
 		t.Fatalf("Email() = %q, want normalized email", user.Email())
 	}
 	if user.PasswordHash() != "hashed-password" {
@@ -66,18 +66,18 @@ func TestRestoreUserRejectsEmptyID(t *testing.T) {
 	}
 }
 
-func TestNormalizeEmailTrimsAndLowercases(t *testing.T) {
+func TestNormalizeEmailTrimsAndNormalizesDomainOnly(t *testing.T) {
 	got, err := NormalizeEmail("  Alice@Example.COM ")
 	if err != nil {
 		t.Fatalf("NormalizeEmail() error = %v", err)
 	}
-	if got != "alice@example.com" {
-		t.Fatalf("NormalizeEmail() = %q, want %q", got, "alice@example.com")
+	if got != "Alice@example.com" {
+		t.Fatalf("NormalizeEmail() = %q, want %q", got, "Alice@example.com")
 	}
 }
 
 func TestNormalizeEmailRejectsInvalidValues(t *testing.T) {
-	for _, value := range []string{"", "alice", "@example.com", "alice@example", "alice @example.com", "alice@example.com@other.com"} {
+	for _, value := range []string{"", "alice", "@example.com", "alice @example.com", "Alice <alice@example.com>", "alice@example.com@other.com"} {
 		t.Run(value, func(t *testing.T) {
 			if _, err := NormalizeEmail(value); err != ErrInvalidEmail {
 				t.Fatalf("NormalizeEmail(%q) error = %v, want %v", value, err, ErrInvalidEmail)
