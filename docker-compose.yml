@@ -1,0 +1,26 @@
+# Local development/test infrastructure. Scoped to what the Identity
+# context needs today (PostgreSQL only); later roadmap phases extend this
+# file with Redis, RabbitMQ, and MinIO rather than replacing it.
+#
+# The credentials below are fixed, non-secret local-only defaults — this
+# service is never reachable from anywhere but the developer's own machine
+# or CI, so there is nothing here worth protecting.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: identity
+      POSTGRES_PASSWORD: identity
+      POSTGRES_DB: identity
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
