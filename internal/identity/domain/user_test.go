@@ -11,7 +11,9 @@ type fixedUserIDGenerator struct {
 	err error
 }
 
-func (g fixedUserIDGenerator) Generate() (UserID, error) { return g.id, g.err }
+func (generator fixedUserIDGenerator) Generate() (UserID, error) {
+	return generator.id, generator.err
+}
 
 func TestNewUserUsesInjectedIDGenerator(t *testing.T) {
 	createdAt := time.Date(2026, time.August, 5, 1, 0, 0, 0, time.UTC)
