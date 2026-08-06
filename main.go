@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -30,7 +31,15 @@ type ProcessingResult struct {
 func main() {
 	createDirs()
 
-	r := setupRouter()
+	identity, _, err := setupIdentity(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+	if identity == nil {
+		log.Printf("identity: IDENTITY_POSTGRES_DSN/%s not set — running with video processing only, no /api/auth routes", identityJWTSigningKeyEnv)
+	}
+
+	r := setupRouterWithIdentity(identity)
 
 	fmt.Println("🎬 Servidor iniciado na porta 8080")
 	fmt.Println("📂 Acesse: http://localhost:8080")
@@ -38,7 +47,14 @@ func main() {
 	log.Fatal(r.Run(":8080"))
 }
 
+// setupRouter builds the router without the Identity module wired in. It
+// exists for callers (like the existing video-processing test suite) that
+// don't need /api/auth and shouldn't be coupled to identity configuration.
 func setupRouter() *gin.Engine {
+	return setupRouterWithIdentity(nil)
+}
+
+func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -67,6 +83,10 @@ func setupRouter() *gin.Engine {
 	r.GET("/download/:filename", handleDownload)
 
 	r.GET("/api/status", handleStatus)
+
+	if identity != nil {
+		identity.registerRoutes(r)
+	}
 
 	return r
 }
