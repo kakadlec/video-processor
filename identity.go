@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,10 +33,11 @@ func (systemClock) Now() time.Time { return time.Now() }
 type identityModule struct {
 	registerUser     *application.RegisterUser
 	authenticateUser *application.AuthenticateUser
+	tokens           domain.TokenVerifier
 }
 
-func newIdentityModule(registerUser *application.RegisterUser, authenticateUser *application.AuthenticateUser) *identityModule {
-	return &identityModule{registerUser: registerUser, authenticateUser: authenticateUser}
+func newIdentityModule(registerUser *application.RegisterUser, authenticateUser *application.AuthenticateUser, tokens domain.TokenVerifier) *identityModule {
+	return &identityModule{registerUser: registerUser, authenticateUser: authenticateUser, tokens: tokens}
 }
 
 // setupIdentity builds the production Identity module from environment
@@ -86,6 +88,7 @@ func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 	module := newIdentityModule(
 		application.NewRegisterUser(repo, ids, passwords, clock),
 		application.NewAuthenticateUser(repo, passwords, tokens, clock),
+		tokens,
 	)
 	return module, db, nil
 }
@@ -102,6 +105,51 @@ func (m *identityModule) registerRoutes(router *gin.Engine) {
 	auth := router.Group("/api/auth")
 	auth.POST("/register", m.handleRegister)
 	auth.POST("/login", m.handleLogin)
+}
+
+// authenticatedUserIDKey is the gin context key under which requireBearerAuth
+// stores the authenticated UserID.
+const authenticatedUserIDKey = "identity.authenticatedUserID"
+
+const bearerPrefix = "Bearer "
+
+// requireBearerAuth extracts an "Authorization: Bearer <token>" header,
+// verifies it through the token port, and stores the resulting UserID in the
+// request context. Missing, malformed, expired, or invalid tokens are
+// rejected with 401 before the wrapped handler runs.
+func (m *identityModule) requireBearerAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		if !strings.HasPrefix(header, bearerPrefix) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, identityErrorResponse{Error: "missing or malformed authorization header"})
+			return
+		}
+
+		token := strings.TrimPrefix(header, bearerPrefix)
+		if token == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, identityErrorResponse{Error: "missing or malformed authorization header"})
+			return
+		}
+
+		userID, err := m.tokens.Verify(token)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, identityErrorResponse{Error: "invalid or expired token"})
+			return
+		}
+
+		c.Set(authenticatedUserIDKey, userID)
+		c.Next()
+	}
+}
+
+// authenticatedUserID returns the UserID stored by requireBearerAuth, if any.
+func authenticatedUserID(c *gin.Context) (domain.UserID, bool) {
+	value, ok := c.Get(authenticatedUserIDKey)
+	if !ok {
+		return domain.UserID{}, false
+	}
+	userID, ok := value.(domain.UserID)
+	return userID, ok
 }
 
 type registerUserRequest struct {
