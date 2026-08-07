@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,10 +33,11 @@ func (systemClock) Now() time.Time { return time.Now() }
 type identityModule struct {
 	registerUser     *application.RegisterUser
 	authenticateUser *application.AuthenticateUser
+	tokens           domain.TokenVerifier
 }
 
-func newIdentityModule(registerUser *application.RegisterUser, authenticateUser *application.AuthenticateUser) *identityModule {
-	return &identityModule{registerUser: registerUser, authenticateUser: authenticateUser}
+func newIdentityModule(registerUser *application.RegisterUser, authenticateUser *application.AuthenticateUser, tokens domain.TokenVerifier) *identityModule {
+	return &identityModule{registerUser: registerUser, authenticateUser: authenticateUser, tokens: tokens}
 }
 
 // setupIdentity builds the production Identity module from environment
@@ -86,6 +88,7 @@ func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 	module := newIdentityModule(
 		application.NewRegisterUser(repo, ids, passwords, clock),
 		application.NewAuthenticateUser(repo, passwords, tokens, clock),
+		tokens,
 	)
 	return module, db, nil
 }
@@ -102,6 +105,48 @@ func (m *identityModule) registerRoutes(router *gin.Engine) {
 	auth := router.Group("/api/auth")
 	auth.POST("/register", m.handleRegister)
 	auth.POST("/login", m.handleLogin)
+}
+
+const bearerPrefix = "Bearer "
+
+type authContextKey string
+
+// authenticatedUserIDKey is the gin context key requireAuth stores the
+// verified UserID under, for downstream handlers to read via authenticatedUserID.
+const authenticatedUserIDKey authContextKey = "identity.authenticatedUserID"
+
+// requireAuth returns middleware that verifies the Authorization header's
+// bearer token and stores the resulting UserID in the request context.
+// Requests with a missing, malformed, expired, or invalid token are
+// rejected with 401 before any downstream handler runs.
+func (m *identityModule) requireAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		if !strings.HasPrefix(header, bearerPrefix) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, identityErrorResponse{Error: "missing or malformed authorization header"})
+			return
+		}
+
+		userID, err := m.tokens.Verify(strings.TrimPrefix(header, bearerPrefix))
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, identityErrorResponse{Error: "invalid or expired token"})
+			return
+		}
+
+		c.Set(string(authenticatedUserIDKey), userID)
+		c.Next()
+	}
+}
+
+// authenticatedUserID retrieves the UserID stored by requireAuth. It is
+// meant for handlers registered behind that middleware.
+func authenticatedUserID(c *gin.Context) (domain.UserID, bool) {
+	value, exists := c.Get(string(authenticatedUserIDKey))
+	if !exists {
+		return domain.UserID{}, false
+	}
+	userID, ok := value.(domain.UserID)
+	return userID, ok
 }
 
 type registerUserRequest struct {

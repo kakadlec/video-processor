@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"video-processor/internal/identity/application"
 	"video-processor/internal/identity/domain"
 	"video-processor/internal/identity/infrastructure/idgen"
@@ -69,13 +71,15 @@ func (r *inMemoryUserRepository) FindByNormalizedEmail(_ context.Context, normal
 	return user, nil
 }
 
+const testSigningKey = "test-only-signing-key-do-not-use-in-production"
+
 func newTestIdentityModule(t *testing.T) *identityModule {
 	t.Helper()
 
 	repo := newInMemoryUserRepository()
 	ids := idgen.New()
 	passwords := password.New()
-	tokens, err := jwtauth.New("test-only-signing-key-do-not-use-in-production")
+	tokens, err := jwtauth.New(testSigningKey)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -83,6 +87,7 @@ func newTestIdentityModule(t *testing.T) *identityModule {
 	return newIdentityModule(
 		application.NewRegisterUser(repo, ids, passwords, systemClock{}),
 		application.NewAuthenticateUser(repo, passwords, tokens, systemClock{}),
+		tokens,
 	)
 }
 
@@ -247,6 +252,156 @@ func TestHandleLogin_MalformedBody(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func testUserID(t *testing.T) domain.UserID {
+	t.Helper()
+	id, err := domain.NewUserID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return id
+}
+
+// newRequireAuthTestServer builds a server with a single test-only route
+// protected by m.requireAuth(), so the middleware's behavior can be
+// exercised over real HTTP without wiring it into any production route.
+func newRequireAuthTestServer(t *testing.T, m *identityModule) *httptest.Server {
+	t.Helper()
+
+	router := gin.New()
+	router.GET("/protected", m.requireAuth(), func(c *gin.Context) {
+		userID, ok := authenticatedUserID(c)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, identityErrorResponse{Error: "missing authenticated user id"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"user_id": userID.String()})
+	})
+
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func getWithAuthorization(t *testing.T, url, authorization string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return resp
+}
+
+func TestRequireAuth_MissingHeader(t *testing.T) {
+	srv := newRequireAuthTestServer(t, newTestIdentityModule(t))
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestRequireAuth_MalformedHeader(t *testing.T) {
+	srv := newRequireAuthTestServer(t, newTestIdentityModule(t))
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Token some-value")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestRequireAuth_InvalidToken(t *testing.T) {
+	srv := newRequireAuthTestServer(t, newTestIdentityModule(t))
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Bearer not-a-jwt")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestRequireAuth_ExpiredToken(t *testing.T) {
+	srv := newRequireAuthTestServer(t, newTestIdentityModule(t))
+
+	issuer, err := jwtauth.New(testSigningKey)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	token, err := issuer.Issue(testUserID(t), time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestRequireAuth_WrongSigningKey(t *testing.T) {
+	srv := newRequireAuthTestServer(t, newTestIdentityModule(t))
+
+	issuer, err := jwtauth.New("a-completely-different-signing-key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	token, err := issuer.Issue(testUserID(t), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestRequireAuth_ValidToken(t *testing.T) {
+	srv := newRequireAuthTestServer(t, newTestIdentityModule(t))
+
+	issuer, err := jwtauth.New(testSigningKey)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	userID := testUserID(t)
+	token, err := issuer.Issue(userID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var got struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("unexpected error decoding response: %v", err)
+	}
+	if got.UserID != userID.String() {
+		t.Fatalf("user_id = %q, want %q", got.UserID, userID.String())
 	}
 }
 
