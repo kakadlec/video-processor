@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/kakadlec/video-processor/compare/v0.3.0...v0.4.0) (2026-08-08)
+
+
+### Features
+
+* enforce authenticated ownership of video artifacts ([b73da2e](https://github.com/kakadlec/video-processor/commit/b73da2e0b858e79581a66358d1af6ba87374fb80))
+* enforce authenticated ownership of video artifacts ([1531901](https://github.com/kakadlec/video-processor/commit/1531901d05f5cc65e13280e72e4e6a7f67dba00a))
+
+
+### Bug Fixes
+
+* address Copilot review findings on artifact ownership ([3c0f555](https://github.com/kakadlec/video-processor/commit/3c0f555fa9ea86f7f09f5063b954069137932df0))
+
 ## [0.3.0](https://github.com/kakadlec/video-processor/compare/v0.2.0...v0.3.0) (2026-08-08)
 
 
