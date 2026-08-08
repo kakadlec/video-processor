@@ -45,6 +45,19 @@ This PR must not contain application source or tests. Tasks and archive belong t
 
 Do not merge a PR because CI is green, tasks are complete, a review is absent, or another PR was authorized. Merge only after the user explicitly authorizes that specific PR in the current session. Authorization applies to one designated PR only.
 
+## Pull request review comments
+
+This repository has a `copilot_code_review` branch ruleset that automatically requests a GitHub Copilot review the first time each pull request opens. `review_on_push` is off, so later commits pushed to an already-reviewed PR do **not** trigger a fresh automatic review — request one manually if a substantial follow-up change warrants a new pass.
+
+Before reporting a PR-related task complete, check that PR for review comments (automatic and human) and address the ones that make sense:
+
+```bash
+gh pr view <n> --json reviews
+gh api repos/{owner}/{repo}/pulls/{n}/comments
+```
+
+Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a change, say why rather than leaving it unaddressed silently. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean there's nothing coming.
+
 ## Validation and handoff
 
 Before opening or handing off a PR:
