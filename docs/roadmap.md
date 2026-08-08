@@ -4,7 +4,9 @@ FIAP X evolves from the current synchronous monolith (`main.go`) into a fully st
 
 > **Canonical source:** The authoritative roadmap — including full scope descriptions, ADRs, dependency rules, and the complete domain model — lives in [`openspec/specs/ddd-architecture/spec.md`](../openspec/specs/ddd-architecture/spec.md). Phase 2's own scope is likewise authoritative in [`openspec/specs/identity-authentication/spec.md`](../openspec/specs/identity-authentication/spec.md).
 >
-> This file is a summary for human readers. If this summary conflicts with the canonical source, the canonical source takes precedence.
+> This file is a summary for human readers. If the Phase Summary or any architecture/target-state description below conflicts with the canonical source, the canonical source takes precedence.
+>
+> The **Change Backlog** section below is different: it's a planning/sequencing artifact with no counterpart in `openspec/specs/` — canonical specs describe target system behavior, not the order in which OpenSpec changes get proposed. It can't "conflict" with the canonical source in the same sense; it's authoritative for change sequencing in its own right, updated directly here as changes are proposed and archived.
 
 ## Phase Summary
 
@@ -59,7 +61,7 @@ Listed at phase granularity only. Decomposing these into concrete changes now wo
 
 | Change | Scope | Depends on | Status |
 |---|---|---|---|
-| `fix-stale-roadmap-link-in-ddd-architecture-spec` | `openspec/specs/ddd-architecture/spec.md`'s "Documentation roadmap contains exactly eight phases" scenario still asserts `docs/roadmap.md` references `openspec/changes/establish-ddd-architecture-foundation/design.md`; the actual file references `openspec/specs/ddd-architecture/spec.md` (that change archived). Needs a proper change since it edits a canonical spec, not a direct hand-edit. | none | not-started |
+| `fix-stale-roadmap-link-in-ddd-architecture-spec` | `openspec/specs/ddd-architecture/spec.md`'s "Documentation roadmap contains exactly eight phases" scenario still asserts `docs/roadmap.md` references `openspec/changes/establish-ddd-architecture-foundation/design.md`; the actual file references `openspec/specs/ddd-architecture/spec.md` (that change archived). Needs a proper change since it edits a canonical spec, not a direct hand-edit. (Scoped narrowly to this one stale reference — the canonical-source disclaimer's wording itself was already clarified directly in `docs/roadmap.md`, no canonical-spec edit needed for that part.) | none | not-started |
 
 ## Current State (Phases 1–2 done)
 
