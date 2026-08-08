@@ -344,3 +344,27 @@ func TestProcessing_Failure_LeavesUploadedFileBehind(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(leftovers[0]) })
 }
+
+// TestStaticOutputs_NeverServesOwnerSidecarFiles guards against a sidecar
+// file written during an earlier, identity-enabled run of the server
+// leaking which UserID owns which artifact once identity is disabled again
+// (the static route then has no ownership middleware at all to catch it).
+func TestStaticOutputs_NeverServesOwnerSidecarFiles(t *testing.T) {
+	srv := startTestServer(t)
+
+	sidecarPath := filepath.Join("outputs", "fake-artifact.zip.owner")
+	if err := os.WriteFile(sidecarPath, []byte("3fa85f64-5717-4562-b3fc-2c963f66afa6"), 0600); err != nil {
+		t.Fatalf("failed to write fake sidecar: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(sidecarPath) })
+
+	resp, err := http.Get(srv.URL + "/outputs/fake-artifact.zip.owner")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served)", resp.StatusCode, http.StatusNotFound)
+	}
+}

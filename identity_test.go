@@ -680,3 +680,27 @@ func TestArtifactOwnership_StaticOutputsEnforcesOwnership(t *testing.T) {
 		t.Fatalf("non-owner static fetch status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
 	}
 }
+
+// TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles proves the
+// sidecar itself is never servable — not even to the user it names as
+// owner — since it's blocked before the ownership check even runs.
+func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	sidecarPath := filepath.Join("outputs", "fake-artifact.zip.owner")
+	if err := os.WriteFile(sidecarPath, []byte(userID.String()), 0600); err != nil {
+		t.Fatalf("failed to write fake sidecar: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(sidecarPath) })
+
+	resp := getWithAuthorization(t, srv.URL+"/outputs/fake-artifact.zip.owner", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served, even to their recorded owner)", resp.StatusCode, http.StatusNotFound)
+	}
+}
