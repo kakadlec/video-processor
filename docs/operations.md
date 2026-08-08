@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is a single Go binary (or `go run .`) behind a Docker container. There is no orchestration. External services are limited to an optional PostgreSQL instance for identity (Phase 2) — everything else still runs with no environment-specific configuration beyond the port.
+The application is a single Go binary (or `go run .`) behind a Docker container. There is no orchestration beyond the local-dev `docker-compose.yml` described below. External services are limited to an optional PostgreSQL instance for identity (Phase 2) — everything else still runs with no environment-specific configuration beyond the port.
 
 ### Docker
 
@@ -10,7 +10,7 @@ The application is a single Go binary (or `go run .`) behind a Docker container.
 # Build
 docker build -t video-processor .
 
-# Run
+# Run — identity disabled (no IDENTITY_* env vars set)
 docker run -p 8080:8080 video-processor
 
 # Custom port
@@ -18,6 +18,14 @@ docker run -p 9090:8080 -e PORT=8080 video-processor
 ```
 
 The Dockerfile is a single-stage build using `golang:1.26-alpine` with `ffmpeg` installed. It runs as root and calls `go run .` as the entry point. **This is an intentional anti-pattern for study purposes** — see the Dockerfile header comment. Hardening (multi-stage build, non-root user) is planned for Phase 8.
+
+### Docker Compose (app + PostgreSQL, identity enabled)
+
+```bash
+docker compose up --build
+```
+
+Builds the same Dockerfile and starts it alongside the `postgres` service, with `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` already wired to the compose network — `/api/auth/register` and `/api/auth/login` work immediately, no manual env vars. `app` depends on `postgres`'s healthcheck, so it won't start (and hit the fail-fast unreachable-DB error) before the database is actually ready. `uploads/` and `outputs/` are bind-mounted to the host so results can be inspected without `docker cp`. Both the `IDENTITY_JWT_SIGNING_KEY` value and the Postgres credentials are fixed, non-secret, local-only defaults — see the `docker-compose.yml` header comment.
 
 ### Environment Variables
 

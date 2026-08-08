@@ -38,7 +38,7 @@ go build -o app .
 
 The server creates `uploads/`, `temp/`, and `outputs/` in the working directory on first run.
 
-By default it runs with identity disabled (video processing only, no auth). To exercise registration/login/bearer-protected routes locally, start PostgreSQL (`docker compose up -d postgres`) and set both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` before `go run .` — see [docs/operations.md](operations.md) for both variables.
+By default it runs with identity disabled (video processing only, no auth). To exercise registration/login/bearer-protected routes locally, either start PostgreSQL (`docker compose up -d postgres`) and set both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` before `go run .` — see [docs/operations.md](operations.md) for both variables — or skip the manual wiring entirely with `docker compose up --build`, which starts the app and PostgreSQL together with identity already configured.
 
 ## Running Tests
 
@@ -105,13 +105,23 @@ All three must pass. The CI build fails on any `gosec` finding — `#nosec` is a
 # Build image
 docker build -t video-processor .
 
-# Run container
+# Run container — identity disabled (no IDENTITY_* env vars set)
 docker run -p 8080:8080 video-processor
 
 # Access the UI by opening http://localhost:8080 in a browser
 ```
 
 > The Dockerfile is intentionally a single-stage build without a non-root user (documented anti-pattern for study). Dockerfile hardening is planned for Phase 8.
+
+### Docker Compose (app + PostgreSQL, identity enabled)
+
+```bash
+docker compose up --build     # start app + postgres, identity wired in
+docker compose down           # stop
+docker compose down -v        # stop and drop the local data volume
+```
+
+Builds from the same Dockerfile, so it's still the same intentional anti-pattern underneath — this just wires PostgreSQL and identity env vars automatically over the compose network, and bind-mounts `uploads/`/`outputs/` to the host so results are inspectable without `docker cp`. See [docs/operations.md](operations.md) for details.
 
 ## Dependency Management
 

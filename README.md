@@ -30,7 +30,15 @@ go run .
 ```bash
 docker build -t video-processor .
 docker run -p 8080:8080 video-processor
-# Server starts on http://localhost:8080
+# Server starts on http://localhost:8080, identity disabled (video processing only)
+```
+
+### Docker Compose (full stack, identity included)
+
+```bash
+docker compose up --build
+# Server starts on http://localhost:8080 with PostgreSQL wired in —
+# /api/auth/register and /api/auth/login are live, no manual env vars needed
 ```
 
 ## Current Limitations

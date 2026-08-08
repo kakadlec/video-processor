@@ -22,5 +22,27 @@ services:
       timeout: 5s
       retries: 5
 
+  # Runs the same Dockerfile used for deployment (intentionally a simple,
+  # single-stage build — see the Dockerfile header comment). This service
+  # exists purely for local dev convenience: `docker compose up --build`
+  # gives a full stack (app + Postgres) with identity already wired in,
+  # instead of the manual `docker build` + `docker run -e ...` dance.
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Fixed, non-secret local-only default — same rationale as the
+      # Postgres credentials above. Never used outside a developer's
+      # machine or CI.
+      IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+
 volumes:
   postgres_data:
