@@ -43,6 +43,12 @@ This is the single source of truth for **what OpenSpec change comes next**. The 
 |---|---|---|---|
 | `extract-frontend-to-static-files` | Move `getHTMLForm()`'s HTML/CSS/JS out of `main.go` into `web/index.html`, `web/app.js`, `web/styles.css`, served via `go:embed`. No behavior change. | none | not-started |
 
+### Local development tooling (orthogonal to everything else, low risk)
+
+| Change | Scope | Depends on | Status |
+|---|---|---|---|
+| `add-docker-compose-app-service` | Add an `app` service to `docker-compose.yml` alongside the existing `postgres` service: builds the existing Dockerfile, wires `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` over the compose network, gated on Postgres's healthcheck so it doesn't hit the fail-fast unreachable-DB error before Postgres is ready, bind-mounts `uploads/`/`outputs/` to the host. Gives `docker compose up --build` as a one-command full local stack (app + Postgres, identity enabled), alongside the existing plain `docker run` (identity-disabled) path — doesn't replace it. Config only, no application code. | none | not-started |
+
 ### Phase 3 — Video Processing persistence & `cmd/api` extraction
 
 | Change | Scope | Depends on | Status |
