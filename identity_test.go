@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -541,5 +542,165 @@ func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 	defer downloadResp.Body.Close()
 	if downloadResp.StatusCode != http.StatusOK {
 		t.Fatalf("authenticated download status = %d, want %d", downloadResp.StatusCode, http.StatusOK)
+	}
+}
+
+// issueTestToken mints a bearer token for a fixed, valid UserID under
+// tokens' signing key, without going through registration/login.
+func issueTestToken(t *testing.T, tokens jwtauth.Adapter, uuid string) (domain.UserID, string) {
+	t.Helper()
+	userID, err := domain.NewUserID(uuid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	token, err := tokens.Issue(userID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return userID, token
+}
+
+// uploadAsUser uploads a freshly generated 1s test video authenticated as
+// token, and returns the resulting output zip's filename. It registers
+// cleanup for both the zip and its ownership sidecar file.
+func uploadAsUser(t *testing.T, baseURL, token string) string {
+	t.Helper()
+
+	videoPath := generateTestVideo(t, 1)
+	resp := uploadWithAuth(t, baseURL, token, videoPath, "owned-video.mp4")
+	defer resp.Body.Close()
+
+	var result ProcessingResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("unexpected error decoding upload response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || !result.Success {
+		t.Fatalf("upload failed: status=%d success=%v message=%q", resp.StatusCode, result.Success, result.Message)
+	}
+
+	cleanupOutputZip(t, result.ZipPath)
+	t.Cleanup(func() {
+		os.Remove(filepath.Join("outputs", result.ZipPath+artifactOwnerSuffix))
+	})
+	return result.ZipPath
+}
+
+func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	zipFilename := uploadAsUser(t, srv.URL, tokenA)
+
+	ownResp := getWithAuthorization(t, srv.URL+"/download/"+zipFilename, "Bearer "+tokenA)
+	defer ownResp.Body.Close()
+	if ownResp.StatusCode != http.StatusOK {
+		t.Fatalf("owner download status = %d, want %d", ownResp.StatusCode, http.StatusOK)
+	}
+
+	otherResp := getWithAuthorization(t, srv.URL+"/download/"+zipFilename, "Bearer "+tokenB)
+	defer otherResp.Body.Close()
+	if otherResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-owner download status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestArtifactOwnership_StatusScopedToOwner(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	zipFilename := uploadAsUser(t, srv.URL, tokenA)
+
+	statusA := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+tokenA)
+	defer statusA.Body.Close()
+	var resultA struct {
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(statusA.Body).Decode(&resultA); err != nil {
+		t.Fatalf("unexpected error decoding status response: %v", err)
+	}
+	if !containsFilename(resultA.Files, zipFilename) {
+		t.Fatalf("expected owner's /api/status to include %q, got %+v", zipFilename, resultA.Files)
+	}
+
+	statusB := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+tokenB)
+	defer statusB.Body.Close()
+	var resultB struct {
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(statusB.Body).Decode(&resultB); err != nil {
+		t.Fatalf("unexpected error decoding status response: %v", err)
+	}
+	if containsFilename(resultB.Files, zipFilename) {
+		t.Fatalf("expected non-owner's /api/status to exclude %q, got %+v", zipFilename, resultB.Files)
+	}
+}
+
+func containsFilename(files []struct {
+	Filename string `json:"filename"`
+}, filename string) bool {
+	for _, f := range files {
+		if f.Filename == filename {
+			return true
+		}
+	}
+	return false
+}
+
+func TestArtifactOwnership_StaticOutputsEnforcesOwnership(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	zipFilename := uploadAsUser(t, srv.URL, tokenA)
+
+	ownResp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenA)
+	defer ownResp.Body.Close()
+	if ownResp.StatusCode != http.StatusOK {
+		t.Fatalf("owner static fetch status = %d, want %d", ownResp.StatusCode, http.StatusOK)
+	}
+
+	otherResp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenB)
+	defer otherResp.Body.Close()
+	if otherResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-owner static fetch status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles proves the
+// sidecar itself is never servable — not even to the user it names as
+// owner — since it's blocked before the ownership check even runs.
+func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	sidecarPath := filepath.Join("outputs", "fake-artifact.zip.owner")
+	if err := os.WriteFile(sidecarPath, []byte(userID.String()), 0600); err != nil {
+		t.Fatalf("failed to write fake sidecar: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(sidecarPath) })
+
+	resp := getWithAuthorization(t, srv.URL+"/outputs/fake-artifact.zip.owner", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served, even to their recorded owner)", resp.StatusCode, http.StatusNotFound)
 	}
 }
