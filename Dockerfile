@@ -22,4 +22,4 @@ RUN mkdir -p uploads outputs temp
 EXPOSE 8080
 
 # Executar aplicação
-CMD ["go", "run", "main.go"] 
+CMD ["go", "run", "."]
