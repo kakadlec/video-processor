@@ -10,9 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type VideoRequest struct {
@@ -85,8 +85,29 @@ func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 		videoRoutes.Use(identity.requireBearerAuth())
 	}
 
-	videoRoutes.Static("/uploads", "./uploads")
-	videoRoutes.Static("/outputs", "./outputs")
+	// The /uploads and /outputs static mounts serve the exact same artifacts
+	// as handleDownload by filename, so they need the same per-owner check —
+	// otherwise they'd be a direct bypass of handleDownload's ownership
+	// enforcement below. rejectOwnerSidecarRequests runs unconditionally
+	// (not just when identity is configured): the sidecar files themselves
+	// must never be servable, including in a deployment that ran with
+	// identity configured before and now doesn't — otherwise old sidecars
+	// left over from that period would leak which UserID owns which
+	// artifact to anyone.
+	uploadsRoutes := videoRoutes.Group("/uploads")
+	uploadsRoutes.Use(rejectOwnerSidecarRequests())
+	if identity != nil {
+		uploadsRoutes.Use(requireArtifactOwnership("uploads"))
+	}
+	uploadsRoutes.Static("/", "./uploads")
+
+	outputsRoutes := videoRoutes.Group("/outputs")
+	outputsRoutes.Use(rejectOwnerSidecarRequests())
+	if identity != nil {
+		outputsRoutes.Use(requireArtifactOwnership("outputs"))
+	}
+	outputsRoutes.Static("/", "./outputs")
+
 	videoRoutes.POST("/upload", handleVideoUpload)
 	videoRoutes.GET("/download/:filename", handleDownload)
 	videoRoutes.GET("/api/status", handleStatus)
@@ -96,6 +117,87 @@ func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	}
 
 	return r
+}
+
+// artifactOwnerSuffix names the sidecar file that records which
+// authenticated user owns a video-processing artifact (an upload or an
+// output zip), stored alongside it under the same directory. This is
+// explicit, checked ownership metadata — not an inference from the
+// artifact's filename or timestamp.
+const artifactOwnerSuffix = ".owner"
+
+// recordArtifactOwner persists that userID owns the artifact at
+// filepath.Join(dir, artifactFilename). dir is confined to like videoPath
+// and zipPath are confined elsewhere in this file.
+func recordArtifactOwner(dir, artifactFilename, userID string) error {
+	path := filepath.Clean(filepath.Join(dir, artifactFilename+artifactOwnerSuffix))
+	if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid artifact filename: %s", artifactFilename)
+	}
+	return os.WriteFile(path, []byte(userID), 0600)
+}
+
+// artifactOwner returns the userID recorded by recordArtifactOwner for the
+// artifact at filepath.Join(dir, artifactFilename), if any.
+func artifactOwner(dir, artifactFilename string) (string, bool) {
+	path := filepath.Clean(filepath.Join(dir, artifactFilename+artifactOwnerSuffix))
+	if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// removeArtifactOwner deletes the ownership sidecar for the artifact at
+// filepath.Join(dir, artifactFilename), confined the same way as above.
+func removeArtifactOwner(dir, artifactFilename string) error {
+	path := filepath.Clean(filepath.Join(dir, artifactFilename+artifactOwnerSuffix))
+	if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid artifact filename: %s", artifactFilename)
+	}
+	return os.Remove(path)
+}
+
+// rejectOwnerSidecarRequests blocks direct HTTP access to ownership sidecar
+// files under a static file group. It's registered unconditionally,
+// regardless of whether identity is configured, since a sidecar written
+// during an earlier, identity-enabled run of the server must stay
+// unreadable even after identity is turned off.
+func rejectOwnerSidecarRequests() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		filename := filepath.Base(c.Param("filepath"))
+		if strings.HasSuffix(filename, artifactOwnerSuffix) {
+			c.AbortWithStatusJSON(404, gin.H{"error": "File not found"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// requireArtifactOwnership gates a static file group (uploads/ or outputs/)
+// so an authenticated user can only fetch artifacts recorded as their own.
+// It's only registered behind requireBearerAuth, so an authenticated UserID
+// is always present in context by the time it runs.
+func requireArtifactOwnership(dir string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID, ok := authenticatedUserID(c)
+		if !ok {
+			c.AbortWithStatusJSON(404, gin.H{"error": "File not found"})
+			return
+		}
+
+		filename := filepath.Base(c.Param("filepath"))
+		owner, hasOwner := artifactOwner(dir, filename)
+		if !hasOwner || owner != userID.String() {
+			c.AbortWithStatusJSON(404, gin.H{"error": "File not found"})
+			return
+		}
+
+		c.Next()
+	}
 }
 
 func createDirs() {
@@ -126,9 +228,15 @@ func handleVideoUpload(c *gin.Context) {
 		return
 	}
 
-	timestamp := time.Now().Format("20060102_150405")
+	// requestID must be collision-resistant, not just distinct-looking: it
+	// names the temp dir, the output zip, and (when authenticated) the
+	// ownership sidecar for both. A colliding ID from two concurrent
+	// requests would let one user's upload overwrite another's artifact and
+	// its ownership record — a UUID keeps that probability negligible,
+	// unlike the second-precision timestamp this used to be.
+	requestID := uuid.NewString()
 	safeFilename := filepath.Base(header.Filename)
-	filename := fmt.Sprintf("%s_%s", timestamp, safeFilename)
+	filename := fmt.Sprintf("%s_%s", requestID, safeFilename)
 	videoPath := filepath.Clean(filepath.Join("uploads", filename))
 	if !strings.HasPrefix(videoPath, "uploads"+string(os.PathSeparator)) {
 		c.JSON(400, ProcessingResult{
@@ -157,21 +265,48 @@ func handleVideoUpload(c *gin.Context) {
 		return
 	}
 
-	result := processVideo(videoPath, timestamp)
+	userID, authenticated := authenticatedUserID(c)
+	if authenticated {
+		if err := recordArtifactOwner("uploads", filename, userID.String()); err != nil {
+			log.Printf("Failed to record owner for upload %s: %v", filename, err)
+		}
+	}
+
+	result := processVideo(videoPath, requestID)
 
 	if result.Success {
 		if err := os.Remove(videoPath); err != nil {
 			log.Printf("Failed to remove original upload %s: %v", videoPath, err)
+		}
+		if authenticated {
+			if err := removeArtifactOwner("uploads", filename); err != nil {
+				log.Printf("Failed to remove owner record for upload %s: %v", filename, err)
+			}
+			// If ownership can't be recorded, the zip would otherwise be
+			// reported as a success the owner can never actually retrieve
+			// (every ownership-checked read path fails closed on a missing
+			// sidecar). Treat it as a processing failure instead.
+			if err := recordArtifactOwner("outputs", result.ZipPath, userID.String()); err != nil {
+				log.Printf("Failed to record owner for output %s: %v", result.ZipPath, err)
+				if removeErr := os.Remove(filepath.Join("outputs", result.ZipPath)); removeErr != nil {
+					log.Printf("Failed to remove orphaned output %s: %v", result.ZipPath, removeErr)
+				}
+				c.JSON(500, ProcessingResult{
+					Success: false,
+					Message: "Failed to record artifact ownership",
+				})
+				return
+			}
 		}
 	}
 
 	c.JSON(200, result)
 }
 
-func processVideo(videoPath, timestamp string) ProcessingResult {
+func processVideo(videoPath, requestID string) ProcessingResult {
 	fmt.Printf("Iniciando processamento: %s\n", videoPath)
 
-	tempDir := filepath.Join("temp", timestamp)
+	tempDir := filepath.Join("temp", requestID)
 	if err := os.MkdirAll(tempDir, 0750); err != nil {
 		log.Printf("Failed to create temp directory %s: %v", tempDir, err)
 	}
@@ -204,7 +339,7 @@ func processVideo(videoPath, timestamp string) ProcessingResult {
 
 	fmt.Printf("📸 Extraídos %d frames\n", len(frames))
 
-	zipFilename := fmt.Sprintf("frames_%s.zip", timestamp)
+	zipFilename := fmt.Sprintf("frames_%s.zip", requestID)
 	zipPath := filepath.Join("outputs", zipFilename)
 
 	err = createZipFile(frames, zipPath)
@@ -294,9 +429,20 @@ func handleDownload(c *gin.Context) {
 	filename := c.Param("filename")
 	filePath := filepath.Join("outputs", filename)
 
+	// The not-found and not-owned responses below are deliberately
+	// identical: a non-owner must not be able to tell "doesn't exist" apart
+	// from "exists but isn't yours" by response content.
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		c.JSON(404, gin.H{"error": "Arquivo não encontrado"})
+		c.JSON(404, gin.H{"error": "File not found"})
 		return
+	}
+
+	if userID, authenticated := authenticatedUserID(c); authenticated {
+		owner, hasOwner := artifactOwner("outputs", filename)
+		if !hasOwner || owner != userID.String() {
+			c.JSON(404, gin.H{"error": "File not found"})
+			return
+		}
 	}
 
 	c.Header("Content-Description", "File Transfer")
@@ -314,11 +460,20 @@ func handleStatus(c *gin.Context) {
 		return
 	}
 
+	userID, authenticated := authenticatedUserID(c)
+
 	var results []map[string]interface{}
 	for _, file := range files {
 		info, err := os.Stat(file)
 		if err != nil {
 			continue
+		}
+
+		if authenticated {
+			owner, hasOwner := artifactOwner("outputs", filepath.Base(file))
+			if !hasOwner || owner != userID.String() {
+				continue
+			}
 		}
 
 		results = append(results, map[string]interface{}{
