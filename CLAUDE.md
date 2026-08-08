@@ -82,6 +82,7 @@ Code, error messages, and comments in **new or changed code** SHALL be written i
 - Do not translate the existing Portuguese (pt-BR) strings already in `main.go` (the HTML form in `getHTMLForm()`, existing JSON `Message`/`error` fields, existing `fmt.Printf`/`log.Printf` calls) just because you're touching a nearby line. Leave them as-is unless a change specifically asks for that.
 - Any error message, log line, or other string you add or rewrite from now on should be in English, even inside an otherwise-Portuguese function.
 - Comments: default to none. Add one only when it explains something genuinely non-obvious (a hidden constraint, a workaround, a subtle invariant) — not to restate what the code already says. When you do add one, write it in English.
+- Exception: new **user-facing UI copy** in `getHTMLForm()` (labels, buttons, status messages shown on the page itself) stays in Portuguese, matching the rest of that page — it's written for the same pt-BR hackathon audience as the existing form, and mixing languages within one UI reads as inconsistent to that audience. This exception is scoped to visible page copy only; error messages, log lines, and comments in the surrounding Go code (including inside `getHTMLForm()`) still follow the English rule above.
 
 ## Notable constraints / gotchas
 
