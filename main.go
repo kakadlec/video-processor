@@ -624,7 +624,9 @@ func getHTMLForm() string {
 
         <div class="auth-panel" id="authPanel">
             <div id="authForms">
+                <label for="authEmail">Email:</label>
                 <input type="email" id="authEmail" placeholder="Email">
+                <label for="authPassword">Senha:</label>
                 <input type="password" id="authPassword" placeholder="Senha">
                 <button type="button" id="loginBtn">🔑 Entrar</button>
                 <button type="button" id="registerBtn">📝 Cadastrar</button>
@@ -805,13 +807,16 @@ func getHTMLForm() string {
 
                 if (result.success) {
                     showResult(
-                        result.message +
-                        '<br><br><button class="download-btn" data-download-filename="' + result.zip_path + '">⬇️ Download ZIP</button>',
+                        escapeHtml(result.message) +
+                        '<br><br><button class="download-btn" data-download-filename="' + escapeHtml(result.zip_path) + '">⬇️ Download ZIP</button>',
                         'success'
                     );
                     loadFilesList();
                 } else {
-                    showResult('Erro: ' + result.message, 'error');
+                    // result.message can echo back ffmpeg's raw output, which
+                    // includes the caller-controlled original filename — it
+                    // must be escaped before reaching innerHTML below.
+                    showResult('Erro: ' + escapeHtml(result.message), 'error');
                 }
             } catch (error) {
                 showResult('Erro de conexão: ' + error.message, 'error');
@@ -819,6 +824,12 @@ func getHTMLForm() string {
                 showLoading(false);
             }
         });
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str == null ? '' : str;
+            return div.innerHTML;
+        }
 
         function showResult(message, type) {
             const result = document.getElementById('result');
@@ -850,8 +861,8 @@ func getHTMLForm() string {
                 if (data.files && data.files.length > 0) {
                     filesList.innerHTML = data.files.map(file =>
                         '<div class="file-item">' +
-                        '<span>' + file.filename + ' (' + formatFileSize(file.size) + ') - ' + file.created_at + '</span>' +
-                        '<button class="download-btn" data-download-filename="' + file.filename + '">⬇️ Download</button>' +
+                        '<span>' + escapeHtml(file.filename) + ' (' + formatFileSize(file.size) + ') - ' + escapeHtml(file.created_at) + '</span>' +
+                        '<button class="download-btn" data-download-filename="' + escapeHtml(file.filename) + '">⬇️ Download</button>' +
                         '</div>'
                     ).join('');
                 } else {
