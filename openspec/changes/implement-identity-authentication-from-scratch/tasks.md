@@ -20,7 +20,7 @@
 - [x] 3.1 Add registration and login endpoints with documented status codes and non-sensitive responses.
 - [x] 3.2 Add bearer middleware that rejects missing, malformed, expired, and invalid tokens.
 - [x] 3.3 Protect all video-processing routes while keeping `GET /` public.
-- [ ] 3.4 Enforce authenticated ownership for upload, status, and download operations.
+- [x] 3.4 Enforce authenticated ownership for upload, status, and download operations.
 - [ ] 3.5 Update the existing UI/client contract only as required for authentication, without unrelated frontend migration.
 
 ## Verification
