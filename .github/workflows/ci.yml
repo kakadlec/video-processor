@@ -51,6 +51,8 @@ jobs:
   sast:
     name: SAST (gosec)
     runs-on: ubuntu-latest
+    env:
+      GOSEC_VERSION: '2.28.0'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -63,8 +65,19 @@ jobs:
         with:
           go-version: 'stable'
 
+      - name: Cache gosec binary
+        id: cache-gosec
+        uses: actions/cache@v6
+        with:
+          path: ~/go/bin/gosec
+          key: ${{ runner.os }}-gosec-v${{ env.GOSEC_VERSION }}
+
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+        # Pinned (not @latest) so the cache key above is stable across runs;
+        # skipped entirely on a cache hit, since go install would otherwise
+        # recompile gosec's whole dependency tree from source every run.
+        if: steps.cache-gosec.outputs.cache-hit != 'true'
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v${{ env.GOSEC_VERSION }}
 
       - name: Run gosec
         run: gosec ./...
@@ -72,6 +85,8 @@ jobs:
   vulncheck:
     name: Vulnerability Scan (govulncheck)
     runs-on: ubuntu-latest
+    env:
+      GOVULNCHECK_VERSION: '1.6.0'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -83,8 +98,18 @@ jobs:
         with:
           go-version: 'stable'
 
+      - name: Cache govulncheck binary
+        id: cache-govulncheck
+        uses: actions/cache@v6
+        with:
+          path: ~/go/bin/govulncheck
+          key: ${{ runner.os }}-govulncheck-v${{ env.GOVULNCHECK_VERSION }}
+
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # Pinned (not @latest) so the cache key above is stable across runs;
+        # skipped entirely on a cache hit.
+        if: steps.cache-govulncheck.outputs.cache-hit != 'true'
+        run: go install golang.org/x/vuln/cmd/govulncheck@v${{ env.GOVULNCHECK_VERSION }}
 
       - name: Run govulncheck
         run: govulncheck ./...
