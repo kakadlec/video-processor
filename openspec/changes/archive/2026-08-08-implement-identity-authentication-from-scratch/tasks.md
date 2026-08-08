@@ -21,7 +21,7 @@
 - [x] 3.2 Add bearer middleware that rejects missing, malformed, expired, and invalid tokens.
 - [x] 3.3 Protect all video-processing routes while keeping `GET /` public.
 - [x] 3.4 Enforce authenticated ownership for upload, status, and download operations.
-- [ ] 3.5 Update the existing UI/client contract only as required for authentication, without unrelated frontend migration.
+- [x] 3.5 Update the existing UI/client contract only as required for authentication, without unrelated frontend migration.
 
 ## Verification
 
