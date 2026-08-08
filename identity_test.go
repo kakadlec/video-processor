@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"video-processor/internal/identity/infrastructure/idgen"
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	"video-processor/internal/identity/infrastructure/password"
+	"video-processor/internal/identity/infrastructure/postgres"
 )
 
 // inMemoryUserRepository is a fake domain.UserRepository so these HTTP tests
@@ -702,5 +705,59 @@ func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served, even to their recorded owner)", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestSetupIdentity_NeitherConfigured_ReturnsNilModuleNoError(t *testing.T) {
+	t.Setenv("IDENTITY_POSTGRES_DSN", "")
+	t.Setenv(identityJWTSigningKeyEnv, "")
+
+	module, db, err := setupIdentity(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if module != nil {
+		t.Fatalf("expected a nil module when identity is unconfigured, got %+v", module)
+	}
+	if db != nil {
+		t.Fatalf("expected a nil db when identity is unconfigured, got %+v", db)
+	}
+}
+
+func TestSetupIdentity_SigningKeyMissing_ReturnsError(t *testing.T) {
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
+	t.Setenv(identityJWTSigningKeyEnv, "")
+
+	_, _, err := setupIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when IDENTITY_POSTGRES_DSN is set but the JWT signing key is missing")
+	}
+	if !strings.Contains(err.Error(), identityJWTSigningKeyEnv) {
+		t.Fatalf("expected error to mention %s, got: %v", identityJWTSigningKeyEnv, err)
+	}
+}
+
+func TestSetupIdentity_DSNMissing_ReturnsError(t *testing.T) {
+	t.Setenv("IDENTITY_POSTGRES_DSN", "")
+	t.Setenv(identityJWTSigningKeyEnv, "a-signing-key")
+
+	_, _, err := setupIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when the JWT signing key is set but IDENTITY_POSTGRES_DSN is missing")
+	}
+	if !errors.Is(err, postgres.ErrDSNRequired) {
+		t.Fatalf("expected error to wrap postgres.ErrDSNRequired, got: %v", err)
+	}
+}
+
+func TestSetupIdentity_UnreachablePostgres_ReturnsError(t *testing.T) {
+	// A loopback address on a port nothing listens on fails fast (connection
+	// refused) rather than hanging, so this stays a fast unit-style test.
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/identity?sslmode=disable&connect_timeout=1")
+	t.Setenv(identityJWTSigningKeyEnv, "a-signing-key")
+
+	_, _, err := setupIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when configured PostgreSQL is unreachable")
 	}
 }
