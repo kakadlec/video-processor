@@ -582,8 +582,37 @@ func getHTMLForm() string {
             text-decoration: none;
             border-radius: 3px;
             font-size: 14px;
+            border: none;
+            cursor: pointer;
         }
         .download-btn:hover { background: #218838; }
+        .auth-panel {
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .auth-panel input {
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        .auth-panel button {
+            padding: 8px 20px;
+            font-size: 14px;
+            margin: 5px;
+        }
+        .auth-message {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        .auth-message.error { color: #721c24; }
+        .auth-logged-in {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
@@ -592,7 +621,21 @@ func getHTMLForm() string {
         <p style="text-align: center; color: #666;">
             Faça upload de um vídeo e receba um ZIP com todos os frames extraídos!
         </p>
-        
+
+        <div class="auth-panel" id="authPanel">
+            <div id="authForms">
+                <input type="email" id="authEmail" placeholder="Email">
+                <input type="password" id="authPassword" placeholder="Senha">
+                <button type="button" id="loginBtn">🔑 Entrar</button>
+                <button type="button" id="registerBtn">📝 Cadastrar</button>
+            </div>
+            <div class="auth-logged-in" id="authLoggedIn" style="display: none;">
+                <span id="authEmailDisplay"></span>
+                <button type="button" id="logoutBtn">🚪 Sair</button>
+            </div>
+            <div class="auth-message" id="authMessage"></div>
+        </div>
+
         <form id="uploadForm" class="upload-form">
             <p><strong>Selecione um arquivo de vídeo:</strong></p>
             <input type="file" id="videoFile" accept="video/*" required>
@@ -613,35 +656,157 @@ func getHTMLForm() string {
     </div>
 
     <script>
+        const ACCESS_TOKEN_KEY = 'fiapx_access_token';
+        const ACCOUNT_EMAIL_KEY = 'fiapx_account_email';
+
+        function getAccessToken() {
+            return localStorage.getItem(ACCESS_TOKEN_KEY);
+        }
+
+        function setSession(accessToken, email) {
+            localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
+            localStorage.setItem(ACCOUNT_EMAIL_KEY, email);
+            updateAuthUI();
+        }
+
+        function clearSession() {
+            localStorage.removeItem(ACCESS_TOKEN_KEY);
+            localStorage.removeItem(ACCOUNT_EMAIL_KEY);
+            updateAuthUI();
+        }
+
+        function authHeaders() {
+            const token = getAccessToken();
+            return token ? { 'Authorization': 'Bearer ' + token } : {};
+        }
+
+        function updateAuthUI() {
+            const token = getAccessToken();
+            document.getElementById('authForms').style.display = token ? 'none' : 'block';
+            document.getElementById('authLoggedIn').style.display = token ? 'flex' : 'none';
+            if (token) {
+                document.getElementById('authEmailDisplay').textContent =
+                    'Autenticado como ' + localStorage.getItem(ACCOUNT_EMAIL_KEY);
+            }
+        }
+
+        function showAuthMessage(message, type) {
+            const el = document.getElementById('authMessage');
+            el.textContent = message;
+            el.className = 'auth-message' + (type ? ' ' + type : '');
+        }
+
+        async function submitAuth(path) {
+            const email = document.getElementById('authEmail').value;
+            const password = document.getElementById('authPassword').value;
+            try {
+                const response = await fetch(path, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email: email, password: password })
+                });
+                const data = await response.json().catch(function() { return {}; });
+                if (!response.ok) {
+                    showAuthMessage(data.error || 'Falha na autenticação.', 'error');
+                    return;
+                }
+                if (path === '/api/auth/register') {
+                    showAuthMessage('Cadastro realizado! Entrando...', '');
+                    await submitAuth('/api/auth/login');
+                    return;
+                }
+                setSession(data.access_token, email);
+                showAuthMessage('');
+                loadFilesList();
+            } catch (error) {
+                showAuthMessage('Erro de conexão: ' + error.message, 'error');
+            }
+        }
+
+        document.getElementById('loginBtn').addEventListener('click', function() {
+            submitAuth('/api/auth/login');
+        });
+
+        document.getElementById('registerBtn').addEventListener('click', function() {
+            submitAuth('/api/auth/register');
+        });
+
+        document.getElementById('logoutBtn').addEventListener('click', function() {
+            clearSession();
+            loadFilesList();
+        });
+
+        async function downloadFile(filename) {
+            try {
+                const response = await fetch('/download/' + encodeURIComponent(filename), {
+                    headers: authHeaders()
+                });
+                if (response.status === 401) {
+                    clearSession();
+                    showResult('Sessão expirada. Faça login novamente.', 'error');
+                    return;
+                }
+                if (!response.ok) {
+                    showResult('Erro ao baixar o arquivo.', 'error');
+                    return;
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                showResult('Erro de conexão: ' + error.message, 'error');
+            }
+        }
+
+        document.addEventListener('click', function(e) {
+            const filename = e.target.getAttribute('data-download-filename');
+            if (filename) {
+                downloadFile(filename);
+            }
+        });
+
         document.getElementById('uploadForm').addEventListener('submit', async function(e) {
             e.preventDefault();
-            
+
             const fileInput = document.getElementById('videoFile');
             const file = fileInput.files[0];
-            
+
             if (!file) {
                 showResult('Selecione um arquivo de vídeo!', 'error');
                 return;
             }
-            
+
             const formData = new FormData();
             formData.append('video', file);
-            
+
             showLoading(true);
             hideResult();
-            
+
             try {
                 const response = await fetch('/upload', {
                     method: 'POST',
+                    headers: authHeaders(),
                     body: formData
                 });
-                
+
+                if (response.status === 401) {
+                    clearSession();
+                    showResult('Sessão expirada. Faça login novamente.', 'error');
+                    return;
+                }
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     showResult(
-                        result.message + 
-                        '<br><br><a href="/download/' + result.zip_path + '" class="download-btn">⬇️ Download ZIP</a>',
+                        result.message +
+                        '<br><br><button class="download-btn" data-download-filename="' + result.zip_path + '">⬇️ Download ZIP</button>',
                         'success'
                     );
                     loadFilesList();
@@ -654,7 +819,7 @@ func getHTMLForm() string {
                 showLoading(false);
             }
         });
-        
+
         function showResult(message, type) {
             const result = document.getElementById('result');
             result.innerHTML = message;
@@ -672,16 +837,21 @@ func getHTMLForm() string {
         
         async function loadFilesList() {
             try {
-                const response = await fetch('/api/status');
+                const response = await fetch('/api/status', { headers: authHeaders() });
+                if (response.status === 401) {
+                    clearSession();
+                    document.getElementById('filesList').innerHTML = '<p>Faça login para ver seus arquivos.</p>';
+                    return;
+                }
                 const data = await response.json();
-                
+
                 const filesList = document.getElementById('filesList');
-                
+
                 if (data.files && data.files.length > 0) {
-                    filesList.innerHTML = data.files.map(file => 
+                    filesList.innerHTML = data.files.map(file =>
                         '<div class="file-item">' +
                         '<span>' + file.filename + ' (' + formatFileSize(file.size) + ') - ' + file.created_at + '</span>' +
-                        '<a href="' + file.download_url + '" class="download-btn">⬇️ Download</a>' +
+                        '<button class="download-btn" data-download-filename="' + file.filename + '">⬇️ Download</button>' +
                         '</div>'
                     ).join('');
                 } else {
@@ -700,7 +870,8 @@ func getHTMLForm() string {
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
         
-        // Carregar lista de arquivos ao inicializar
+        // Carregar estado de autenticação e lista de arquivos ao inicializar
+        updateAuthUI();
         loadFilesList();
     </script>
 </body>
