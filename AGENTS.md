@@ -21,11 +21,11 @@ Create `openspec/changes/<change-id>/` with the proposal, design, tasks, and del
 
 ### 2. Implementation PR
 
-The implementation PR must contain **only application source and test files**. It must not modify:
+The implementation PR must contain **only the files that implement the change's declared proposal scope**: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI (e.g. `docker-compose.yml`, `.github/workflows/ci.yml`). It must not modify:
 
 - `tasks.md` or any other OpenSpec file;
 - `README.md`, `docs/`, `CLAUDE.md`, or `AGENTS.md`;
-- configuration or CI files;
+- configuration or CI files unrelated to this change's declared proposal scope;
 - canonical specs;
 - unrelated files.
 

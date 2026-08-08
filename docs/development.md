@@ -153,7 +153,7 @@ Skip this flow only for trivial changes (typo fixes, comment tweaks, dependency 
 Non-trivial changes use three PR roles, in this order:
 
 1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
-2. **Implementation PR** — only application source and test files. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration, CI, or any file under `openspec/`.
+2. **Implementation PR** — only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`.
 3. **Finalization/archive PR** — after implementation merges, mark the completed tasks, promote the delta into `openspec/specs/`, and move the change folder into `openspec/changes/archive/`. It must not contain application source or tests.
 
 Permanent documentation or agent-instruction changes belong in a separate docs PR and must never be bundled into the implementation PR. `tasks.md` checkoffs belong in the finalization/archive PR, not in the implementation PR.
