@@ -29,7 +29,7 @@ apk add --no-cache ffmpeg
 go mod download
 
 # Start the server (listens on :8080)
-go run main.go
+go run .
 
 # Build a binary
 go build -o app .
@@ -37,6 +37,8 @@ go build -o app .
 ```
 
 The server creates `uploads/`, `temp/`, and `outputs/` in the working directory on first run.
+
+By default it runs with identity disabled (video processing only, no auth). To exercise registration/login/bearer-protected routes locally, start PostgreSQL (`docker compose up -d postgres`) and set both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` before `go run .` — see [docs/operations.md](operations.md) for both variables.
 
 ## Running Tests
 

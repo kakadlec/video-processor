@@ -4,6 +4,37 @@
 
 Processing is fully synchronous. The HTTP connection stays open until `ffmpeg` finishes and the ZIP is ready.
 
+### Authentication (optional, Phase 2)
+
+When `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` are configured, every step below runs behind bearer-token middleware:
+
+```
+Browser                        Go server (main.go / identity.go)     PostgreSQL
+  │                                     │                                 │
+  │  POST /api/auth/register            │                                 │
+  │  { email, password }                │                                 │
+  │────────────────────────────────────►│  Hash password (bcrypt)         │
+  │                                     │  Persist user                   │
+  │                                     │─────────────────────────────────►│
+  │◄────────────────────────────────────│                                 │
+  │  201 { id, email, created_at }       │                                 │
+  │                                     │                                 │
+  │  POST /api/auth/login               │                                 │
+  │  { email, password }                │                                 │
+  │────────────────────────────────────►│  Verify credentials             │
+  │                                     │  Issue signed JWT               │
+  │◄────────────────────────────────────│                                 │
+  │  200 { access_token, expires_at }    │                                 │
+  │                                     │                                 │
+  │  POST /upload                       │                                 │
+  │  Authorization: Bearer <token>      │                                 │
+  │────────────────────────────────────►│  Verify token → UserID          │
+  │                                     │  (401 and stop here if invalid) │
+  │                                     │  ... continues below ...        │
+```
+
+Without those two env vars set, identity is disabled: `/api/auth/*` don't exist, and `/upload`, `/download/:filename`, `/api/status`, `/uploads/*`, `/outputs/*` all run exactly as shown below with no auth check.
+
 ```
 Browser                   Go server (main.go)              Filesystem
   │                             │                               │
@@ -44,6 +75,7 @@ Browser                   Go server (main.go)              Filesystem
 - No job ID, no status polling, no notifications.
 - On success, the original upload file is deleted; the ZIP in `outputs/` is the only durable artifact.
 - On failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`).
+- Authentication (Phase 2) is optional and off by default; when enabled, artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and enforced identically on `/download`, `/api/status`, and the `/uploads`/`/outputs` static mounts.
 
 ---
 
@@ -113,18 +145,30 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
 
 ```
 Page load
-  └─► GET /api/status    → populate "Arquivos Processados" list
+  └─► Read access token from localStorage, if any
+  └─► GET /api/status  (with Authorization header if a token is present)
+        → populate "Arquivos Processados" list
 
-User submits form
-  └─► POST /upload       → blocks until processing completes
+User clicks Entrar/Cadastrar
+  └─► POST /api/auth/login or /api/auth/register
+        on success: store access_token in localStorage, refresh file list
+        on error:   show error message
+
+User submits upload form
+  └─► POST /upload  (with Authorization header if a token is present)
+        → blocks until processing completes
         on success:
-          └─► show download link for zip_path
+          └─► show a "Download ZIP" button (fetches the file with the
+              Authorization header and saves it via a Blob, since a
+              plain link can't carry a custom header)
           └─► GET /api/status    → refresh file list
         on error:
           └─► show error message
+        on 401 (token expired/invalid):
+          └─► clear the stored token, prompt to log in again
 ```
 
-The JS is embedded in the Go string returned by `getHTMLForm()`. There is no separate build step.
+The JS is embedded in the Go string returned by `getHTMLForm()`. There is no separate build step. The login/register panel is optional at the UI level too — it works the same whether or not the server has identity configured; without it, requests simply carry no `Authorization` header and the server accepts them unauthenticated.
 
 ### After Phase 3 (static files extracted to `web/`)
 
@@ -155,7 +199,9 @@ User submits form
 
 | Endpoint | Current behavior | Phase 6 behavior | Removed? |
 |---|---|---|---|
-| `POST /upload` | Blocks; returns ZIP download link | Returns immediately; returns job ID + status URL | No — kept for compatibility |
+| `POST /api/auth/register` | Creates a user (Phase 2, only when identity is configured) | Unchanged | No |
+| `POST /api/auth/login` | Issues a bearer JWT (Phase 2, only when identity is configured) | Unchanged | No |
+| `POST /upload` | Blocks; returns ZIP download link; requires a bearer token when identity is configured | Returns immediately; returns job ID + status URL | No — kept for compatibility |
 | `GET /api/status` | Lists all ZIPs in `outputs/` | Lists outputs (compat) | No — kept for compatibility |
 | `GET /download/:filename` | Serves ZIP from `outputs/` | Serves from MinIO (via redirect or proxy) | No |
 | `GET /jobs/{id}/status` | Does not exist | Per-job polling endpoint | N/A — new in Phase 6 |

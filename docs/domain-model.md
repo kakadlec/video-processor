@@ -1,6 +1,6 @@
 # Domain Model
 
-> The domain model described here is the **target design** established by the DDD architecture foundation. The current codebase (`main.go`) does not yet implement bounded contexts, aggregate roots, or domain events — these are introduced incrementally across Phases 2–7. See [docs/roadmap.md](roadmap.md) for the phase plan.
+> The domain model described here is the **target design** established by the DDD architecture foundation. Identity (Phase 2) is implemented as described below. Video Processing and Notification, and their aggregate roots and domain events, are introduced incrementally across Phases 3–7. See [docs/roadmap.md](roadmap.md) for the phase plan.
 
 ## Bounded Contexts
 
@@ -14,9 +14,9 @@
 
 **Aggregate root:** `User` (ID, email, hashed credential, created-at).
 
-**Domain events emitted:** `UserRegistered`, `UserAuthenticated`.
+**Domain events emitted:** none in this slice — `RegisterUser`/`AuthenticateUser` return synchronously and don't publish events. Domain events for Identity (e.g. `UserRegistered`) are deferred until a consumer needs them (see Notification, Phase 7); introducing them speculatively was an explicit non-goal of Phase 2's design.
 
-**Introduced in:** Phase 2 (`implement-identity-and-authentication`).
+**Introduced in:** Phase 2 (`implement-identity-authentication-from-scratch`) — implemented; see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md).
 
 ---
 
@@ -101,13 +101,14 @@ pending → queued → processing → completed
 | `CompleteJob` | Worker (internal) | Job in `processing` | Job transitions to `completed`; `StorageKey` and `FrameCount` set; `VideoJobCompleted` event emitted |
 | `FailJob` | Worker (internal) | Job in `processing` | Job transitions to `failed`; `ErrorReason` set; `VideoJobFailed` event emitted |
 
-#### Identity Context
+#### Identity Context (implemented, Phase 2)
 
 | Use case | Actor | Pre-condition | Post-condition |
 |---|---|---|---|
-| `RegisterUser` | Anonymous | Email not already registered | `User` persisted; `UserRegistered` event emitted |
-| `AuthenticateUser` | Anonymous | User exists; credential matches | Token issued; `UserAuthenticated` event emitted |
-| `VerifyToken` | API middleware | Token present in request | `UserID` extracted and forwarded; request rejected on invalid token |
+| `RegisterUser` | Anonymous | Email not already registered | `User` persisted; no domain event emitted (see Domain Events below) |
+| `AuthenticateUser` | Anonymous | User exists; credential matches | Bearer JWT issued; no domain event emitted |
+
+Token verification is bearer middleware (`requireBearerAuth`), not a use case object: it extracts `Authorization: Bearer <token>`, verifies it via the `domain.TokenVerifier` port, and stores the resulting `UserID` in the request context or rejects with `401` before any handler runs.
 
 #### Notification Context
 
@@ -122,17 +123,17 @@ pending → queued → processing → completed
 
 All events are serialized as JSON. The `type` field is the canonical discriminator. Events are immutable once emitted.
 
-| Event | JSON fields | Crosses context boundary? |
-|---|---|---|
-| `VideoJobCreated` | `type`, `job_id`, `user_id`, `original_filename`, `occurred_at` | No (internal) |
-| `VideoJobQueued` | `type`, `job_id`, `occurred_at` | No (internal) |
-| `VideoJobStarted` | `type`, `job_id`, `occurred_at` | No (internal) |
-| `VideoJobCompleted` | `type`, `job_id`, `user_id`, `frame_count`, `storage_key`, `occurred_at` | Yes — Video Processing → Notification |
-| `VideoJobFailed` | `type`, `job_id`, `user_id`, `error_reason`, `occurred_at` | Yes — Video Processing → Notification |
-| `UserRegistered` | `type`, `user_id`, `email`, `occurred_at` | Yes (optionally) — Identity → Notification |
-| `UserAuthenticated` | `type`, `user_id`, `occurred_at` | No (internal) |
+| Event | JSON fields | Crosses context boundary? | Status |
+|---|---|---|---|
+| `VideoJobCreated` | `type`, `job_id`, `user_id`, `original_filename`, `occurred_at` | No (internal) | Planned (Phase 3+) |
+| `VideoJobQueued` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
+| `VideoJobStarted` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
+| `VideoJobCompleted` | `type`, `job_id`, `user_id`, `frame_count`, `storage_key`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
+| `VideoJobFailed` | `type`, `job_id`, `user_id`, `error_reason`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
+| `UserRegistered` | `type`, `user_id`, `email`, `occurred_at` | Yes (optionally) — Identity → Notification | Planned — deferred until Notification (Phase 7) needs it; Identity itself (Phase 2) is implemented |
+| `UserAuthenticated` | `type`, `user_id`, `occurred_at` | No (internal) | Planned; not emitted by the current `AuthenticateUser` use case |
 
-Integration events that cross context boundaries are published to RabbitMQ (Phase 6). Internal domain events do not need to be published to the broker.
+Integration events that cross context boundaries are published to RabbitMQ (Phase 6). Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
 
 ---
 
