@@ -25,9 +25,9 @@
 
 ## Verification
 
-- [ ] 4.1 Add unit and HTTP tests for registration, duplicate email, login success/failure, and token failures.
-- [ ] 4.2 Add regression tests proving public landing-page access and protected-route behavior.
-- [ ] 4.3 Add tests proving one authenticated user cannot read or download another user's processing artifacts.
-- [ ] 4.4 Verify domain/application package dependency rules and configuration failure behavior.
-- [ ] 4.5 Run the existing video upload → processing → download regression flow with authentication.
-- [ ] 4.6 Run `go test ./...`, `go vet ./...`, `gosec ./...`, and `govulncheck ./...`; resolve all findings before the implementation PR.
+- [x] 4.1 Add unit and HTTP tests for registration, duplicate email, login success/failure, and token failures.
+- [x] 4.2 Add regression tests proving public landing-page access and protected-route behavior.
+- [x] 4.3 Add tests proving one authenticated user cannot read or download another user's processing artifacts.
+- [x] 4.4 Verify domain/application package dependency rules and configuration failure behavior.
+- [x] 4.5 Run the existing video upload → processing → download regression flow with authentication.
+- [x] 4.6 Run `go test ./...`, `go vet ./...`, `gosec ./...`, and `govulncheck ./...`; resolve all findings before the implementation PR.
