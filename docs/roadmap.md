@@ -26,7 +26,7 @@ This is the single source of truth for **what OpenSpec change comes next**. The 
 **How to use this:**
 - Before running `/opsx:propose`, pick the next `not-started` row below in dependency order. Don't invent scope ad hoc.
 - New work that isn't listed here gets added here first (status `not-started`), then proposed — never the other way around.
-- When a change is proposed, flip its status to `proposed` and link the folder. When it archives, flip to `archived` and link the archive folder plus the promoted spec(s).
+- When a change is proposed, flip its status to `proposed` and link the folder. When it archives, flip to `archived` and link the archive folder plus the promoted spec(s). **Each of these status/link updates is its own separate docs-only PR** — never bundled into the propose PR or the archive PR of the change being tracked. This file is a permanent documentation file, and the repository's PR-separation rule (`openspec/specs/ddd-architecture/spec.md`, "Documentation PR is isolated from spec and code PRs") applies to it exactly like any other permanent doc.
 - **One change = one coherent spec delta.** If implementing reveals a second spec, or a design decision that wasn't in the original `design.md`, stop — add a new row here instead of expanding the change in flight. This is exactly what went wrong with `implement-identity-authentication-from-scratch`: the ownership/access-control concern (`video-processing-access` spec) was only discovered while archiving, and a design decision about unconfigured startup behavior shipped without ever being written into `design.md` up front. It should have been closer to five smaller changes.
 
 ### Phase 2 corrections (already shipped — fixing a design mistake)
@@ -45,10 +45,11 @@ This is the single source of truth for **what OpenSpec change comes next**. The 
 
 | Change | Scope | Depends on | Status |
 |---|---|---|---|
-| `add-videojob-domain-and-application` | `VideoJob` aggregate, state machine, value objects, repository/port interfaces, use cases (`CreateVideoJob`, `GetJobStatus`, `ListUserJobs`, ...). No infra, no HTTP. | none | not-started |
+| `add-videojob-domain-and-application` | `VideoJob` aggregate, state machine, value objects, repository/port interfaces, and exactly three use cases: `CreateVideoJob`, `GetJobStatus`, `ListUserJobs`. No infra, no HTTP. `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, and `FailJob` are explicitly out of scope here — they're worker/queue commands that belong to `implement-rabbitmq-and-worker` (Phase 6), which doesn't exist yet in this synchronous slice. | none | not-started |
 | `add-videojob-infrastructure` | PostgreSQL adapter for `VideoJob`, jobs + outbox schema/migration. | `add-videojob-domain-and-application` | not-started |
 | `extract-cmd-api-entrypoint` | Move the HTTP composition root from `main.go` into `cmd/api`, preserving current routes/behavior 1:1. | `extract-frontend-to-static-files` (no Go string literal to drag along) | not-started |
-| `wire-videojob-http-endpoints` | New job-oriented endpoints backed by `VideoJob`, alongside (not replacing) the legacy synchronous flow. | `add-videojob-infrastructure`, `extract-cmd-api-entrypoint` | not-started |
+| `wire-videojob-http-endpoints` | New job-oriented endpoints backed by `VideoJob`, added alongside the legacy synchronous flow (not yet replacing it — this row only wires the new read/create paths). | `add-videojob-infrastructure`, `extract-cmd-api-entrypoint` | not-started |
+| `migrate-ffmpeg-execution-to-videojob-application` | Cut `POST /upload`'s `ffmpeg` invocation over to run through the `VideoJob` application layer (still synchronous — no queue/worker until Phase 6) and retire the legacy in-`main.go`/`cmd/api` exec path. This is what actually fulfills Phase 3's "synchronous `ffmpeg` call migrated from `main.go` into application layer" promise; without this row the prior four only add a parallel path and never complete Phase 3. | `wire-videojob-http-endpoints` | not-started |
 
 ### Phases 4–8 — not yet decomposed
 
