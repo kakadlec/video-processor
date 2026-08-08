@@ -98,7 +98,7 @@ For the current synchronous API, uploads and status/download operations must not
 
 ## Persistence and configuration
 
-The PostgreSQL adapter must use parameterized queries and a migration/schema mechanism that can be exercised in tests. Connection settings and JWT signing configuration come from environment/configuration, never hard-coded secrets. Startup must fail clearly when required identity configuration is absent rather than silently running with a default signing key.
+The PostgreSQL adapter must use parameterized queries and a migration/schema mechanism that can be exercised in tests. Connection settings and JWT signing configuration come from environment/configuration, never hard-coded secrets. Startup must fail clearly when identity configuration is partially present but invalid or incomplete, rather than silently running with a default signing key. If identity configuration is entirely absent (neither the PostgreSQL DSN nor the JWT signing key is set), the composition root starts without the Identity module instead of failing — this preserves the pre-Identity video-processing-only workflow for local/Docker runs that have not opted in, and is distinct from the partial/invalid case above.
 
 Unit tests should use fakes for domain/application ports. Integration tests should exercise HTTP behavior and the PostgreSQL adapter using the repository's supported test strategy; they must not require a live external service in the default unit-test path unless the test explicitly provisions it.
 
