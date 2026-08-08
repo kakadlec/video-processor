@@ -70,19 +70,26 @@ func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 		c.Next()
 	})
 
-	r.Static("/uploads", "./uploads")
-	r.Static("/outputs", "./outputs")
-
 	r.GET("/", func(c *gin.Context) {
 		c.Header("Content-Type", "text/html")
 		c.String(200, getHTMLForm())
 	})
 
-	r.POST("/upload", handleVideoUpload)
+	// videoRoutes holds every route that serves or accepts video-processing
+	// artifacts. When identity is configured, all of them require a valid
+	// bearer token; when it's nil (identity not configured — see
+	// setupIdentity), they stay open so video processing keeps working
+	// standalone for local/Docker runs that haven't opted into auth.
+	videoRoutes := r.Group("/")
+	if identity != nil {
+		videoRoutes.Use(identity.requireBearerAuth())
+	}
 
-	r.GET("/download/:filename", handleDownload)
-
-	r.GET("/api/status", handleStatus)
+	videoRoutes.Static("/uploads", "./uploads")
+	videoRoutes.Static("/outputs", "./outputs")
+	videoRoutes.POST("/upload", handleVideoUpload)
+	videoRoutes.GET("/download/:filename", handleDownload)
+	videoRoutes.GET("/api/status", handleStatus)
 
 	if identity != nil {
 		identity.registerRoutes(r)

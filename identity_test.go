@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -410,5 +413,133 @@ func TestSetupRouter_IdentityRoutesNotRegisteredWithoutModule(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d (identity routes must not be registered when setupRouter() is called without a module)", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// uploadWithAuth performs a multipart /upload request, attaching an
+// Authorization header only when token is non-empty, so it can exercise both
+// the authenticated and unauthenticated paths through the same helper.
+func uploadWithAuth(t *testing.T, baseURL, token, videoPath, filename string) *http.Response {
+	t.Helper()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("video", filename)
+	if err != nil {
+		t.Fatalf("failed to create form file: %v", err)
+	}
+	file, err := os.Open(videoPath)
+	if err != nil {
+		t.Fatalf("failed to open test video: %v", err)
+	}
+	defer file.Close()
+	if _, err := io.Copy(part, file); err != nil {
+		t.Fatalf("failed to copy video into form: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/upload", body)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	return resp
+}
+
+func TestVideoRoutes_PublicGetRoot(t *testing.T) {
+	module, _ := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
+	module, _ := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	getCases := []string{
+		"/api/status",
+		"/download/whatever.zip",
+		"/uploads/whatever.mp4",
+		"/outputs/whatever.zip",
+	}
+	for _, path := range getCases {
+		resp := getWithAuthorization(t, srv.URL+path, "")
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET %s without token: status = %d, want %d", path, resp.StatusCode, http.StatusUnauthorized)
+		}
+	}
+
+	fakeVideo := generateUndecodableVideo(t, "unauthenticated.mp4")
+	resp := uploadWithAuth(t, srv.URL, "", fakeVideo, "test.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("POST /upload without token: status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	userID, err := domain.NewUserID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	token, err := tokens.Issue(userID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	videoPath := generateTestVideo(t, 1)
+	uploadResp := uploadWithAuth(t, srv.URL, token, videoPath, "test-video.mp4")
+	defer uploadResp.Body.Close()
+
+	var result ProcessingResult
+	if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
+		t.Fatalf("unexpected error decoding upload response: %v", err)
+	}
+	cleanupOutputZip(t, result.ZipPath)
+
+	if uploadResp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated upload status = %d, want %d", uploadResp.StatusCode, http.StatusOK)
+	}
+	if !result.Success {
+		t.Fatalf("expected success=true, got message: %s", result.Message)
+	}
+
+	statusResp := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+token)
+	defer statusResp.Body.Close()
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated /api/status status = %d, want %d", statusResp.StatusCode, http.StatusOK)
+	}
+
+	downloadResp := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated download status = %d, want %d", downloadResp.StatusCode, http.StatusOK)
 	}
 }
