@@ -70,7 +70,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/go/bin/gosec
-          key: ${{ runner.os }}-gosec-v${{ env.GOSEC_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-gosec-v${{ env.GOSEC_VERSION }}
 
       - name: Install gosec
         # Pinned (not @latest) so the cache key above is stable across runs;
@@ -103,7 +103,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/go/bin/govulncheck
-          key: ${{ runner.os }}-govulncheck-v${{ env.GOVULNCHECK_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-govulncheck-v${{ env.GOVULNCHECK_VERSION }}
 
       - name: Install govulncheck
         # Pinned (not @latest) so the cache key above is stable across runs;
