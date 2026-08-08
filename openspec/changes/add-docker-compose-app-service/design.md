@@ -6,11 +6,11 @@
 
 **Goals:**
 - One documented command (`docker compose up --build`) that starts the application and PostgreSQL together, with identity already configured, for local manual testing and demos.
-- Keep the existing plain `docker build` + `docker run` (identity-disabled) path working and documented, unchanged — this is additive, not a replacement.
+- This change itself doesn't touch or remove the existing plain `docker build` + `docker run` (identity-disabled) path — it's additive. Note that path's continued existence is not a guarantee of this change specifically: `enforce-mandatory-identity-config`, a separate backlog item, plans to remove the "runs unauthenticated when unconfigured" behavior entirely, which would make the identity-disabled `docker run` path stop working regardless of anything here.
 - Avoid the app container racing PostgreSQL's startup and hitting the existing fail-fast unreachable-database error.
 
 **Non-Goals:**
-- Hardening the `Dockerfile` itself (multi-stage build, non-root user) — out of scope, tracked separately as Phase 8 in `docs/roadmap.md`.
+- Hardening the `Dockerfile` itself (multi-stage build, non-root user) — tracked as its own backlog item, `harden-dockerfile`, not part of this change's scope.
 - Making identity mandatory — that's `enforce-mandatory-identity-config`, a separate backlog item; this change just makes the already-optional identity easy to turn on locally.
 - Production or CI orchestration — this is a local-dev-only convenience; CI already provisions its own `postgres` service directly in `ci.yml`, not via this compose file.
 - A `.env` file or secrets-management mechanism — the signing key follows the same "fixed, non-secret, local-only default" precedent already established for the `postgres` service's credentials.
@@ -27,10 +27,13 @@
 
 **`uploads/` and `outputs/` are bind-mounted from the host.** Alternative considered: named volumes (Docker-managed, not host-visible). Rejected — the point of local dev tooling is to inspect results directly (e.g., extracted ZIPs) without `docker cp`; both directories are already `.gitignore`d, so this introduces no risk of committing generated content.
 
+**`app`'s port is published as `127.0.0.1:8080:8080`, loopback-only — not the unqualified `8080:8080` used by the plain `docker run` path.** A Compose `ports` entry without a host IP binds to all interfaces (`0.0.0.0`), reachable from any peer on the same network. Combined with `IDENTITY_JWT_SIGNING_KEY` being a fixed, repository-visible value (see above), an unqualified publish would let any network peer mint accepted bearer tokens for arbitrary user IDs — a materially different risk than the plain `docker run` path, which has no signing key to forge at all. There's no legitimate reason a local dev convenience service needs LAN reachability, so loopback-only costs nothing functionally and closes this off. Alternative considered: leave the signing key out of the committed file entirely and require it as a manually-set env var — rejected as reintroducing exactly the manual-configuration friction this change exists to remove; loopback binding addresses the actual exposure at lower cost.
+
 ## Risks / Trade-offs
 
 - **[Risk]** A developer already running Postgres on host port 5432 (for another project) hits a port conflict when `docker compose up` tries to publish `postgres`'s port. → **Mitigation**: none needed in this change — the port publish already exists for the test-only use case (`Local PostgreSQL Development Service`) and is unrelated to adding `app`; documented as a known local-environment consideration, not something this change introduces or need solve.
 - **[Risk]** Bind-mounting `uploads/`/`outputs/` into the container could shadow directories the `Dockerfile` creates at build time (`RUN mkdir -p uploads outputs temp`). → **Mitigation**: the application already calls `createDirs()` at startup regardless (idempotent `os.MkdirAll`), so an empty bind-mounted directory is handled the same as a fresh checkout.
+- **[Risk]** A repository-visible, hardcoded JWT signing key is dangerous if this `docker-compose.yml` pattern is ever copied into a network-reachable deployment (not just used locally). → **Mitigation**: loopback-only publish (above) prevents *this* service specifically from being LAN/network reachable; the file's existing header comment already documents these credentials as local-only, non-secret by design, and this change doesn't change that framing — it just makes the port-binding enforce it instead of only asserting it in a comment.
 
 ## Migration Plan
 
