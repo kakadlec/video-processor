@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is a single Go binary (or `go run main.go`) behind a Docker container. There is no orchestration, no external services, and no environment-specific configuration beyond the port.
+The application is a single Go binary (or `go run .`) behind a Docker container. There is no orchestration. External services are limited to an optional PostgreSQL instance for identity (Phase 2) — everything else still runs with no environment-specific configuration beyond the port.
 
 ### Docker
 
@@ -17,7 +17,7 @@ docker run -p 8080:8080 video-processor
 docker run -p 9090:8080 -e PORT=8080 video-processor
 ```
 
-The Dockerfile is a single-stage build using `golang:1.26-alpine` with `ffmpeg` installed. It runs as root and calls `go run main.go` as the entry point. **This is an intentional anti-pattern for study purposes** — see the Dockerfile header comment. Hardening (multi-stage build, non-root user) is planned for Phase 8.
+The Dockerfile is a single-stage build using `golang:1.26-alpine` with `ffmpeg` installed. It runs as root and calls `go run .` as the entry point. **This is an intentional anti-pattern for study purposes** — see the Dockerfile header comment. Hardening (multi-stage build, non-root user) is planned for Phase 8.
 
 ### Environment Variables
 
@@ -25,8 +25,10 @@ The Dockerfile is a single-stage build using `golang:1.26-alpine` with `ffmpeg` 
 |---|---|---|
 | `PORT` | `8080` | Listening port (hardcoded in `main.go` as `:8080`; no env var read currently — listed here for future use) |
 | `GIN_MODE` | `debug` | Set to `release` to suppress Gin debug output |
+| `IDENTITY_POSTGRES_DSN` | unset | PostgreSQL connection string for the Identity module (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). Required together with `IDENTITY_JWT_SIGNING_KEY` to enable authentication. |
+| `IDENTITY_JWT_SIGNING_KEY` | unset | Symmetric key used to sign/verify access tokens (HMAC-SHA256). Required together with `IDENTITY_POSTGRES_DSN`. There is no default signing key — startup fails clearly rather than falling back to one. |
 
-Currently no environment variables are required. The application runs with defaults.
+No environment variables are strictly required: with `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` both unset, the application runs exactly as it did before Phase 2 — video processing only, no `/api/auth` routes, no auth check on any route. Setting **both** enables identity; setting only one is a configuration error and the process exits at startup rather than running with unsafe defaults (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md)).
 
 ## Runtime Directory Structure
 
@@ -63,13 +65,20 @@ Releases are automated via `release-please`. On every push to `main`, it maintai
 
 ---
 
+## Implemented Infrastructure
+
+### PostgreSQL — Implemented (Phase 2), optional
+
+Authoritative state store for users (`User` aggregate) when identity is configured via `IDENTITY_POSTGRES_DSN`. Schema/migrations are applied automatically at startup (`postgres.Migrate`). Video processing jobs (`VideoJob` aggregate) and the transactional-outbox `outbox` table are Phase 3 additions and don't exist yet.
+
+- **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
+- **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
+
+---
+
 ## Planned Infrastructure (Not Yet Implemented)
 
 > The components below are planned for future phases. They do not exist in the current deployment. Each is labeled with the phase that introduces it.
-
-### PostgreSQL — Planned (Phase 2–3)
-
-Authoritative state store for users (`User` aggregate) and video processing jobs (`VideoJob` aggregate). Also hosts the `outbox` table used for reliable domain event publishing (transactional outbox pattern). Redis is a read-through cache only; PostgreSQL is always the source of truth.
 
 ### Redis — Planned (Phase 4)
 
