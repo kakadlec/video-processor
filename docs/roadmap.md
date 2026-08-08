@@ -19,7 +19,7 @@ FIAP X evolves from the current synchronous monolith (`main.go`) into a fully st
 | **5** | MinIO storage adapter behind the `StoragePort` interface; migrate upload and result storage from local filesystem to MinIO; presigned download URLs. Not yet decomposed. | Planned |
 | **6** | RabbitMQ infrastructure; `EnqueueVideoJob` publishes to queue; transactional outbox relay; `cmd/worker` picks up messages and runs `ffmpeg`; `POST /upload` becomes non-blocking (returns job ID immediately); `web/app.js` updated for async polling flow. Not yet decomposed. | Planned |
 | **7** | `internal/notification/domain` and `application`; RabbitMQ event subscription; email and webhook delivery; `NotificationPreference` per user; retry logic and HMAC webhook signatures. Not yet decomposed. | Planned |
-| **8** | Structured logging; Prometheus metrics; `/health` and `/ready` endpoints; Dockerfile hardening (multi-stage, non-root); `docker-compose.yml` for full local dev stack (PostgreSQL, Redis, RabbitMQ, MinIO). Not yet decomposed. | Planned |
+| **8** | Structured logging; Prometheus metrics; `/health` and `/ready` endpoints; `docker-compose.yml` for full local dev stack (PostgreSQL, Redis, RabbitMQ, MinIO). Not yet decomposed. Dockerfile hardening was originally planned here but has been pulled forward — see `harden-dockerfile` in the Change Backlog. | Planned |
 
 ## Change Backlog
 
@@ -48,6 +48,12 @@ This is the single source of truth for **what OpenSpec change comes next**. The 
 | Change | Scope | Depends on | Status |
 |---|---|---|---|
 | `add-docker-compose-app-service` | Add an `app` service to `docker-compose.yml` alongside the existing `postgres` service: builds the existing Dockerfile, wires `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` over the compose network, gated on Postgres's healthcheck so it doesn't hit the fail-fast unreachable-DB error before Postgres is ready, bind-mounts `uploads/`/`outputs/` to the host. Gives `docker compose up --build` as a one-command full local stack (app + Postgres, identity enabled), alongside the existing plain `docker run` (identity-disabled) path — doesn't replace it. Config only, no application code. | none | not-started |
+
+### Dockerfile hardening (pulled forward from Phase 8, orthogonal, low risk)
+
+| Change | Scope | Depends on | Status |
+|---|---|---|---|
+| `harden-dockerfile` | Replace the current single-stage, root-user `Dockerfile` (documented anti-pattern, `go mod tidy` at build time) with a multi-stage build: a builder stage that compiles a static binary, a minimal runtime stage (`ffmpeg` installed, no Go toolchain) that runs as a non-root user, and dependency resolution (`go mod download`) happening at build time from a committed `go.sum` rather than `go mod tidy` on every container start. Pulled forward from Phase 8 at the user's explicit request — no longer bundled with that phase's observability work. Must keep `docker-compose.yml`'s `app` service (from `add-docker-compose-app-service`, once implemented) working against the hardened image. | none (independent of `add-docker-compose-app-service`, but should land after it to avoid rebasing that change's `build: .` reference through an in-flight Dockerfile rewrite) | not-started |
 
 ### Phase 3 — Video Processing persistence & `cmd/api` extraction
 
