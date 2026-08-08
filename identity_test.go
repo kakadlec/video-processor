@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"video-processor/internal/identity/infrastructure/idgen"
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	"video-processor/internal/identity/infrastructure/password"
+	"video-processor/internal/identity/infrastructure/postgres"
 )
 
 // inMemoryUserRepository is a fake domain.UserRepository so these HTTP tests
@@ -681,6 +684,58 @@ func TestArtifactOwnership_StaticOutputsEnforcesOwnership(t *testing.T) {
 	}
 }
 
+// TestArtifactOwnership_StaticUploadsEnforcesOwnership covers the /uploads
+// static mount specifically: on a successful run the upload is deleted, so
+// the only way to exercise this path is a failed run, whose upload file and
+// ownership sidecar are deliberately left behind (see
+// TestProcessing_Failure_LeavesUploadedFileBehind in main_test.go).
+func TestArtifactOwnership_StaticUploadsEnforcesOwnership(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	defer srv.Close()
+
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	videoPath := generateUndecodableVideo(t, "uploads-ownership-check.mp4")
+	resp := uploadWithAuth(t, srv.URL, tokenA, videoPath, "uploads-ownership-check.mp4")
+	defer resp.Body.Close()
+
+	var result ProcessingResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("unexpected error decoding upload response: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("expected processing to fail for undecodable content, got success")
+	}
+
+	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_uploads-ownership-check.mp4"))
+	if err != nil {
+		t.Fatalf("failed to glob uploads dir: %v", err)
+	}
+	if len(leftovers) != 1 {
+		t.Fatalf("expected exactly one leftover upload after a failed run, found: %v", leftovers)
+	}
+	uploadPath := leftovers[0]
+	uploadFilename := filepath.Base(uploadPath)
+	t.Cleanup(func() {
+		os.Remove(uploadPath)
+		os.Remove(uploadPath + artifactOwnerSuffix)
+	})
+
+	ownResp := getWithAuthorization(t, srv.URL+"/uploads/"+uploadFilename, "Bearer "+tokenA)
+	defer ownResp.Body.Close()
+	if ownResp.StatusCode != http.StatusOK {
+		t.Fatalf("owner static fetch status = %d, want %d", ownResp.StatusCode, http.StatusOK)
+	}
+
+	otherResp := getWithAuthorization(t, srv.URL+"/uploads/"+uploadFilename, "Bearer "+tokenB)
+	defer otherResp.Body.Close()
+	if otherResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-owner static fetch status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
+	}
+}
+
 // TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles proves the
 // sidecar itself is never servable — not even to the user it names as
 // owner — since it's blocked before the ownership check even runs.
@@ -702,5 +757,59 @@ func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served, even to their recorded owner)", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestSetupIdentity_NeitherConfigured_ReturnsNilModuleNoError(t *testing.T) {
+	t.Setenv("IDENTITY_POSTGRES_DSN", "")
+	t.Setenv(identityJWTSigningKeyEnv, "")
+
+	module, db, err := setupIdentity(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if module != nil {
+		t.Fatalf("expected a nil module when identity is unconfigured, got %+v", module)
+	}
+	if db != nil {
+		t.Fatalf("expected a nil db when identity is unconfigured, got %+v", db)
+	}
+}
+
+func TestSetupIdentity_SigningKeyMissing_ReturnsError(t *testing.T) {
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
+	t.Setenv(identityJWTSigningKeyEnv, "")
+
+	_, _, err := setupIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when IDENTITY_POSTGRES_DSN is set but the JWT signing key is missing")
+	}
+	if !strings.Contains(err.Error(), identityJWTSigningKeyEnv) {
+		t.Fatalf("expected error to mention %s, got: %v", identityJWTSigningKeyEnv, err)
+	}
+}
+
+func TestSetupIdentity_DSNMissing_ReturnsError(t *testing.T) {
+	t.Setenv("IDENTITY_POSTGRES_DSN", "")
+	t.Setenv(identityJWTSigningKeyEnv, "a-signing-key")
+
+	_, _, err := setupIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when the JWT signing key is set but IDENTITY_POSTGRES_DSN is missing")
+	}
+	if !errors.Is(err, postgres.ErrDSNRequired) {
+		t.Fatalf("expected error to wrap postgres.ErrDSNRequired, got: %v", err)
+	}
+}
+
+func TestSetupIdentity_UnreachablePostgres_ReturnsError(t *testing.T) {
+	// A loopback address on a port nothing listens on fails fast (connection
+	// refused) rather than hanging, so this stays a fast unit-style test.
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/identity?sslmode=disable&connect_timeout=1")
+	t.Setenv(identityJWTSigningKeyEnv, "a-signing-key")
+
+	_, _, err := setupIdentity(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when configured PostgreSQL is unreachable")
 	}
 }

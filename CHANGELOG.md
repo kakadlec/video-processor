@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/kakadlec/video-processor/compare/v0.4.0...v0.5.0) (2026-08-08)
+
+
+### Features
+
+* authenticate the built-in web UI ([#54](https://github.com/kakadlec/video-processor/issues/54)) ([c5b8696](https://github.com/kakadlec/video-processor/commit/c5b86965df45bb980bd2ab68855c4aaea1c0c0bf))
+
+
+### Bug Fixes
+
+* run the whole package in the Docker CMD, not just main.go ([#55](https://github.com/kakadlec/video-processor/issues/55)) ([3fe9f67](https://github.com/kakadlec/video-processor/commit/3fe9f67bdf94c71b8e15f394c58276caa5c47306))
+
 ## [0.4.0](https://github.com/kakadlec/video-processor/compare/v0.3.0...v0.4.0) (2026-08-08)
 
 
