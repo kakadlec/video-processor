@@ -268,4 +268,4 @@ The repository SHALL include a set of permanent documentation files (`README.md`
 
 - **GIVEN** the PR separation policy (propose PR → implementation PR → finalization PR)
 - **WHEN** permanent documentation (`README.md`, files under `docs/`, `CLAUDE.md`, `AGENTS.md`) needs to change as a consequence of a shipped change
-- **THEN** it SHALL be updated in that change's finalization PR (alongside task checkoffs, spec promotion, the archive folder move, and the `docs/roadmap.md` Change Backlog status flip) — never in the implementation PR, which contains only `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, or the specific configuration/CI files the change's own scope names
+- **THEN** it SHALL be updated in that change's finalization PR (alongside task checkoffs, spec promotion, the archive folder move, and the `docs/roadmap.md` Change Backlog status flip) — never in the implementation PR, which contains only the application source, test, and configuration/CI files that change's own declared proposal scope names
