@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Local Full-Stack Development Service
-The repository SHALL provide a documented single command that starts the application together with PostgreSQL, with identity enabled, so a contributor can exercise registration, login, and bearer-protected video-processing routes locally without hand-configuring environment variables or manually wiring network access to the database. `docker-compose.yml` SHALL be the sole documented entry point for Docker-based workflows in this repository — there SHALL NOT be a separately-documented plain `docker build`/`docker run` alternative.
+The repository SHALL provide a documented single command that starts the application together with PostgreSQL, with identity enabled, so a contributor can exercise registration, login, and bearer-protected video-processing routes locally without hand-configuring environment variables or manually wiring network access to the database. `docker-compose.yml` SHALL be the sole documented entry point for Docker-based **local development** workflows — there SHALL NOT be a separately-documented plain `docker build`/`docker run` alternative for local development. Container deployment (`docs/operations.md`) is a distinct concern and is unaffected by this requirement.
 
 #### Scenario: Contributor starts the full stack with one command
 - **WHEN** a contributor runs the documented `docker compose up --build` command
