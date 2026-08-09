@@ -64,7 +64,9 @@ This builds the image from the repository's `Dockerfile` and runs `go test` insi
 
 That database is separate from the runtime `identity` database `IDENTITY_POSTGRES_DSN` uses, so this is safe to run even while `docker compose up --build` is serving real registered users — the test run's `TRUNCATE` only touches `identity_test`.
 
-`docker-compose.yml` is the sole documented way to run the application or its tests via Docker in this repository — there is no separate plain `docker build`/`docker run` fallback. The `identity`/`identity` Postgres credentials and the app's JWT signing key are fixed, non-secret local-only defaults — this stack is never reachable from anywhere but your machine or CI.
+> **If you already have a `postgres_data` volume from before this change:** the init script that creates `identity_test` only runs against a fresh, empty PostgreSQL data directory. An existing volume won't get the new database, and the command above will fail rather than run the adapter tests. Run `docker compose down -v` once to drop the old volume (this destroys any local Postgres data you had), then `docker compose up --build` recreates it with `identity_test` included.
+
+`docker-compose.yml` is the sole documented way to run the application or its tests via Docker **for local development** (container deployment is a separate concern; see [docs/operations.md](operations.md)) — there is no separate plain `docker build`/`docker run` fallback documented for local dev. The `identity`/`identity` Postgres credentials and the app's JWT signing key are fixed, non-secret local-only defaults. `app`'s port is published loopback-only (`127.0.0.1:8080:8080`); note that `postgres`'s port (`5432:5432`, unqualified, matching the pre-existing test-infrastructure setup) is not similarly restricted and is reachable from other machines on the same network unless firewalled.
 
 ```bash
 docker compose down       # stop
@@ -98,7 +100,7 @@ docker compose up --build
 # identity is already configured (PostgreSQL + JWT signing key)
 ```
 
-`docker-compose.yml` is the sole documented way to build and run the application via Docker in this repository (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment.
+`docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.
 
 > The Dockerfile is intentionally a single-stage build without a non-root user (documented anti-pattern for study). Dockerfile hardening is tracked in `docs/roadmap.md`'s Change Backlog (`harden-dockerfile`).
 

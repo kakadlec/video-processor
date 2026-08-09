@@ -58,7 +58,7 @@ go test ./... -v        # run the integration test suite (requires ffmpeg on PAT
 docker compose up --build   # full stack via Docker (app + PostgreSQL, identity enabled)
 ```
 
-`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside Docker instead: `docker compose run --build --rm app go test ./... -v`. `docker-compose.yml` is the sole documented way to build, run, or test the application via Docker — there is no separate plain `docker build`/`docker run` workflow.
+`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside Docker instead: `docker compose run --build --rm app go test ./... -v`. `docker-compose.yml` is the sole documented way to build, run, or test the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. Container deployment is a separate, intentionally-retained concern documented in `docs/operations.md`.
 
 ## Architecture
 
