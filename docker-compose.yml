@@ -16,11 +16,46 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Creates a second, isolated "identity_test" database on first init
+      # (alongside the "identity" runtime database above) — see the SQL
+      # file's own comment for why the test suite needs its own database.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U identity"]
       interval: 5s
       timeout: 5s
       retries: 5
+
+  # Runs the same Dockerfile used for deployment (intentionally a simple,
+  # single-stage build — see the Dockerfile header comment). This is the
+  # sole documented way to build/run/test the application via Docker in
+  # this repository — `docker compose up --build` gives a full stack
+  # (app + Postgres) with identity already wired in.
+  app:
+    build: .
+    ports:
+      # Loopback-only: an unqualified "8080:8080" binds to all host
+      # interfaces, and the fixed signing key below is repository-visible
+      # — an unqualified publish would let any network peer forge
+      # accepted bearer tokens. There's no legitimate reason this local
+      # dev service needs LAN reachability.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Fixed, non-secret local-only defaults — same rationale as the
+      # Postgres credentials above. Never used outside a developer's
+      # machine or CI.
+      IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+      # Points at the isolated identity_test database (not the runtime
+      # "identity" database above) so `docker compose run app go test`
+      # can't TRUNCATE data the running app actually uses.
+      IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
 
 volumes:
   postgres_data:
