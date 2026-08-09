@@ -29,17 +29,19 @@ The implementation PR must contain **only the files that implement the change's 
 - canonical specs;
 - unrelated files.
 
-Do not mark tasks complete in this PR. Do not mix documentation or governance updates with code. If permanent documentation or agent instructions need updating, use a separate docs PR.
+Do not mark tasks complete in this PR. Do not mix documentation or governance updates with code — those belong in the finalization PR below, not here.
 
-### 3. Finalization/archive PR
+### 3. Finalization PR (documentation, archive, and roadmap together)
 
-After the implementation PR merges, create one closure PR that:
+After the implementation PR merges, create **one** closure PR that contains all of the following together — do not split them into separate PRs:
 
 - marks the completed tasks in `tasks.md`;
 - promotes the delta into `openspec/specs/`;
-- moves the complete change folder to `openspec/changes/archive/<date>-<change-id>/`.
+- moves the complete change folder to `openspec/changes/archive/<date>-<change-id>/`;
+- updates any permanent documentation (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change;
+- flips the change's `docs/roadmap.md` Change Backlog row to `archived` with links to the archive folder and promoted spec(s).
 
-This PR must not contain application source or tests. Tasks and archive belong together in this finalization PR.
+This PR must not contain application source or tests — only the closure operations above.
 
 ## Merge rule
 

@@ -149,9 +149,9 @@ Non-trivial changes use three PR roles, in this order:
 
 1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
 2. **Implementation PR** — only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`.
-3. **Finalization/archive PR** — after implementation merges, mark the completed tasks, promote the delta into `openspec/specs/`, and move the change folder into `openspec/changes/archive/`. It must not contain application source or tests.
+3. **Finalization PR** — after implementation merges, one PR bundling *all* of: marking the completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, updating any permanent documentation (`README`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and flipping the change's `docs/roadmap.md` Change Backlog row to `archived`. Do not split these into separate docs/archive/roadmap PRs. It must not contain application source or tests.
 
-Permanent documentation or agent-instruction changes belong in a separate docs PR and must never be bundled into the implementation PR. `tasks.md` checkoffs belong in the finalization/archive PR, not in the implementation PR.
+`tasks.md` checkoffs belong in the finalization PR, not in the implementation PR.
 
 Green CI does not authorize a merge. An agent may merge only when the user explicitly authorizes that specific PR in the current session; authorization for one PR does not extend to later PRs.
 ### Branch Protection
