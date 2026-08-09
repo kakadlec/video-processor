@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/kakadlec/video-processor/compare/v0.5.0...v0.6.0) (2026-08-09)
+
+
+### Features
+
+* add docker-compose app service for full local stack ([#75](https://github.com/kakadlec/video-processor/issues/75)) ([4106f3a](https://github.com/kakadlec/video-processor/commit/4106f3a3d60616b616e3767737c65fe64ef8c791))
+
 ## [0.5.0](https://github.com/kakadlec/video-processor/compare/v0.4.0...v0.5.0) (2026-08-08)
 
 
