@@ -38,7 +38,7 @@ go build -o app .
 
 The server creates `uploads/`, `temp/`, and `outputs/` in the working directory on first run.
 
-By default it runs with identity disabled (video processing only, no auth). To exercise registration/login/bearer-protected routes locally, start PostgreSQL (`docker compose up -d postgres`) and set both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` before `go run .` — see [docs/operations.md](operations.md) for both variables.
+By default it runs with identity disabled (video processing only, no auth). To exercise registration/login/bearer-protected routes locally, start PostgreSQL (`docker compose up -d postgres`) and set both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` before `go run .` — see [docs/operations.md](operations.md) for both variables. Or skip the manual wiring entirely with `docker compose up --build`, which runs the whole application inside Docker with identity already configured — see "Docker Workflow" below.
 
 ## Running Tests
 
@@ -54,30 +54,21 @@ If `ffmpeg` is not available, the suite exits immediately with code 1:
 FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE.md for the Docker fallback.
 ```
 
-### Docker fallback (no local Go/ffmpeg required)
+### Running the full suite via Docker, including PostgreSQL-backed tests
 
 ```bash
-docker build -t video-processor . && docker run --rm video-processor go test ./... -v
+docker compose run --build --rm app go test ./... -v
 ```
 
-This uses the image's bundled Go toolchain and ffmpeg. Use this if your local environment does not have Go 1.25 or ffmpeg installed.
+This builds the image from the repository's `Dockerfile` and runs `go test` inside it — no local Go or ffmpeg install required. `internal/identity/infrastructure/postgres`'s adapter tests, which otherwise skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and `IDENTITY_POSTGRES_TEST_DSN` is already pointed at it — no manual export needed.
 
-### PostgreSQL (identity persistence tests)
+That database is separate from the runtime `identity` database `IDENTITY_POSTGRES_DSN` uses, so this is safe to run even while `docker compose up --build` is serving real registered users — the test run's `TRUNCATE` only touches `identity_test`.
 
-`internal/identity/infrastructure/postgres`'s adapter tests only run against a real database — they skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, so they don't require PostgreSQL for the rest of the suite to run. To exercise them locally:
-
-```bash
-docker compose up -d postgres
-
-export IDENTITY_POSTGRES_TEST_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
-go test ./... -v
-```
-
-`docker-compose.yml` at the repo root defines this service (`postgres:16-alpine`, matching the version CI provisions). The `identity`/`identity` credentials are fixed, non-secret local-only defaults — this service is never reachable from anywhere but your machine or CI.
+`docker-compose.yml` is the sole documented way to run the application or its tests via Docker in this repository — there is no separate plain `docker build`/`docker run` fallback. The `identity`/`identity` Postgres credentials and the app's JWT signing key are fixed, non-secret local-only defaults — this stack is never reachable from anywhere but your machine or CI.
 
 ```bash
 docker compose down       # stop
-docker compose down -v    # stop and drop the local data volume
+docker compose down -v    # stop and drop the local data volume(s)
 ```
 
 ## Code Quality Gates
@@ -102,16 +93,14 @@ All three must pass. The CI build fails on any `gosec` finding — `#nosec` is a
 ## Docker Workflow
 
 ```bash
-# Build image
-docker build -t video-processor .
-
-# Run container
-docker run -p 8080:8080 video-processor
-
-# Access the UI by opening http://localhost:8080 in a browser
+docker compose up --build
+# Access the UI by opening http://127.0.0.1:8080 in a browser —
+# identity is already configured (PostgreSQL + JWT signing key)
 ```
 
-> The Dockerfile is intentionally a single-stage build without a non-root user (documented anti-pattern for study). Dockerfile hardening is planned for Phase 8.
+`docker-compose.yml` is the sole documented way to build and run the application via Docker in this repository (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment.
+
+> The Dockerfile is intentionally a single-stage build without a non-root user (documented anti-pattern for study). Dockerfile hardening is tracked in `docs/roadmap.md`'s Change Backlog (`harden-dockerfile`).
 
 ## Dependency Management
 
