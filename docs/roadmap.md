@@ -79,7 +79,7 @@ Listed at phase granularity only. Decomposing these into concrete changes now wo
 
 | Change | Scope | Depends on | Status |
 |---|---|---|---|
-| `require-explore-before-propose` | Make `/opsx:explore` required before `/opsx:propose` for Change Backlog rows that are complex or ambiguous (cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or open design questions) — a narrower distinction than, and layered on top of, the existing trivial-edit exemption that skips OpenSpec entirely. Simple, already-scoped rows may still go straight to `/opsx:propose`. Updates `CLAUDE.md`'s workflow description and this file's "How to use this" guidance, and adds a `development-workflow` spec requirement capturing the rule. Config/docs only, no application code. | none | not-started |
+| `require-explore-before-propose` | Make `/opsx:explore` required before `/opsx:propose` for Change Backlog rows that are complex or ambiguous (cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or open design questions) — a narrower distinction than, and layered on top of, the existing trivial-edit exemption that skips OpenSpec entirely. Simple, already-scoped rows may still go straight to `/opsx:propose`. Updates `CLAUDE.md`'s workflow description and this file's "How to use this" guidance, and adds a `development-workflow` spec requirement capturing the rule. Config/docs only, no application code. | none | [proposed](../openspec/changes/require-explore-before-propose/) |
 
 ## Current State (Phases 1–2 done)
 
