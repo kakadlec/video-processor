@@ -58,7 +58,7 @@ go test ./... -v        # run the integration test suite (requires ffmpeg on PAT
 docker compose up --build   # full stack via Docker (app + PostgreSQL, identity enabled)
 ```
 
-`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside Docker instead: `docker compose run --build --rm app go test ./... -v`. `docker-compose.yml` is the sole documented way to build, run, or test the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. Container deployment is a separate, intentionally-retained concern documented in `docs/operations.md`.
+`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside Docker instead: `docker compose run --build --rm app-test go test ./... -v` (`app-test` builds from the `Dockerfile`'s `test` stage — the hardened `app` service's image has no Go toolchain to run tests with). `docker-compose.yml` is the sole documented way to build, run, or test the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. Container deployment is a separate, intentionally-retained concern documented in `docs/operations.md`.
 
 ## Architecture
 
@@ -85,7 +85,7 @@ Code, error messages, and comments in **new or changed code** SHALL be written i
 
 ## Notable constraints / gotchas
 
-- The Dockerfile is deliberately written as an anti-pattern example (see its header comment: "sem boas práticas - propositalmente!" — no multi-stage build, no non-root user, `go mod tidy` at container build time). Do not treat it as a template to copy elsewhere; if asked to fix/harden the Dockerfile, that's expected, in-scope work, not a misunderstanding of the file's intent.
+- The Dockerfile is a multi-stage, non-root build (`builder` → `test` → `runtime`) — it is no longer the intentional single-stage/root anti-pattern this project originally shipped with.
 - The app's *existing* user-facing strings (error messages, HTML) are in Portuguese (pt-BR) — this was the original convention for this pt-BR hackathon audience. It's superseded for new code by the language policy above; existing pt-BR strings are grandfathered in and not being retroactively translated.
 - File type validation (`isValidVideoFile`) is by extension only (`.mp4 .avi .mov .mkv .wmv .flv .webm`), not content sniffing.
 - `handleDownload` and `handleStatus` join user-controlled `:filename`/glob results directly into filesystem paths under `outputs/` with `filepath.Join` — there's no path-traversal check beyond that; be careful if extending this to accept arbitrary filenames.
