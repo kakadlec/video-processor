@@ -264,8 +264,8 @@ The repository SHALL include a set of permanent documentation files (`README.md`
 - **WHEN** a reader counts the phases
 - **THEN** exactly 8 phases are listed (1–8); no ninth or additional phase is present; the file references `openspec/changes/establish-ddd-architecture-foundation/design.md` as the canonical source
 
-#### Scenario: Documentation PR is isolated from spec and code PRs
+#### Scenario: Documentation updates land in the finalization PR, not the implementation PR
 
-- **GIVEN** the three-PR separation policy (propose PR → implement PR → archive PR)
-- **WHEN** the documentation PR is opened
-- **THEN** it SHALL contain only `README.md` and files under `docs/` — no changes to `openspec/changes/`, `openspec/specs/`, `main.go`, `main_test.go`, `go.mod`, `Dockerfile`, or CI workflow files
+- **GIVEN** the PR separation policy (propose PR → implementation PR → finalization PR)
+- **WHEN** permanent documentation (`README.md`, files under `docs/`, `CLAUDE.md`, `AGENTS.md`) needs to change as a consequence of a shipped change
+- **THEN** it SHALL be updated in that change's finalization PR (alongside task checkoffs, spec promotion, the archive folder move, and the `docs/roadmap.md` Change Backlog status flip) — never in the implementation PR, which contains only the application source, test, and configuration/CI files that change's own declared proposal scope names

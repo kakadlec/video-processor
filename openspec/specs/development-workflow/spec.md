@@ -192,53 +192,58 @@ A propose PR for a change SHALL contain only the artifacts belonging to that cha
 - **WHEN** a propose PR for a change has been opened but not merged
 - **THEN** no implementation work for that change SHALL begin
 
-### Requirement: Implementation PR Contains Only Application Code and Tests
+### Requirement: Implementation PR Contains Only the Change's Declared Scope
 
-An implementation PR SHALL contain only changes to application source files and test files. It SHALL NOT contain task checkoffs or other modifications to `tasks.md`, README or documentation files, `CLAUDE.md` or `AGENTS.md`, configuration files, CI files, spec files, or any other file under `openspec/`.
+An implementation PR SHALL contain only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It SHALL NOT contain task checkoffs or other modifications to `tasks.md`, README or documentation files, `CLAUDE.md` or `AGENTS.md`, configuration or CI files unrelated to the change's declared scope, spec files, or any other file under `openspec/`.
 
 #### Scenario: Implementation PR with only source and test changes is valid
 
 - **WHEN** a PR modifies only application source files and test files
 - **THEN** it is a valid implementation PR
 
+#### Scenario: Implementation PR scoped to configuration or infrastructure is valid
+
+- **WHEN** a change's own declared subject is configuration, infrastructure, or CI, and its implementation PR modifies only the specific configuration/CI/infrastructure files named in that change's proposal
+- **THEN** it is a valid implementation PR
+
 #### Scenario: Implementation PR containing task checkoffs is invalid
 
-- **WHEN** a PR contains application code and also modifies `tasks.md` to check off completed items
-- **THEN** it is NOT a valid implementation PR; task checkoffs SHALL be deferred to the finalization/archive PR
+- **WHEN** a PR contains application/configuration code and also modifies `tasks.md` to check off completed items
+- **THEN** it is NOT a valid implementation PR; task checkoffs SHALL be deferred to the finalization PR
 
 #### Scenario: Implementation PR containing project guidance is invalid
 
-- **WHEN** a PR contains application code and also modifies `CLAUDE.md`, `AGENTS.md`, README, docs, configuration, or CI
-- **THEN** it is NOT a valid implementation PR; those changes SHALL be moved to a separate non-implementation PR
+- **WHEN** a PR contains application/configuration code and also modifies `CLAUDE.md`, `AGENTS.md`, README, or docs
+- **THEN** it is NOT a valid implementation PR; those changes SHALL be moved to the finalization PR
 
 #### Scenario: Implementation PR containing OpenSpec files is invalid
 
-- **WHEN** a PR contains application code and also modifies any file under `openspec/`
+- **WHEN** a PR contains application/configuration code and also modifies any file under `openspec/`
 - **THEN** it is NOT a valid implementation PR
 
-### Requirement: Finalization and Archive Occur in One Closure PR
+### Requirement: Finalization PR Bundles Archive, Documentation, and Roadmap Status
 
-After the implementation PR for a change is merged, an agent SHALL use one finalization/archive PR to mark the change's completed tasks, promote its delta specs into canonical specs, and move the complete change folder from `openspec/changes/<name>/` to `openspec/changes/archive/<date>-<name>/`. This closure PR SHALL contain no application code or tests. Permanent documentation or agent-instruction changes MAY be delivered in a separate docs PR and SHALL NOT be added to the implementation PR.
+After the implementation PR for a change is merged, an agent SHALL use one finalization PR to: mark the change's completed tasks; promote its delta specs into canonical specs; move the complete change folder from `openspec/changes/<name>/` to `openspec/changes/archive/<date>-<name>/`; update any permanent documentation or agent instructions (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that need to reflect the shipped change; and flip the change's `docs/roadmap.md` Change Backlog row to `archived` with links to the archive folder and promoted spec(s). These SHALL NOT be split across separate docs/archive/roadmap PRs. This finalization PR SHALL contain no application code or tests.
 
-#### Scenario: Closure PR after implementation contains only closure operations
+#### Scenario: Finalization PR after implementation contains all closure operations together
 
-- **WHEN** the implementation PR is merged and a subsequent PR marks tasks complete, updates canonical specs from the delta, and moves the change folder to archive
-- **THEN** it is a valid finalization/archive PR
+- **WHEN** the implementation PR is merged and a subsequent PR marks tasks complete, updates canonical specs from the delta, moves the change folder to archive, updates permanent documentation, and flips the roadmap backlog status
+- **THEN** it is a valid finalization PR
 
-#### Scenario: Closure PR before implementation merges is premature
+#### Scenario: Finalization PR before implementation merges is premature
 
 - **WHEN** a PR checks off tasks or archives a change whose implementation PR has not merged
 - **THEN** that PR SHALL NOT be merged
 
-#### Scenario: Closure PR containing application code is invalid
+#### Scenario: Finalization PR containing application code is invalid
 
-- **WHEN** a finalization/archive PR modifies application source or test files
-- **THEN** it is NOT a valid finalization/archive PR and the code changes SHALL be removed
+- **WHEN** a finalization PR modifies application source or test files
+- **THEN** it is NOT a valid finalization PR and the code changes SHALL be removed
 
 #### Scenario: Documentation is not silently bundled into implementation
 
 - **WHEN** permanent documentation, agent instructions, or configuration must change as a consequence of implementation
-- **THEN** those files SHALL be delivered in a separate non-implementation PR, never bundled with the application code PR
+- **THEN** those files SHALL be delivered in the finalization PR, never bundled with the application code (implementation) PR
 
 ### Requirement: Merge Requires Explicit User Authorization
 
