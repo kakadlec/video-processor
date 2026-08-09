@@ -7,7 +7,7 @@
 **Goals:**
 - One canonical prose source (`docs/development.md`) for these rules, with `CLAUDE.md`/`AGENTS.md` reduced to pointers.
 - A Claude-Code-specific mechanism that surfaces the compact, actionable version of these rules only when the current task shape calls for it, not on every turn.
-- Close the lifecycle gap: no existing document or skill currently encodes the roadmap-item sequence (explore if complex → discuss → propose → wait for propose-PR approval → apply → verify CI/review comments before calling a task done → archive/finalize) end to end.
+- Close the lifecycle gap: no existing document or skill currently encodes the roadmap-item sequence (explore if complex → discuss → propose → wait for the propose PR to merge → apply → verify CI/review comments before calling a task done → archive/finalize) end to end.
 - Fix the specific bugs PR #96 introduced/exposed (broken link, inaccurate pointer, missing `go test` in trigger scope, unconditional test-completion requirement) so they aren't silently reintroduced.
 - This change itself follows the propose → implementation → finalization sequence it defines — no shortcutting, unlike PR #96.
 
@@ -39,7 +39,7 @@ Rationale for splitting rather than one file (PR #96's approach): the "is this d
 | `AGENTS.md` | Short pointer only, framed as the non-Claude-Code fallback | On demand |
 | `.claude/skills/repo-workflow/SKILL.md`, `.claude/skills/change-lifecycle/SKILL.md` | Compact, agent-actionable version | On demand (auto-trigger or by name) |
 
-The skills are a distilled, differently-shaped version of `docs/development.md` (checklist/trigger format vs. reference prose), not a byte-identical copy — some duplication of facts (rule thresholds, commands, links) is unavoidable across the two formats. Mitigation: both are authored/reviewed together in this change's implementation PR, and any future policy change must touch both in the same PR (documented as a rule inside `repo-workflow` itself).
+The skills are a distilled, differently-shaped version of `docs/development.md` (checklist/trigger format vs. reference prose), not a byte-identical copy — some duplication of facts (rule thresholds, commands, links) is unavoidable across the two formats. **Correction from an earlier draft of this design**: the skill files and the `docs/development.md`/`CLAUDE.md`/`AGENTS.md` edits cannot be synchronized in a single PR under this repo's own rules — see "3-PR shape confirmed" below for why they land in different PRs. Mitigation: both are drafted during the same implementation work (even though they merge as two separate PRs, reviewed back-to-back before either is reported ready), and `repo-workflow`'s validation-before-handoff checklist includes an explicit cross-check that the skill and `docs/development.md` still agree.
 
 ### Fixing PR #96's specific bugs
 
@@ -48,24 +48,24 @@ The skills are a distilled, differently-shaped version of `docs/development.md` 
 - `CLAUDE.md`'s pointer to `docs/development.md` is verified against that file's actual contents at write time — no claim of coverage that isn't true (PR #96 claimed release-please mechanics lived there when they didn't).
 - `docs/development.md` retains the "report PR number, URL, changed-file scope, and check results" requirement that PR #96 accidentally dropped when moving the validation/handoff section.
 
-### Test-completion requirement gets a Go-file carve-out
+### Test-completion requirement gets a Go-module-input carve-out
 
-`development-workflow`'s "Change Completion Requires A Passing Test Run" requirement is modified (delta spec, `MODIFIED Requirements`) to require `go test ./...` only when the change's diff includes `.go` files. A docs/config-only change (like this one) has no Go tests to run and should not report a false/misleading test-completion claim. Determining "does the diff include `.go` files" is a normal `git diff --name-only` judgment call by the agent — no new tooling needed.
+`development-workflow`'s "Change Completion Requires A Passing Test Run" requirement is modified (delta spec, `MODIFIED Requirements`) to require `go test ./...` only when the change's diff includes a Go module input file — `.go` source, `go.mod`, or `go.sum`. Scoping the carve-out to `.go` files alone would open a loophole: a dependency bump can change `go.mod`/`go.sum` without touching any `.go` file, yet still change compiled/runtime behavior, so it must still require a passing test run. Only diffs limited to non-build inputs (docs, OpenSpec artifacts, agent/skill config) are exempt. Determining this is a normal `git diff --name-only` judgment call by the agent — no new tooling needed.
 
-### 3-PR shape confirmed
+### 3-PR shape confirmed, with a corrected split
 
-This change's own subject is configuration/workflow (docs + a new skill file), so per the existing `development-workflow` spec ("Implementation PR Contains Only the Change's Declared Scope"), the implementation PR contains exactly the files named in this proposal's Impact section (`CLAUDE.md`, `AGENTS.md`, `docs/development.md`, the new skill file(s)) — not a 2-PR shortcut. Standard propose → implementation → finalization applies.
+This change's own subject is configuration/workflow. Per the existing `development-workflow` spec's "Implementation PR Contains Only the Change's Declared Scope" requirement, the **implementation PR** contains only the new skill files (`.claude/skills/repo-workflow/SKILL.md`, `.claude/skills/change-lifecycle/SKILL.md`) — the "configuration files named in the proposal" for this change's declared scope. It does **not** include `CLAUDE.md`, `AGENTS.md`, or `docs/development.md`: that same spec requirement explicitly excludes documentation and agent-instruction files from the implementation PR ("Implementation PR containing project guidance is invalid"), routing them to finalization instead. So `docs/development.md` consolidation, the `CLAUDE.md` trim, and the `AGENTS.md` trim all land in the **finalization PR**, alongside the archive operation and delta-spec promotion — not bundled with the skill files. (An earlier draft of this design proposed merging all four together in one PR; that would have re-created the exact kind of self-violation PR #96 committed. Corrected after review — see `tasks.md` for the PR grouping this produces.)
 
 ## Risks / Trade-offs
 
-- **Skill/doc drift returns over time** → Mitigated by the explicit same-PR-update rule stated inside `repo-workflow` itself, but this is a process convention, not an automated check — residual risk accepted.
+- **Skill/doc drift returns over time** → The skill files (implementation PR) and `docs/development.md` (finalization PR) necessarily land in different PRs under this repo's own rules, so they can't be guaranteed atomic. Mitigated by drafting both during the same implementation work and cross-checking them in `repo-workflow`'s validation-before-handoff step before either PR is reported ready; residual risk accepted since this is a process convention, not an automated check.
 - **Trigger under-fires** (skill doesn't engage when it should, recreating silent rule violations like PR #96's) → Mitigated by explicit, broad trigger phrasing including `go test`; residual risk accepted since trigger matching is inherently judgment-based, not mechanical.
 - **Trigger over-fires** (skill engages for genuinely simple/direct tasks, recreating the original friction) → Mitigated by an explicit "skip for read-only/pure-exploration/trivial single-file edit" clause in the trigger description, carried over from PR #96's (correct) pattern.
 - **`AGENTS.md` becomes an unmaintained pointer** since only Claude Code is in use today → Accepted; kept minimal specifically so staleness cost is low, revisit if/when another agent is adopted.
 
 ## Migration Plan
 
-No runtime/deployment migration — docs and agent-config only. Land as: propose PR (this change's artifacts) → implementation PR (`CLAUDE.md`, `AGENTS.md`, `docs/development.md`, new skill files) → finalization PR (archive + any doc touch-ups discovered during implementation). PR #96 is left open and untouched throughout; not part of this migration.
+No runtime/deployment migration — docs and agent-config only. Land as: propose PR (this change's artifacts, this PR) → implementation PR (only the two new skill files) → finalization PR (`CLAUDE.md`, `AGENTS.md`, `docs/development.md` edits + archive + delta-spec promotion + task checkoffs). PR #96 is left open and untouched throughout; not part of this migration.
 
 ## Open Questions
 

@@ -1,14 +1,18 @@
 ## MODIFIED Requirements
 
 ### Requirement: Change Completion Requires A Passing Test Run
-A change whose diff includes one or more `.go` files SHALL NOT be considered complete until `go test ./...` has been run and passes, in addition to any applicable CI checks. A change whose diff includes no `.go` files (for example, documentation, OpenSpec artifacts, or agent-configuration-only changes) is exempt from this requirement.
+A change whose diff includes one or more Go module input files (`.go` source files, `go.mod`, or `go.sum`) SHALL NOT be considered complete until `go test ./...` has been run and passes, in addition to any applicable CI checks. A change whose diff is limited to non-build inputs — documentation, OpenSpec artifacts, or agent-configuration/skill files — with no Go module input files, is exempt from this requirement.
 
 #### Scenario: A Go change is not marked done without a passing local test run
-- **WHEN** a change whose diff includes one or more `.go` files is made
+- **WHEN** a change whose diff includes one or more `.go` files, `go.mod`, or `go.sum` is made
 - **THEN** `go test ./...` is run and passes before the change is reported as complete
 
-#### Scenario: A non-Go change is exempt from the local test-run requirement
-- **WHEN** a change's diff includes no `.go` files
+#### Scenario: A dependency-only change still requires a passing test run
+- **WHEN** a change modifies `go.mod` or `go.sum` without touching any `.go` file (for example, a dependency version bump)
+- **THEN** `go test ./...` is run and passes before the change is reported as complete — the non-build exemption does not apply
+
+#### Scenario: A non-build change is exempt from the local test-run requirement
+- **WHEN** a change's diff includes no `.go` files, `go.mod`, or `go.sum`
 - **THEN** the change may be reported as complete without running `go test ./...`, and this requirement does not apply
 
 ## ADDED Requirements
