@@ -26,11 +26,12 @@ services:
       timeout: 5s
       retries: 5
 
-  # Runs the same Dockerfile used for deployment (intentionally a simple,
-  # single-stage build — see the Dockerfile header comment). This is the
-  # sole documented way to build/run/test the application via Docker in
-  # this repository — `docker compose up --build` gives a full stack
-  # (app + Postgres) with identity already wired in.
+  # Runs the same Dockerfile used for deployment, built to its default
+  # "runtime" target (hardened, non-root, no Go toolchain — see the
+  # Dockerfile's own comments). `docker compose up --build` gives a full
+  # stack (app + Postgres) with identity already wired in. Running the
+  # test suite uses the separate "app-test" service below, since this
+  # image has no Go toolchain to run `go test` with.
   app:
     build: .
     ports:
@@ -46,16 +47,31 @@ services:
       # machine or CI.
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
-      # Points at the isolated identity_test database (not the runtime
-      # "identity" database above) so `docker compose run app go test`
-      # can't TRUNCATE data the running app actually uses.
-      IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./uploads:/app/uploads
       - ./outputs:/app/outputs
+
+  # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
+  # than "app"'s hardened "runtime" stage, which deliberately has neither —
+  # `docker compose run --build --rm app-test go test ./... -v` is the
+  # documented way to run the suite via Docker (see docs/development.md).
+  app-test:
+    build:
+      context: .
+      target: test
+    environment:
+      IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+      # Points at the isolated identity_test database (not the runtime
+      # "identity" database above) so `docker compose run app-test go test`
+      # can't TRUNCATE data the running app actually uses.
+      IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
