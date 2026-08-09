@@ -35,7 +35,7 @@ This is the single source of truth for **what OpenSpec change comes next**. The 
 
 | Change | Scope | Depends on | Status |
 |---|---|---|---|
-| `enforce-mandatory-identity-config` | Remove the "runs unauthenticated when entirely unconfigured" path (`setupIdentity`'s current behavior). Startup must fail without both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY`. Every protected route always requires a valid bearer token — no bypass. Corrects the "entirely unconfigured runs video-processing only" scenario in `openspec/specs/identity-authentication/spec.md`. | none | not-started |
+| `enforce-mandatory-identity-config` | Remove the "runs unauthenticated when entirely unconfigured" path (`setupIdentity`'s current behavior). Startup must fail without both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY`. Every protected route always requires a valid bearer token — no bypass. Corrects the "entirely unconfigured runs video-processing only" scenario in `openspec/specs/identity-authentication/spec.md`. | none | [proposed](../openspec/changes/enforce-mandatory-identity-config/) |
 
 ### Frontend (orthogonal to everything else, low risk)
 
