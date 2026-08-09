@@ -16,7 +16,7 @@ video-processor/
       application/    # RegisterUser, AuthenticateUser use cases
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
   go.mod / go.sum  # Module definition: gin, pgx, golang-jwt, bcrypt, google/uuid
-  Dockerfile       # Single-stage build (intentional anti-pattern for study)
+  Dockerfile       # Multi-stage build: builder -> test -> runtime (non-root)
   docker-compose.yml # Local/CI PostgreSQL service for identity persistence tests
   .github/
     workflows/

@@ -57,10 +57,12 @@ FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE
 ### Running the full suite via Docker, including PostgreSQL-backed tests
 
 ```bash
-docker compose run --build --rm app go test ./... -v
+docker compose run --build --rm app-test go test ./... -v
 ```
 
-This builds the image from the repository's `Dockerfile` and runs `go test` inside it — no local Go or ffmpeg install required. `internal/identity/infrastructure/postgres`'s adapter tests, which otherwise skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and `IDENTITY_POSTGRES_TEST_DSN` is already pointed at it — no manual export needed.
+`app-test` builds from the `Dockerfile`'s `test` stage (Go toolchain + `ffmpeg`) and runs `go test` inside it — no local Go or ffmpeg install required. It's a separate service from `app` because `app`'s image (the hardened, deployed build) deliberately has no Go toolchain; see "Docker Workflow" below. `app-test` is gated behind Compose's `test` profile so it never starts as part of a plain `docker compose up`/`up --build` — `docker compose run` targets it explicitly regardless, so the command above needs no extra flag.
+
+`internal/identity/infrastructure/postgres`'s adapter tests, which otherwise skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and `IDENTITY_POSTGRES_TEST_DSN` is already pointed at it — no manual export needed.
 
 That database is separate from the runtime `identity` database `IDENTITY_POSTGRES_DSN` uses, so this is safe to run even while `docker compose up --build` is serving real registered users — the test run's `TRUNCATE` only touches `identity_test`.
 
@@ -102,7 +104,9 @@ docker compose up --build
 
 `docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.
 
-> The Dockerfile is intentionally a single-stage build without a non-root user (documented anti-pattern for study). Dockerfile hardening is tracked in `docs/roadmap.md`'s Change Backlog (`harden-dockerfile`).
+> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app` and deployment both use — ships only the compiled binary and `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000).
+>
+> **If the app fails to write to `./uploads`/`./outputs` on a fresh clone:** those directories are bind-mounted into the container, and the non-root user (UID 1000) needs write access to them. `chown -R 1000:1000 uploads outputs` once, or `chmod` them, fixes it — deleting and letting Docker recreate the directories does **not** help, since Docker creates a missing bind-mount source as root-owned regardless of which user runs `docker compose`.
 
 ## Dependency Management
 
