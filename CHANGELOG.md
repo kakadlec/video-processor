@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/kakadlec/video-processor/compare/v0.6.0...v0.7.0) (2026-08-09)
+
+
+### Features
+
+* harden Dockerfile with a multi-stage, non-root build ([#81](https://github.com/kakadlec/video-processor/issues/81)) ([8ac9ef4](https://github.com/kakadlec/video-processor/commit/8ac9ef4debf6baf634af6b5c81f0ac641148d5cc))
+
+
+### Bug Fixes
+
+* require identity configuration on startup, no unauthenticated fallback ([#95](https://github.com/kakadlec/video-processor/issues/95)) ([c77f136](https://github.com/kakadlec/video-processor/commit/c77f136d0ff2a42c9a0d35775f68d78b162c6e30))
+
 ## [0.6.0](https://github.com/kakadlec/video-processor/compare/v0.5.0...v0.6.0) (2026-08-09)
 
 
