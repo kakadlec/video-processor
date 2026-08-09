@@ -304,6 +304,21 @@ func TestProcessing_Failure_CleansTempDir(t *testing.T) {
 		t.Fatalf("expected processing to fail for undecodable content, got success")
 	}
 
+	// Processing failure leaves the uploaded file (and, since this request is
+	// authenticated, its ownership sidecar) behind — see
+	// TestProcessing_Failure_LeavesUploadedFileBehind for why. Clean both up
+	// so this test doesn't accumulate files in the workspace on every run.
+	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_corrupt-temp-check.mp4"))
+	if err != nil {
+		t.Fatalf("failed to glob uploads dir: %v", err)
+	}
+	for _, leftover := range leftovers {
+		t.Cleanup(func() {
+			os.Remove(leftover)
+			os.Remove(leftover + artifactOwnerSuffix)
+		})
+	}
+
 	assertTempDirClean(t)
 }
 
