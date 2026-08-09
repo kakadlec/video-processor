@@ -26,11 +26,12 @@ services:
       timeout: 5s
       retries: 5
 
-  # Runs the same Dockerfile used for deployment (intentionally a simple,
-  # single-stage build — see the Dockerfile header comment). This is the
-  # sole documented way to build/run/test the application via Docker in
-  # this repository — `docker compose up --build` gives a full stack
-  # (app + Postgres) with identity already wired in.
+  # Runs the same Dockerfile used for deployment, built to its default
+  # "runtime" target (hardened, non-root, no Go toolchain — see the
+  # Dockerfile's own comments). `docker compose up --build` gives a full
+  # stack (app + Postgres) with identity already wired in. Running the
+  # test suite uses the separate "app-test" service below, since this
+  # image has no Go toolchain to run `go test` with.
   app:
     build: .
     ports:
@@ -47,8 +48,11 @@ services:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
       # Points at the isolated identity_test database (not the runtime
-      # "identity" database above) so `docker compose run app go test`
-      # can't TRUNCATE data the running app actually uses.
+      # "identity" database above) so `docker compose run app-test go test`
+      # can't TRUNCATE data the running app actually uses. Unused by "app"
+      # itself (it never runs tests) but kept here to match "app-test"
+      # exactly, per this change's approved design (app-test mirrors app's
+      # environment; app's own definition is otherwise unchanged).
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
     depends_on:
       postgres:
@@ -56,6 +60,31 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./outputs:/app/outputs
+
+  # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
+  # than "app"'s hardened "runtime" stage, which deliberately has neither.
+  # `docker compose run --build --rm app-test go test ./... -v` is how the
+  # suite runs via Docker going forward (docs/development.md is updated in
+  # a follow-up docs PR, per this repo's PR-separation rule).
+  #
+  # Behind the "test" profile so `docker compose up`/`up --build` (no
+  # --profile flag) never starts this service — its "test" image build
+  # target has no long-running command and would just exit immediately.
+  # `docker compose run`/`run --build` explicitly targets a service and
+  # starts it (and its dependencies) regardless of profile gating, so the
+  # command above still works unchanged.
+  app-test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+      IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
