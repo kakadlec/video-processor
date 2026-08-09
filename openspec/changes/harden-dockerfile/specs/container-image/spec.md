@@ -1,0 +1,38 @@
+## ADDED Requirements
+
+### Requirement: Multi-Stage Image Build
+The repository's `Dockerfile` SHALL use a multi-stage build: a builder stage that compiles the application and a separate runtime stage that contains no Go toolchain or source tree. Dependency resolution in the builder SHALL run in a read-only mode (e.g. `go mod download` under `-mod=readonly`) that verifies against the committed `go.sum` and fails the build on any mismatch or missing entry, rather than a mode that can add to or rewrite `go.mod`/`go.sum` (e.g. `go mod tidy`, or bare `go mod download` without `-mod=readonly`).
+
+#### Scenario: Runtime image contains no Go toolchain
+- **WHEN** the runtime stage's image is built
+- **THEN** it does not contain the `go` binary or the application's source tree — only the compiled binary, `ffmpeg`, and their runtime dependencies
+
+#### Scenario: Build resolves dependencies deterministically
+- **WHEN** the builder stage runs
+- **THEN** it resolves modules in read-only mode, verifying against the committed `go.sum`, and fails the build if a checksum doesn't match or an entry is missing — it does not add missing checksums or otherwise rewrite `go.mod`/`go.sum` to make the build succeed
+
+#### Scenario: A Go- and ffmpeg-capable stage exists for running tests
+- **WHEN** the Dockerfile is built targeting its test stage
+- **THEN** the resulting image contains both the Go toolchain and `ffmpeg`, sufficient to run `go test ./...` (including `main_test.go`'s integration tests), while the default/final image built without a target selection remains the Go-toolchain-free runtime stage
+
+### Requirement: Non-Root Runtime User
+The runtime stage SHALL run the application process as a non-root user, not `root`, with a working directory and `uploads`/`outputs`/`temp` subdirectories that user owns and can write to.
+
+#### Scenario: Container process runs unprivileged
+- **WHEN** a container is started from the built image
+- **THEN** the application process's effective user is a non-root user
+
+#### Scenario: Non-root user can create its runtime directories
+- **WHEN** the application starts for the first time and creates `uploads/`, `outputs/`, and `temp/` relative to its working directory
+- **THEN** it succeeds, because the runtime stage pre-creates and owns these directories (and the working directory containing them) for the non-root user before switching to it
+
+### Requirement: Unchanged External Contract
+Hardening the image SHALL NOT change its external contract: the application SHALL still listen on port 8080, require no environment variables to start, and create `uploads/`, `outputs/`, and `temp/` on first run — so `docker-compose.yml`'s `app` service and the deployment commands documented in `docs/operations.md` keep working without modification.
+
+#### Scenario: Existing compose service keeps working
+- **WHEN** `docker compose up --build` runs against the hardened image
+- **THEN** the `app` service builds successfully and serves the application on port 8080 exactly as before, with no changes required to the `app` service's own definition
+
+#### Scenario: Existing deployment commands keep working
+- **WHEN** a deployer runs the `docker build`/`docker run` commands documented in `docs/operations.md`
+- **THEN** they succeed unmodified and the resulting container behaves identically to before hardening (same port, same required/optional environment variables, same first-run directory creation)
