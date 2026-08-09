@@ -1,8 +1,10 @@
 ## Context
 
-`setupIdentity` (`identity.go:50`) currently has three outcomes: (1) neither `IDENTITY_POSTGRES_DSN` nor `IDENTITY_JWT_SIGNING_KEY` set → returns `(nil, nil, nil)`, identity disabled; (2) exactly one set, or both set but invalid/unreachable → returns an error, startup fails; (3) both set and valid → returns a working `identityModule`. `main.go:34-40` treats outcome (1) as expected and logs that video processing runs unauthenticated. `setupRouterWithIdentity` (`identity.go:57`) then threads `identity != nil` through every route group to decide whether to attach `requireBearerAuth()`/`requireArtifactOwnership()` middleware at all.
+`setupIdentity` (`identity.go:50`) currently has three outcomes: (1) neither `IDENTITY_POSTGRES_DSN` nor `IDENTITY_JWT_SIGNING_KEY` set → returns `(nil, nil, nil)`, identity disabled; (2) exactly one set, or both set but invalid/unreachable → returns an error, startup fails; (3) both set and valid → returns a working `identityModule`. `main.go:34-40` treats outcome (1) as expected and logs that video processing runs unauthenticated. `setupRouterWithIdentity` (`main.go:57`) then threads `identity != nil` through every route group to decide whether to attach `requireBearerAuth()`/`requireArtifactOwnership()` middleware at all.
 
-`main_test.go`'s entire video-processing integration suite calls `setupRouter()`, which is a thin wrapper (`identity.go` area, see `main.go:53-55`) around `setupRouterWithIdentity(nil)` — i.e. today's tests exercise the unauthenticated path exclusively. `identity_test.go` already has a parallel, richer suite that stands up a real `identityModule` via `newTestIdentityModule(t)`/`newTestIdentityModuleWithTokens(t)`, backed by an in-memory fake `domain.UserRepository` (no live PostgreSQL needed) plus the real password/JWT/ID-generation adapters, and mints tokens for authenticated requests.
+`main_test.go`'s entire video-processing integration suite calls `setupRouter()`, a thin wrapper defined right above it (`main.go:53-55`) around `setupRouterWithIdentity(nil)` — i.e. today's tests exercise the unauthenticated path exclusively. `identity_test.go` already has a parallel, richer suite that stands up a real `identityModule` via `newTestIdentityModule(t)`/`newTestIdentityModuleWithTokens(t)`, backed by an in-memory fake `domain.UserRepository` (no live PostgreSQL needed) plus the real password/JWT/ID-generation adapters, and mints tokens for authenticated requests.
+
+Once `main_test.go`'s requests are authenticated, every successful `/upload` records an `outputs/<zip>.owner` sidecar and every failed `/upload` retains an `uploads/<file>.owner` sidecar (`recordArtifactOwner`, `main.go:132`). `uploads/` and `outputs/` are not per-test tmpdirs — they're the app's real durable directories — and none of the existing cleanup helpers (`assertTempDirClean`, the `filepath.Glob` leftover checks) remove `.owner` files. Left unaddressed, every CI run of the newly-authenticated suite would leave stray sidecar files behind indefinitely.
 
 ## Goals / Non-Goals
 
@@ -34,10 +36,15 @@ Today the function special-cases `errors.Is(pgErr, postgres.ErrDSNRequired) && s
 **Decision: remove `TestSetupRouter_IdentityRoutesNotRegisteredWithoutModule` and `TestSetupIdentity_NeitherConfigured_ReturnsNilModuleNoError`; add their replacements asserting startup failure instead.**
 Both tests currently assert the exact behavior this change removes. `TestSetupIdentity_NeitherConfigured_ReturnsNilModuleNoError` (`identity_test.go:763`) is replaced by a test asserting `setupIdentity` returns a non-nil error when both variables are unset. `TestSetupRouter_IdentityRoutesNotRegisteredWithoutModule` (`identity_test.go:411`) is deleted outright — there's no longer a `setupRouter()` no-identity entry point to exercise it against.
 
+**Decision: `main_test.go`'s cleanup helpers remove `.owner` sidecar files, not just the artifact they annotate.**
+`assertTempDirClean` and the `filepath.Glob` leftover checks in `main_test.go` (currently matching only the video/zip filename pattern) are extended to also account for the `<artifact>.owner` sidecar that `recordArtifactOwner` now writes alongside every artifact created by an authenticated request. This keeps `uploads/`/`outputs/` in the same clean state after each test run that the pre-change suite already guaranteed, rather than silently accumulating sidecar files run over run.
+- *Alternative considered*: leave sidecar cleanup unaddressed since it doesn't fail any existing assertion today. Rejected — CI runs the suite repeatedly against the same checked-out `uploads/`/`outputs/` directories, so unbounded accumulation is a real (if slow) resource leak, and it's inconsistent with this project's existing discipline of asserting on leftover state (see `assertTempDirClean`, the `TestProcessing_*_CleansTempDir` tests).
+
 ## Risks / Trade-offs
 
 - **[Risk] Any deployment currently relying on the unauthenticated fallback (e.g. a `go run .` without exported env vars) breaks on upgrade.** → Mitigation: this is the explicit intent of the change (tracked as a design-mistake correction in `docs/roadmap.md`); the finalization PR updates all affected documentation so the new hard requirement is discoverable, and `docker-compose.yml`'s services are already correctly configured today so the primary documented local workflow is unaffected.
 - **[Risk] Deleting `setupRouter()` could break other test files that reference it.** → Mitigation: grep confirms `main_test.go` is the only caller; the design's task list includes re-running `go build ./...` and `go vet ./...` after the rename to catch any other reference.
+- **[Risk] Authenticated test requests leave `.owner` sidecar files in `uploads/`/`outputs/` that existing cleanup assertions don't check for.** → Mitigation: covered by the sidecar-cleanup decision above and its own implementation task.
 
 ## Migration Plan
 
@@ -45,8 +52,9 @@ Both tests currently assert the exact behavior this change removes. `TestSetupId
 2. Update `setupRouterWithIdentity` to drop the nil-module branches; delete `setupRouter()`.
 3. Update `main.go`'s startup log line (the `identity == nil` branch becomes unreachable and is removed).
 4. Update `main_test.go` to build a configured test `identityModule` and attach bearer tokens to every request.
-5. Replace the two identity tests whose assertions describe the removed behavior.
-6. Run `go vet ./...` and `go test ./... -v` locally to confirm the full suite passes against the new mandatory-config behavior.
+5. Extend `main_test.go`'s cleanup assertions to remove/account for `.owner` sidecar files.
+6. Replace the two identity tests whose assertions describe the removed behavior.
+7. Run `go vet ./...` and `go test ./... -v` locally to confirm the full suite passes against the new mandatory-config behavior.
 
 No data migration or rollback beyond a standard revert — this changes only startup validation and route wiring, no persisted state or schema.
 

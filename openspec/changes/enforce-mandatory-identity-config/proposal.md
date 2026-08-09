@@ -21,7 +21,7 @@ Phase 2 shipped `setupIdentity` so that when neither `IDENTITY_POSTGRES_DSN` nor
 
 ## Impact
 
-- **Code**: `identity.go` (`setupIdentity`, `setupRouterWithIdentity`'s `identity != nil` branches), `main.go` (the `identity == nil` log line and nil-check at startup).
+- **Code**: `identity.go` (`setupIdentity`), `main.go` (`setupRouterWithIdentity`'s `identity != nil` branches, the `setupRouter()` no-identity wrapper, and the `identity == nil` log line and nil-check at startup).
 - **Tests**: `main_test.go` (currently calls `setupRouter()`, which forwards to `setupRouterWithIdentity(nil)` — needs a real configured `identityModule` and a way to obtain a valid bearer token for existing video-processing assertions).
 - **Deployments**: any environment currently running without `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` set (e.g. bare `go run .` without exporting them) stops starting until both are configured. `docker-compose.yml`'s `app`/`app-test` services already set both, so they're unaffected.
 - **Docs**: `README.md`, `docs/operations.md`, `docs/architecture.md`, `docs/development.md`, `docs/flows.md` all describe the current optional behavior and will need updates — deferred to this change's finalization PR.
