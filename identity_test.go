@@ -408,18 +408,6 @@ func TestRequireBearerAuth_AcceptsValidTokenAndSetsUserID(t *testing.T) {
 	}
 }
 
-func TestSetupRouter_IdentityRoutesNotRegisteredWithoutModule(t *testing.T) {
-	srv := httptest.NewServer(setupRouter())
-	defer srv.Close()
-
-	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "user@example.com", Password: "correct-horse"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d (identity routes must not be registered when setupRouter() is called without a module)", resp.StatusCode, http.StatusNotFound)
-	}
-}
-
 // uploadWithAuth performs a multipart /upload request, attaching an
 // Authorization header only when token is non-empty, so it can exercise both
 // the authenticated and unauthenticated paths through the same helper.
@@ -760,19 +748,22 @@ func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
 	}
 }
 
-func TestSetupIdentity_NeitherConfigured_ReturnsNilModuleNoError(t *testing.T) {
+func TestSetupIdentity_NeitherConfigured_ReturnsError(t *testing.T) {
 	t.Setenv("IDENTITY_POSTGRES_DSN", "")
 	t.Setenv(identityJWTSigningKeyEnv, "")
 
 	module, db, err := setupIdentity(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected an error when neither IDENTITY_POSTGRES_DSN nor the JWT signing key is set")
+	}
+	if !errors.Is(err, postgres.ErrDSNRequired) {
+		t.Fatalf("expected error to wrap postgres.ErrDSNRequired, got: %v", err)
 	}
 	if module != nil {
-		t.Fatalf("expected a nil module when identity is unconfigured, got %+v", module)
+		t.Fatalf("expected a nil module on error, got %+v", module)
 	}
 	if db != nil {
-		t.Fatalf("expected a nil db when identity is unconfigured, got %+v", db)
+		t.Fatalf("expected a nil db on error, got %+v", db)
 	}
 }
 

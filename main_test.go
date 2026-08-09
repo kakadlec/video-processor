@@ -72,17 +72,23 @@ func assertTempDirClean(t *testing.T) {
 }
 
 // startTestServer spins up the real router (real handlers, real ffmpeg calls,
-// real filesystem) on an in-process httptest server.
-func startTestServer(t *testing.T) *httptest.Server {
+// real filesystem) on an in-process httptest server, backed by a configured
+// (in-memory) identity module, and returns a bearer token valid for that
+// server's fixed test user.
+func startTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	srv := httptest.NewServer(setupRouter())
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouterWithIdentity(module))
 	t.Cleanup(srv.Close)
-	return srv
+
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	return srv, token
 }
 
-// uploadVideo performs a multipart upload of the file at videoPath under the
-// given filename (the filename controls which extension the server sees).
-func uploadVideo(t *testing.T, baseURL, videoPath, filename string) (*http.Response, ProcessingResult) {
+// uploadVideo performs an authenticated multipart upload of the file at
+// videoPath under the given filename (the filename controls which extension
+// the server sees).
+func uploadVideo(t *testing.T, baseURL, token, videoPath, filename string) (*http.Response, ProcessingResult) {
 	t.Helper()
 
 	body := &bytes.Buffer{}
@@ -103,12 +109,12 @@ func uploadVideo(t *testing.T, baseURL, videoPath, filename string) (*http.Respo
 		t.Fatalf("failed to close multipart writer: %v", err)
 	}
 
-	return doUpload(t, baseURL, body, writer.FormDataContentType())
+	return doUpload(t, baseURL, token, body, writer.FormDataContentType())
 }
 
-// uploadEmptyForm sends a multipart form with no "video" field, simulating a
-// client that forgot to attach a file.
-func uploadEmptyForm(t *testing.T, baseURL string) (*http.Response, ProcessingResult) {
+// uploadEmptyForm sends an authenticated multipart form with no "video"
+// field, simulating a client that forgot to attach a file.
+func uploadEmptyForm(t *testing.T, baseURL, token string) (*http.Response, ProcessingResult) {
 	t.Helper()
 
 	body := &bytes.Buffer{}
@@ -117,10 +123,10 @@ func uploadEmptyForm(t *testing.T, baseURL string) (*http.Response, ProcessingRe
 		t.Fatalf("failed to close multipart writer: %v", err)
 	}
 
-	return doUpload(t, baseURL, body, writer.FormDataContentType())
+	return doUpload(t, baseURL, token, body, writer.FormDataContentType())
 }
 
-func doUpload(t *testing.T, baseURL string, body *bytes.Buffer, contentType string) (*http.Response, ProcessingResult) {
+func doUpload(t *testing.T, baseURL, token string, body *bytes.Buffer, contentType string) (*http.Response, ProcessingResult) {
 	t.Helper()
 
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/upload", body)
@@ -128,6 +134,7 @@ func doUpload(t *testing.T, baseURL string, body *bytes.Buffer, contentType stri
 		t.Fatalf("failed to build request: %v", err)
 	}
 	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -142,8 +149,9 @@ func doUpload(t *testing.T, baseURL string, body *bytes.Buffer, contentType stri
 	return resp, result
 }
 
-// cleanupOutputZip removes a zip created under outputs/ during a test, so
-// repeated `go test` runs don't accumulate files.
+// cleanupOutputZip removes a zip (and its ownership sidecar, if any) created
+// under outputs/ during a test, so repeated `go test` runs don't accumulate
+// files.
 func cleanupOutputZip(t *testing.T, zipFilename string) {
 	t.Helper()
 	if zipFilename == "" {
@@ -151,14 +159,15 @@ func cleanupOutputZip(t *testing.T, zipFilename string) {
 	}
 	t.Cleanup(func() {
 		os.Remove(filepath.Join("outputs", zipFilename))
+		os.Remove(filepath.Join("outputs", zipFilename+artifactOwnerSuffix))
 	})
 }
 
 func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 	videoPath := generateTestVideo(t, 3)
 
-	resp, result := uploadVideo(t, srv.URL, videoPath, "test-video.mp4")
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "test-video.mp4")
 	cleanupOutputZip(t, result.ZipPath)
 
 	if resp.StatusCode != http.StatusOK {
@@ -175,10 +184,7 @@ func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
 	}
 
 	// The zip must be downloadable and contain exactly the reported frames.
-	downloadResp, err := http.Get(srv.URL + "/download/" + result.ZipPath)
-	if err != nil {
-		t.Fatalf("download request failed: %v", err)
-	}
+	downloadResp := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
 	defer downloadResp.Body.Close()
 	if downloadResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected HTTP 200 downloading zip, got %d", downloadResp.StatusCode)
@@ -207,14 +213,14 @@ func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
 }
 
 func TestUpload_UnsupportedExtension_Rejected(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 
 	tmpFile := filepath.Join(t.TempDir(), "not-a-video.txt")
 	if err := os.WriteFile(tmpFile, []byte("hello"), 0644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
 	}
 
-	resp, result := uploadVideo(t, srv.URL, tmpFile, "not-a-video.txt")
+	resp, result := uploadVideo(t, srv.URL, token, tmpFile, "not-a-video.txt")
 	cleanupOutputZip(t, result.ZipPath)
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -229,9 +235,9 @@ func TestUpload_UnsupportedExtension_Rejected(t *testing.T) {
 }
 
 func TestUpload_MissingFileField_Rejected(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 
-	resp, result := uploadEmptyForm(t, srv.URL)
+	resp, result := uploadEmptyForm(t, srv.URL, token)
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected HTTP 400, got %d", resp.StatusCode)
@@ -242,19 +248,16 @@ func TestUpload_MissingFileField_Rejected(t *testing.T) {
 }
 
 func TestStatus_ListsProcessedZip(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 	videoPath := generateTestVideo(t, 1)
 
-	_, result := uploadVideo(t, srv.URL, videoPath, "status-check.mp4")
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "status-check.mp4")
 	cleanupOutputZip(t, result.ZipPath)
 	if !result.Success {
 		t.Fatalf("setup upload failed: %s", result.Message)
 	}
 
-	resp, err := http.Get(srv.URL + "/api/status")
-	if err != nil {
-		t.Fatalf("status request failed: %v", err)
-	}
+	resp := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+token)
 	defer resp.Body.Close()
 
 	var status struct {
@@ -280,12 +283,9 @@ func TestStatus_ListsProcessedZip(t *testing.T) {
 }
 
 func TestDownload_NonexistentFile_Returns404(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 
-	resp, err := http.Get(srv.URL + "/download/this-file-does-not-exist.zip")
-	if err != nil {
-		t.Fatalf("download request failed: %v", err)
-	}
+	resp := getWithAuthorization(t, srv.URL+"/download/this-file-does-not-exist.zip", "Bearer "+token)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNotFound {
@@ -294,10 +294,10 @@ func TestDownload_NonexistentFile_Returns404(t *testing.T) {
 }
 
 func TestProcessing_Failure_CleansTempDir(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 	videoPath := generateUndecodableVideo(t, "corrupt-temp-check.mp4")
 
-	_, result := uploadVideo(t, srv.URL, videoPath, "corrupt-temp-check.mp4")
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "corrupt-temp-check.mp4")
 	cleanupOutputZip(t, result.ZipPath)
 
 	if result.Success {
@@ -308,10 +308,10 @@ func TestProcessing_Failure_CleansTempDir(t *testing.T) {
 }
 
 func TestProcessing_Success_CleansTempDir(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 	videoPath := generateTestVideo(t, 1)
 
-	_, result := uploadVideo(t, srv.URL, videoPath, "success-temp-check.mp4")
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "success-temp-check.mp4")
 	cleanupOutputZip(t, result.ZipPath)
 	if !result.Success {
 		t.Fatalf("setup upload failed: %s", result.Message)
@@ -327,10 +327,10 @@ func TestProcessing_Success_CleansTempDir(t *testing.T) {
 // openspec/specs/video-frame-extraction/spec.md, "Uploaded File Retained On
 // Processing Failure".
 func TestProcessing_Failure_LeavesUploadedFileBehind(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 	videoPath := generateUndecodableVideo(t, "leftover-check.mp4")
 
-	_, result := uploadVideo(t, srv.URL, videoPath, "leftover-check.mp4")
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "leftover-check.mp4")
 	if result.Success {
 		t.Fatalf("expected processing to fail for undecodable content, got success")
 	}
@@ -342,15 +342,18 @@ func TestProcessing_Failure_LeavesUploadedFileBehind(t *testing.T) {
 	if len(leftovers) != 1 {
 		t.Fatalf("expected exactly one leftover upload file (known cleanup gap on failure), found: %v", leftovers)
 	}
-	t.Cleanup(func() { os.Remove(leftovers[0]) })
+	t.Cleanup(func() {
+		os.Remove(leftovers[0])
+		os.Remove(leftovers[0] + artifactOwnerSuffix)
+	})
 }
 
 // TestStaticOutputs_NeverServesOwnerSidecarFiles guards against a sidecar
-// file written during an earlier, identity-enabled run of the server
-// leaking which UserID owns which artifact once identity is disabled again
-// (the static route then has no ownership middleware at all to catch it).
+// file leaking which UserID owns which artifact, even to the authenticated
+// user it names as owner: rejectOwnerSidecarRequests must reject the
+// .owner suffix outright rather than deferring to ownership matching.
 func TestStaticOutputs_NeverServesOwnerSidecarFiles(t *testing.T) {
-	srv := startTestServer(t)
+	srv, token := startTestServer(t)
 
 	sidecarPath := filepath.Join("outputs", "fake-artifact.zip.owner")
 	if err := os.WriteFile(sidecarPath, []byte("3fa85f64-5717-4562-b3fc-2c963f66afa6"), 0600); err != nil {
@@ -358,10 +361,7 @@ func TestStaticOutputs_NeverServesOwnerSidecarFiles(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Remove(sidecarPath) })
 
-	resp, err := http.Get(srv.URL + "/outputs/fake-artifact.zip.owner")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	resp := getWithAuthorization(t, srv.URL+"/outputs/fake-artifact.zip.owner", "Bearer "+token)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNotFound {
