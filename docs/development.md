@@ -92,7 +92,7 @@ go install golang.org/x/vuln/cmd/govulncheck@latest
 govulncheck ./...
 ```
 
-All three must pass. The CI build fails on any `gosec` finding — `#nosec` is a last resort, not the default response. See `CLAUDE.md` for the full policy.
+All three must pass. The CI build fails on **any** `gosec` finding — deliberate policy, not a bug. `#nosec` is a last resort, not the default response to a finding: check the rule's own docs (e.g. `securego.io/docs/rules/G304.html`) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression — several findings that looked like they needed `#nosec` turned out to be fixable with a real containment check instead. Only suppress a finding that's genuinely a false positive or an accepted risk with no recognized fix pattern, using a bare inline `#nosec G<rule-id>` comment (no restated prose). Never disable the SAST job or exclude whole files/rules to make it pass. `govulncheck` failures are resolved by upgrading the implicated dependency (see `go mod graph` for which direct dependency pulls it in transitively), then `go mod tidy`.
 
 ## Docker Workflow
 
@@ -154,6 +154,7 @@ Non-trivial changes use three PR roles, in this order:
 `tasks.md` checkoffs belong in the finalization PR, not in the implementation PR.
 
 Green CI does not authorize a merge. An agent may merge only when the user explicitly authorizes that specific PR in the current session; authorization for one PR does not extend to later PRs.
+
 ### Branch Protection
 
 `main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. A PR is not mergeable until all three pass and the branch is up to date with `main`.
@@ -162,4 +163,24 @@ Green CI does not authorize a merge. An agent may merge only when the user expli
 git checkout -b feat/short-description
 git push -u origin feat/short-description
 gh pr create --fill
+```
+
+### PR Review Comments
+
+This repo auto-requests a GitHub Copilot review the first time each PR opens (`review_on_push` is off, so later pushes to an already-reviewed PR don't trigger a fresh automatic review — request one manually for a substantial follow-up). Before reporting a PR-related task complete, check for review comments (automatic and human) and address genuine findings:
+
+```bash
+gh pr view <n> --json reviews
+gh api repos/{owner}/{repo}/pulls/{n}/comments
+```
+
+Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a change, say why rather than leaving it unaddressed silently. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean nothing is coming.
+
+### Validation Before Handoff
+
+Before opening or handing off a PR:
+
+```bash
+git diff --check
+npx --yes @fission-ai/openspec validate <change-id> --strict --no-interactive   # only if an OpenSpec change is involved
 ```
