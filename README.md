@@ -28,10 +28,12 @@ go run .
 ### Docker (no Go/ffmpeg install required)
 
 ```bash
-docker build -t video-processor .
-docker run -p 8080:8080 video-processor
-# Server starts on http://localhost:8080
+docker compose up --build
+# Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
+# already wired in — /api/auth/register and /api/auth/login are live
 ```
+
+`docker-compose.yml` is the only supported way to run the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. (Container deployment is a different concern; see [docs/operations.md](docs/operations.md).) See [docs/development.md](docs/development.md) for running the test suite the same way.
 
 ## Current Limitations
 
