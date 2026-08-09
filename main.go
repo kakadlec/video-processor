@@ -35,9 +35,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if identity == nil {
-		log.Printf("identity: IDENTITY_POSTGRES_DSN/%s not set — running with video processing only, no /api/auth routes", identityJWTSigningKeyEnv)
-	}
 
 	r := setupRouterWithIdentity(identity)
 
@@ -47,20 +44,13 @@ func main() {
 	log.Fatal(r.Run(":8080"))
 }
 
-// setupRouter builds the router without the Identity module wired in. It
-// exists for callers (like the existing video-processing test suite) that
-// don't need /api/auth and shouldn't be coupled to identity configuration.
-func setupRouter() *gin.Engine {
-	return setupRouterWithIdentity(nil)
-}
-
 func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
@@ -76,45 +66,31 @@ func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	})
 
 	// videoRoutes holds every route that serves or accepts video-processing
-	// artifacts. When identity is configured, all of them require a valid
-	// bearer token; when it's nil (identity not configured — see
-	// setupIdentity), they stay open so video processing keeps working
-	// standalone for local/Docker runs that haven't opted into auth.
+	// artifacts. All of them require a valid bearer token.
 	videoRoutes := r.Group("/")
-	if identity != nil {
-		videoRoutes.Use(identity.requireBearerAuth())
-	}
+	videoRoutes.Use(identity.requireBearerAuth())
 
 	// The /uploads and /outputs static mounts serve the exact same artifacts
 	// as handleDownload by filename, so they need the same per-owner check —
 	// otherwise they'd be a direct bypass of handleDownload's ownership
-	// enforcement below. rejectOwnerSidecarRequests runs unconditionally
-	// (not just when identity is configured): the sidecar files themselves
-	// must never be servable, including in a deployment that ran with
-	// identity configured before and now doesn't — otherwise old sidecars
-	// left over from that period would leak which UserID owns which
-	// artifact to anyone.
+	// enforcement below. rejectOwnerSidecarRequests runs unconditionally: the
+	// sidecar files themselves must never be servable, including any left
+	// over from before this route was protected.
 	uploadsRoutes := videoRoutes.Group("/uploads")
 	uploadsRoutes.Use(rejectOwnerSidecarRequests())
-	if identity != nil {
-		uploadsRoutes.Use(requireArtifactOwnership("uploads"))
-	}
+	uploadsRoutes.Use(requireArtifactOwnership("uploads"))
 	uploadsRoutes.Static("/", "./uploads")
 
 	outputsRoutes := videoRoutes.Group("/outputs")
 	outputsRoutes.Use(rejectOwnerSidecarRequests())
-	if identity != nil {
-		outputsRoutes.Use(requireArtifactOwnership("outputs"))
-	}
+	outputsRoutes.Use(requireArtifactOwnership("outputs"))
 	outputsRoutes.Static("/", "./outputs")
 
 	videoRoutes.POST("/upload", handleVideoUpload)
 	videoRoutes.GET("/download/:filename", handleDownload)
 	videoRoutes.GET("/api/status", handleStatus)
 
-	if identity != nil {
-		identity.registerRoutes(r)
-	}
+	identity.registerRoutes(r)
 
 	return r
 }

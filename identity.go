@@ -41,19 +41,13 @@ func newIdentityModule(registerUser *application.RegisterUser, authenticateUser 
 }
 
 // setupIdentity builds the production Identity module from environment
-// configuration. It returns a nil module (identity disabled) only when
-// neither IDENTITY_POSTGRES_DSN nor IDENTITY_JWT_SIGNING_KEY is set at all,
-// preserving video-processing-only startup for local/Docker runs that
-// haven't opted into identity yet. Any other configuration state — partial,
-// or present but invalid — fails startup clearly rather than silently
-// running with unsafe defaults.
+// configuration. Identity configuration is always required: any missing or
+// invalid piece — including both variables being entirely absent — fails
+// startup clearly rather than running with unsafe defaults.
 func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 	pgConfig, pgErr := postgres.LoadConfigFromEnv()
 	signingKey := os.Getenv(identityJWTSigningKeyEnv)
 
-	if errors.Is(pgErr, postgres.ErrDSNRequired) && signingKey == "" {
-		return nil, nil, nil
-	}
 	if pgErr != nil {
 		return nil, nil, fmt.Errorf("identity: %w", pgErr)
 	}
