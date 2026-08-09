@@ -75,6 +75,12 @@ Listed at phase granularity only. Decomposing these into concrete changes now wo
 |---|---|---|---|
 | `fix-stale-roadmap-link-in-ddd-architecture-spec` | `openspec/specs/ddd-architecture/spec.md`'s "Documentation roadmap contains exactly eight phases" scenario still asserts `docs/roadmap.md` references `openspec/changes/establish-ddd-architecture-foundation/design.md`; the actual file references `openspec/specs/ddd-architecture/spec.md` (that change archived). Needs a proper change since it edits a canonical spec, not a direct hand-edit. (Scoped narrowly to this one stale reference — the canonical-source disclaimer's wording itself was already clarified directly in `docs/roadmap.md`, no canonical-spec edit needed for that part.) | none | not-started |
 
+### OpenSpec process itself (workflow change, docs only)
+
+| Change | Scope | Depends on | Status |
+|---|---|---|---|
+| `require-explore-before-propose` | Make `/opsx:explore` a mandatory first step — not just `propose → apply → archive` — for every Change Backlog row that goes through OpenSpec at all: every row in this backlog except the trivial edits already exempted from OpenSpec entirely (typo/comment/dependency-only changes). Updates `CLAUDE.md`'s workflow description and this file's "How to use this" guidance, and adds a `development-workflow` spec requirement capturing the rule. Config/docs only, no application code. | none | not-started |
+
 ## Current State (Phases 1–2 done)
 
 Phase 1 established the architectural foundation — bounded contexts, aggregate design, ADRs, dependency rules, and this documentation — without touching any application code.
