@@ -50,15 +50,15 @@ The handler returns only after `ffmpeg` completes and the ZIP is written. There 
 
 ### State (current)
 
-Video-processing artifacts still live in the local filesystem; user accounts live in PostgreSQL when identity is configured:
+Video-processing artifacts still live in the local filesystem; user accounts live in PostgreSQL:
 
 | Store | Purpose | Durability |
 |---|---|---|
 | `uploads/` | Transient input; deleted on successful processing | Lost on failure |
 | `temp/` | Per-request scratch; always cleaned up (defer) | Ephemeral |
 | `outputs/` | Durable ZIP results; served by `/download/:filename` | Persistent across restarts |
-| `uploads/*.owner`, `outputs/*.owner` | Sidecar files recording which authenticated `UserID` owns an artifact (only written when identity is configured) | Same lifecycle as the artifact they accompany |
-| PostgreSQL `users` table | User accounts (normalized email, password hash) — only used when identity is configured | Persistent, external to the container |
+| `uploads/*.owner`, `outputs/*.owner` | Sidecar files recording which authenticated `UserID` owns an artifact | Same lifecycle as the artifact they accompany |
+| PostgreSQL `users` table | User accounts (normalized email, password hash) | Persistent, external to the container |
 
 No cache, no message broker.
 
@@ -67,15 +67,15 @@ No cache, no message broker.
 | Route | Handler | Description |
 |---|---|---|
 | `GET /` | inline | Returns inline HTML page from `getHTMLForm()`; always public |
-| `POST /api/auth/register` | `handleRegister` | Create a user account; only registered when identity is configured |
-| `POST /api/auth/login` | `handleLogin` | Authenticate and issue a bearer JWT; only registered when identity is configured |
-| `POST /upload` | `handleVideoUpload` | Accept multipart video, process synchronously; requires a bearer token when identity is configured |
-| `GET /download/:filename` | `handleDownload` | Serve a ZIP from `outputs/`; owner-only when identity is configured |
-| `GET /api/status` | `handleStatus` | JSON list of ZIPs in `outputs/`; scoped to the caller's own uploads when identity is configured |
-| `GET /uploads/*` | `gin.Static` | Static file serving of `uploads/`; owner-only when identity is configured; `.owner` sidecar files are never served regardless |
-| `GET /outputs/*` | `gin.Static` | Static file serving of `outputs/`; owner-only when identity is configured; `.owner` sidecar files are never served regardless |
+| `POST /api/auth/register` | `handleRegister` | Create a user account |
+| `POST /api/auth/login` | `handleLogin` | Authenticate and issue a bearer JWT |
+| `POST /upload` | `handleVideoUpload` | Accept multipart video, process synchronously; requires a bearer token |
+| `GET /download/:filename` | `handleDownload` | Serve a ZIP from `outputs/`; owner-only |
+| `GET /api/status` | `handleStatus` | JSON list of ZIPs in `outputs/`; scoped to the caller's own uploads |
+| `GET /uploads/*` | `gin.Static` | Static file serving of `uploads/`; owner-only; `.owner` sidecar files are never served regardless |
+| `GET /outputs/*` | `gin.Static` | Static file serving of `outputs/`; owner-only; `.owner` sidecar files are never served regardless |
 
-When `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` are both unset, identity is disabled entirely: the two `/api/auth` routes don't exist, and every other route above behaves exactly as it did before Phase 2 (open, unauthenticated). See [docs/operations.md](operations.md) for configuration.
+`IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` are both required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
 
 CORS headers (`Access-Control-Allow-Origin: *`) are applied globally.
 
@@ -139,7 +139,7 @@ video-processor/
 
 | Component | Role | Status |
 |---|---|---|
-| PostgreSQL | Authoritative state store for users (jobs/outbox tables land in Phase 3) | **Implemented** (Phase 2), optional at deployment time — see [docs/operations.md](operations.md) |
+| PostgreSQL | Authoritative state store for users (jobs/outbox tables land in Phase 3) | **Implemented** (Phase 2), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache, distributed locks | Planned (Phase 4) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
