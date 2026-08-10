@@ -6,7 +6,7 @@ FIAP X evolves from the current synchronous monolith (`main.go`) into a fully st
 >
 > This file is a summary for human readers. If the Phase Summary or any architecture/target-state description below conflicts with the canonical source, the canonical source takes precedence.
 >
-> The **Change Backlog** section below is different: it's a planning/sequencing artifact with no counterpart in `openspec/specs/` — canonical specs describe target system behavior, not the order in which OpenSpec changes get proposed. It can't "conflict" with the canonical source in the same sense; it's authoritative for change sequencing in its own right, updated directly here as rows are added/re-scoped and as they archive — the two moments this document is touched for.
+> The **Change Backlog** section below is different: it's a planning/sequencing artifact with no counterpart in `openspec/specs/` — canonical specs describe target system behavior, not the order in which OpenSpec changes get proposed. It can't "conflict" with the canonical source in the same sense; it's authoritative for change sequencing in its own right. See [`openspec/specs/development-workflow/spec.md`](../openspec/specs/development-workflow/spec.md) for how it's maintained.
 
 ## Phase Summary
 
@@ -23,7 +23,7 @@ FIAP X evolves from the current synchronous monolith (`main.go`) into a fully st
 
 ## Change Backlog
 
-This is the single source of truth for what **product/architecture-scope** OpenSpec change comes next — the 8-phase DDD roadmap above, decomposed to the finer-grained `openspec/changes/<name>/` level. Workflow/process-only changes (this repo's own development process, OpenSpec conventions, agent tooling) are out of scope for this document entirely, at any stage; they're proposed and shipped through the normal OpenSpec flow without ever appearing here. This document is touched at exactly two moments: a row is added or re-scoped (a planning decision), or a row reaches `archived` (a completion signal). For the process rules governing how changes move through explore/propose/apply/archive, which changes get a row here, and PR sequencing, see [`openspec/specs/development-workflow/spec.md`](../openspec/specs/development-workflow/spec.md).
+This is the single source of truth for the product/architecture-scope OpenSpec work ahead — the 8-phase DDD roadmap above, decomposed to the finer-grained `openspec/changes/<name>/` level. For which changes get a row here, when this document is touched, and the rest of the OpenSpec/PR process, see [`openspec/specs/development-workflow/spec.md`](../openspec/specs/development-workflow/spec.md).
 
 ### Phase 2 corrections (already shipped — fixing a design mistake)
 
