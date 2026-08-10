@@ -52,7 +52,7 @@ The system SHALL expose `GET /api/status`, returning zip files present in `outpu
 - **THEN** the response lists only that caller's own zips, and `total` counts only those
 
 ### Requirement: Processed File Download
-The system SHALL expose `GET /download/:filename`, serving the matching file from `outputs/` when it exists and the caller is entitled to it, and responding `HTTP 404` with a Portuguese error message otherwise. When the request carries an authenticated identity, entitlement requires that the recorded artifact owner match that identity. The not-found and not-owned responses SHALL be indistinguishable, so a caller cannot use them to probe for artifacts belonging to someone else.
+The system SHALL expose `GET /download/:filename`, serving the matching file from `outputs/` when it exists and the caller is entitled to it, and responding `HTTP 404` with a generic `File not found` error body otherwise. When the request carries an authenticated identity, entitlement requires that the recorded artifact owner match that identity. The not-found and not-owned responses SHALL be indistinguishable, so a caller cannot use them to probe for artifacts belonging to someone else.
 
 #### Scenario: Existing zip is downloadable by its owner
 - **WHEN** a client requests `GET /download/:filename` for a zip that exists in `outputs/` and either no identity is authenticated or the authenticated identity owns it
