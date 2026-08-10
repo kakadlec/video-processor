@@ -17,11 +17,12 @@ video-processor/
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
   go.mod / go.sum  # Module definition: gin, pgx, golang-jwt, bcrypt, google/uuid
   Dockerfile       # Multi-stage build: builder -> test -> runtime (non-root)
-  docker-compose.yml # Local/CI PostgreSQL service for identity persistence tests
+  docker-compose.yml # Local dev stack: postgres, app, and the app-test service used to run the suite
   .github/
     workflows/
-      ci.yml              # Build & Test, SAST (gosec), Vulnerability Scan
-      release-please.yml  # Automated release management
+      ci.yml                      # Build & Test, SAST (gosec), Vulnerability Scan
+      release-please.yml          # Automated release management
+      auto-update-pr-branches.yml # Keeps open PR branches current with their base
   docs/            # Project documentation (this directory)
   openspec/        # Spec-driven change governance artifacts
 ```

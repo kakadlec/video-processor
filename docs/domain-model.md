@@ -32,7 +32,7 @@
 
 **Public interface to Notification:** Emits domain events consumed by Notification. Does not call Notification directly.
 
-**Introduced in:** Phase 3 (`implement-videojob-persistence`).
+**Introduced in:** Phase 3, decomposed across several changes — `add-videojob-domain-and-application`, `add-videojob-infrastructure`, `wire-videojob-http-endpoints`, and `migrate-ffmpeg-execution-to-videojob-application`. See [docs/roadmap.md](roadmap.md)'s Change Backlog for their order and dependencies.
 
 ---
 
@@ -46,7 +46,7 @@
 
 **Public interface to other contexts:** None — Notification is a downstream consumer only.
 
-**Introduced in:** Phase 7 (`implement-notifications`).
+**Introduced in:** Phase 7, not yet decomposed into named changes (see [docs/roadmap.md](roadmap.md) — Phases 4–8 are listed at phase granularity only).
 
 ---
 
@@ -139,6 +139,6 @@ Integration events that cross context boundaries are published to RabbitMQ (Phas
 
 ## Cross-Context Contracts
 
-- **`UserID`** is the only value object that crosses bounded context boundaries as a type. It is defined in `pkg/` so both the Identity and Video Processing contexts can reference it without importing each other.
+- **`UserID`** is the only value object that crosses bounded context boundaries as a type. Target: it moves to `pkg/` so both the Identity and Video Processing contexts can reference it without importing each other. Current state (Phase 2): `pkg/` does not exist yet and `UserID` lives in `internal/identity/domain/user_id.go` — nothing outside Identity consumes it as a type yet, so the move is deferred until the Video Processing context needs it (Phase 3).
 - The Video Processing context treats `UserID` as a foreign key — it validates format only, not existence (existence is guaranteed by the API middleware that runs before the handler).
 - The Notification context receives integration events over RabbitMQ and resolves delivery preferences by `UserID` alone, never by calling into Identity or Video Processing internals.

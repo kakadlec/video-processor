@@ -262,7 +262,7 @@ The repository SHALL include a set of permanent documentation files (`README.md`
 
 - **GIVEN** `docs/roadmap.md` summarizes the evolution roadmap
 - **WHEN** a reader counts the phases
-- **THEN** exactly 8 phases are listed (1–8); no ninth or additional phase is present; the file references `openspec/changes/establish-ddd-architecture-foundation/design.md` as the canonical source
+- **THEN** exactly 8 phases are listed (1–8); no ninth or additional phase is present; the file references `openspec/specs/ddd-architecture/spec.md` as the canonical source
 
 #### Scenario: Documentation updates land in the finalization PR, not the implementation PR
 

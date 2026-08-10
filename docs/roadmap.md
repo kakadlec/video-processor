@@ -63,12 +63,6 @@ This is the single source of truth for the product/architecture-scope OpenSpec w
 
 Listed at phase granularity only. Decomposing these into concrete changes now would mean designing Redis/MinIO/RabbitMQ/Notification/Observability details that haven't been discussed yet — that happens when each phase is actually next up, using the same discipline as above.
 
-### Documentation hygiene
-
-| Change | Scope | Depends on | Status |
-|---|---|---|---|
-| `fix-stale-roadmap-link-in-ddd-architecture-spec` | `openspec/specs/ddd-architecture/spec.md`'s "Documentation roadmap contains exactly eight phases" scenario still asserts `docs/roadmap.md` references `openspec/changes/establish-ddd-architecture-foundation/design.md`; the actual file references `openspec/specs/ddd-architecture/spec.md` (that change archived). Needs a proper change since it edits a canonical spec, not a direct hand-edit. (Scoped narrowly to this one stale reference — the canonical-source disclaimer's wording itself was already clarified directly in `docs/roadmap.md`, no canonical-spec edit needed for that part.) | none | not-started |
-
 ### OpenSpec process itself (workflow change, docs only)
 
 | Change | Scope | Depends on | Status |
