@@ -6,7 +6,7 @@ FIAP X evolves from the current synchronous monolith (`main.go`) into a fully st
 >
 > This file is a summary for human readers. If the Phase Summary or any architecture/target-state description below conflicts with the canonical source, the canonical source takes precedence.
 >
-> The **Change Backlog** section below is different: it's a planning/sequencing artifact with no counterpart in `openspec/specs/` — canonical specs describe target system behavior, not the order in which OpenSpec changes get proposed. It can't "conflict" with the canonical source in the same sense; it's authoritative for change sequencing in its own right, updated directly here as changes are proposed and archived.
+> The **Change Backlog** section below is different: it's a planning/sequencing artifact with no counterpart in `openspec/specs/` — canonical specs describe target system behavior, not the order in which OpenSpec changes get proposed. It can't "conflict" with the canonical source in the same sense; it's authoritative for change sequencing in its own right, updated directly here as rows are added/re-scoped and as they archive — the two moments this document is touched for.
 
 ## Phase Summary
 
@@ -23,13 +23,7 @@ FIAP X evolves from the current synchronous monolith (`main.go`) into a fully st
 
 ## Change Backlog
 
-This is the single source of truth for **what OpenSpec change comes next**. The Phase Summary above stays at business granularity; this section is the finer-grained queue of individual `openspec/changes/<name>/` units — the level `/opsx:propose` should actually operate at.
-
-**How to use this:**
-- Before running `/opsx:propose`, pick the next `not-started` row below in dependency order. Don't invent scope ad hoc. If the row is complex or ambiguous — cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or design questions the row's description doesn't already settle — run `/opsx:explore` on it first. A simple row that's already unambiguously scoped by its description may go straight to `/opsx:propose`.
-- New work that isn't listed here gets added here first (status `not-started`), then proposed — never the other way around.
-- When a change is proposed, flip its status to `proposed` and link the folder — this status/link update is its own separate docs-only PR, since the propose PR itself must contain only the new change's own artifacts. When a change archives, flip its status to `archived` and link the archive folder plus the promoted spec(s) **in the same PR as the archive operation itself** (task checkoffs, spec promotion, folder move) and any permanent-documentation updates the change requires — these no longer split into separate PRs; see the "Finalization PR" role in `AGENTS.md`/`CLAUDE.md`/`docs/development.md`.
-- **One change = one coherent spec delta.** If implementing reveals a second spec, or a design decision that wasn't in the original `design.md`, stop — add a new row here instead of expanding the change in flight. This is exactly what went wrong with `implement-identity-authentication-from-scratch`: the ownership/access-control concern (`video-processing-access` spec) was only discovered while archiving, and a design decision about unconfigured startup behavior shipped without ever being written into `design.md` up front. It should have been closer to five smaller changes.
+This is the single source of truth for what **product/architecture-scope** OpenSpec change comes next — the 8-phase DDD roadmap above, decomposed to the finer-grained `openspec/changes/<name>/` level. Workflow/process-only changes (this repo's own development process, OpenSpec conventions, agent tooling) are out of scope for this document entirely, at any stage; they're proposed and shipped through the normal OpenSpec flow without ever appearing here. This document is touched at exactly two moments: a row is added or re-scoped (a planning decision), or a row reaches `archived` (a completion signal). For the process rules governing how changes move through explore/propose/apply/archive, which changes get a row here, and PR sequencing, see [`openspec/specs/development-workflow/spec.md`](../openspec/specs/development-workflow/spec.md).
 
 ### Phase 2 corrections (already shipped — fixing a design mistake)
 
