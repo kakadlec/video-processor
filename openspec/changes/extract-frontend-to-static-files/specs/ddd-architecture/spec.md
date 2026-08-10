@@ -2,7 +2,7 @@
 
 ### Requirement: Frontend as Presentation/Delivery Layer
 
-The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served by `GET /`) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
+The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served as `GET /`, `GET /styles.css`, and `GET /app.js` respectively) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
 
 #### Scenario: Frontend is not a bounded context
 

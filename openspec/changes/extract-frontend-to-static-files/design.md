@@ -7,7 +7,7 @@
 **Goals:**
 - Move the HTML/CSS/JS out of the Go string literal into `web/index.html`, `web/styles.css`, `web/app.js`.
 - Serve them from the compiled binary (no new runtime file-path dependency, no change to how the app is deployed/containerized).
-- Preserve `GET /` behavior byte-for-byte: same status code, same rendered markup, same pt-BR copy, same JS behavior against `/upload` and `/api/status`.
+- Preserve `GET /` behavior in substance: same status code, same visible rendering, same pt-BR copy, same JS behavior against `/upload` and `/api/status`. The HTML markup itself is *not* byte-for-byte identical — replacing the inline `<style>`/`<script>` elements with `<link rel="stylesheet">`/`<script src>` references necessarily changes the served HTML; that's an intentional, expected normalization, not a regression.
 
 **Non-Goals:**
 - No UI redesign, copy changes, or new frontend features.
@@ -24,7 +24,7 @@
 
 ## Risks / Trade-offs
 
-- [Copy-paste transcription errors moving ~386 lines of embedded HTML/CSS/JS into separate files could subtly change rendered output or break the JS] → diff the extracted files' concatenated content against the original string literal before removing `getHTMLForm()`; rely on `main_test.go`'s existing `GET /` coverage plus a manual browser check of the upload flow before merging.
+- [Copy-paste transcription errors moving ~386 lines of embedded HTML/CSS/JS into separate files could subtly change rendered output or break the JS] → compare the extracted `web/styles.css` and `web/app.js` bodies against the original inline `<style>`/`<script>` content verbatim, and review the remaining HTML against the original markup accounting for the intentional `<link>`/`<script src>` normalization (concatenating all three files and diffing against the original string literal would not work, since the HTML itself is expected to differ — see the Goals note above); back this with new `GET /`, `/styles.css`, `/app.js` integration tests (`main_test.go` has none today) plus a manual browser check of the upload flow before merging.
 - [gosec or `go vet` flagging the new `embed.FS` usage or route wiring] → run the standard `go vet` / `gosec` gates locally before opening the PR, per `repo-workflow`'s definition-of-done.
 - [Static files served under `/styles.css` and `/app.js` might collide with existing routes] → checked against `setupRouter()`'s existing route table (`/`, `/upload`, `/download/:filename`, `/api/status`, plus static mounts for `/uploads` and `/outputs`) — no collision.
 

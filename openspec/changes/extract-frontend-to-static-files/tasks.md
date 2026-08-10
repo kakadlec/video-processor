@@ -5,12 +5,13 @@
 - [ ] 1.3 Create `web/app.js` containing the extracted contents of the inline `<script>` block (the `fetch` calls to `/upload` and `/api/status`), unchanged.
 - [ ] 1.4 In `main.go`, add a `//go:embed web` directive and an `embed.FS` variable; update the `GET /` handler to serve `web/index.html`'s contents instead of calling `getHTMLForm()`; add routes serving `web/styles.css` at `/styles.css` and `web/app.js` at `/app.js` from the embedded FS.
 - [ ] 1.5 Delete `getHTMLForm()` from `main.go`.
-- [ ] 1.6 Diff the concatenated content of the three new `web/` files against the original `getHTMLForm()` string literal (e.g. via a throwaway script or manual review) to confirm no content was dropped or altered during extraction.
+- [ ] 1.6 Compare `web/styles.css` and `web/app.js` against the original inline `<style>`/`<script>` content verbatim, and review `web/index.html` against the original markup accounting for the intentional `<link>`/`<script src>` normalization (the extracted files are not expected to concatenate back to a byte-for-byte match of the original string literal — see `design.md`), to confirm no content was dropped or altered during extraction.
+- [ ] 1.7 Add integration tests to `main_test.go` for `GET /`, `GET /styles.css`, and `GET /app.js`, each asserting HTTP 200, the expected `Content-Type`, and representative content (there is no existing test covering these routes today).
 
 ## 2. Verification
 
 - [ ] 2.1 `go build -o app .` succeeds.
-- [ ] 2.2 `go test ./... -v` passes (requires `ffmpeg` on `PATH`, or run via `docker compose run --build --rm app-test go test ./... -v`).
+- [ ] 2.2 `go test ./... -v` passes, including the new tests from 1.7 (requires `ffmpeg` on `PATH`, or run via `docker compose run --build --rm app-test go test ./... -v`).
 - [ ] 2.3 `go vet ./...` and `gosec ./...` report no new findings.
 - [ ] 2.4 Manually load `GET /` in a browser, confirm the page renders identically to before (styling intact, no console errors), and complete one full upload → status → download flow through the UI.
 

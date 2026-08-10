@@ -23,7 +23,7 @@ The entire frontend (HTML, CSS, and JavaScript) is currently a single Go string 
 ## Impact
 
 - **Code**: `main.go` (`getHTMLForm()` removed, `GET /` handler updated, `go:embed` directive added); new `web/index.html`, `web/styles.css`, `web/app.js`.
-- **Tests**: `main_test.go`'s coverage of `GET /` must still pass unchanged (same status code and content expectations).
+- **Tests**: `main_test.go` currently has no test covering `GET /` at all, so there is no pre-existing coverage to "keep passing" — this change must add new integration tests asserting `GET /`, `GET /styles.css`, and `GET /app.js` each return HTTP 200 with the expected content type and representative content, otherwise a broken index page or missing asset route would ship undetected.
 - **Docs**: `openspec/specs/ddd-architecture/spec.md` (delta spec, per above); `CLAUDE.md`'s architecture section, which currently says "editing the UI means editing the Go string literal" — updated at finalization, not here.
 - **Dependencies**: none new (Go's standard-library `embed` package).
 - **No API/behavior change**: routes, request/response contracts, and rendered output are unaffected.
