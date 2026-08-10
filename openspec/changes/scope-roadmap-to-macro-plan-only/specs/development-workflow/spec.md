@@ -26,7 +26,7 @@
 
 ### Requirement: One Change Equals One Coherent Spec Delta
 
-A single OpenSpec change SHALL correspond to exactly one coherent spec delta. If implementing a change reveals a second, distinct spec-level concern, or a design decision not already captured in that change's `design.md`, the change SHALL NOT be expanded in flight to absorb it — a new Change Backlog row (for product/architecture-scope work) or a new change proposal (for workflow-scope work) SHALL be created instead.
+A single OpenSpec change SHALL correspond to exactly one coherent spec delta. If implementing a change reveals a second, distinct spec-level concern, or a design decision not already captured in that change's `design.md`, the change SHALL NOT be expanded in flight to absorb it — a new Change Backlog row (for product/architecture-scope work) or a new change proposal (for workflow-scope work) SHALL be created instead. `implement-identity-authentication-from-scratch` is the illustrative precedent this requirement generalizes from: the ownership/access-control concern (`video-processing-access` spec) was only discovered while archiving, and a design decision about unconfigured startup behavior shipped without ever being written into `design.md` up front — it should have been closer to five smaller changes.
 
 #### Scenario: A second spec concern is discovered mid-implementation
 
@@ -36,7 +36,7 @@ A single OpenSpec change SHALL correspond to exactly one coherent spec delta. If
 #### Scenario: An undocumented design decision is discovered mid-implementation
 
 - **WHEN** implementing a change requires a design decision that was never written into that change's `design.md`
-- **THEN** the decision is documented in that change's `design.md` before proceeding, or split into a follow-up change if it materially changes scope
+- **THEN** the in-flight change is not expanded to absorb it either; a new change is proposed to make and document that decision, exactly as the second-spec-concern scenario above requires
 
 ## MODIFIED Requirements
 
@@ -68,3 +68,27 @@ After the implementation PR for a change is merged, an agent SHALL use one final
 
 - **WHEN** the finalization PR is for a workflow/process-only change that never received a `docs/roadmap.md` Change Backlog row
 - **THEN** the finalization PR proceeds without a roadmap-status edit — its absence is expected, not an omission
+
+### Requirement: Explore Precedes Propose For Complex Or Ambiguous Changes
+
+Among changes that are not exempt from the OpenSpec flow under the existing trivial-edit criteria (typo fixes, comment tweaks, dependency bumps), those that are complex or ambiguous SHALL go through `/opsx:explore` before `/opsx:propose`. A change qualifies as complex or ambiguous under the same criteria this project already uses to decide whether a change needs a `design.md`: cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design decisions not already settled by the change's own scoping description — a `docs/roadmap.md` Change Backlog row's description for product/architecture-scope work, or the idea's own stated scope for a workflow/process-only change that has no such row. Changes that are simple and already unambiguously scoped by that description MAY go straight to `/opsx:propose` without an explore step. This is a judgment call made when picking up the work, not a mechanically checked gate — when genuinely unsure, `/opsx:explore` SHALL be run.
+
+#### Scenario: A complex or ambiguous change is proposed
+
+- **WHEN** the next `not-started` row picked from `docs/roadmap.md`'s Change Backlog involves cross-cutting impact, a new architectural pattern or external dependency, security/performance/migration complexity, or design questions the row description doesn't already settle
+- **THEN** `/opsx:explore` is run on it before `/opsx:propose`
+
+#### Scenario: A simple, already-scoped change skips straight to propose
+
+- **WHEN** the next `not-started` row picked from `docs/roadmap.md`'s Change Backlog is narrowly scoped to a single file or config change with no open design questions (e.g. fixing one stale documentation link, adding one already-fully-specified service to `docker-compose.yml`)
+- **THEN** `/opsx:propose` may be run directly, without an `/opsx:explore` step
+
+#### Scenario: A trivial edit remains exempt from the whole flow, explore included
+
+- **WHEN** a change qualifies for the existing trivial-edit exemption from the full OpenSpec flow (typo fix, comment tweak, dependency bump)
+- **THEN** it never reaches `/opsx:propose` or `/opsx:explore` at all — this requirement only applies to changes that already go through OpenSpec
+
+#### Scenario: A workflow/process-only change with no backlog row is still evaluated for explore
+
+- **WHEN** a workflow/process-only change with no `docs/roadmap.md` Change Backlog row (per "Roadmap Change Backlog Is Scoped To Product/Architecture Work" above) is complex or ambiguous by the same criteria — cross-cutting impact, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions its own stated scope doesn't already settle
+- **THEN** `/opsx:explore` is run on it before `/opsx:propose`, exactly as it would be for a backlog row — the absence of a row does not exempt it from this requirement
