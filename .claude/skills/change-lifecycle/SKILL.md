@@ -35,13 +35,13 @@ pick a Change Backlog row (or comparable non-trivial idea)
    (tasks.md checkoffs excluded — see Step 3's override)
         │ (merged, after explicit user authorization)
         ▼
-   finalize: task checkoffs → doc updates → roadmap status → THEN
+   finalize: task checkoffs → doc updates → roadmap status (if applicable) → THEN
    /opsx:archive → finalization PR (all of the above together)
 ```
 
 ## Step 1: decide if `/opsx:explore` is warranted
 
-Same criteria as `openspec/specs/development-workflow/spec.md`'s "Explore Precedes Propose For Complex Or Ambiguous Changes" requirement: cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions the row's description doesn't already settle. A row that's already narrowly and unambiguously scoped may skip straight to `/opsx:propose`. This is a judgment call made when picking up the row, not a mechanical gate — when genuinely unsure, explore.
+Same criteria as `openspec/specs/development-workflow/spec.md`'s "Explore Precedes Propose For Complex Or Ambiguous Changes" requirement: cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions not already settled by the change's own scoping description — a `docs/roadmap.md` Change Backlog row's description for product/architecture-scope work, or the idea's own stated scope for a workflow/process-only change that has no such row (see `docs/roadmap.md`'s scoping rule). Already-unambiguously-scoped work may skip straight to `/opsx:propose`, row or no row. This is a judgment call made when picking up the work, not a mechanical gate — when genuinely unsure, explore.
 
 ## Step 2: `/opsx:propose`, then wait for the merge — not the approval
 
@@ -63,6 +63,6 @@ The vendored `/opsx:archive` skill only assesses/syncs delta specs and moves the
 
 1. Check off all completed tasks in `tasks.md` (including any implementation-scoped ones deferred per Step 3's override).
 2. Update permanent docs (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that need to reflect the shipped change.
-3. Flip the change's `docs/roadmap.md` Change Backlog row to `archived`, with links to the archive folder and promoted spec(s).
+3. If the change has a `docs/roadmap.md` Change Backlog row (only product/architecture-scope changes do — workflow/process-only changes never gain one, see `docs/roadmap.md`), flip it to `archived`, with links to the archive folder and promoted spec(s). No row means this step is skipped, not missed.
 4. Only then run `/opsx:archive` (or the `openspec-archive-change` skill) to promote the delta spec and move the change folder.
 5. Open the finalization PR containing all of the above together, per `repo-workflow`'s PR-sequence section.
