@@ -1,0 +1,45 @@
+## Context
+
+`docs/roadmap.md`'s "How to use this" section currently mandates three separate touches to the document per change that has a row: add the row before proposing, flip it to `proposed` in its own docs-only PR, flip it to `archived` in the finalization PR. It also holds a "one change = one coherent spec delta" scoping lesson and, implicitly, an explore-before-propose pointer. Some of this is already duplicated in the canonical `development-workflow` spec (the explore-before-propose requirement already exists there, referencing `docs/roadmap.md`'s Change Backlog by name) or in an in-flight, unmerged skill (`change-lifecycle`, on branch `feat/add-repo-workflow-skills`) that explicitly defers the "does this change need a row" question to "`docs/roadmap.md`'s own convention" — a convention that, after this change, will no longer live in `docs/roadmap.md`'s prose.
+
+This was reached via an `/opsx:explore` session (2026-08-09/2026-08-10) rather than invented ad hoc: the trigger was a real inconsistency (Copilot flagging that `extract-repo-workflow-into-skill`, PR #97, skipped its backlog row while the doc's own "OpenSpec process itself" category has one precedent that got a row), but the resolution that emerged goes further than patching that one inconsistency — it questions why a roadmap document should carry live process rules and a three-touch edit cadence at all.
+
+`extract-repo-workflow-into-skill` has since fully shipped (propose #97, implementation #98, finalization #100, all merged) — the `repo-workflow` and `change-lifecycle` skills it added, plus `docs/development.md`'s "PR Separation Rule", now exist and each independently restate the exact "flip the `docs/roadmap.md` Change Backlog row to `archived`" mechanic this change's spec delta modifies. During #100's own finalization, a draft briefly added a "(if that change has one)" hedge to match the one-off exception `extract-repo-workflow-into-skill` itself took, but it was reverted after Copilot flagged it as contradicting the still-unconditional canonical requirement — i.e. the live docs currently say "every change needs a row" while at least one shipped change didn't have one. This change is what actually resolves that contradiction at the source (the canonical spec) rather than patching a downstream restatement of it.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Make `docs/roadmap.md` editable only at two meaningful moments: a planning decision (row added/re-scoped) and a completion signal (row archived).
+- Give workflow/process-only changes a clean, permanent "not tracked here" status, rather than a per-change judgment call about whether to add a row.
+- Relocate the process rules currently living only in `docs/roadmap.md` prose (not the canonical spec) into `openspec/specs/development-workflow/spec.md`, so `change-lifecycle`'s existing pointer resolves to something real.
+
+**Non-Goals:**
+- Not touching the existing `require-explore-before-propose` row or any other already-archived backlog content — no retroactive cleanup, since that itself would be the kind of churn this change is trying to eliminate.
+- Not redesigning the Change Backlog's table structure/columns, phase categories, or the DDD architecture plan itself — this is a process/edit-cadence change, not a re-plan.
+- Not resolving or waiting indefinitely on the concurrent `feat/add-repo-workflow-skills` branch; see Risks below for how the two are kept independent.
+
+## Decisions
+
+**1. Scope `docs/roadmap.md`'s Change Backlog to product/architecture work only.** Workflow/process-only changes (like this one) are never listed, at any stage. This was chosen over a formal "carve-out to an otherwise-universal rule" framing because the backlog's own stated purpose — sequencing the 8-phase DDD roadmap with dependency ordering — never applied to workflow changes in the first place (they're discovered reactively, mid-flight, with no dependency chain to sequence). Framing it as "out of scope" rather than "exception" also means no per-change judgment call about whether a given workflow change is important enough to warrant an exception — it's categorical.
+
+**2. Drop the mandatory mid-flight "flip to `proposed`" edit.** `openspec list --json` already reports `status: "in-progress"` (with task counts) for anything under `openspec/changes/<name>/`, so a hand-maintained "proposed" flip in `docs/roadmap.md` is redundant with information OpenSpec already derives from the filesystem. The only state OpenSpec can't derive is "we've decided this is next but haven't created the folder yet" (row exists, no folder) — which is exactly the planning-decision moment this design keeps as a required touch point.
+
+**3. Two touch points only: add/re-scope, and archive.** This directly encodes "roadmap should change as little as possible" — every other edit that isn't one of these two events is out of scope for `docs/roadmap.md`. The existing `development-workflow` requirement "Finalization PR Bundles Archive, Documentation, and Roadmap Status" already mandates the archive-time flip; it needs one adjustment — making that flip conditional on the change having had a row at all, since workflow-only changes now categorically don't.
+
+**4. Generalize "one change = one coherent spec delta" into `development-workflow` rather than leaving it as roadmap.md-hosted prose tied to one incident.** It's a scoping discipline that applies to every change, not roadmap-specific process — the identity-auth incident becomes an illustrative example in the spec's scenario, not the sole justification.
+
+**5. This change gets no `docs/roadmap.md` row itself.** Self-consistent application of decision #1 — it's a workflow/process change.
+
+**6. Propagate the same conditional to every prose restatement of the finalization mechanic, in this one change, rather than leaving downstream copies to drift.** `docs/development.md`, `.claude/skills/repo-workflow/SKILL.md`, and `.claude/skills/change-lifecycle/SKILL.md` each independently restate "flip the `docs/roadmap.md` Change Backlog row to `archived`" as an unconditional step. `repo-workflow`'s own file already commits to keeping itself and `docs/development.md` in sync when either changes; this change is exactly that trigger, and extends the same discipline to `change-lifecycle`. Leaving any of the three unconditional after the canonical spec changes would recreate the identical contradiction (docs vs. actual practice) that motivated this change in the first place.
+
+**7. PR split follows this repo's own existing categorization, applied reflexively.** Per `repo-workflow`/`docs/development.md`'s "PR Separation Rule," configuration/infrastructure files (skill files, per the explicit precedent of PR #98) belong to an implementation PR, while documentation (`docs/roadmap.md`, `docs/development.md`) bundles into the finalization PR alongside task checkoffs, spec promotion, and archiving. Applying that rule to this change means: implementation PR = the two `.claude/skills/*.md` edits; finalization PR = everything else. This is a slightly larger footprint than originally scoped (before the skills existed, this looked like a docs-only change eligible to skip the implementation PR) — but skipping it now would violate the categorization this same change is trying to keep consistent.
+
+## Risks / Trade-offs
+
+- **[Risk] "Out of scope, categorically" could be read as under-documenting workflow-change history.** → **Mitigation**: workflow changes still go through the full OpenSpec artifact lifecycle (`openspec/changes/<name>/` → `openspec/changes/archive/<date>-<name>/`) and are fully visible via `openspec list --json` and git history; `docs/roadmap.md` was never the only record of change history, just the DDD-roadmap-specific planning view.
+- **[Trade-off] Losing the "proposed" status column value in `docs/roadmap.md` means a reader skimming the doc won't see in-flight architecture work without also running `openspec list`.** Accepted: the goal is explicitly to stop optimizing `docs/roadmap.md` for moment-to-moment status and instead optimize it for macro "where are we" — in-flight detail belongs to `openspec list`, not a hand-maintained doc.
+- **[Risk] Four files (`docs/roadmap.md`, `docs/development.md`, two skill files) all encode a version of the same rule — a fifth future restatement could still be missed.** → **Mitigation**: this change's own tasks include a grep pass for the literal phrase "Change Backlog row to `archived`" (and close variants) across the repo before finalizing, to catch anything not already identified here.
+
+## Migration Plan
+
+No runtime migration; this is documentation and skill-prose only. Sequencing: propose PR (this folder) → implementation PR (`.claude/skills/repo-workflow/SKILL.md`, `.claude/skills/change-lifecycle/SKILL.md`) → finalization PR (`docs/roadmap.md`, `docs/development.md`, task checkoffs, `development-workflow` spec delta promoted into `openspec/specs/`, archive). No rollback complexity beyond a normal PR revert at any stage.
