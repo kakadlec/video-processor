@@ -10,3 +10,5 @@
 *.exe
 /app
 /video-processor
+
+.claude/worktrees
