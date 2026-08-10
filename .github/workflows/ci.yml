@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately unfiltered: `branches:` filters on the pull request's *base*,
+  # so pinning it to main would skip CI entirely on a stacked PR whose base is
+  # another feature branch — exactly the PRs that most need the signal.
   pull_request:
-    branches: [main]
 
 jobs:
   test:
