@@ -8,45 +8,13 @@ A minimal Go web service ("FIAP X - Processador de Vídeos") that accepts a vide
 
 The entire application lives in `main.go` (single package `main`, no internal packages/modules), plus `main_test.go` for integration tests. CI runs on GitHub Actions (`.github/workflows/ci.yml`); there is no linter config beyond `go vet` and `gosec`.
 
-## Development process: OpenSpec is mandatory
+## Development workflow
 
-This project uses [OpenSpec](https://github.com/Fission-AI/OpenSpec) for spec-driven development, and it is the **default process for every non-trivial change** — new features, behavior changes, bug fixes with real design decisions, refactors. Do not go straight to editing `main.go` for that kind of work.
+Non-trivial changes (new features, behavior changes, bug fixes with real design decisions, refactors, infra/workflow/CI changes) go through [OpenSpec](https://github.com/Fission-AI/OpenSpec) (`/opsx:propose` → `/opsx:apply` → `/opsx:archive`, with `/opsx:explore` first for complex/ambiguous ones) and land as a 3-PR sequence (propose / implementation / finalization). `main` has no direct pushes — every change lands via a feature branch + PR, gated by three required CI checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`). Commit messages follow Conventional Commits, which drives automated versioning via `release-please`.
 
-- Workflow: `/opsx:propose` (creates `proposal.md` + `design.md` + `tasks.md` under `openspec/changes/<name>/`) → implement against `tasks.md` (`/opsx:apply`) → `/opsx:archive` once shipped, which folds the change into `openspec/specs/`. For a change that's complex or ambiguous — cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions the Change Backlog row doesn't already settle — run `/opsx:explore` first, before `/opsx:propose`, to surface scope and design questions while they're still cheap to act on. A simple change that's already unambiguously scoped by its backlog row description (a single-file config fix, one clearly-specified addition) may go straight to `/opsx:propose`.
-- Specs live in `openspec/specs/`; in-flight change proposals live in `openspec/changes/`; completed ones move to `openspec/changes/archive/`.
-- Project context/conventions for OpenSpec artifact generation are configured in `openspec/config.yaml` (`context:` block) — keep it in sync if the tech stack or conventions here change.
-- Skip the full flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps) — when in doubt, propose first (and if it's a complex or ambiguous change, explore first).
-- **PRs SHALL separate spec content from code content — never bundle both in one PR.** Each non-trivial change uses three PR roles, in order: (1) a **propose** PR containing only the new `openspec/changes/<name>/` artifacts (`proposal.md`/`design.md`/`tasks.md`/delta specs), with no code; merge this first. (2) An **implementation** PR containing only the files that implement the change's declared proposal scope — application source and test changes for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI — and nothing else: no `tasks.md`, README/docs, `CLAUDE.md`/`AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`. (3) One **finalization** PR, opened after implementation merges, that bundles *all* of: marking tasks complete, folding the delta into `openspec/specs/`, moving the change folder under `openspec/changes/archive/`, updating any permanent documentation (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and flipping the change's `docs/roadmap.md` Change Backlog row to `archived` — all in this one PR, not split across separate docs/archive/roadmap PRs. It contains no application code or tests. A reviewer should never have to wade through `openspec/` diffs to review a `main.go` change, or vice versa.
-- `openspec/specs/**` and `openspec/changes/**` are marked `linguist-generated=true` in `.gitattributes`, so GitHub collapses them by default in the PR diff view (still fully tracked and reviewable on demand — this is a display aid, not a substitute for the PR-splitting rule above).
+The full rules (PR role boundaries, branch protection, quality-gate triage incl. `#nosec` policy, PR review-comment checking, merge authorization, commit/release mechanics) are **not** repeated here — they live in `docs/development.md`'s "Code Quality Gates" and "Contribution Conventions" sections for human contributors and non-Claude-Code agents, and are auto-applied for Claude Code by the `repo-workflow` and `change-lifecycle` skills (`.claude/skills/`) at the right moments (opening/merging a PR, wrapping up a change, writing a commit, running quality gates), so this file stays out of the way for simple, direct tasks. `AGENTS.md` carries the same pointers for non-Claude-Code agents. Specs live in `openspec/specs/`; in-flight proposals in `openspec/changes/`; completed ones in `openspec/changes/archive/`.
 
-## Branch protection: PRs only, no direct pushes to `main`
-
-`main` is protected: direct pushes are rejected, including for repo admins (no bypass). Every change — yours or Claude Code's — lands via a feature branch and a pull request:
-
-```bash
-git checkout -b feat/short-description   # or fix/..., chore/..., matching Conventional Commits type
-git push -u origin feat/short-description
-gh pr create --fill
-```
-
-A PR is **not mergeable** until all three required status checks pass — `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` — and the branch is up to date with `main`. This applies to every PR, including `release-please`'s own automated release PR — no special-casing. If any of these is red because of an unrelated pre-existing finding elsewhere in the codebase, that still blocks your PR; the fix is to triage the findings (see below), not to bypass the check.
-
-## Quality gates: tests, SAST, and dependency vulnerabilities must pass
-
-A change is **not complete** until `go test ./...` has been run and passes locally — this applies before reporting any change as done, not just before pushing. CI (`.github/workflows/ci.yml`) enforces this plus a SAST gate and a dependency-vulnerability gate on every push to `main` and every pull request:
-
-- **`test` job** (`Build & Test`): `go vet ./...` + `go test ./... -v` (installs `ffmpeg` on the runner first).
-- **`sast` job** (`SAST (gosec)`): [`gosec`](https://github.com/securego/gosec) against the whole codebase. **The build fails on any finding** — this is a deliberate policy, not a bug. **`#nosec` is a last resort, not the default response to a finding** — check the rule's own docs (e.g. `securego.io/docs/rules/g304.html`) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression; several findings that looked like they needed `#nosec` turned out to be fixable with a real containment check instead. Only suppress a finding that's genuinely a false positive or an accepted risk with no recognized fix pattern, using a bare inline `#nosec G<rule-id>` comment (no restated prose — that's what commit messages and PR descriptions are for). Never disable the SAST job or exclude whole files/rules to make it pass.
-- **`vulncheck` job** (`Vulnerability Scan (govulncheck)`): [`govulncheck`](https://go.dev/security/vuln) against the module. It only fails when a known vulnerability is reachable from code actually called by this project (not merely present in `go.sum`) — resolve a failure by upgrading the implicated dependency, generally by bumping the direct dependency that pulls it in transitively (see `go mod graph`), then `go mod tidy`.
-- All `gosec` findings and reachable `govulncheck` vulnerabilities present as of this writing have been resolved (see `openspec/changes/archive/fix-gosec-and-dependabot-findings/` once archived, or `openspec/specs/development-workflow/spec.md`). Dependabot alerts should be resolved the same way — upgrade the flagged module or the direct dependency pulling it in — as soon as they're opened, not left to accumulate.
-
-## Commit messages and releases
-
-Commit messages **must** follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `ci:`, `test:`, `refactor:`, `!` after the type or a `BREAKING CHANGE:` footer for breaking changes) — this isn't just style, it's the signal [`release-please`](https://github.com/googleapis/release-please) (`.github/workflows/release-please.yml`) uses to compute the next version automatically.
-
-- Versioning is **not** manual. Nobody runs `git tag` by hand. On every push to `main`, release-please maintains a single up-to-date "Release PR" showing the next version and changelog computed from Conventional Commits since the last release.
-- Merging that PR is what actually cuts a release: it creates the git tag, publishes a GitHub Release with generated notes, and updates `CHANGELOG.md`. Until it's merged, nothing is tagged or released.
-- Config: `release-please-config.json` (`release-type: simple` — this app has no package-manager manifest to version-bump) and `.release-please-manifest.json` (tracks the current released version per path).
+One rule worth restating because it applies to every change, trivial or not: **`go test ./... -v` must pass locally before reporting a change complete, whenever the diff includes a Go module input (`.go`/`go.mod`/`go.sum`)** — tests require `ffmpeg` on `PATH`, or run via `docker compose run --build --rm app-test go test ./... -v`.
 
 ## Commands
 
