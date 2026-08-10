@@ -39,9 +39,9 @@ pick a Change Backlog row (or comparable non-trivial idea)
    /opsx:archive → finalization PR (all of the above together)
 ```
 
-## Step 0: locate the change before picking a step
+## Orientation: which step is this change actually on?
 
-The step you owe depends on where the change *actually* is, which isn't always where the request says it is. A backlog row's status cell, a task list, and someone's recollection all go stale independently — a change described as "just proposed" can already have its implementation on `main`, and acting on the stated position re-does merged work or skips a gate. Before choosing a step, check the cheap signals: is the change folder under `openspec/changes/` or `openspec/changes/archive/`, is the delta already promoted into `openspec/specs/`, what does `git log --oneline main -- <the change's files>` show, and what does `gh pr list --state all --search <change-id>` say. When the repo and the request disagree, say so and reconcile before touching anything.
+Not a step and not a gate — just the diagnostic worth reaching for when the sequence below has to be entered somewhere other than the beginning. Which step you owe depends on where the change actually is, and a backlog row's status cell, a task list, and someone's recollection all go stale independently: a change described as "just proposed" can already have its implementation on `main`, and taking the stated position at face value either re-does merged work or skips past a gate. The cheap signals, when you want them: whether the change folder sits under `openspec/changes/` or `openspec/changes/archive/`, whether the delta is already promoted into `openspec/specs/`, `git log --oneline origin/main -- <the change's files>`, and `gh pr list --state all --search <change-id>`. If the repo and the request disagree, saying so beats quietly picking one.
 
 ## Step 1: decide if `/opsx:explore` is warranted
 

@@ -46,7 +46,7 @@ git push -u origin feat/short-description
 gh pr create --fill
 ```
 
-Branch from freshly-fetched `origin/main`, not from whatever happens to be checked out. This repo's PRs land in sequences, so the working tree is often sitting on an earlier branch of the same sequence (or an unrelated open PR); branching from there drags that branch's commits into the new PR's diff, which silently breaks the per-PR file-scope rules below.
+Branch from freshly-fetched `origin/main`, not from whatever happens to be checked out. This repo's PRs land in sequences, so the working tree is often sitting on an earlier branch of the same sequence (or an unrelated open PR); branching from there drags that branch's commits into the new PR's diff, which silently breaks the per-PR file-scope rules in the section above.
 
 Not mergeable until all three required checks pass **and** the branch is up to date with `main`: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. This applies to every PR, including `release-please`'s own release PR — no special-casing.
 
