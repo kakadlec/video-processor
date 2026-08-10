@@ -63,10 +63,6 @@ The vendored `/opsx:archive` skill only assesses/syncs delta specs and moves the
 
 1. Check off all completed tasks in `tasks.md` (including any implementation-scoped ones deferred per Step 3's override).
 2. Update permanent docs (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that need to reflect the shipped change.
-3. Flip the change's `docs/roadmap.md` Change Backlog row to `archived`, if it has one — see that document's own convention on whether every change needs one.
+3. Flip the change's `docs/roadmap.md` Change Backlog row to `archived`, with links to the archive folder and promoted spec(s).
 4. Only then run `/opsx:archive` (or the `openspec-archive-change` skill) to promote the delta spec and move the change folder.
 5. Open the finalization PR containing all of the above together, per `repo-workflow`'s PR-sequence section.
-
-## What this skill does not decide
-
-Whether a given change needs a `docs/roadmap.md` Change Backlog row at all is `docs/roadmap.md`'s own convention to interpret, not this skill's — don't assume every change needs one just because this sequence mentions the backlog.

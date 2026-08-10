@@ -77,7 +77,7 @@ docker compose down -v    # stop and drop the local data volume(s)
 
 ## Code Quality Gates
 
-The CI pipeline runs three checks on every push and pull request. Run them locally before pushing:
+The CI pipeline runs three checks — `Build & Test` (`go vet` + `go test`), `SAST` (`gosec`), `Vulnerability Scan` (`govulncheck`) — on every push and pull request, regardless of what the diff touches; that's the branch-protection gate, not a diff-conditional one.
 
 ```bash
 # Static analysis
@@ -92,7 +92,9 @@ go install golang.org/x/vuln/cmd/govulncheck@latest
 govulncheck ./...
 ```
 
-All three must pass. The CI build fails on **any** `gosec` finding — deliberate policy, not a bug. `#nosec` is a last resort, not the default response to a finding: check the rule's own docs (e.g. `securego.io/docs/rules/g304.html` — lowercase, case-sensitive path) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression — several findings that looked like they needed `#nosec` turned out to be fixable with a real containment check instead. Only suppress a finding that's genuinely a false positive or an accepted risk with no recognized fix pattern, using a bare inline `#nosec G<rule-id>` comment (no restated prose — that's what commit messages and PR descriptions are for). Never disable the SAST job or exclude whole files/rules to make it pass. `govulncheck` failures are resolved by upgrading the implicated dependency — generally by bumping the direct dependency that pulls it in transitively (see `go mod graph`) — then `go mod tidy`. Dependabot alerts should be resolved the same way, as soon as they're opened, not left to accumulate.
+Locally, only run `go vet`/`go test` when the diff includes a Go module input (`.go`/`go.mod`/`go.sum` — see "Change Completion Requires A Passing Test Run" below); `gosec`/`govulncheck` scan the whole codebase, so a docs/skill-only change rarely needs a fresh local run of those two, but running them costs little and CI catches anything missed regardless.
+
+All three must pass in CI. The CI build fails on **any** `gosec` finding — deliberate policy, not a bug. `#nosec` is a last resort, not the default response to a finding: check the rule's own docs (e.g. `securego.io/docs/rules/g304.html` — lowercase, case-sensitive path) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression — several findings that looked like they needed `#nosec` turned out to be fixable with a real containment check instead. Only suppress a finding that's genuinely a false positive or an accepted risk with no recognized fix pattern, using a bare inline `#nosec G<rule-id>` comment (no restated prose — that's what commit messages and PR descriptions are for). Never disable the SAST job or exclude whole files/rules to make it pass. `govulncheck` failures are resolved by upgrading the implicated dependency — generally by bumping the direct dependency that pulls it in transitively (see `go mod graph`) — then `go mod tidy`. Dependabot alerts should be resolved the same way, as soon as they're opened, not left to accumulate.
 
 ### Change Completion Requires A Passing Test Run
 
@@ -150,7 +152,7 @@ Non-trivial changes (new features, behavior changes, bug fixes with real design 
 3. **Implement:** `/opsx:apply` → work through `tasks.md`
 4. **Archive:** `/opsx:archive` → folds the change into `openspec/specs/`
 
-Skip this flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks) — a dependency bump is not automatically trivial for this purpose, since it still requires a passing test run (see "Change Completion Requires A Passing Test Run" above). When in doubt, don't skip it.
+Skip this flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps). This is a separate question from the test-run requirement above: a dependency bump can still skip OpenSpec/the 3-PR split, but if it's reported as a completed change it still needs a passing local test run first. When in doubt about whether something is trivial, don't skip the flow.
 
 For Claude Code specifically, the `change-lifecycle` skill (`.claude/skills/change-lifecycle/SKILL.md`) encodes this sequence and its gates (wait for the propose PR to merge before implementing, verify done-ness before reporting a task complete, do finalization work before running archive) so it can be invoked directly instead of re-deriving it each time; `repo-workflow` (`.claude/skills/repo-workflow/SKILL.md`) carries the compact version of everything else in this "Contribution Conventions" section.
 
@@ -160,7 +162,7 @@ Non-trivial changes use three PR roles, in this order:
 
 1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
 2. **Implementation PR** — only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`.
-3. **Finalization PR** — after implementation merges, one PR bundling *all* of: marking the completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, updating any permanent documentation (`README`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and flipping the change's `docs/roadmap.md` Change Backlog row to `archived` (if that change has one — not every change is required to have a backlog row; see `docs/roadmap.md`'s own convention). Do not split these into separate docs/archive/roadmap PRs. It must not contain application source or tests.
+3. **Finalization PR** — after implementation merges, one PR bundling *all* of: marking the completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, updating any permanent documentation (`README`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and flipping the change's `docs/roadmap.md` Change Backlog row to `archived`. Do not split these into separate docs/archive/roadmap PRs. It must not contain application source or tests.
 
 `tasks.md` checkoffs belong in the finalization PR, not in the implementation PR. Note that the vendored `openspec-apply-change` skill checks off tasks immediately as it completes them — when applying implementation-scoped tasks, keep those checkoff edits out of the implementation PR's commit and re-apply them during finalization instead.
 
