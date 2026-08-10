@@ -173,13 +173,10 @@ Green CI does not authorize a merge. An agent may merge only when the user expli
 `main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. A PR is not mergeable until all three pass and the branch is up to date with `main`.
 
 ```bash
-git fetch origin
-git checkout -b feat/short-description origin/main
+git checkout -b feat/short-description
 git push -u origin feat/short-description
 gh pr create --fill
 ```
-
-Branch from freshly-fetched `origin/main` rather than from whatever is currently checked out. Changes here land as PR sequences, so the working tree is frequently on an earlier branch of the same sequence or on an unrelated open PR; branching from there carries those commits into the new PR's diff and breaks its declared file scope.
 
 ### PR Review Comments
 
