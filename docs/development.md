@@ -24,9 +24,18 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
+Identity configuration is required at startup — the server refuses to start unless both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` are set (see [docs/operations.md](operations.md) for both variables). Start PostgreSQL (`docker compose up -d postgres`) and export both before `go run .`:
+
 ```bash
 # Download dependencies
 go mod download
+
+# Start PostgreSQL for the identity module
+docker compose up -d postgres
+
+# Set required identity configuration
+export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
+export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
 
 # Start the server (listens on :8080)
 go run .
@@ -38,7 +47,7 @@ go build -o app .
 
 The server creates `uploads/`, `temp/`, and `outputs/` in the working directory on first run.
 
-By default it runs with identity disabled (video processing only, no auth). To exercise registration/login/bearer-protected routes locally, start PostgreSQL (`docker compose up -d postgres`) and set both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` before `go run .` — see [docs/operations.md](operations.md) for both variables. Or skip the manual wiring entirely with `docker compose up --build`, which runs the whole application inside Docker with identity already configured — see "Docker Workflow" below.
+To skip the manual wiring entirely, use `docker compose up --build`, which runs the whole application inside Docker with identity already configured — see "Docker Workflow" below.
 
 ## Running Tests
 

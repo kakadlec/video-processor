@@ -4,9 +4,9 @@
 
 Processing is fully synchronous. The HTTP connection stays open until `ffmpeg` finishes and the ZIP is ready.
 
-### Authentication (optional, Phase 2)
+### Authentication (Phase 2)
 
-When `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` are configured, every step below runs behind bearer-token middleware:
+`IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` are required at startup, and every step below runs behind bearer-token middleware:
 
 ```
 Browser                        Go server (main.go / identity.go)     PostgreSQL
@@ -33,7 +33,7 @@ Browser                        Go server (main.go / identity.go)     PostgreSQL
   │                                     │  ... continues below ...        │
 ```
 
-Without those two env vars set, identity is disabled: `/api/auth/*` don't exist, and `/upload`, `/download/:filename`, `/api/status`, `/uploads/*`, `/outputs/*` all run exactly as shown below with no auth check.
+The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, `/api/status`, `/uploads/*`, and `/outputs/*` carries a valid bearer token; there is no unauthenticated mode.
 
 ```
 Browser                   Go server (main.go)              Filesystem
@@ -75,7 +75,7 @@ Browser                   Go server (main.go)              Filesystem
 - No job ID, no status polling, no notifications.
 - On success, the original upload file is deleted; the ZIP in `outputs/` is the only durable artifact.
 - On failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`).
-- Authentication (Phase 2) is optional and off by default; when enabled, artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and enforced identically on `/download`, `/api/status`, and the `/uploads`/`/outputs` static mounts.
+- Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and enforced identically on `/download`, `/api/status`, and the `/uploads`/`/outputs` static mounts.
 
 ---
 
@@ -168,7 +168,7 @@ User submits upload form
           └─► clear the stored token, prompt to log in again
 ```
 
-The JS is embedded in the Go string returned by `getHTMLForm()`. There is no separate build step. The login/register panel is optional at the UI level too — it works the same whether or not the server has identity configured; without it, requests simply carry no `Authorization` header and the server accepts them unauthenticated.
+The JS is embedded in the Go string returned by `getHTMLForm()`. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
 
 ### After Phase 3 (static files extracted to `web/`)
 
@@ -199,10 +199,10 @@ User submits form
 
 | Endpoint | Current behavior | Phase 6 behavior | Removed? |
 |---|---|---|---|
-| `POST /api/auth/register` | Creates a user (Phase 2, only when identity is configured) | Unchanged | No |
-| `POST /api/auth/login` | Issues a bearer JWT (Phase 2, only when identity is configured) | Unchanged | No |
-| `POST /upload` | Blocks; returns ZIP download link; requires a bearer token when identity is configured | Returns immediately; returns job ID + status URL | No — kept for compatibility |
-| `GET /api/status` | Lists ZIPs in `outputs/`; scoped to the caller's own uploads when identity is configured | Lists outputs (compat) | No — kept for compatibility |
-| `GET /download/:filename` | Serves ZIP from `outputs/`; owner-only when identity is configured (a non-owner gets the same 404 as a missing file) | Serves from MinIO (via redirect or proxy) | No |
+| `POST /api/auth/register` | Creates a user (Phase 2) | Unchanged | No |
+| `POST /api/auth/login` | Issues a bearer JWT (Phase 2) | Unchanged | No |
+| `POST /upload` | Blocks; returns ZIP download link; requires a bearer token | Returns immediately; returns job ID + status URL | No — kept for compatibility |
+| `GET /api/status` | Lists ZIPs in `outputs/`; scoped to the caller's own uploads | Lists outputs (compat) | No — kept for compatibility |
+| `GET /download/:filename` | Serves ZIP from `outputs/`; owner-only (a non-owner gets the same 404 as a missing file) | Serves from MinIO (via redirect or proxy) | No |
 | `GET /jobs/{id}/status` | Does not exist | Per-job polling endpoint | N/A — new in Phase 6 |
 | `POST /jobs` | Does not exist | Canonical async upload endpoint | N/A — new in Phase 6 |

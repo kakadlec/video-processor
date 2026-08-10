@@ -62,7 +62,7 @@ Identity domain and application packages SHALL define and consume ports for pers
 
 ### Requirement: Configuration does not provide insecure defaults
 
-The system SHALL load database and token-signing configuration from the environment or an equivalent explicit configuration source and SHALL fail clearly when identity configuration is partially present but invalid or incomplete. Identity as a whole MAY be entirely unconfigured, in which case the system SHALL start without registering `/api/auth` routes or enforcing bearer authentication, rather than treating an entirely absent configuration as a startup failure.
+The system SHALL load database and token-signing configuration from the environment or an equivalent explicit configuration source and SHALL fail clearly when identity configuration is partially present, entirely absent, or invalid. There is no supported mode in which the system starts without a fully configured Identity module.
 
 #### Scenario: Missing signing configuration fails startup
 
@@ -70,11 +70,11 @@ The system SHALL load database and token-signing configuration from the environm
 - **WHEN** the API composition root starts
 - **THEN** startup fails with a clear configuration error and does not use a hard-coded fallback secret
 
-#### Scenario: Identity entirely unconfigured runs video processing only
+#### Scenario: Identity entirely unconfigured fails startup
 
 - **GIVEN** neither `IDENTITY_POSTGRES_DSN` nor the JWT signing configuration is set
 - **WHEN** the API composition root starts
-- **THEN** startup succeeds without an Identity module, `/api/auth` routes are not registered, and video-processing routes remain reachable without a bearer token — preserving the pre-Identity local/Docker workflow for deployments that have not opted in
+- **THEN** startup fails with a clear configuration error, `/api/auth` routes are never registered, and no video-processing route becomes reachable
 
 ### Requirement: Authentication protects video-processing access
 
