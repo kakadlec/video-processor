@@ -39,9 +39,15 @@ pick a Change Backlog row (or comparable non-trivial idea)
    /opsx:archive → finalization PR (all of the above together)
 ```
 
+## Orientation: which step is this change actually on?
+
+Not a step and not a gate — just the diagnostic worth reaching for when the sequence below has to be entered somewhere other than the beginning. Which step you owe depends on where the change actually is, and a backlog row's status cell, a task list, and someone's recollection all go stale independently: a change described as "just proposed" can already have its implementation on `main`, and taking the stated position at face value either re-does merged work or skips past a gate. The cheap signals, when you want them: whether the change folder sits under `openspec/changes/` or `openspec/changes/archive/`, whether the delta is already promoted into `openspec/specs/`, `git log --oneline origin/main -- <the change's files>`, and `gh pr list --state all --search <change-id>`. If the repo and the request disagree, saying so beats quietly picking one.
+
 ## Step 1: decide if `/opsx:explore` is warranted
 
 Same criteria as `openspec/specs/development-workflow/spec.md`'s "Explore Precedes Propose For Complex Or Ambiguous Changes" requirement: cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions not already settled by the change's own scoping description — a `docs/roadmap.md` Change Backlog row's description for product/architecture-scope work, or the idea's own stated scope for a workflow/process-only change that has no such row (see `docs/roadmap.md`'s scoping rule). Already-unambiguously-scoped work may skip straight to `/opsx:propose`, row or no row. This is a judgment call made when picking up the work, not a mechanical gate — when genuinely unsure, explore.
+
+One open question is easy to read past because both sides sound authoritative: the scoping description and the permanent docs/canonical specs describing the same future state can disagree about mechanism. A row that names one implementation while `docs/` or `openspec/specs/` describes another has not settled that decision — it has recorded two of them, and picking the one you happen to read second is a design decision made by accident. Treat that contradiction as an open design question and explore, rather than reconciling it silently in the proposal.
 
 ## Step 2: `/opsx:propose`, then wait for the merge — not the approval
 

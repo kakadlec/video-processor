@@ -19,11 +19,11 @@ Before reporting **any** change complete:
   gh pr view <n> --json reviews
   gh api repos/{owner}/{repo}/pulls/{n}/comments
   ```
-  Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a change, say why instead of leaving it silently unaddressed. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean nothing is coming.
+  Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a change, say why instead of leaving it silently unaddressed. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean nothing is coming. It is requested automatically only the **first** time each PR opens (`review_on_push` is off), so a PR that was force-pushed or reopened gets no fresh pass on its own — request one manually when the follow-up change is substantial.
 
 ## Commit messages
 
-[Conventional Commits](https://www.conventionalcommits.org/) only: `feat:`, `fix:`, `chore:`, `docs:`, `ci:`, `test:`, `refactor:`. Use `!` after the type or a `BREAKING CHANGE:` footer for breaking changes. `release-please` maintains a single up-to-date Release PR from these commits on every push to `main`; merging that PR — not tagging manually — is what creates the git tag, publishes the GitHub Release, and updates `CHANGELOG.md`. Never tag or version manually.
+[Conventional Commits](https://www.conventionalcommits.org/) only: `feat:`, `fix:`, `chore:`, `docs:`, `ci:`, `test:`, `refactor:`. Use `!` after the type or a `BREAKING CHANGE:` footer for breaking changes. `release-please` computes the version bump from the commit message alone, so a change whose `proposal.md` calls itself breaking has to carry that marker on the implementation commit too — a `fix:` subject on a proposal-declared breaking change ships as a patch bump. `release-please` maintains a single up-to-date Release PR from these commits on every push to `main`; merging that PR — not tagging manually — is what creates the git tag, publishes the GitHub Release, and updates `CHANGELOG.md`. Never tag or version manually.
 
 ## OpenSpec + PR sequence for non-trivial changes
 
@@ -40,10 +40,13 @@ Skip OpenSpec and the 3-PR split only for trivial changes (typo fixes, comment t
 `main` rejects direct pushes, no exceptions (including for admins). Every change lands via a feature branch + PR:
 
 ```bash
-git checkout -b feat/short-description   # or fix/..., chore/..., docs/... — Conventional Commits type
+git fetch origin
+git checkout -b feat/short-description origin/main   # or fix/..., chore/..., docs/... — Conventional Commits type
 git push -u origin feat/short-description
 gh pr create --fill
 ```
+
+Branch from freshly-fetched `origin/main`, not from whatever happens to be checked out. This repo's PRs land in sequences, so the working tree is often sitting on an earlier branch of the same sequence (or an unrelated open PR); branching from there drags that branch's commits into the new PR's diff, which silently breaks the per-PR file-scope rules in the section above.
 
 Not mergeable until all three required checks pass **and** the branch is up to date with `main`: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. This applies to every PR, including `release-please`'s own release PR — no special-casing.
 
