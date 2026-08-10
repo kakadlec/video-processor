@@ -202,7 +202,7 @@ User submits form
 | `POST /api/auth/register` | Creates a user (Phase 2, only when identity is configured) | Unchanged | No |
 | `POST /api/auth/login` | Issues a bearer JWT (Phase 2, only when identity is configured) | Unchanged | No |
 | `POST /upload` | Blocks; returns ZIP download link; requires a bearer token when identity is configured | Returns immediately; returns job ID + status URL | No — kept for compatibility |
-| `GET /api/status` | Lists all ZIPs in `outputs/` | Lists outputs (compat) | No — kept for compatibility |
-| `GET /download/:filename` | Serves ZIP from `outputs/` | Serves from MinIO (via redirect or proxy) | No |
+| `GET /api/status` | Lists ZIPs in `outputs/`; scoped to the caller's own uploads when identity is configured | Lists outputs (compat) | No — kept for compatibility |
+| `GET /download/:filename` | Serves ZIP from `outputs/`; owner-only when identity is configured (a non-owner gets the same 404 as a missing file) | Serves from MinIO (via redirect or proxy) | No |
 | `GET /jobs/{id}/status` | Does not exist | Per-job polling endpoint | N/A — new in Phase 6 |
 | `POST /jobs` | Does not exist | Canonical async upload endpoint | N/A — new in Phase 6 |

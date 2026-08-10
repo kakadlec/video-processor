@@ -1,7 +1,7 @@
 # video-frame-extraction Specification
 
 ## Purpose
-TBD - created by archiving change add-integration-tests. Update Purpose after archive.
+Define the video-processing HTTP surface as it behaves today: which uploads are accepted, how frames are extracted and packaged, which artifacts survive a request, and how processed results are listed and downloaded. Access control over those results is specified in `identity-authentication` and `video-processing-access`; this spec covers the processing behavior itself and references ownership only where it changes a response.
 ## Requirements
 ### Requirement: Video Upload Validation
 The system SHALL accept an uploaded video file only when its filename extension is one of: `.mp4`, `.avi`, `.mov`, `.mkv`, `.wmv`, `.flv`, `.webm`. Requests with an unsupported extension or missing the `video` form field SHALL be rejected with HTTP 400 and a Portuguese-language error message, without invoking `ffmpeg`.
@@ -40,22 +40,32 @@ On successful processing, the system SHALL delete the original uploaded video fi
 - **THEN** the temporary uploaded file under `uploads/` no longer exists after the request completes
 
 ### Requirement: Processed Files Listing
-The system SHALL expose `GET /api/status`, returning the list of zip files currently present in `outputs/`, including filename, size, creation time, and a download URL for each.
+The system SHALL expose `GET /api/status`, returning zip files present in `outputs/` with filename, size, creation time, and a download URL for each. When the request carries an authenticated identity, the listing SHALL include only the zips that identity owns; an entry with no recorded owner SHALL be omitted rather than shown. When no identity is authenticated, every zip in `outputs/` is listed.
 
 #### Scenario: Newly created zip appears in status listing
 - **WHEN** an upload has been successfully processed
 - **THEN** `GET /api/status` includes an entry whose `filename` matches the returned `zip_path`
 
-### Requirement: Processed File Download
-The system SHALL expose `GET /download/:filename`, serving the matching file from `outputs/` when it exists, and responding `HTTP 404` with a Portuguese error message when it does not.
+#### Scenario: Listing is scoped to the authenticated owner
+- **GIVEN** `outputs/` holds zips produced by two different authenticated users
+- **WHEN** one of them requests `GET /api/status` with a valid bearer token
+- **THEN** the response lists only that caller's own zips, and `total` counts only those
 
-#### Scenario: Existing zip is downloadable
-- **WHEN** a client requests `GET /download/:filename` for a zip that exists in `outputs/`
+### Requirement: Processed File Download
+The system SHALL expose `GET /download/:filename`, serving the matching file from `outputs/` when it exists and the caller is entitled to it, and responding `HTTP 404` with a Portuguese error message otherwise. When the request carries an authenticated identity, entitlement requires that the recorded artifact owner match that identity. The not-found and not-owned responses SHALL be indistinguishable, so a caller cannot use them to probe for artifacts belonging to someone else.
+
+#### Scenario: Existing zip is downloadable by its owner
+- **WHEN** a client requests `GET /download/:filename` for a zip that exists in `outputs/` and either no identity is authenticated or the authenticated identity owns it
 - **THEN** the server responds `HTTP 200` with the zip's binary content
 
 #### Scenario: Nonexistent file returns 404
 - **WHEN** a client requests `GET /download/:filename` for a file that does not exist in `outputs/`
 - **THEN** the server responds `HTTP 404`
+
+#### Scenario: Another user's zip is indistinguishable from a missing one
+- **GIVEN** a zip in `outputs/` owned by user A
+- **WHEN** user B requests it with a valid bearer token
+- **THEN** the server responds `HTTP 404` with the same body it returns for a file that does not exist
 
 ### Requirement: Temporary Frame Directory Cleanup
 The system SHALL remove the per-request temporary frame-extraction directory under `temp/` after a request completes, whether frame extraction succeeds or fails.
