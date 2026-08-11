@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"embed"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+//go:embed web
+var webFS embed.FS
 
 type VideoRequest struct {
 	VideoPath string `json:"video_path"`
@@ -44,6 +48,15 @@ func main() {
 	log.Fatal(r.Run(":8080"))
 }
 
+func serveEmbeddedFile(c *gin.Context, path, contentType string) {
+	data, err := webFS.ReadFile(path)
+	if err != nil {
+		c.Status(404)
+		return
+	}
+	c.Data(200, contentType, data)
+}
+
 func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	r := gin.Default()
 
@@ -61,8 +74,13 @@ func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	})
 
 	r.GET("/", func(c *gin.Context) {
-		c.Header("Content-Type", "text/html")
-		c.String(200, getHTMLForm())
+		serveEmbeddedFile(c, "web/index.html", "text/html; charset=utf-8")
+	})
+	r.GET("/styles.css", func(c *gin.Context) {
+		serveEmbeddedFile(c, "web/styles.css", "text/css; charset=utf-8")
+	})
+	r.GET("/app.js", func(c *gin.Context) {
+		serveEmbeddedFile(c, "web/app.js", "application/javascript; charset=utf-8")
 	})
 
 	// videoRoutes holds every route that serves or accepts video-processing
@@ -476,391 +494,4 @@ func isValidVideoFile(filename string) bool {
 		}
 	}
 	return false
-}
-
-func getHTMLForm() string {
-	return `
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FIAP X - Processador de Vídeos</title>
-    <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            max-width: 800px; 
-            margin: 50px auto; 
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 { 
-            color: #333; 
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .upload-form {
-            border: 2px dashed #ddd;
-            padding: 30px;
-            text-align: center;
-            border-radius: 10px;
-            margin: 20px 0;
-        }
-        input[type="file"] {
-            margin: 20px 0;
-            padding: 10px;
-        }
-        button {
-            background: #007bff;
-            color: white;
-            padding: 12px 30px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        button:hover { background: #0056b3; }
-        .result {
-            margin-top: 20px;
-            padding: 15px;
-            border-radius: 5px;
-            display: none;
-        }
-        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .loading { 
-            text-align: center; 
-            display: none;
-            margin: 20px 0;
-        }
-        .files-list {
-            margin-top: 30px;
-        }
-        .file-item {
-            background: #f8f9fa;
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 5px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .download-btn {
-            background: #28a745;
-            color: white;
-            padding: 5px 15px;
-            text-decoration: none;
-            border-radius: 3px;
-            font-size: 14px;
-            border: none;
-            cursor: pointer;
-        }
-        .download-btn:hover { background: #218838; }
-        .auth-panel {
-            border: 1px solid #ddd;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-        }
-        .auth-panel input {
-            padding: 8px;
-            margin: 5px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-        }
-        .auth-panel button {
-            padding: 8px 20px;
-            font-size: 14px;
-            margin: 5px;
-        }
-        .auth-message {
-            margin-top: 10px;
-            font-size: 14px;
-        }
-        .auth-message.error { color: #721c24; }
-        .auth-logged-in {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎬 FIAP X - Processador de Vídeos</h1>
-        <p style="text-align: center; color: #666;">
-            Faça upload de um vídeo e receba um ZIP com todos os frames extraídos!
-        </p>
-
-        <div class="auth-panel" id="authPanel">
-            <div id="authForms">
-                <label for="authEmail">Email:</label>
-                <input type="email" id="authEmail" placeholder="Email">
-                <label for="authPassword">Senha:</label>
-                <input type="password" id="authPassword" placeholder="Senha">
-                <button type="button" id="loginBtn">🔑 Entrar</button>
-                <button type="button" id="registerBtn">📝 Cadastrar</button>
-            </div>
-            <div class="auth-logged-in" id="authLoggedIn" style="display: none;">
-                <span id="authEmailDisplay"></span>
-                <button type="button" id="logoutBtn">🚪 Sair</button>
-            </div>
-            <div class="auth-message" id="authMessage"></div>
-        </div>
-
-        <form id="uploadForm" class="upload-form">
-            <p><strong>Selecione um arquivo de vídeo:</strong></p>
-            <input type="file" id="videoFile" accept="video/*" required>
-            <br>
-            <button type="submit">🚀 Processar Vídeo</button>
-        </form>
-        
-        <div class="loading" id="loading">
-            <p>⏳ Processando vídeo... Isso pode levar alguns minutos.</p>
-        </div>
-        
-        <div class="result" id="result"></div>
-        
-        <div class="files-list">
-            <h3>📁 Arquivos Processados:</h3>
-            <div id="filesList">Carregando...</div>
-        </div>
-    </div>
-
-    <script>
-        const ACCESS_TOKEN_KEY = 'fiapx_access_token';
-        const ACCOUNT_EMAIL_KEY = 'fiapx_account_email';
-
-        function getAccessToken() {
-            return localStorage.getItem(ACCESS_TOKEN_KEY);
-        }
-
-        function setSession(accessToken, email) {
-            localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
-            localStorage.setItem(ACCOUNT_EMAIL_KEY, email);
-            updateAuthUI();
-        }
-
-        function clearSession() {
-            localStorage.removeItem(ACCESS_TOKEN_KEY);
-            localStorage.removeItem(ACCOUNT_EMAIL_KEY);
-            updateAuthUI();
-        }
-
-        function authHeaders() {
-            const token = getAccessToken();
-            return token ? { 'Authorization': 'Bearer ' + token } : {};
-        }
-
-        function updateAuthUI() {
-            const token = getAccessToken();
-            document.getElementById('authForms').style.display = token ? 'none' : 'block';
-            document.getElementById('authLoggedIn').style.display = token ? 'flex' : 'none';
-            if (token) {
-                document.getElementById('authEmailDisplay').textContent =
-                    'Autenticado como ' + localStorage.getItem(ACCOUNT_EMAIL_KEY);
-            }
-        }
-
-        function showAuthMessage(message, type) {
-            const el = document.getElementById('authMessage');
-            el.textContent = message;
-            el.className = 'auth-message' + (type ? ' ' + type : '');
-        }
-
-        async function submitAuth(path) {
-            const email = document.getElementById('authEmail').value;
-            const password = document.getElementById('authPassword').value;
-            try {
-                const response = await fetch(path, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email: email, password: password })
-                });
-                const data = await response.json().catch(function() { return {}; });
-                if (!response.ok) {
-                    showAuthMessage(data.error || 'Falha na autenticação.', 'error');
-                    return;
-                }
-                if (path === '/api/auth/register') {
-                    showAuthMessage('Cadastro realizado! Entrando...', '');
-                    await submitAuth('/api/auth/login');
-                    return;
-                }
-                setSession(data.access_token, email);
-                showAuthMessage('');
-                loadFilesList();
-            } catch (error) {
-                showAuthMessage('Erro de conexão: ' + error.message, 'error');
-            }
-        }
-
-        document.getElementById('loginBtn').addEventListener('click', function() {
-            submitAuth('/api/auth/login');
-        });
-
-        document.getElementById('registerBtn').addEventListener('click', function() {
-            submitAuth('/api/auth/register');
-        });
-
-        document.getElementById('logoutBtn').addEventListener('click', function() {
-            clearSession();
-            loadFilesList();
-        });
-
-        async function downloadFile(filename) {
-            try {
-                const response = await fetch('/download/' + encodeURIComponent(filename), {
-                    headers: authHeaders()
-                });
-                if (response.status === 401) {
-                    clearSession();
-                    showResult('Sessão expirada. Faça login novamente.', 'error');
-                    return;
-                }
-                if (!response.ok) {
-                    showResult('Erro ao baixar o arquivo.', 'error');
-                    return;
-                }
-                const blob = await response.blob();
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = filename;
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                URL.revokeObjectURL(url);
-            } catch (error) {
-                showResult('Erro de conexão: ' + error.message, 'error');
-            }
-        }
-
-        document.addEventListener('click', function(e) {
-            const filename = e.target.getAttribute('data-download-filename');
-            if (filename) {
-                downloadFile(filename);
-            }
-        });
-
-        document.getElementById('uploadForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-
-            const fileInput = document.getElementById('videoFile');
-            const file = fileInput.files[0];
-
-            if (!file) {
-                showResult('Selecione um arquivo de vídeo!', 'error');
-                return;
-            }
-
-            const formData = new FormData();
-            formData.append('video', file);
-
-            showLoading(true);
-            hideResult();
-
-            try {
-                const response = await fetch('/upload', {
-                    method: 'POST',
-                    headers: authHeaders(),
-                    body: formData
-                });
-
-                if (response.status === 401) {
-                    clearSession();
-                    showResult('Sessão expirada. Faça login novamente.', 'error');
-                    return;
-                }
-
-                const result = await response.json();
-
-                if (result.success) {
-                    showResult(
-                        escapeHtml(result.message) +
-                        '<br><br><button class="download-btn" data-download-filename="' + escapeHtml(result.zip_path) + '">⬇️ Download ZIP</button>',
-                        'success'
-                    );
-                    loadFilesList();
-                } else {
-                    // result.message can echo back ffmpeg's raw output, which
-                    // includes the caller-controlled original filename — it
-                    // must be escaped before reaching innerHTML below.
-                    showResult('Erro: ' + escapeHtml(result.message), 'error');
-                }
-            } catch (error) {
-                showResult('Erro de conexão: ' + error.message, 'error');
-            } finally {
-                showLoading(false);
-            }
-        });
-
-        function escapeHtml(str) {
-            const div = document.createElement('div');
-            div.textContent = str == null ? '' : str;
-            return div.innerHTML;
-        }
-
-        function showResult(message, type) {
-            const result = document.getElementById('result');
-            result.innerHTML = message;
-            result.className = 'result ' + type;
-            result.style.display = 'block';
-        }
-        
-        function hideResult() {
-            document.getElementById('result').style.display = 'none';
-        }
-        
-        function showLoading(show) {
-            document.getElementById('loading').style.display = show ? 'block' : 'none';
-        }
-        
-        async function loadFilesList() {
-            try {
-                const response = await fetch('/api/status', { headers: authHeaders() });
-                if (response.status === 401) {
-                    clearSession();
-                    document.getElementById('filesList').innerHTML = '<p>Faça login para ver seus arquivos.</p>';
-                    return;
-                }
-                const data = await response.json();
-
-                const filesList = document.getElementById('filesList');
-
-                if (data.files && data.files.length > 0) {
-                    filesList.innerHTML = data.files.map(file =>
-                        '<div class="file-item">' +
-                        '<span>' + escapeHtml(file.filename) + ' (' + formatFileSize(file.size) + ') - ' + escapeHtml(file.created_at) + '</span>' +
-                        '<button class="download-btn" data-download-filename="' + escapeHtml(file.filename) + '">⬇️ Download</button>' +
-                        '</div>'
-                    ).join('');
-                } else {
-                    filesList.innerHTML = '<p>Nenhum arquivo processado ainda.</p>';
-                }
-            } catch (error) {
-                document.getElementById('filesList').innerHTML = '<p>Erro ao carregar arquivos.</p>';
-            }
-        }
-        
-        function formatFileSize(bytes) {
-            if (bytes === 0) return '0 Bytes';
-            const k = 1024;
-            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-        }
-        
-        // Carregar estado de autenticação e lista de arquivos ao inicializar
-        updateAuthUI();
-        loadFilesList();
-    </script>
-</body>
-</html>`
 }
