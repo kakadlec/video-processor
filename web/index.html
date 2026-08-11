@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FIAP X - Processador de Vídeos</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 FIAP X - Processador de Vídeos</h1>
+        <p style="text-align: center; color: #666;">
+            Faça upload de um vídeo e receba um ZIP com todos os frames extraídos!
+        </p>
+
+        <div class="auth-panel" id="authPanel">
+            <div id="authForms">
+                <label for="authEmail">Email:</label>
+                <input type="email" id="authEmail" placeholder="Email">
+                <label for="authPassword">Senha:</label>
+                <input type="password" id="authPassword" placeholder="Senha">
+                <button type="button" id="loginBtn">🔑 Entrar</button>
+                <button type="button" id="registerBtn">📝 Cadastrar</button>
+            </div>
+            <div class="auth-logged-in" id="authLoggedIn" style="display: none;">
+                <span id="authEmailDisplay"></span>
+                <button type="button" id="logoutBtn">🚪 Sair</button>
+            </div>
+            <div class="auth-message" id="authMessage"></div>
+        </div>
+
+        <form id="uploadForm" class="upload-form">
+            <p><strong>Selecione um arquivo de vídeo:</strong></p>
+            <input type="file" id="videoFile" accept="video/*" required>
+            <br>
+            <button type="submit">🚀 Processar Vídeo</button>
+        </form>
+
+        <div class="loading" id="loading">
+            <p>⏳ Processando vídeo... Isso pode levar alguns minutos.</p>
+        </div>
+
+        <div class="result" id="result"></div>
+
+        <div class="files-list">
+            <h3>📁 Arquivos Processados:</h3>
+            <div id="filesList">Carregando...</div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

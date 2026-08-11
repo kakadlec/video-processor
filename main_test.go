@@ -282,6 +282,42 @@ func TestStatus_ListsProcessedZip(t *testing.T) {
 	}
 }
 
+func TestFrontend_StaticRoutes_ServeExpectedContent(t *testing.T) {
+	srv, _ := startTestServer(t)
+
+	cases := []struct {
+		path                string
+		wantContentType     string
+		wantContentContains string
+	}{
+		{"/", "text/html", "FIAP X - Processador de Vídeos"},
+		{"/styles.css", "text/css", ".upload-form"},
+		{"/app.js", "application/javascript", "function loadFilesList"},
+	}
+
+	for _, tc := range cases {
+		resp, err := http.Get(srv.URL + tc.path)
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", tc.path, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: expected HTTP 200, got %d", tc.path, resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); !bytes.Contains([]byte(ct), []byte(tc.wantContentType)) {
+			t.Fatalf("GET %s: expected Content-Type containing %q, got %q", tc.path, tc.wantContentType, ct)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("GET %s: failed to read body: %v", tc.path, err)
+		}
+		if !bytes.Contains(body, []byte(tc.wantContentContains)) {
+			t.Fatalf("GET %s: expected body to contain %q", tc.path, tc.wantContentContains)
+		}
+	}
+}
+
 func TestDownload_NonexistentFile_Returns404(t *testing.T) {
 	srv, token := startTestServer(t)
 
