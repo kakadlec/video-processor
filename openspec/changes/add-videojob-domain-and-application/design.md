@@ -16,7 +16,7 @@
 **Non-Goals:**
 - PostgreSQL adapter, `video_jobs`/`outbox` schema or migration — `add-videojob-infrastructure`.
 - Any HTTP route, `cmd/api`, or change to `main.go` — `extract-cmd-api-entrypoint` and `wire-videojob-http-endpoints`.
-- `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` — no use case in this change triggers a state transition, so none of these are implemented as domain methods or use cases yet. `docs/roadmap.md` now documents which later change adds each (Enqueue/StartProcessing: Phase 6; Complete/Fail: `migrate-ffmpeg-execution-to-videojob-application`, still Phase 3).
+- `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` — no use case in this change triggers a state transition, so none of these are implemented as domain methods or use cases yet. All four are added together by `migrate-ffmpeg-execution-to-videojob-application` (still Phase 3), which calls them synchronously in-process; `docs/roadmap.md` documents why they can't be split (`completed`/`failed` require `processing`, itself reachable only via `queued`, so a synchronous path needs all four, not just the last two).
 - Domain events (`VideoJobCreated`, `VideoJobCompleted`, etc.) — no consumer exists yet. Mirrors Identity's Phase 2 precedent (`RegisterUser`/`AuthenticateUser` emit nothing either, per `docs/domain-model.md`); `ddd-architecture`'s "Domain Events as Cross-Context Integration Contracts" requirement only binds `VideoJobCompleted`/`VideoJobFailed`, both unreachable from this change's use cases.
 - A shared `pkg/` package of any kind — see Decisions.
 
@@ -37,7 +37,7 @@
 ## Risks / Trade-offs
 
 - [The `ddd-architecture` spec correction (removing `pkg/`) is a change to already-canonical (Phase 1, "Done") text, not just this change's own scope] → the delta is narrow (one scenario's `GIVEN`/wording), and is required for the domain model this change actually ships to be spec-compliant; leaving the stale `pkg/` wording in place would make the canonical spec describe an architecture nobody is building.
-- [Deferring `CompleteJob`/`FailJob` here means `migrate-ffmpeg-execution-to-videojob-application` must add them later, coupling that change's scope to a decision made here] → already reflected in `docs/roadmap.md`'s Phase 3 Change Backlog (updated separately, PR #112), so the dependency is explicit and won't surprise whoever proposes that change.
+- [Deferring all four transition use cases here means `migrate-ffmpeg-execution-to-videojob-application` must add all of them at once, coupling that change's scope to a decision made here] → already reflected in `docs/roadmap.md`'s Phase 3 Change Backlog (updated separately, PR #112), including the correction that they can't be split 2-and-2 with Phase 6, so the dependency is explicit and won't surprise whoever proposes that change.
 - [A second, independent `UserID` type could drift from Identity's if either context's validation rules change] → both are intentionally minimal (non-empty string wrapper); any richer validation belongs to the ID *scheme* (UUID v4), which both contexts get from the same `github.com/google/uuid` library independently, not from sharing a type.
 
 ## Migration Plan
