@@ -35,7 +35,7 @@ This is the single source of truth for the product/architecture-scope OpenSpec w
 
 | Change | Scope | Depends on | Status |
 |---|---|---|---|
-| `extract-frontend-to-static-files` | Move `getHTMLForm()`'s HTML/CSS/JS out of `main.go` into `web/index.html`, `web/app.js`, `web/styles.css`, served via `go:embed`. No behavior change. | none | not-started |
+| `extract-frontend-to-static-files` | Move `getHTMLForm()`'s HTML/CSS/JS out of `main.go` into `web/index.html`, `web/app.js`, `web/styles.css`, served via `go:embed`. No behavior change. | none | [archived](../openspec/changes/archive/2026-08-11-extract-frontend-to-static-files/), promoted into [`openspec/specs/ddd-architecture/spec.md`](../openspec/specs/ddd-architecture/spec.md) |
 
 ### Local development tooling (orthogonal to everything else, low risk)
 

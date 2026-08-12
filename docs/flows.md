@@ -141,7 +141,7 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
 
 ## Frontend Interaction Sequences
 
-### Current (inline HTML/CSS/JS in `getHTMLForm()`)
+### Current (`web/index.html`, `web/styles.css`, `web/app.js`, served via `go:embed`)
 
 ```
 Page load
@@ -168,11 +168,7 @@ User submits upload form
           └─► clear the stored token, prompt to log in again
 ```
 
-The JS is embedded in the Go string returned by `getHTMLForm()`. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
-
-### After Phase 3 (static files extracted to `web/`)
-
-`GET /` continues to return the same HTML page, but the server now serves it from `web/index.html` via a static file handler. `web/styles.css` and `web/app.js` are served from `GET /web/styles.css` and `GET /web/app.js`. Functionality is identical; the code just lives in dedicated files instead of a Go string literal.
+`web/index.html`, `web/styles.css`, and `web/app.js` are embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
 
 ### After Phase 6 (async API)
 

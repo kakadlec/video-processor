@@ -33,7 +33,7 @@ docker compose up --build   # full stack via Docker (app + PostgreSQL, identity 
 Request flow, all in `main.go`:
 
 1. `setupRouter()` wires a single `gin` router: static file serving for `/uploads` and `/outputs`, a permissive CORS middleware (allows `*`), and routes `GET /`, `POST /upload`, `GET /download/:filename`, `GET /api/status`. `main()` just calls `setupRouter()` then `.Run(":8080")` — the split exists so `main_test.go` can drive the real handlers via `httptest.NewServer` without binding the real port.
-2. `GET /` returns a hardcoded HTML page (`getHTMLForm()`) — an inline upload form with vanilla JS (fetch calls to `/upload` and `/api/status`). There is no separate frontend build; editing the UI means editing the Go string literal.
+2. `GET /` serves `web/index.html` (with `web/styles.css` and `web/app.js` at `/styles.css` and `/app.js`), embedded into the binary via `go:embed` — an upload form with vanilla JS (fetch calls to `/upload` and `/api/status`). There is no separate frontend build; editing the UI means editing the files under `web/`.
 3. `POST /upload` (`handleVideoUpload`) validates the file extension, saves the upload to `uploads/<timestamp>_<original-filename>`, then calls `processVideo`.
 4. `processVideo` is the core pipeline: creates a per-request scratch dir under `temp/<timestamp>`, runs `ffmpeg -i <video> -vf fps=1 -y temp/<timestamp>/frame_%04d.png`, globs the resulting PNGs, zips them into `outputs/frames_<timestamp>.zip` via `createZipFile`/`addFileToZip`, then removes the temp dir (`defer os.RemoveAll`). On success the original upload in `uploads/` is deleted too, so `outputs/*.zip` is the only durable artifact.
 5. `GET /download/:filename` and `GET /api/status` just stat/serve files out of `outputs/`.
@@ -46,10 +46,10 @@ Processing is synchronous and in-request: `handleVideoUpload` blocks on the full
 
 Code, error messages, and comments in **new or changed code** SHALL be written in English, going forward. This is a change from the project's original convention (see below) — it applies prospectively, not retroactively:
 
-- Do not translate the existing Portuguese (pt-BR) strings already in `main.go` (the HTML form in `getHTMLForm()`, existing JSON `Message`/`error` fields, existing `fmt.Printf`/`log.Printf` calls) just because you're touching a nearby line. Leave them as-is unless a change specifically asks for that.
+- Do not translate the existing Portuguese (pt-BR) strings already in `main.go` and `web/index.html` (the HTML form, existing JSON `Message`/`error` fields, existing `fmt.Printf`/`log.Printf` calls) just because you're touching a nearby line. Leave them as-is unless a change specifically asks for that.
 - Any error message, log line, or other string you add or rewrite from now on should be in English, even inside an otherwise-Portuguese function.
 - Comments: default to none. Add one only when it explains something genuinely non-obvious (a hidden constraint, a workaround, a subtle invariant) — not to restate what the code already says. When you do add one, write it in English.
-- Exception: new **user-facing UI copy** in `getHTMLForm()` (labels, buttons, status messages shown on the page itself) stays in Portuguese, matching the rest of that page — it's written for the same pt-BR hackathon audience as the existing form, and mixing languages within one UI reads as inconsistent to that audience. This exception is scoped to visible page copy only; error messages, log lines, and comments in the surrounding Go code (including inside `getHTMLForm()`) still follow the English rule above.
+- Exception: new **user-facing UI copy** in `web/index.html` (labels, buttons, status messages shown on the page itself) and user-facing strings in `web/app.js` stay in Portuguese, matching the rest of that page — it's written for the same pt-BR hackathon audience as the existing form, and mixing languages within one UI reads as inconsistent to that audience. This exception is scoped to visible page copy only; error messages, log lines, and comments in the surrounding Go code still follow the English rule above.
 
 ## Notable constraints / gotchas
 
