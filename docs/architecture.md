@@ -66,7 +66,7 @@ No cache, no message broker.
 
 | Route | Handler | Description |
 |---|---|---|
-| `GET /` | inline | Returns inline HTML page from `getHTMLForm()`; always public |
+| `GET /` | inline | Serves embedded `web/index.html` (via `go:embed`); always public |
 | `POST /api/auth/register` | `handleRegister` | Create a user account |
 | `POST /api/auth/login` | `handleLogin` | Authenticate and issue a bearer JWT |
 | `POST /upload` | `handleVideoUpload` | Accept multipart video, process synchronously; requires a bearer token |
@@ -81,11 +81,11 @@ CORS headers (`Access-Control-Allow-Origin: *`) are applied globally.
 
 ### Frontend (current)
 
-The web UI is a Go string literal returned by `getHTMLForm()` in `main.go`. It contains:
+The web UI lives in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. It contains:
 
 - Plain HTML form for file selection, plus a login/register panel (Phase 2)
-- Inline CSS (`<style>` block)
-- Vanilla JavaScript using `fetch` to call `POST /upload`, `GET /api/status`, `POST /api/auth/register`, and `POST /api/auth/login`; the bearer token is kept in `localStorage` and attached as an `Authorization` header on protected requests
+- CSS in `web/styles.css`
+- Vanilla JavaScript in `web/app.js` using `fetch` to call `POST /upload`, `GET /api/status`, `POST /api/auth/register`, and `POST /api/auth/login`; the bearer token is kept in `localStorage` and attached as an `Authorization` header on protected requests
 
 There is no separate frontend build, no Node.js toolchain, and no bundler.
 
@@ -113,7 +113,7 @@ video-processor/
     api/        # HTTP entrypoint — replaces main.go (Phase 3+)
     worker/     # Async frame-extraction worker (Phase 6)
   web/
-    index.html  # Extracted from getHTMLForm() (Phase 3)
+    index.html  # Extracted from getHTMLForm()
     styles.css
     app.js
   internal/

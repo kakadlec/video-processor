@@ -198,17 +198,17 @@ The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/w
 
 ### Requirement: Frontend as Presentation/Delivery Layer
 
-The web frontend (HTML/CSS/JavaScript currently embedded in `getHTMLForm()`) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
+The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served as `GET /`, `GET /styles.css`, and `GET /app.js` respectively) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
 
 #### Scenario: Frontend is not a bounded context
 
 - **GIVEN** the system is organized into bounded contexts
-- **WHEN** the inline HTML/CSS/JS served by `GET /` is evaluated
+- **WHEN** the HTML/CSS/JS served by `GET /` is evaluated
 - **THEN** it SHALL NOT be assigned domain responsibilities, aggregate roots, or domain events; it is a delivery layer that consumes the Video Processing context's HTTP API
 
 #### Scenario: Frontend extraction preserves GET / behavior
 
-- **GIVEN** `web/index.html`, `web/styles.css`, and `web/app.js` have been extracted from `getHTMLForm()` in Phase 3
+- **GIVEN** `web/index.html`, `web/styles.css`, and `web/app.js` have been extracted from `getHTMLForm()` and are served via `go:embed`
 - **WHEN** a browser requests `GET /`
 - **THEN** the server returns HTTP 200 with the HTML page and the page renders without JavaScript errors
 
@@ -222,7 +222,13 @@ The web frontend (HTML/CSS/JavaScript currently embedded in `getHTMLForm()`) SHA
 
 - **GIVEN** a backend change adds, renames, or removes an HTTP endpoint consumed by the frontend
 - **WHEN** the change is being specified and implemented
-- **THEN** the same OpenSpec change SHALL include a task to update `web/app.js` (or the inline JS, until extraction) to reflect the new contract
+- **THEN** the same OpenSpec change SHALL include a task to update `web/app.js` to reflect the new contract
+
+#### Scenario: Full-flow non-regression passes at each phase
+
+- **GIVEN** any phase change that modifies API contracts or routing
+- **WHEN** implementation is complete and before the PR is merged
+- **THEN** uploading a video through the web UI must result in a downloadable zip — verified via browser interaction or a curl sequence simulating the complete upload → poll → download flow
 
 #### Scenario: Full-flow non-regression passes at each phase
 
