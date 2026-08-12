@@ -230,12 +230,6 @@ The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and
 - **WHEN** implementation is complete and before the PR is merged
 - **THEN** uploading a video through the web UI must result in a downloadable zip — verified via browser interaction or a curl sequence simulating the complete upload → poll → download flow
 
-#### Scenario: Full-flow non-regression passes at each phase
-
-- **GIVEN** any phase change that modifies API contracts or routing
-- **WHEN** implementation is complete and before the PR is merged
-- **THEN** uploading a video through the web UI must result in a downloadable zip — verified via browser interaction or a curl sequence simulating the complete upload → poll → download flow
-
 ### Requirement: Permanent Project Documentation Is Accurate, Current-State-Faithful, and Separate from OpenSpec Artifacts
 
 The repository SHALL include a set of permanent documentation files (`README.md`, `docs/architecture.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/development.md`, `docs/operations.md`, `docs/roadmap.md`) serving as the stable reference for contributors, evaluators, and operators. These files are distinct from OpenSpec artifacts: OpenSpec governs change proposals and implementation tasks; permanent docs describe the system as it exists and where it is going, in terms readable without knowledge of the OpenSpec workflow.
