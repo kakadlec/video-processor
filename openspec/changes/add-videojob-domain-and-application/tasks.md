@@ -1,0 +1,34 @@
+## 1. Implementation (implementation PR)
+
+- [ ] 1.1 Create `internal/video/domain/user_id.go`: a `UserID` value object local to this context (distinct Go type from `internal/identity/domain.UserID`) with a validating constructor (`NewUserID(string) (UserID, error)`, non-empty invariant only), `String()`, `IsZero()`, `Equal()`. No generator, no parser port — Video Processing only ever receives an already-verified ID string.
+- [ ] 1.2 Create `internal/video/domain/video_job_id.go`: `VideoJobID` value object mirroring `internal/identity/domain/user_id.go`'s shape — `NewVideoJobID(string)` (non-empty invariant), `VideoJobIDGenerator` port (mints new IDs), `VideoJobIDParser` port (validates/parses an externally-supplied ID string).
+- [ ] 1.3 Create `internal/video/domain/job_status.go`: `JobStatus` enum covering `pending`, `queued`, `processing`, `completed`, `failed`, plus a pure `CanTransitionTo(next JobStatus) bool` (or equivalent) encoding the valid-transitions table (`pending → queued → processing → completed`, `processing → failed`; no backwards transitions; no skipping states). No `VideoJob` mutator methods use this yet — it stands alone, independently unit-tested.
+- [ ] 1.4 Create `internal/video/domain/original_filename.go`: `OriginalFilename` value object, non-empty invariant.
+- [ ] 1.5 Create `internal/video/domain/storage_key.go`: `StorageKey` value object, non-empty invariant (only set once a job reaches `completed`; unset otherwise).
+- [ ] 1.6 Create `internal/video/domain/video_job.go`: `VideoJob` aggregate root with fields for `VideoJobID`, `UserID`, `OriginalFilename`, `StorageKey`, `FrameCount` (int, ≥0), `ErrorReason` (string, empty unless `failed`), `JobStatus`. `NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, createdAt time.Time) (*VideoJob, error)` always produces `JobStatus: pending`, `FrameCount: 0`, empty `ErrorReason`, unset `StorageKey`. `RestoreVideoJob(...)` reconstructs from already-validated storage values. Accessors only — no `Enqueue`/`StartProcessing`/`Complete`/`Fail` methods (out of scope; see `design.md`).
+- [ ] 1.7 Create `internal/video/domain/repository.go`: `VideoJobRepository` port — `Create(ctx, *VideoJob) error`, `FindByID(ctx, VideoJobID) (*VideoJob, error)`, `FindByUserID(ctx, UserID, offset, limit int) ([]*VideoJob, error)` — plus `ErrVideoJobNotFound`.
+- [ ] 1.8 Create `internal/video/application/clock.go`: a `Clock` interface (`Now() time.Time`), independent of `internal/identity/application`'s copy — importing another context's `application` package is forbidden by the dependency rules, so this is a small intentional duplication, not an oversight.
+- [ ] 1.9 Create `internal/video/application/create_video_job.go`: `CreateVideoJob` use case — input `{UserID, OriginalFilename}`, wires `VideoJobIDGenerator`, `VideoJobRepository`, `Clock`; returns a result describing the created (`pending`) job.
+- [ ] 1.10 Create `internal/video/application/get_job_status.go`: `GetJobStatus` use case — input `{RequestingUserID, JobID string}`; parses `JobID` via `VideoJobIDParser`, fetches via the repository, and returns `ErrVideoJobNotFound` both when the job does not exist and when `RequestingUserID` does not match the job's owner (never a distinct "forbidden" result).
+- [ ] 1.11 Create `internal/video/application/list_user_jobs.go`: `ListUserJobs` use case — input `{UserID, Offset, Limit}`; delegates to `VideoJobRepository.FindByUserID`.
+- [ ] 1.12 Create `internal/video/application/fakes_test.go`: in-memory `fakeVideoJobRepository`, `fakeVideoJobIDGenerator`, `fakeVideoJobIDParser`, `fakeClock`, mirroring `internal/identity/application/fakes_test.go`'s pattern.
+- [ ] 1.13 Add unit tests for all three use cases (`create_video_job_test.go`, `get_job_status_test.go`, `list_user_jobs_test.go`) covering every scenario in `specs/videojob-lifecycle/spec.md`.
+- [ ] 1.14 Add unit tests for `JobStatus.CanTransitionTo` covering valid, backwards, and skipped-state transitions.
+- [ ] 1.15 Create `internal/video/dependency_rules_test.go`, mirroring `internal/identity/dependency_rules_test.go`: `domain`/`application` under `internal/video/` must not import `internal/video/infrastructure/`, `net/http`, `database/sql`, `github.com/gin-gonic`, `github.com/golang-jwt`, `github.com/jackc` — **and must not import `internal/identity/domain` or `internal/identity/application`**.
+
+## 2. Verification
+
+- [ ] 2.1 `go build ./...` succeeds.
+- [ ] 2.2 `go test ./... -v` passes (no `ffmpeg` dependency for these packages; existing `main_test.go` behavior is unaffected).
+- [ ] 2.3 `go vet ./...` and `gosec ./...` report no new findings.
+- [ ] 2.4 Confirm `internal/video/domain` and `internal/video/application` are not imported anywhere from `main.go` (`grep -rn "internal/video" main.go` returns nothing) — this change must stay inert in the running system.
+
+## 3. Finalization (finalization PR, after implementation merges)
+
+- [ ] 3.1 Mark all tasks above complete.
+- [ ] 3.2 Promote `specs/ddd-architecture/spec.md`'s MODIFIED requirement into `openspec/specs/ddd-architecture/spec.md`.
+- [ ] 3.3 Promote `specs/videojob-lifecycle/spec.md`'s ADDED requirements into a new `openspec/specs/videojob-lifecycle/spec.md`.
+- [ ] 3.4 Update `docs/domain-model.md`'s "Cross-Context Contracts" section: remove the "Target: it moves to `pkg/`" note and describe the local-`UserID`-per-context-plus-composition-root-translation model actually implemented.
+- [ ] 3.5 Update `docs/architecture.md`: remove the `pkg/` entry and its comment from the "Target Package Topology" tree (no `pkg/` directory is introduced by this change or planned by the corrected architecture), and reword Dependency Rule 5 ("Cross-Context communication uses domain events or the shared `UserID` value object from `pkg/`") to describe the local-value-object-plus-composition-root-translation model instead.
+- [ ] 3.6 Move the change folder to `openspec/changes/archive/`.
+- [ ] 3.7 Update `docs/roadmap.md`'s `add-videojob-domain-and-application` Change Backlog row to `archived`, linking the archive folder and the promoted specs.
