@@ -42,7 +42,7 @@ Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in th
 
 - **GIVEN** a valid `*domain.VideoJob` passed to `Repository.Create`
 - **WHEN** the call succeeds
-- **THEN** a `video_job_outbox` row exists whose `event_type` is `video_job.created`, whose `payload` contains that job's `job_id`, `user_id`, `original_filename`, and `occurred_at`, and whose `published_at` is `NULL`
+- **THEN** a `video_job_outbox` row exists whose `event_type` is `video_job.created`, whose `payload` contains `type: "video_job.created"` plus that job's `job_id`, `user_id`, `original_filename`, and `occurred_at`, and whose `published_at` is `NULL`
 
 #### Scenario: A failed job-row insert leaves no outbox row
 
