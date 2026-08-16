@@ -54,6 +54,14 @@ services:
       # exactly, per this change's approved design (app-test mirrors app's
       # environment; app's own definition is otherwise unchanged).
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # video_jobs/video_job_outbox share the same PostgreSQL instance and
+      # database as identity_users (docs/architecture.md's documented
+      # target) — intentionally identical to the IDENTITY_* values above,
+      # not a separate database. Unused until a video composition root
+      # calls postgres.Open/Migrate (add-videojob-infrastructure is
+      # infra-only; wiring lands in wire-videojob-http-endpoints).
+      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,6 +90,10 @@ services:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # See the "app" service above for why these are intentionally
+      # identical to the IDENTITY_* values.
+      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
