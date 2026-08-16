@@ -23,6 +23,14 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE.md for the Docker fallback.")
 		os.Exit(1)
 	}
+	// go test sets the working directory to this package's own directory
+	// (cmd/api), but the app's uploads/outputs/temp paths are relative to
+	// the repo root — chdir so tests exercise the same directories the
+	// running app actually uses, not a shadow copy under cmd/api.
+	if err := os.Chdir("../.."); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: failed to chdir to repo root: %v\n", err)
+		os.Exit(1)
+	}
 	createDirs()
 	os.Exit(m.Run())
 }

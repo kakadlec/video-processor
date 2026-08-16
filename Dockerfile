@@ -10,7 +10,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/app .
+RUN CGO_ENABLED=0 go build -o /out/app ./cmd/api
 
 FROM builder AS test
 RUN apk add --no-cache ffmpeg
