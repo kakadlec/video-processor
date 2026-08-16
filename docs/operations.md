@@ -69,7 +69,7 @@ Releases are automated via `release-please`. On every push to `main`, it maintai
 
 ### PostgreSQL — Implemented (Phase 2), required
 
-Authoritative state store for users (`User` aggregate), configured via `IDENTITY_POSTGRES_DSN`. Schema/migrations are applied automatically at startup (`postgres.Migrate`). Video processing jobs (`VideoJob` aggregate) and the transactional-outbox `outbox` table are Phase 3 additions and don't exist yet.
+Authoritative state store for users (`User` aggregate), configured via `IDENTITY_POSTGRES_DSN`. Schema/migrations are applied automatically at startup (`postgres.Migrate`). The video processing schema (`video_jobs` and the transactional-outbox `video_job_outbox` table) exists too, as of Phase 3's `add-videojob-infrastructure` — `internal/video/infrastructure/postgres` implements the same `Config`/`Open`/`Migrate`/`Repository` shape, configured via `VIDEO_POSTGRES_DSN`. It is not yet in this section's "required at deployment time" scope, or in the Environment Variables table above, because nothing in `main.go` calls it yet — no composition root instantiates or migrates it. That wiring is `wire-videojob-http-endpoints`.
 
 - **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
 - **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
