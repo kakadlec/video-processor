@@ -22,9 +22,10 @@
 - [ ] 4.1 `internal/video/infrastructure/postgres/repository_test.go`: env-var-gated integration tests (`VIDEO_POSTGRES_TEST_DSN`, skip if unset) mirroring identity's `testDB` helper pattern (open, migrate, truncate `video_jobs` and `video_job_outbox` before each test)
 - [ ] 4.2 Test: `Create` then `FindByID` round-trips all fields correctly
 - [ ] 4.3 Test: `FindByID` returns `domain.ErrVideoJobNotFound` for an unknown ID
-- [ ] 4.4 Test: `FindByUserID` scopes to the caller's `UserID`, orders `CreatedAt` descending with `VideoJobID` ascending tie-break, and respects offset/limit
-- [ ] 4.5 Test: `Create` writes a matching `video_job_outbox` row (`event_type = 'video_job.created'`, payload fields, `published_at IS NULL`)
+- [ ] 4.4 Test: `FindByUserID` scopes to the caller's `UserID`, orders by `CreatedAt` descending (distinct timestamps, not just the tie-break case), breaks ties by ascending `VideoJobID`, and respects offset/limit
+- [ ] 4.5 Test: `Create` writes a matching `video_job_outbox` row (`event_type = 'video_job.created'`, payload fields including `type`, `published_at IS NULL`)
 - [ ] 4.6 Test: a `Create` that fails to insert the `video_jobs` row (duplicate ID) leaves no `video_job_outbox` row committed
+- [ ] 4.7 Test: a `Create` where the `video_jobs` insert succeeds but the `video_job_outbox` insert fails leaves no `video_jobs` row committed either (the direction 4.6 cannot prove, since its failure happens before the outbox insert is attempted) — verify by confirming this test fails against a non-transactional two-Exec implementation before it lands
 
 ## 5. Local Dev / CI Wiring (config only, no application wiring)
 
