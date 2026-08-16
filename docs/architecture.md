@@ -129,8 +129,6 @@ video-processor/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
       infrastructure/ # Email adapter, webhook adapter (Phase 7)
-  pkg/
-    # Shared primitives with no domain knowledge (ID generation, clock)
 ```
 
 **Migration strategy:** `main.go` remains functional during the transition. New packages are introduced alongside it. Each feature phase migrates one slice of the handler into the appropriate use case and wires it back to the HTTP layer. No big-bang rewrite.
@@ -152,6 +150,6 @@ See [docs/roadmap.md](roadmap.md) for the full phase plan.
 2. `application` packages depend only on repository/port **interfaces** defined in `domain`.
 3. `infrastructure` packages implement interfaces from `domain` and may import third-party drivers.
 4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). Today, before the Phase 3 `cmd/api` extraction, `main.go`/`identity.go` play that role for Identity.
-5. No bounded context may import another context's `domain` or `application` packages. Cross-context communication uses domain events or the shared `UserID` value object from `pkg/`.
+5. No bounded context may import another context's `domain` or `application` packages directly. Each context defines and owns its own local value object for any identifier that crosses a boundary (e.g. `identity.UserID` and `video.UserID` are distinct types) — cross-context communication uses domain events or translation at the composition root, never a package shared between contexts' `domain` layers. There is no `pkg/` directory; a shared kernel was considered for the crossing `UserID` and rejected as tighter coupling than this architecture's context-independence goal justifies (see `add-videojob-domain-and-application`'s `design.md` in `openspec/changes/archive/`).
 
-Rules 1–3 for `internal/identity/{domain,application}` are enforced by an automated test (`internal/identity/dependency_rules_test.go`), not just convention.
+Rules 1–3 for `internal/identity/{domain,application}` and `internal/video/{domain,application}` are each enforced by an automated test (`internal/identity/dependency_rules_test.go`, `internal/video/dependency_rules_test.go`), not just convention.

@@ -116,7 +116,7 @@ The package structure SHALL enforce a strict dependency hierarchy so that domain
 
 - **GIVEN** any Go file in any bounded context's packages
 - **WHEN** it needs to reference a concept from another bounded context
-- **THEN** it SHALL use only the shared `UserID` value object from `pkg/` or consume integration events; it SHALL NOT import another context's `domain` or `application` packages directly
+- **THEN** it SHALL NOT import another context's `domain` or `application` packages directly; each bounded context SHALL define and own its own local value object for any identifier that crosses a context boundary (e.g. each of `internal/identity/domain` and `internal/video/domain` defines its own `UserID` type), and translation between a source context's identifier and a consuming context's local type SHALL happen only at the composition root (`cmd/api`, `cmd/worker`, or `main.go` during incremental migration) or via consumed integration events — never via a package shared between the two contexts' `domain` layers
 
 #### Scenario: Composition root is the only DI boundary
 
