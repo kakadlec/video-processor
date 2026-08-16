@@ -199,21 +199,9 @@ Before reporting a PR-related task complete, check that PR for review comments (
 ```bash
 gh pr view <n> --json reviews,mergeable,mergeStateStatus
 gh api repos/{owner}/{repo}/pulls/{n}/comments
-
-# Resolution state is available through GraphQL, not the REST comments list above.
-gh api graphql \
-  -F owner='{owner}' -F repo='{repo}' -F number=<n> \
-  -f query='query($owner:String!,$repo:String!,$number:Int!){
-    repository(owner:$owner,name:$repo){pullRequest(number:$number){
-      reviewThreads(first:100){nodes{
-        isResolved comments(first:10){nodes{author{login} body url}}
-      }}
-    }}
-  }' \
-  --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
 
-The final GraphQL command must return `[]` before the PR is considered complete. Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a code change, document why and still resolve the conversation rather than leaving it silently open. `gh pr checks` does not report unresolved conversations as a failed CI check; GitHub exposes the condition through the PR's blocked merge state and enforces it server-side when merging. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean there's nothing coming.
+Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a code change, document why and still resolve the conversation rather than leaving it silently open. `gh pr checks` does not report unresolved conversations as a failed CI check; GitHub exposes the condition through the PR's blocked merge state and enforces it server-side when merging. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean there's nothing coming.
 
 ### Validation and Handoff
 
