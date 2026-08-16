@@ -24,7 +24,7 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity configuration is required at startup — the server refuses to start unless both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` are set (see [docs/operations.md](operations.md) for both variables). Start PostgreSQL (`docker compose up -d postgres`) and export both before `go run .`:
+Identity configuration is required at startup — the server refuses to start unless both `IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` are set (see [docs/operations.md](operations.md) for both variables). Start PostgreSQL (`docker compose up -d postgres`) and export both before `go run ./cmd/api`:
 
 ```bash
 # Download dependencies
@@ -38,10 +38,10 @@ export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identi
 export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
 
 # Start the server (listens on :8080)
-go run .
+go run ./cmd/api
 
 # Build a binary
-go build -o app .
+go build -o app ./cmd/api
 ./app
 ```
 

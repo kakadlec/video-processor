@@ -196,6 +196,12 @@ The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/w
 - **WHEN** `go build ./cmd/api` and `go build ./cmd/worker` are run
 - **THEN** each produces an independent binary that can be containerized and deployed separately
 
+#### Scenario: cmd/api is the actual HTTP composition root
+
+- **GIVEN** `main.go`, `identity.go`, and their test files have been moved into `cmd/api/`
+- **WHEN** the server is built or run
+- **THEN** `go build -o app ./cmd/api` and `go run ./cmd/api` produce the same HTTP behavior the repo-root `main.go` produced before the move, and no `main.go` exists at the repo root anymore
+
 ### Requirement: Frontend as Presentation/Delivery Layer
 
 The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served as `GET /`, `GET /styles.css`, and `GET /app.js` respectively) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
