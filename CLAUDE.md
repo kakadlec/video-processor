@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A minimal Go web service ("FIAP X - Processador de Vídeos") that accepts a video upload, extracts frames at 1fps via `ffmpeg`, zips them, and serves the zip back for download. It's the code deliverable for a POSTECH/FIAP hackathon (see `docs/project-requirements.pdf` for the assignment brief — a binary PDF, not readable as text).
 
-The entire application lives in `main.go` (single package `main`, no internal packages/modules), plus `main_test.go` for integration tests. CI runs on GitHub Actions (`.github/workflows/ci.yml`); there is no linter config beyond `go vet` and `gosec`.
+The HTTP composition root lives in `cmd/api/main.go` (package `main`), alongside `identity.go` and their `_test.go` files; `internal/identity` and `internal/video` hold the DDD bounded contexts introduced in later phases (see `docs/architecture.md`). CI runs on GitHub Actions (`.github/workflows/ci.yml`); there is no linter config beyond `go vet` and `gosec`.
 
 ## Development workflow
 
@@ -19,21 +19,21 @@ One rule worth restating because it applies to every change, trivial or not: **`
 ## Commands
 
 ```bash
-go run .                # run the server directly (listens on :8080)
-go build -o app .       # build a binary
+go run ./cmd/api        # run the server directly (listens on :8080)
+go build -o app ./cmd/api  # build a binary
 go mod tidy             # sync go.mod/go.sum after dependency changes
 go test ./... -v        # run the integration test suite (requires ffmpeg on PATH; exits 1 with an error if absent)
 docker compose up --build   # full stack via Docker (app + PostgreSQL, identity enabled)
 ```
 
-`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside Docker instead: `docker compose run --build --rm app-test go test ./... -v` (`app-test` builds from the `Dockerfile`'s `test` stage — the hardened `app` service's image has no Go toolchain to run tests with). `docker-compose.yml` is the sole documented way to build, run, or test the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. Container deployment is a separate, intentionally-retained concern documented in `docs/operations.md`.
+`ffmpeg` must be installed and on `PATH` — the app shells out to it (`exec.Command("ffmpeg", ...)`) and has no fallback or embedded copy. This is also true for running the tests in `cmd/api/main_test.go`; if `ffmpeg` isn't available (e.g. locally on non-Linux setups), run tests inside Docker instead: `docker compose run --build --rm app-test go test ./... -v` (`app-test` builds from the `Dockerfile`'s `test` stage — the hardened `app` service's image has no Go toolchain to run tests with). `docker-compose.yml` is the sole documented way to build, run, or test the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. Container deployment is a separate, intentionally-retained concern documented in `docs/operations.md`.
 
 ## Architecture
 
-Request flow, all in `main.go`:
+Request flow, all in `cmd/api/main.go` and `cmd/api/identity.go`:
 
 1. `setupRouter()` wires a single `gin` router: static file serving for `/uploads` and `/outputs`, a permissive CORS middleware (allows `*`), and routes `GET /`, `POST /upload`, `GET /download/:filename`, `GET /api/status`. `main()` just calls `setupRouter()` then `.Run(":8080")` — the split exists so `main_test.go` can drive the real handlers via `httptest.NewServer` without binding the real port.
-2. `GET /` serves `web/index.html` (with `web/styles.css` and `web/app.js` at `/styles.css` and `/app.js`), embedded into the binary via `go:embed` — an upload form with vanilla JS (fetch calls to `/upload` and `/api/status`). There is no separate frontend build; editing the UI means editing the files under `web/`.
+2. `GET /` serves `cmd/api/web/index.html` (with `cmd/api/web/styles.css` and `cmd/api/web/app.js` at `/styles.css` and `/app.js`), embedded into the binary via `go:embed` — an upload form with vanilla JS (fetch calls to `/upload` and `/api/status`). There is no separate frontend build; editing the UI means editing the files under `cmd/api/web/`.
 3. `POST /upload` (`handleVideoUpload`) validates the file extension, saves the upload to `uploads/<timestamp>_<original-filename>`, then calls `processVideo`.
 4. `processVideo` is the core pipeline: creates a per-request scratch dir under `temp/<timestamp>`, runs `ffmpeg -i <video> -vf fps=1 -y temp/<timestamp>/frame_%04d.png`, globs the resulting PNGs, zips them into `outputs/frames_<timestamp>.zip` via `createZipFile`/`addFileToZip`, then removes the temp dir (`defer os.RemoveAll`). On success the original upload in `uploads/` is deleted too, so `outputs/*.zip` is the only durable artifact.
 5. `GET /download/:filename` and `GET /api/status` just stat/serve files out of `outputs/`.
@@ -46,10 +46,10 @@ Processing is synchronous and in-request: `handleVideoUpload` blocks on the full
 
 Code, error messages, and comments in **new or changed code** SHALL be written in English, going forward. This is a change from the project's original convention (see below) — it applies prospectively, not retroactively:
 
-- Do not translate the existing Portuguese (pt-BR) strings already in `main.go` and `web/index.html` (the HTML form, existing JSON `Message`/`error` fields, existing `fmt.Printf`/`log.Printf` calls) just because you're touching a nearby line. Leave them as-is unless a change specifically asks for that.
+- Do not translate the existing Portuguese (pt-BR) strings already in `cmd/api/main.go` and `cmd/api/web/index.html` (the HTML form, existing JSON `Message`/`error` fields, existing `fmt.Printf`/`log.Printf` calls) just because you're touching a nearby line. Leave them as-is unless a change specifically asks for that.
 - Any error message, log line, or other string you add or rewrite from now on should be in English, even inside an otherwise-Portuguese function.
 - Comments: default to none. Add one only when it explains something genuinely non-obvious (a hidden constraint, a workaround, a subtle invariant) — not to restate what the code already says. When you do add one, write it in English.
-- Exception: new **user-facing UI copy** in `web/index.html` (labels, buttons, status messages shown on the page itself) and user-facing strings in `web/app.js` stay in Portuguese, matching the rest of that page — it's written for the same pt-BR hackathon audience as the existing form, and mixing languages within one UI reads as inconsistent to that audience. This exception is scoped to visible page copy only; error messages, log lines, and comments in the surrounding Go code still follow the English rule above.
+- Exception: new **user-facing UI copy** in `cmd/api/web/index.html` (labels, buttons, status messages shown on the page itself) and user-facing strings in `cmd/api/web/app.js` stay in Portuguese, matching the rest of that page — it's written for the same pt-BR hackathon audience as the existing form, and mixing languages within one UI reads as inconsistent to that audience. This exception is scoped to visible page copy only; error messages, log lines, and comments in the surrounding Go code still follow the English rule above.
 
 ## Notable constraints / gotchas
 

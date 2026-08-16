@@ -12,7 +12,7 @@ A Go web service that accepts a video upload, extracts frames at 1 fps via `ffmp
 
 ## Quickstart
 
-The server requires identity configuration (`IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY`) to start — see [docs/development.md](docs/development.md) for running it directly with `go run .`. The fastest path with no manual wiring is Docker:
+The server requires identity configuration (`IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY`) to start — see [docs/development.md](docs/development.md) for running it directly with `go run ./cmd/api`. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo

@@ -9,7 +9,7 @@ Processing is fully synchronous. The HTTP connection stays open until `ffmpeg` f
 `IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` are required at startup, and every step below runs behind bearer-token middleware:
 
 ```
-Browser                        Go server (main.go / identity.go)     PostgreSQL
+Browser                        Go server (cmd/api/main.go / identity.go)     PostgreSQL
   │                                     │                                 │
   │  POST /api/auth/register            │                                 │
   │  { email, password }                │                                 │
@@ -36,7 +36,7 @@ Browser                        Go server (main.go / identity.go)     PostgreSQL
 The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, `/api/status`, `/uploads/*`, and `/outputs/*` carries a valid bearer token; there is no unauthenticated mode.
 
 ```
-Browser                   Go server (main.go)              Filesystem
+Browser                   Go server (cmd/api/main.go)              Filesystem
   │                             │                               │
   │  POST /upload (multipart)   │                               │
   │────────────────────────────►│                               │
@@ -141,7 +141,7 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
 
 ## Frontend Interaction Sequences
 
-### Current (`web/index.html`, `web/styles.css`, `web/app.js`, served via `go:embed`)
+### Current (`cmd/api/web/index.html`, `cmd/api/web/styles.css`, `cmd/api/web/app.js`, served via `go:embed`)
 
 ```
 Page load
@@ -168,7 +168,7 @@ User submits upload form
           └─► clear the stored token, prompt to log in again
 ```
 
-`web/index.html`, `web/styles.css`, and `web/app.js` are embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
+`cmd/api/web/index.html`, `cmd/api/web/styles.css`, and `cmd/api/web/app.js` are embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
 
 ### After Phase 6 (async API)
 
@@ -187,7 +187,7 @@ User submits form
                 └─► stop polling
 ```
 
-`web/app.js` is updated in Phase 6 to implement the polling loop. `POST /upload` and `GET /api/status` remain available for backward compatibility.
+`cmd/api/web/app.js` is updated in Phase 6 to implement the polling loop. `POST /upload` and `GET /api/status` remain available for backward compatibility.
 
 ---
 

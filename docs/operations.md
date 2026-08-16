@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is a single Go binary (or `go run .`) behind a Docker container. There is no orchestration. External services are limited to a required PostgreSQL instance for identity (Phase 2) — everything else still runs with no environment-specific configuration beyond the port.
+The application is a single Go binary (or `go run ./cmd/api`) behind a Docker container. There is no orchestration. External services are limited to a required PostgreSQL instance for identity (Phase 2) — everything else still runs with no environment-specific configuration beyond the port.
 
 ### Docker
 
@@ -23,7 +23,7 @@ The Dockerfile is a multi-stage build. The default (final) stage — used by the
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8080` | Listening port (hardcoded in `main.go` as `:8080`; no env var read currently — listed here for future use) |
+| `PORT` | `8080` | Listening port (hardcoded in `cmd/api/main.go` as `:8080`; no env var read currently — listed here for future use) |
 | `GIN_MODE` | `debug` | Set to `release` to suppress Gin debug output |
 | `IDENTITY_POSTGRES_DSN` | unset | PostgreSQL connection string for the Identity module (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). Required at startup. |
 | `IDENTITY_JWT_SIGNING_KEY` | unset | Symmetric key used to sign/verify access tokens (HMAC-SHA256). Required at startup. There is no default signing key — startup fails clearly rather than falling back to one. |
@@ -69,7 +69,7 @@ Releases are automated via `release-please`. On every push to `main`, it maintai
 
 ### PostgreSQL — Implemented (Phase 2), required
 
-Authoritative state store for users (`User` aggregate), configured via `IDENTITY_POSTGRES_DSN`. Schema/migrations are applied automatically at startup (`postgres.Migrate`). The video processing schema (`video_jobs` and the transactional-outbox `video_job_outbox` table) exists too, as of Phase 3's `add-videojob-infrastructure` — `internal/video/infrastructure/postgres` implements the same `Config`/`Open`/`Migrate`/`Repository` shape, configured via `VIDEO_POSTGRES_DSN`. It is not yet in this section's "required at deployment time" scope, or in the Environment Variables table above, because nothing in `main.go` calls it yet — no composition root instantiates or migrates it. That wiring is `wire-videojob-http-endpoints`.
+Authoritative state store for users (`User` aggregate), configured via `IDENTITY_POSTGRES_DSN`. Schema/migrations are applied automatically at startup (`postgres.Migrate`). The video processing schema (`video_jobs` and the transactional-outbox `video_job_outbox` table) exists too, as of Phase 3's `add-videojob-infrastructure` — `internal/video/infrastructure/postgres` implements the same `Config`/`Open`/`Migrate`/`Repository` shape, configured via `VIDEO_POSTGRES_DSN`. It is not yet in this section's "required at deployment time" scope, or in the Environment Variables table above, because nothing in `cmd/api/main.go` calls it yet — no composition root instantiates or migrates it. That wiring is `wire-videojob-http-endpoints`.
 
 - **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
 - **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.

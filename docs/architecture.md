@@ -2,14 +2,20 @@
 
 ## Current Implementation
 
-The video-processing HTTP surface still lives in `main.go` (package `main`) — Phase 3's `cmd/api` extraction hasn't happened yet. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `main.go`'s composition root rather than a package of its own.
+The video-processing HTTP surface lives in `cmd/api/main.go` (package `main`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own.
 
 ```
 video-processor/
-  main.go          # HTTP server, router, video-processing handlers, business logic
-  identity.go       # Identity composition root: wires internal/identity into main.go's router
-  main_test.go     # Integration tests (drive the real handlers via httptest)
-  identity_test.go # Identity HTTP/middleware/ownership tests
+  cmd/
+    api/
+      main.go          # HTTP server, router, video-processing handlers, business logic
+      identity.go       # Identity composition root: wires internal/identity into main.go's router
+      main_test.go     # Integration tests (drive the real handlers via httptest)
+      identity_test.go # Identity HTTP/middleware/ownership tests
+      web/
+        index.html   # Upload form + login/register panel
+        styles.css
+        app.js
   internal/
     identity/
       domain/         # User, UserID, ports (repository, password hasher, token issuer/verifier)
@@ -66,7 +72,7 @@ No cache, no message broker.
 
 | Route | Handler | Description |
 |---|---|---|
-| `GET /` | inline | Serves embedded `web/index.html` (via `go:embed`); always public |
+| `GET /` | inline | Serves embedded `cmd/api/web/index.html` (via `go:embed`); always public |
 | `POST /api/auth/register` | `handleRegister` | Create a user account |
 | `POST /api/auth/login` | `handleLogin` | Authenticate and issue a bearer JWT |
 | `POST /upload` | `handleVideoUpload` | Accept multipart video, process synchronously; requires a bearer token |
@@ -81,11 +87,11 @@ CORS headers (`Access-Control-Allow-Origin: *`) are applied globally.
 
 ### Frontend (current)
 
-The web UI lives in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. It contains:
+The web UI lives in `cmd/api/web/index.html`, `cmd/api/web/styles.css`, and `cmd/api/web/app.js`, embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. It contains:
 
 - Plain HTML form for file selection, plus a login/register panel (Phase 2)
-- CSS in `web/styles.css`
-- Vanilla JavaScript in `web/app.js` using `fetch` to call `POST /upload`, `GET /api/status`, `POST /api/auth/register`, and `POST /api/auth/login`; the bearer token is kept in `localStorage` and attached as an `Authorization` header on protected requests
+- CSS in `cmd/api/web/styles.css`
+- Vanilla JavaScript in `cmd/api/web/app.js` using `fetch` to call `POST /upload`, `GET /api/status`, `POST /api/auth/register`, and `POST /api/auth/login`; the bearer token is kept in `localStorage` and attached as an `Authorization` header on protected requests
 
 There is no separate frontend build, no Node.js toolchain, and no bundler.
 
@@ -95,7 +101,7 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) is implemented as described below. Video Processing and Notification, and the `cmd/api`/`cmd/worker` split, remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) is implemented as described below, as is the `cmd/api` split (Phase 3's `extract-cmd-api-entrypoint`). Video Processing's HTTP wiring, Notification, and `cmd/worker` remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
@@ -110,14 +116,14 @@ The hackathon requirements include user authentication, asynchronous processing,
 ```
 video-processor/
   cmd/
-    api/        # HTTP entrypoint — replaces main.go (Phase 3+)
+    api/        # HTTP entrypoint (implemented, Phase 3) — main.go/identity.go moved here
+      web/
+        index.html  # Extracted from getHTMLForm()
+        styles.css
+        app.js
     worker/     # Async frame-extraction worker (Phase 6)
-  web/
-    index.html  # Extracted from getHTMLForm()
-    styles.css
-    app.js
   internal/
-    identity/                        # Implemented (Phase 2), wired into main.go rather than cmd/api
+    identity/                        # Implemented (Phase 2), wired into cmd/api
       domain/         # User aggregate, value objects, repository/password/token ports
       application/    # Use cases: RegisterUser, AuthenticateUser
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
@@ -131,7 +137,7 @@ video-processor/
       infrastructure/ # Email adapter, webhook adapter (Phase 7)
 ```
 
-**Migration strategy:** `main.go` remains functional during the transition. New packages are introduced alongside it. Each feature phase migrates one slice of the handler into the appropriate use case and wires it back to the HTTP layer. No big-bang rewrite.
+**Migration strategy:** `cmd/api` (formerly the repo-root `main.go`, moved by Phase 3's `extract-cmd-api-entrypoint`) remains functional during the transition. New packages are introduced alongside it. Each feature phase migrates one slice of the handler into the appropriate use case and wires it back to the HTTP layer. No big-bang rewrite.
 
 ### Infrastructure Components
 
@@ -149,7 +155,7 @@ See [docs/roadmap.md](roadmap.md) for the full phase plan.
 1. `domain` packages MUST NOT import `application`, `infrastructure`, or transport packages.
 2. `application` packages depend only on repository/port **interfaces** defined in `domain`.
 3. `infrastructure` packages implement interfaces from `domain` and may import third-party drivers.
-4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). Today, before the Phase 3 `cmd/api` extraction, `main.go`/`identity.go` play that role for Identity.
+4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). `cmd/api/main.go`/`cmd/api/identity.go` play that role for Identity today; `cmd/worker` doesn't exist yet (Phase 6).
 5. No bounded context may import another context's `domain` or `application` packages directly. Each context defines and owns its own local value object for any identifier that crosses a boundary (e.g. `identity.UserID` and `video.UserID` are distinct types) — cross-context communication uses domain events or translation at the composition root, never a package shared between contexts' `domain` layers. There is no `pkg/` directory; a shared kernel was considered for the crossing `UserID` and rejected as tighter coupling than this architecture's context-independence goal justifies (see `add-videojob-domain-and-application`'s `design.md` in `openspec/changes/archive/`).
 
 Rules 1–3 for `internal/identity/{domain,application}` and `internal/video/{domain,application}` are each enforced by an automated test (`internal/identity/dependency_rules_test.go`, `internal/video/dependency_rules_test.go`), not just convention.
