@@ -1,0 +1,39 @@
+## 1. Schema
+
+- [ ] 1.1 Write `internal/video/infrastructure/postgres/schema.sql`: `video_jobs` table (id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at) with a `(user_id, created_at DESC, id ASC)` index
+- [ ] 1.2 Add `video_job_outbox` table to the same schema file (id, event_type, payload jsonb, occurred_at, published_at nullable)
+
+## 2. ID Generator Adapter
+
+- [ ] 2.1 `internal/video/infrastructure/idgen/idgen.go`: `Adapter` implementing `domain.VideoJobIDGenerator` and `domain.VideoJobIDParser` via UUID v4, mirroring `internal/identity/infrastructure/idgen`
+- [ ] 2.2 Unit tests for the adapter (valid generation, valid/invalid parsing) mirroring `internal/identity/infrastructure/idgen/idgen_test.go`
+
+## 3. PostgreSQL Repository Adapter
+
+- [ ] 3.1 `internal/video/infrastructure/postgres/config.go`: `Config`/`LoadConfigFromEnv` reading `VIDEO_POSTGRES_DSN`, mirroring identity's `ErrDSNRequired` fail-fast behavior
+- [ ] 3.2 `internal/video/infrastructure/postgres/db.go`: `Open(cfg Config) (*sql.DB, error)` mirroring identity's
+- [ ] 3.3 `internal/video/infrastructure/postgres/migrate.go`: `Migrate(ctx, db) error` embedding `schema.sql`, idempotent `CREATE TABLE/INDEX IF NOT EXISTS`
+- [ ] 3.4 `internal/video/infrastructure/postgres/repository.go`: `Repository` struct wired with `*sql.DB` and a `domain.VideoJobIDParser`; implement `FindByID` and `FindByUserID` (parameterized queries, `domain.RestoreVideoJob` reconstruction, `domain.ErrVideoJobNotFound` on no rows)
+- [ ] 3.5 Implement `Repository.Create`: single transaction inserting the `video_jobs` row and a `video_job.created` outbox row (payload fields: `type`, `job_id`, `user_id`, `original_filename`, `occurred_at`, matching `docs/domain-model.md`'s documented `VideoJobCreated` shape); roll back and return the error if either insert fails
+- [ ] 3.6 `var _ domain.VideoJobRepository = (*Repository)(nil)` compile-time assertion
+
+## 4. Tests
+
+- [ ] 4.1 `internal/video/infrastructure/postgres/repository_test.go`: env-var-gated integration tests (`VIDEO_POSTGRES_TEST_DSN`, skip if unset) mirroring identity's `testDB` helper pattern (open, migrate, truncate `video_jobs` and `video_job_outbox` before each test)
+- [ ] 4.2 Test: `Create` then `FindByID` round-trips all fields correctly
+- [ ] 4.3 Test: `FindByID` returns `domain.ErrVideoJobNotFound` for an unknown ID
+- [ ] 4.4 Test: `FindByUserID` scopes to the caller's `UserID`, orders `CreatedAt` descending with `VideoJobID` ascending tie-break, and respects offset/limit
+- [ ] 4.5 Test: `Create` writes a matching `video_job_outbox` row (`event_type = 'video_job.created'`, payload fields, `published_at IS NULL`)
+- [ ] 4.6 Test: a `Create` that fails to insert the `video_jobs` row (duplicate ID) leaves no `video_job_outbox` row committed
+
+## 5. Local Dev / CI Wiring (config only, no application wiring)
+
+- [ ] 5.1 Add `VIDEO_POSTGRES_DSN`/`VIDEO_POSTGRES_TEST_DSN` to the `app` and `app-test` services in `docker-compose.yml`, pointing at the same instance/database as `IDENTITY_POSTGRES_DSN`/`IDENTITY_POSTGRES_TEST_DSN`, with a comment noting they're intentionally identical for now
+- [ ] 5.2 Add `VIDEO_POSTGRES_TEST_DSN` to `.github/workflows/ci.yml`'s `Test` step env, pointing at the same CI Postgres service identity already uses
+
+## 6. Validation
+
+- [ ] 6.1 `go vet ./...` passes
+- [ ] 6.2 `go test ./... -v` passes (non-Postgres-gated tests; `ffmpeg` on `PATH` or via `docker compose run --build --rm app-test go test ./... -v`)
+- [ ] 6.3 `docker compose run --build --rm app-test go test ./... -v` passes with `VIDEO_POSTGRES_TEST_DSN` set, exercising the new integration tests against real PostgreSQL
+- [ ] 6.4 `gosec ./...` and `govulncheck ./...` clean
