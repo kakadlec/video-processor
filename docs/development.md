@@ -179,7 +179,7 @@ Green CI does not authorize a merge. An agent may merge only when the user expli
 
 ### Branch Protection
 
-`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. A PR is not mergeable until all three pass and the branch is up to date with `main`.
+`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. All review conversations must also be resolved before merge, including inline threads opened by GitHub Copilot. A PR is not mergeable until all three checks pass, the branch is up to date with `main`, and no review thread remains unresolved. This protection is enforced for administrators too.
 
 ```bash
 git fetch origin
@@ -194,14 +194,26 @@ Branch from freshly-fetched `origin/main` rather than from whatever is currently
 
 This repository has a `copilot_code_review` branch ruleset that automatically requests a GitHub Copilot review the first time each pull request opens. `review_on_push` is off, so later commits pushed to an already-reviewed PR do **not** trigger a fresh automatic review — request one manually if a substantial follow-up change warrants a new pass.
 
-Before reporting a PR-related task complete, check that PR for review comments (automatic and human) and address the ones that make sense:
+Before reporting a PR-related task complete, check that PR for review comments (automatic and human), inspect the merge state, and address the findings that make sense:
 
 ```bash
-gh pr view <n> --json reviews
+gh pr view <n> --json reviews,mergeable,mergeStateStatus
 gh api repos/{owner}/{repo}/pulls/{n}/comments
+
+# Resolution state is available through GraphQL, not the REST comments list above.
+gh api graphql \
+  -F owner='{owner}' -F repo='{repo}' -F number=<n> \
+  -f query='query($owner:String!,$repo:String!,$number:Int!){
+    repository(owner:$owner,name:$repo){pullRequest(number:$number){
+      reviewThreads(first:100){nodes{
+        isResolved comments(first:10){nodes{author{login} body url}}
+      }}
+    }}
+  }' \
+  --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
 
-Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a change, say why rather than leaving it unaddressed silently. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean there's nothing coming.
+The final GraphQL command must return `[]` before the PR is considered complete. Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a code change, document why and still resolve the conversation rather than leaving it silently open. `gh pr checks` does not report unresolved conversations as a failed CI check; GitHub exposes the condition through the PR's blocked merge state and enforces it server-side when merging. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean there's nothing coming.
 
 ### Validation and Handoff
 
