@@ -124,7 +124,7 @@ video-processor/
     video/
       domain/         # VideoJob aggregate, value objects, events, repository interface
       application/    # Use cases: CreateVideoJob, EnqueueVideoJob, GetJobStatus, …
-      infrastructure/ # PostgreSQL adapter, MinIO adapter, RabbitMQ publisher (Phases 3–6)
+      infrastructure/ # PostgreSQL adapter (implemented, Phase 3 — not yet wired into a composition root), MinIO adapter, RabbitMQ publisher (Phases 5–6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
@@ -137,7 +137,7 @@ video-processor/
 
 | Component | Role | Status |
 |---|---|---|
-| PostgreSQL | Authoritative state store for users (jobs/outbox tables land in Phase 3) | **Implemented** (Phase 2), required at deployment time — see [docs/operations.md](operations.md) |
+| PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, not yet wired into a composition root), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache, distributed locks | Planned (Phase 4) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
