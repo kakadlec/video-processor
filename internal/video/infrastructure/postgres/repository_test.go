@@ -68,6 +68,10 @@ func TestRepository_CreateAndFindByID(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
+	// See schema.sql's comment on video_jobs.created_at: TIMESTAMPTZ is
+	// microsecond-precision, so an untruncated time.Now() would not
+	// round-trip exactly and this test's own CreatedAt assertion below
+	// would fail on a real (not fake) precision boundary, not a bug.
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	job := newTestJob(t, ids, "user-1", "video.mp4", now)
 
@@ -246,6 +250,9 @@ func TestRepository_Create_RecordsOutboxEvent(t *testing.T) {
 	}
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		t.Fatalf("unexpected error unmarshaling payload: %v", err)
+	}
+	if payload.Type != "video_job.created" {
+		t.Fatalf("payload.Type = %q, want %q", payload.Type, "video_job.created")
 	}
 	if payload.JobID != job.ID().String() {
 		t.Fatalf("payload.JobID = %q, want %q", payload.JobID, job.ID().String())

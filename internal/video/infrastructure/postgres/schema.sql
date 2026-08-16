@@ -6,6 +6,15 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     frame_count INTEGER NOT NULL DEFAULT 0,
     error_reason TEXT NOT NULL DEFAULT '',
     storage_key TEXT NOT NULL DEFAULT '',
+    -- PostgreSQL's TIMESTAMPTZ has microsecond resolution, one order of
+    -- magnitude coarser than Go's time.Time (nanosecond). A CreatedAt with a
+    -- non-zero sub-microsecond component will not round-trip exactly through
+    -- this column — the same latent constraint identity's created_at column
+    -- already has. No code currently depends on sub-microsecond CreatedAt
+    -- equality; whichever future change wires a real (non-fake) Clock for
+    -- this context should truncate to microsecond precision at that source,
+    -- not here, so the in-memory aggregate and the persisted row agree from
+    -- the moment the timestamp is minted.
     created_at TIMESTAMPTZ NOT NULL
 );
 
