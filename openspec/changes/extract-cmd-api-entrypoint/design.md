@@ -35,7 +35,8 @@ Two mechanics make this more than a bare `git mv`:
 ## Risks / Trade-offs
 
 - [Risk] Missing a cwd-relative path somewhere in `main_test.go`/`identity_test.go` that the chdir fix doesn't cover, causing a silent test-data location bug. → Mitigation: the design was informed by an explicit grep across both files for `ReadFile`/`WriteFile`/`filepath.Join`/`ReadDir`/`Open`/`MkdirAll`/`TempDir`; every hit is either one of the three known directories or `t.TempDir()`. `go test ./... -v` passing locally (or via the Docker fallback) after the move is the acceptance check, not just a code-review read-through.
-- [Risk] Forgetting a doc/config file that still references the old `main.go` path. → Mitigation: this proposal explicitly scopes doc updates (`CLAUDE.md`, `docs/architecture.md`, `docs/roadmap.md`) to the finalization PR per this repo's PR-sequencing rules, so they aren't silently skipped — tasks.md tracks them there, not here.
+- [Risk] Forgetting a doc/config file that still references the old `main.go`/`web/` paths. → Mitigation: this proposal's Impact section enumerates every permanent doc with a stale reference (`CLAUDE.md`, `README.md`, `docs/architecture.md`, `docs/development.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/operations.md`, `docs/roadmap.md`), scoped to the finalization PR per this repo's PR-sequencing rules, and `tasks.md` tracks the update there — not just the three files an earlier draft of this proposal named.
+- [Risk] The canonical `ddd-architecture` spec's "Frontend as Presentation/Delivery Layer" requirement names `web/index.html`/`web/styles.css`/`web/app.js` directly — if the delta only touched "Monorepo Package Topology," archiving this change would leave that requirement describing paths that no longer exist. → Mitigation: this change's delta spec includes a full `MODIFIED` block for that requirement too, with every path updated to `cmd/api/web/...`.
 
 ## Migration Plan
 

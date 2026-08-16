@@ -18,11 +18,11 @@ The composition root for HTTP is still `main.go` at the repo root, a leftover fr
 
 ### Modified Capabilities
 
-- `ddd-architecture`: the "Monorepo Package Topology Is the Target Structure" requirement's scenario "Each cmd entrypoint produces an independent deployable binary" moves from anticipated to actually true for `cmd/api` — `main.go` no longer exists at the repo root once this change ships.
+- `ddd-architecture`: the "Monorepo Package Topology Is the Target Structure" requirement's scenario "Each cmd entrypoint produces an independent deployable binary" moves from anticipated to actually true for `cmd/api` — `main.go` no longer exists at the repo root once this change ships. The "Frontend as Presentation/Delivery Layer" requirement also needs its `web/index.html`/`web/styles.css`/`web/app.js` path references updated to `cmd/api/web/...`, since those files move too.
 
 ## Impact
 
 - **Moved**: `main.go`, `identity.go`, `main_test.go`, `identity_test.go`, `web/*` → `cmd/api/`.
 - **Changed**: `Dockerfile` build command.
-- **Not in scope for the implementation PR** (finalization PR only, per this repo's PR-scope rules): `CLAUDE.md`'s `go run .` / `go build -o app .` command docs, `docs/architecture.md`'s Target Package Topology tree and Dependency Rules note, `docs/roadmap.md` row status.
+- **Not in scope for the implementation PR** (finalization PR only, per this repo's PR-scope rules) — every permanent doc with a stale `main.go`/`go run .`/`go build -o app .`/`web/` reference once the move lands: `CLAUDE.md`, `README.md`, `docs/architecture.md` (Target Package Topology tree, Dependency Rules note, Current Implementation section), `docs/development.md` (run/build commands), `docs/domain-model.md` (composition-root reference), `docs/flows.md` (sequence-diagram labels, frontend section), `docs/operations.md` (`go run .`, `PORT` description), `docs/roadmap.md` (Change Backlog row status).
 - No change to `go.mod`, `docker-compose.yml`, or `.github/workflows/ci.yml` — all three already operate on `./...` or the module root and need no path update.
