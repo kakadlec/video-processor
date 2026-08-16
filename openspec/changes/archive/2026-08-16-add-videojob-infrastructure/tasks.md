@@ -37,4 +37,4 @@
 - [x] 6.1 `go vet ./...` passes
 - [x] 6.2 `go test ./... -v` passes (non-Postgres-gated tests; `ffmpeg` on `PATH` or via `docker compose run --build --rm app-test go test ./... -v`)
 - [x] 6.3 `docker compose run --build --rm app-test go test ./... -v` passes with `VIDEO_POSTGRES_TEST_DSN` set, exercising the new integration tests against real PostgreSQL
-- [x] 6.4 `gosec ./...` and `govulncheck ./...` clean
+- [x] 6.4 `gosec ./...` and `govulncheck ./...` clean, verified by CI's `SAST (gosec)` and `Vulnerability Scan (govulncheck)` required checks (neither tool was run locally for this change)

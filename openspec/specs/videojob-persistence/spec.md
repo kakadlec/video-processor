@@ -22,6 +22,12 @@ Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in th
 - **WHEN** `Repository.FindByID` is called with that ID
 - **THEN** it returns `domain.ErrVideoJobNotFound`
 
+#### Scenario: FindByUserID orders by CreatedAt descending
+
+- **GIVEN** `VideoJob`s persisted for the same `UserID` with distinct `CreatedAt` values
+- **WHEN** `Repository.FindByUserID` is called
+- **THEN** the returned jobs are ordered newest-`CreatedAt`-first
+
 #### Scenario: FindByUserID orders and paginates via the stored index
 
 - **GIVEN** multiple `VideoJob`s persisted for the same `UserID`, some with equal `CreatedAt` values
@@ -43,3 +49,9 @@ Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in th
 - **GIVEN** `Repository.Create` is called with a `VideoJob` whose insert into `video_jobs` violates a database constraint (e.g. a duplicate ID)
 - **WHEN** the call returns an error
 - **THEN** no corresponding `video_job_outbox` row was committed
+
+#### Scenario: A failed outbox insert leaves no job row
+
+- **GIVEN** `Repository.Create` is called and the `video_jobs` insert succeeds but the subsequent `video_job_outbox` insert fails
+- **WHEN** the call returns an error
+- **THEN** no corresponding `video_jobs` row was committed either — the transaction rolls back both writes, not just the one that failed

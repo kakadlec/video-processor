@@ -125,7 +125,7 @@ All events are serialized as JSON. The `type` field is the canonical discriminat
 
 | Event | JSON fields | Crosses context boundary? | Status |
 |---|---|---|---|
-| `VideoJobCreated` | `type`, `job_id`, `user_id`, `original_filename`, `occurred_at` | No (internal) | Planned (Phase 3+) |
+| `VideoJobCreated` | `type`, `job_id`, `user_id`, `original_filename`, `occurred_at` | No (internal) | **Recorded** (Phase 3): `internal/video/infrastructure/postgres.Repository.Create` writes this exact payload to the `video_job_outbox` table transactionally with the `video_jobs` row — not yet published anywhere, since nothing consumes it (marked "No" cross-context above) |
 | `VideoJobQueued` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
 | `VideoJobStarted` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
 | `VideoJobCompleted` | `type`, `job_id`, `user_id`, `frame_count`, `storage_key`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
@@ -133,7 +133,7 @@ All events are serialized as JSON. The `type` field is the canonical discriminat
 | `UserRegistered` | `type`, `user_id`, `email`, `occurred_at` | Yes (optionally) — Identity → Notification | Planned — deferred until Notification (Phase 7) needs it; Identity itself (Phase 2) is implemented |
 | `UserAuthenticated` | `type`, `user_id`, `occurred_at` | No (internal) | Planned; not emitted by the current `AuthenticateUser` use case |
 
-Integration events that cross context boundaries are published to RabbitMQ (Phase 6). Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
+Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay; `video_job_outbox` (Phase 3) is where such events are recorded ahead of that relay existing — see `openspec/specs/videojob-persistence/spec.md`. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
 
 ---
 
