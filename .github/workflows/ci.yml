@@ -46,6 +46,9 @@ jobs:
       - name: Test
         env:
           IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
+          # Same CI Postgres service and database as IDENTITY_POSTGRES_TEST_DSN —
+          # video_jobs/video_job_outbox coexist with identity_users there.
+          VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
         run: go test ./... -v
 
   sast:
