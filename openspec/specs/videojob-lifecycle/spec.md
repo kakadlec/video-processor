@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the `VideoJob` aggregate's creation, status-query, and listing behavior in the Video Processing bounded context's `domain` and `application` layers — the `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs` use cases, and the pure `JobStatus` transition-validity function they rely on. No infrastructure, HTTP route, or state-transition use case (`EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob`) is in scope here — see `ddd-architecture` for the aggregate's full canonical shape and the Change Backlog in `docs/roadmap.md` for what completes it.
+Define the `VideoJob` aggregate's creation, status-query, and listing behavior in the Video Processing bounded context's `domain` and `application` layers — the `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs` use cases, plus the pure `JobStatus` transition-validity function, included here as an independently specified and tested piece of the aggregate even though none of the three use cases calls it. No infrastructure, HTTP route, or state-transition use case (`EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob`) is in scope here — see `ddd-architecture` for the aggregate's full canonical shape and the Change Backlog in `docs/roadmap.md` for what completes it.
 
 ## Requirements
 
@@ -74,7 +74,7 @@ The `GetJobStatus` use case SHALL return a `VideoJob`'s current status only when
 
 ### Requirement: ListUserJobs Returns Only the Caller's Own Jobs, Paginated in a Stable Order
 
-The `ListUserJobs` use case SHALL return only `VideoJob`s owned by the requesting `UserID`, ordered by `CreatedAt` descending (newest first) with `VideoJobID` as a tie-breaker for equal `CreatedAt` values, bounded by an offset and limit. `limit` SHALL be between 1 and 100 inclusive; `offset` SHALL be ≥ 0. A request outside those bounds SHALL be rejected with an error rather than silently clamped.
+The `ListUserJobs` use case SHALL return only `VideoJob`s owned by the requesting `UserID`, ordered by `CreatedAt` descending (newest first) with `VideoJobID` ascending as a tie-breaker for equal `CreatedAt` values, bounded by an offset and limit. `limit` SHALL be between 1 and 100 inclusive; `offset` SHALL be ≥ 0. A request outside those bounds SHALL be rejected with an error rather than silently clamped.
 
 #### Scenario: Listing is scoped to the caller
 
@@ -87,6 +87,12 @@ The `ListUserJobs` use case SHALL return only `VideoJob`s owned by the requestin
 - **GIVEN** `UserID` A owns multiple `VideoJob`s created at different times
 - **WHEN** `ListUserJobs.Execute` is called with `UserID` A
 - **THEN** the returned list is ordered by `CreatedAt` descending
+
+#### Scenario: Equal CreatedAt values are broken by ascending VideoJobID
+
+- **GIVEN** `UserID` A owns two or more `VideoJob`s with the same `CreatedAt`
+- **WHEN** `ListUserJobs.Execute` is called with `UserID` A
+- **THEN** those jobs appear in ascending `VideoJobID` order relative to each other
 
 #### Scenario: Offset and limit bound the returned page
 
