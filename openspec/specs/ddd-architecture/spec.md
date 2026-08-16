@@ -204,7 +204,7 @@ The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/w
 
 ### Requirement: Frontend as Presentation/Delivery Layer
 
-The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and `web/app.js`, embedded into the binary via `go:embed` and served as `GET /`, `GET /styles.css`, and `GET /app.js` respectively) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
+The web frontend (HTML/CSS/JavaScript in `cmd/api/web/index.html`, `cmd/api/web/styles.css`, and `cmd/api/web/app.js`, embedded into the binary via `go:embed` and served as `GET /`, `GET /styles.css`, and `GET /app.js` respectively) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
 
 #### Scenario: Frontend is not a bounded context
 
@@ -214,7 +214,7 @@ The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and
 
 #### Scenario: Frontend extraction preserves GET / behavior
 
-- **GIVEN** `web/index.html`, `web/styles.css`, and `web/app.js` have been extracted from `getHTMLForm()` and are served via `go:embed`
+- **GIVEN** `cmd/api/web/index.html`, `cmd/api/web/styles.css`, and `cmd/api/web/app.js` have been extracted from `getHTMLForm()` and are served via `go:embed`
 - **WHEN** a browser requests `GET /`
 - **THEN** the server returns HTTP 200 with the HTML page and the page renders without JavaScript errors
 
@@ -228,7 +228,7 @@ The web frontend (HTML/CSS/JavaScript in `web/index.html`, `web/styles.css`, and
 
 - **GIVEN** a backend change adds, renames, or removes an HTTP endpoint consumed by the frontend
 - **WHEN** the change is being specified and implemented
-- **THEN** the same OpenSpec change SHALL include a task to update `web/app.js` to reflect the new contract
+- **THEN** the same OpenSpec change SHALL include a task to update `cmd/api/web/app.js` to reflect the new contract
 
 #### Scenario: Full-flow non-regression passes at each phase
 
