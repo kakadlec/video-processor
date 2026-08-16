@@ -121,6 +121,14 @@ func TestRestoreVideoJob_CompletedStatusWithoutStorageKeyRejected(t *testing.T) 
 	}
 }
 
+func TestRestoreVideoJob_FailedStatusWithoutErrorReasonRejected(t *testing.T) {
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusFailed, time.Now())
+	if !errors.Is(err, domain.ErrErrorReasonRequiresFailedStatus) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrErrorReasonRequiresFailedStatus)
+	}
+}
+
 func TestRestoreVideoJob_NegativeFrameCountRejected(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, -1, "", domain.JobStatusPending, time.Now())

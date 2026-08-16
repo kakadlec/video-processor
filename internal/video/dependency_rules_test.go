@@ -3,6 +3,7 @@ package video_test
 import (
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,20 +36,26 @@ func TestDomainAndApplicationPackages_DoNotImportForbiddenDependencies(t *testin
 func checkPackageDependencies(t *testing.T, dir string) {
 	t.Helper()
 
-	entries, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	var entries []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		entries = append(entries, path)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("failed to glob %s: %v", dir, err)
+		t.Fatalf("failed to walk %s: %v", dir, err)
 	}
 	if len(entries) == 0 {
-		t.Fatalf("no .go files found in %q — dependency check would pass vacuously", dir)
+		t.Fatalf("no .go files found under %q — dependency check would pass vacuously", dir)
 	}
 
 	fset := token.NewFileSet()
 	for _, path := range entries {
-		if strings.HasSuffix(path, "_test.go") {
-			continue
-		}
-
 		file, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
 		if err != nil {
 			t.Fatalf("failed to parse %s: %v", path, err)

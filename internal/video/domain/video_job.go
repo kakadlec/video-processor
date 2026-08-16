@@ -28,8 +28,12 @@ var ErrFrameCountNegative = errors.New("video: frame count must not be negative"
 var ErrFrameCountRequiresCompletedStatus = errors.New("video: non-zero frame count requires completed status")
 
 // ErrErrorReasonRequiresFailedStatus is returned when constructing a
-// VideoJob with a non-empty ErrorReason whose status is not failed.
-var ErrErrorReasonRequiresFailedStatus = errors.New("video: error reason requires failed status")
+// VideoJob whose ErrorReason is set but status is not failed, or whose
+// status is failed but ErrorReason is empty — the canonical aggregate
+// scenario requires a failed job to always carry a non-empty reason, so
+// corrupted persistence data must not be able to enter the domain as a
+// valid aggregate.
+var ErrErrorReasonRequiresFailedStatus = errors.New("video: error reason and failed status must be set together")
 
 // ErrStorageKeyRequiresCompletedStatus is returned when constructing a
 // VideoJob whose StorageKey is set but status is not completed, or whose
@@ -88,7 +92,7 @@ func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, st
 	if frameCount != 0 && status != JobStatusCompleted {
 		return nil, ErrFrameCountRequiresCompletedStatus
 	}
-	if errorReason != "" && status != JobStatusFailed {
+	if (errorReason == "") == (status == JobStatusFailed) {
 		return nil, ErrErrorReasonRequiresFailedStatus
 	}
 	if storageKey.IsZero() == (status == JobStatusCompleted) {
