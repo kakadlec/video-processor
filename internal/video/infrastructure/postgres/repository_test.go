@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -119,7 +120,39 @@ func TestRepository_FindByID_NotFound(t *testing.T) {
 	}
 }
 
-func TestRepository_FindByUserID_OrdersAndPaginates(t *testing.T) {
+func TestRepository_FindByUserID_OrdersByCreatedAtDescending(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	older := newTestJob(t, ids, "user-1", "older.mp4", time.Now().UTC().Add(-time.Hour))
+	newer := newTestJob(t, ids, "user-1", "newer.mp4", time.Now().UTC())
+	if err := repo.Create(ctx, older); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := repo.Create(ctx, newer); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	userID, err := domain.NewUserID("user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	jobs, err := repo.FindByUserID(ctx, userID, 0, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("len(jobs) = %d, want 2", len(jobs))
+	}
+	if !jobs[0].ID().Equal(newer.ID()) || !jobs[1].ID().Equal(older.ID()) {
+		t.Fatalf("jobs = [%v, %v], want [newer, older] (CreatedAt descending)", jobs[0].ID(), jobs[1].ID())
+	}
+}
+
+func TestRepository_FindByUserID_TieBreaksByAscendingIDAndPaginates(t *testing.T) {
 	db := testDB(t)
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
@@ -153,16 +186,9 @@ func TestRepository_FindByUserID_OrdersAndPaginates(t *testing.T) {
 		t.Fatalf("len(page) = %d, want 2", len(page))
 	}
 
-	wantIDs := []string{mine[0].ID().String(), mine[1].ID().String(), mine[2].ID().String()}
-	sortedWant := append([]string(nil), wantIDs...)
+	sortedWant := []string{mine[0].ID().String(), mine[1].ID().String(), mine[2].ID().String()}
 	// All three jobs share CreatedAt, so ascending VideoJobID breaks the tie.
-	for i := 0; i < len(sortedWant); i++ {
-		for j := i + 1; j < len(sortedWant); j++ {
-			if sortedWant[j] < sortedWant[i] {
-				sortedWant[i], sortedWant[j] = sortedWant[j], sortedWant[i]
-			}
-		}
-	}
+	sort.Strings(sortedWant)
 
 	got := []string{page[0].ID().String(), page[1].ID().String()}
 	want := sortedWant[:2]
@@ -263,5 +289,40 @@ func TestRepository_Create_DuplicateID_LeavesNoOutboxRow(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("outbox row count = %d, want 1 (only the first, successful Create)", count)
+	}
+}
+
+// TestRepository_Create_OutboxInsertFailure_RollsBackJobRow exercises the
+// direction the duplicate-ID test above cannot: it lets the video_jobs
+// insert succeed and forces the video_job_outbox insert to fail, so only a
+// genuinely transactional Create passes. A non-transactional implementation
+// (two independent inserts) would leave an orphaned video_jobs row here.
+func TestRepository_Create_OutboxInsertFailure_RollsBackJobRow(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE video_job_outbox"); err != nil {
+		t.Fatalf("unexpected error dropping outbox table: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := postgres.Migrate(context.Background(), db); err != nil {
+			t.Fatalf("unexpected error re-migrating schema: %v", err)
+		}
+	})
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
+	if err := repo.Create(ctx, job); err == nil {
+		t.Fatal("expected an error when the outbox insert fails, got nil")
+	}
+
+	var count int
+	row := db.QueryRowContext(ctx, `SELECT count(*) FROM video_jobs WHERE id = $1`, job.ID().String())
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("unexpected error counting video_jobs rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("video_jobs row count = %d, want 0 (the transaction must roll back the job insert too)", count)
 	}
 }
