@@ -133,7 +133,7 @@ All events are serialized as JSON. The `type` field is the canonical discriminat
 | `UserRegistered` | `type`, `user_id`, `email`, `occurred_at` | Yes (optionally) — Identity → Notification | Planned — deferred until Notification (Phase 7) needs it; Identity itself (Phase 2) is implemented |
 | `UserAuthenticated` | `type`, `user_id`, `occurred_at` | No (internal) | Planned; not emitted by the current `AuthenticateUser` use case |
 
-Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay; `video_job_outbox` (Phase 3) is where such events are recorded ahead of that relay existing — see `openspec/specs/videojob-persistence/spec.md`. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
+Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay. `video_job_outbox` (Phase 3) is that relay's future source table, but today it only records `VideoJobCreated` — an internal event, not one of the two that actually cross to Notification (`VideoJobCompleted`, `VideoJobFailed`). Those two remain fully "Planned": no code writes them anywhere yet, since the use cases that would (`CompleteJob`, `FailJob`) don't exist yet either. See `openspec/specs/videojob-persistence/spec.md` for what `video_job_outbox` currently does. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
 
 ---
 
