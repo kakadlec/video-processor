@@ -35,12 +35,19 @@ type ProcessingResult struct {
 func main() {
 	createDirs()
 
-	identity, _, err := setupIdentity(context.Background())
+	ctx := context.Background()
+
+	identity, _, err := setupIdentity(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	r := setupRouterWithIdentity(identity)
+	video, _, err := setupVideo(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	r := setupRouter(identity, video)
 
 	fmt.Println("🎬 Servidor iniciado na porta 8080")
 	fmt.Println("📂 Acesse: http://localhost:8080")
@@ -57,7 +64,7 @@ func serveEmbeddedFile(c *gin.Context, path, contentType string) {
 	c.Data(200, contentType, data)
 }
 
-func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
+func setupRouter(identity *identityModule, video *videoModule) *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -107,6 +114,8 @@ func setupRouterWithIdentity(identity *identityModule) *gin.Engine {
 	videoRoutes.POST("/upload", handleVideoUpload)
 	videoRoutes.GET("/download/:filename", handleDownload)
 	videoRoutes.GET("/api/status", handleStatus)
+
+	video.registerRoutes(videoRoutes)
 
 	identity.registerRoutes(r)
 

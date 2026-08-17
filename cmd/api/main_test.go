@@ -86,7 +86,7 @@ func assertTempDirClean(t *testing.T) {
 func startTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouterWithIdentity(module))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
 	t.Cleanup(srv.Close)
 
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
