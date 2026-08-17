@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/kakadlec/video-processor/compare/v0.7.0...v0.8.0) (2026-08-17)
+
+
+### Features
+
+* add PostgreSQL adapter for VideoJob with transactional outbox ([#120](https://github.com/kakadlec/video-processor/issues/120)) ([34dc140](https://github.com/kakadlec/video-processor/commit/34dc140e78c01eae6b1e5f234bb68a0fd894c734))
+* add repo-workflow and change-lifecycle Claude Code skills ([#98](https://github.com/kakadlec/video-processor/issues/98)) ([96fb06b](https://github.com/kakadlec/video-processor/commit/96fb06b912e58d65957b9cc95c2a27a47e2b0250))
+* add VideoJob domain and application layers ([#116](https://github.com/kakadlec/video-processor/issues/116)) ([cf19322](https://github.com/kakadlec/video-processor/commit/cf19322f9fcd04624152f83b5931aedf5528aa19))
+* extract frontend into static files served via go:embed ([#110](https://github.com/kakadlec/video-processor/issues/110)) ([c40a755](https://github.com/kakadlec/video-processor/commit/c40a755964d6074541e028d9abff4458895d2b0d))
+* make roadmap-status flip and explore criteria row-optional ([#102](https://github.com/kakadlec/video-processor/issues/102)) ([67d0def](https://github.com/kakadlec/video-processor/commit/67d0def9f7f705f7f285ea91db8a18ccc5f0fc23))
+* wire VideoJob use cases into HTTP endpoints ([#128](https://github.com/kakadlec/video-processor/issues/128)) ([13cd6cf](https://github.com/kakadlec/video-processor/commit/13cd6cf5c2e7901642f8a4835b986e8a77944886))
+
 ## [0.7.0](https://github.com/kakadlec/video-processor/compare/v0.6.0...v0.7.0) (2026-08-09)
 
 
