@@ -22,6 +22,12 @@ type ProcessVideoJobResult struct {
 	ImageNames    []string
 	StorageKey    string
 	FailureReason string
+	// ExtractionError is the domain.FrameExtractor error that caused
+	// Success to be false, unwrapped so a caller can classify it (e.g. via
+	// errors.Is against a specific infrastructure adapter's sentinel
+	// errors) to choose its own user-facing message, instead of exposing
+	// FailureReason's raw text directly. Nil when Success is true.
+	ExtractionError error
 }
 
 // ProcessVideoJob runs a VideoJob's enqueue/start-processing/extract
@@ -68,10 +74,16 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 		if reason == "" {
 			reason = fallbackFailureReason
 		}
-		if _, err := uc.fail.Execute(ctx, FailJobInput{JobID: jobID, Reason: reason}); err != nil {
+		// A detached context, not ctx: extractErr may itself be the result
+		// of ctx being canceled (exec.CommandContext killing ffmpeg), and
+		// this write must still succeed so the job reaches "failed" rather
+		// than being stuck wherever it was.
+		finalizeCtx, cancel := NewFinalizationContext()
+		defer cancel()
+		if _, err := uc.fail.Execute(finalizeCtx, FailJobInput{JobID: jobID, Reason: reason}); err != nil {
 			return ProcessVideoJobResult{}, err
 		}
-		return ProcessVideoJobResult{JobID: jobID, Success: false, FailureReason: reason}, nil
+		return ProcessVideoJobResult{JobID: jobID, Success: false, FailureReason: reason, ExtractionError: extractErr}, nil
 	}
 
 	return ProcessVideoJobResult{
