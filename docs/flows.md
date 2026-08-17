@@ -54,10 +54,16 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
   │                        │                            │─────────────────►│
   │                        │                            │  (blocks)        │
   │                        │                            │◄─────────────────│
-  │                        │    Complete / Fail          │                 │
+  │                        │    Fail if extraction failed│                 │
+  │                        │    (job stays "processing"  │                 │
+  │                        │     if extraction succeeded)│                 │
   │                        │───────────────────────────►│                  │
-  │                        │  Remove temp/, uploads/<file>│                │
+  │                        │  Remove temp/, uploads/<file>,│               │
+  │                        │  record output artifact ownership│            │
   │                        │───────────────────────────────────────────────►│
+  │                        │    Complete if ownership recorded,│           │
+  │                        │    else Fail                │                 │
+  │                        │───────────────────────────►│                  │
   │◄───────────────────────│                            │                  │
   │  200 { success, zip_path,│                           │                 │
   │        frame_count, images}│                         │                 │

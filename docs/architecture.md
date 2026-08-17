@@ -55,14 +55,19 @@ Browser / client
         │    ├─ EnqueueVideoJob                     (pending → queued)
         │    ├─ StartProcessing                      (queued → processing)
         │    ├─ FrameExtractor.ExtractFrames (infrastructure/ffmpeg):
-        │    │    ├─ exec ffmpeg -i <video> -vf fps=1 temp/<jobID>/frame_%04d.png
+        │    │    ├─ exec.CommandContext ffmpeg -i <video> -vf fps=1 temp/<jobID>/frame_%04d.png
         │    │    ├─ Glob PNGs from temp/<jobID>/
         │    │    ├─ Write outputs/frames_<jobID>.zip
         │    │    └─ Remove temp/<jobID>/            (defer, always)
-        │    └─ CompleteJob or FailJob                (processing → completed/failed)
+        │    └─ FailJob if extraction failed          (processing → failed)
+        │         (on success, job stays "processing" — see below)
         ├─ Remove uploads/<file>                    (on success only)
+        ├─ Record output artifact ownership
+        ├─ CompleteJob if that succeeded, else FailJob (processing → completed/failed)
         └─ Return JSON { success, message, zip_path, frame_count, images }
 ```
+
+`ProcessVideoJob` deliberately doesn't call `CompleteJob` itself on extraction success: the job stays `processing` until `handleVideoUpload`'s own remaining step (recording who owns the output artifact) has also succeeded. This matters because `completed → failed` isn't a valid transition — calling `CompleteJob` any earlier would make a later failure in that step unrecoverable (the job would stay `completed` forever, pointing at a `StorageKey` for an artifact that got deleted).
 
 The handler returns only after the full sequence completes and the ZIP is written. There is still no queue, no worker, and no async signalling — see `openspec/specs/videojob-execution/spec.md` for the full contract. The `VideoJob` created for the upload is queryable afterward via `GET /api/video-jobs/:id`/`GET /api/video-jobs` (see the preview API note below).
 
