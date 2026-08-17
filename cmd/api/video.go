@@ -248,7 +248,7 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	if !processed.Success {
 		c.JSON(200, ProcessingResult{
 			Success: false,
-			Message: "Erro no processamento: " + processed.FailureReason,
+			Message: extractionFailureMessage(processed.ExtractionError, processed.FailureReason),
 		})
 		return
 	}
@@ -279,7 +279,12 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		if removeErr := os.Remove(filepath.Join("outputs", result.ZipPath)); removeErr != nil {
 			log.Printf("Failed to remove orphaned output %s: %v", result.ZipPath, removeErr)
 		}
-		if _, failErr := m.failJob.Execute(c.Request.Context(), videoapplication.FailJobInput{
+		// A detached context: c.Request.Context() may already be canceled
+		// (e.g. client disconnect), and this write must still succeed so
+		// the job reaches "failed" instead of being stuck "processing".
+		finalizeCtx, cancel := videoapplication.NewFinalizationContext()
+		defer cancel()
+		if _, failErr := m.failJob.Execute(finalizeCtx, videoapplication.FailJobInput{
 			JobID:  created.JobID,
 			Reason: "failed to record artifact ownership after processing",
 		}); failErr != nil {
@@ -293,8 +298,10 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	}
 
 	// Only now — once the result is durably reachable — is the job
-	// actually complete.
-	if _, err := m.completeJob.Execute(c.Request.Context(), videoapplication.CompleteJobInput{
+	// actually complete. Same detached-context reasoning as above.
+	finalizeCtx, cancel := videoapplication.NewFinalizationContext()
+	defer cancel()
+	if _, err := m.completeJob.Execute(finalizeCtx, videoapplication.CompleteJobInput{
 		JobID:      created.JobID,
 		StorageKey: processed.StorageKey,
 		FrameCount: processed.FrameCount,
@@ -308,6 +315,23 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	}
 
 	c.JSON(200, result)
+}
+
+// extractionFailureMessage maps ProcessVideoJob's classifiable
+// ExtractionError to the same distinct pt-BR messages POST /upload always
+// returned, instead of exposing the underlying (English, infrastructure)
+// error text directly in the response body.
+func extractionFailureMessage(extractionErr error, reason string) string {
+	switch {
+	case errors.Is(extractionErr, videoffmpeg.ErrNoFramesExtracted):
+		return "Nenhum frame foi extraído do vídeo"
+	case errors.Is(extractionErr, videoffmpeg.ErrFfmpegExecFailed):
+		return "Erro no ffmpeg: " + reason
+	case errors.Is(extractionErr, videoffmpeg.ErrZipCreationFailed):
+		return "Erro ao criar arquivo ZIP: " + reason
+	default:
+		return "Erro no processamento: " + reason
+	}
 }
 
 func (m *videoModule) handleCreateVideoJob(c *gin.Context) {

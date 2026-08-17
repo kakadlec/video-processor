@@ -409,3 +409,42 @@ func TestRepository_Update_DoesNotWriteOutboxRow(t *testing.T) {
 		t.Fatalf("outbox row count changed from %d to %d; Update must not write an outbox row", before, after)
 	}
 }
+
+// TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds
+// demonstrates the exact risk application.NewFinalizationContext exists
+// for: reusing a request context that's already canceled by the time a
+// terminal state transition needs to be persisted makes that persistence
+// write itself fail, leaving the job stuck wherever it was — a fresh,
+// independent context succeeds where the canceled one fails.
+func TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := repo.Update(canceledCtx, job); err == nil {
+		t.Fatalf("expected an error updating with an already-canceled context, got nil")
+	}
+
+	if err := repo.Update(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error updating with a fresh context: %v", err)
+	}
+
+	found, err := repo.FindByID(context.Background(), job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found.Status() != domain.JobStatusQueued {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
+	}
+}

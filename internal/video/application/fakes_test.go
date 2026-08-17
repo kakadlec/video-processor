@@ -13,7 +13,13 @@ import (
 // unit test use cases without depending on any real persistence adapter.
 // FindByUserID implements the CreatedAt-descending/VideoJobID-ascending-
 // tie-breaker ordering domain.VideoJobRepository requires, so pagination
-// tests are meaningful.
+// tests are meaningful. Create/FindByID/Update all store and return
+// independent clones — like the real PostgreSQL adapter, which always
+// reconstructs a fresh *domain.VideoJob from scanned rows — so mutating a
+// job a caller holds (e.g. via job.Enqueue()) never changes what's in the
+// repository unless the caller actually calls Update. Without that, a use
+// case that forgot to call Update could still pass its own tests purely
+// because it mutated the same pointer the repository already held.
 type fakeVideoJobRepository struct {
 	mu   sync.Mutex
 	byID map[string]*domain.VideoJob
@@ -23,11 +29,19 @@ func newFakeVideoJobRepository() *fakeVideoJobRepository {
 	return &fakeVideoJobRepository{byID: make(map[string]*domain.VideoJob)}
 }
 
+func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	if err != nil {
+		panic("fakeVideoJobRepository: failed to clone video job: " + err.Error())
+	}
+	return clone
+}
+
 func (r *fakeVideoJobRepository) Create(_ context.Context, job *domain.VideoJob) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.byID[job.ID().String()] = job
+	r.byID[job.ID().String()] = cloneVideoJob(job)
 	return nil
 }
 
@@ -39,7 +53,7 @@ func (r *fakeVideoJobRepository) FindByID(_ context.Context, id domain.VideoJobI
 	if !ok {
 		return nil, domain.ErrVideoJobNotFound
 	}
-	return job, nil
+	return cloneVideoJob(job), nil
 }
 
 func (r *fakeVideoJobRepository) FindByUserID(_ context.Context, userID domain.UserID, offset, limit int) ([]*domain.VideoJob, error) {
@@ -49,7 +63,7 @@ func (r *fakeVideoJobRepository) FindByUserID(_ context.Context, userID domain.U
 	var matches []*domain.VideoJob
 	for _, job := range r.byID {
 		if job.UserID().Equal(userID) {
-			matches = append(matches, job)
+			matches = append(matches, cloneVideoJob(job))
 		}
 	}
 
@@ -77,7 +91,7 @@ func (r *fakeVideoJobRepository) Update(_ context.Context, job *domain.VideoJob)
 	if _, ok := r.byID[job.ID().String()]; !ok {
 		return domain.ErrVideoJobNotFound
 	}
-	r.byID[job.ID().String()] = job
+	r.byID[job.ID().String()] = cloneVideoJob(job)
 	return nil
 }
 

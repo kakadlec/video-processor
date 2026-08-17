@@ -22,6 +22,17 @@ const (
 	outputsDirName = "outputs"
 )
 
+// ErrFfmpegExecFailed, ErrNoFramesExtracted, and ErrZipCreationFailed
+// classify ExtractFrames' failure modes so a caller can map each to its own
+// user-facing message (e.g. cmd/api/video.go's handleVideoUpload) instead of
+// exposing this package's own (English, per the repo's language policy)
+// error text directly.
+var (
+	ErrFfmpegExecFailed  = errors.New("ffmpeg execution failed")
+	ErrNoFramesExtracted = errors.New("no frames were extracted from the video")
+	ErrZipCreationFailed = errors.New("failed to create zip file")
+)
+
 var _ domain.FrameExtractor = (*Extractor)(nil)
 
 // Extractor implements domain.FrameExtractor against a local ffmpeg
@@ -56,7 +67,7 @@ func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, 
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("ffmpeg error: %s\noutput: %s", err.Error(), string(output))
+		return domain.StorageKey{}, 0, nil, fmt.Errorf("%w: %s\noutput: %s", ErrFfmpegExecFailed, err.Error(), string(output))
 	}
 
 	frames, err := filepath.Glob(filepath.Join(tempDir, "*.png"))
@@ -64,14 +75,14 @@ func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, 
 		return domain.StorageKey{}, 0, nil, fmt.Errorf("video: glob extracted frames: %w", err)
 	}
 	if len(frames) == 0 {
-		return domain.StorageKey{}, 0, nil, errors.New("no frames were extracted from the video")
+		return domain.StorageKey{}, 0, nil, ErrNoFramesExtracted
 	}
 
 	zipFilename := fmt.Sprintf("frames_%s.zip", jobID.String())
 	zipPath := filepath.Join(outputsDirName, zipFilename)
 
 	if err := createZipFile(frames, zipPath); err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("video: create zip file: %w", err)
+		return domain.StorageKey{}, 0, nil, fmt.Errorf("%w: %s", ErrZipCreationFailed, err.Error())
 	}
 
 	imageNames := make([]string, len(frames))
@@ -87,7 +98,12 @@ func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, 
 	return storageKey, len(frames), imageNames, nil
 }
 
-func createZipFile(files []string, zipPath string) error {
+// createZipFile writes files into a new zip archive at zipPath. zip.Writer's
+// Close writes the archive's central directory — the only point a
+// disk/write failure can surface for an otherwise successful write — so its
+// error is propagated explicitly rather than discarded via a bare defer,
+// which would otherwise let a truncated/invalid zip be reported as success.
+func createZipFile(files []string, zipPath string) (err error) {
 	zipPath = filepath.Clean(zipPath)
 	if !strings.HasPrefix(zipPath, outputsDirName+string(os.PathSeparator)) {
 		return fmt.Errorf("invalid zip path: %s", zipPath)
@@ -97,18 +113,22 @@ func createZipFile(files []string, zipPath string) error {
 	if err != nil {
 		return err
 	}
-	defer zipFile.Close()
+	defer func() {
+		if closeErr := zipFile.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	zipWriter := zip.NewWriter(zipFile)
-	defer zipWriter.Close()
 
 	for _, file := range files {
-		if err := addFileToZip(zipWriter, file); err != nil {
-			return err
+		if ferr := addFileToZip(zipWriter, file); ferr != nil {
+			_ = zipWriter.Close()
+			return ferr
 		}
 	}
 
-	return nil
+	return zipWriter.Close()
 }
 
 func addFileToZip(zipWriter *zip.Writer, filename string) error {
