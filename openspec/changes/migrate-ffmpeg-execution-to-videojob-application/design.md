@@ -18,9 +18,11 @@
 
 ## Decisions
 
-### 1. `ProcessVideoJob` is a fifth application-layer use case, not handler-side glue
+### 1. `ProcessVideoJob` is a fifth application-layer use case, not handler-side glue — but it stops short of calling `CompleteJob`
 
-`ProcessVideoJob` holds `*EnqueueVideoJob`, `*StartProcessing`, `*CompleteJob`, `*FailJob`, and `domain.FrameExtractor` as dependencies, and sequences them in `Execute(ctx, jobID, videoPath)`. Alternative considered: have `cmd/api/video.go`'s handler call the four use cases directly. Rejected — Phase 3's own promise is "ffmpeg call migrated *into the application layer*"; if `cmd/api` does the sequencing, the process logic never actually left the transport layer, just changed which functions it calls. Building `ProcessVideoJob` now also means Phase 6's worker can reuse most of this shape (`StartProcessing → extract → Complete/Fail`) instead of re-deriving it.
+`ProcessVideoJob` holds `*EnqueueVideoJob`, `*StartProcessing`, `*FailJob`, and `domain.FrameExtractor` as dependencies, and sequences them in `Execute(ctx, jobID, videoPath)`: enqueue, start processing, extract. Alternative considered: have `cmd/api/video.go`'s handler call the individual use cases directly. Rejected — Phase 3's own promise is "ffmpeg call migrated *into the application layer*"; if `cmd/api` does the sequencing, the process logic never actually left the transport layer, just changed which functions it calls. Building `ProcessVideoJob` now also means Phase 6's worker can reuse most of this shape (`StartProcessing → extract → Fail-on-error`) instead of re-deriving it.
+
+`CompleteJob` is deliberately **not** called by `ProcessVideoJob` on extraction success — see decision 8 below for why, and the consequence: on success, `ProcessVideoJob` leaves the job in `processing`, not `completed`. The caller (`handleVideoUpload`) calls `CompleteJob` itself once it's confirmed the result is durably usable.
 
 ### 2. `FrameExtractor` port lives in `domain`, implemented by a new `internal/video/infrastructure/ffmpeg` package
 
@@ -31,7 +33,9 @@ type FrameExtractor interface {
 }
 ```
 
-The adapter reproduces `processVideo`/`createZipFile`/`addFileToZip`'s exact logic (temp dir under `temp/<jobID>/`, `exec.Command("ffmpeg", "-i", videoPath, "-vf", "fps=1", "-y", pattern)` with its `#nosec G204` suppression carried over unchanged, glob PNGs, zip into `outputs/frames_<jobID>.zip` with the same path-prefix guards `createZipFile`/`addFileToZip` had, `defer os.RemoveAll(tempDir)`), replacing the old ad hoc `requestID := uuid.NewString()` correlation with the real `VideoJobID` — so temp/output artifacts are now keyed by the same ID `GetJobStatus`/`GET /api/video-jobs/:id` report on. `imageNames` (the frame basenames) is returned alongside `storageKey`/`frameCount` since the extractor already computes it while zipping — threading it through avoids the handler reopening the zip just to rebuild the `images` JSON field.
+The adapter reproduces `processVideo`/`createZipFile`/`addFileToZip`'s exact logic (temp dir under `temp/<jobID>/`, `exec.CommandContext(ctx, "ffmpeg", "-i", videoPath, "-vf", "fps=1", "-y", pattern)` with its `#nosec G204` suppression carried over unchanged, glob PNGs, zip into `outputs/frames_<jobID>.zip` with the same path-prefix guards `createZipFile`/`addFileToZip` had, `defer os.RemoveAll(tempDir)`), replacing the old ad hoc `requestID := uuid.NewString()` correlation with the real `VideoJobID` — so temp/output artifacts are now keyed by the same ID `GetJobStatus`/`GET /api/video-jobs/:id` report on. `imageNames` (the frame basenames) is returned alongside `storageKey`/`frameCount` since the extractor already computes it while zipping — threading it through avoids the handler reopening the zip just to rebuild the `images` JSON field.
+
+`exec.CommandContext` (not plain `exec.Command`) is used specifically so the port's `ctx context.Context` parameter is load-bearing: a canceled context (client disconnect, server shutdown) kills the `ffmpeg` subprocess instead of leaving it running to completion in the background, consuming CPU/disk for an abandoned upload. Verified by a dedicated test that blocks `ffmpeg` on a named pipe (so the assertion doesn't depend on real decode speed) and confirms cancellation both stops the process and still runs the temp-dir cleanup.
 
 ### 3. `Repository.Update`, no new outbox row
 
@@ -57,12 +61,16 @@ It needs `m.createVideoJob` and `m.processVideoJob`, which only `videoModule` ho
 
 Once `/upload` also calls `CreateVideoJob`, a user's job list legitimately contains jobs created via `/upload` (which will show `completed`/`failed`, with real `frame_count`/`storage_key`) alongside any jobs created directly via `POST /api/video-jobs` (which still only ever show `pending` — that endpoint still calls nothing beyond `CreateVideoJob`). No filter is added to hide either kind from the other — they're the same aggregate, same table, same owner-scoping rule already enforced by `ListUserJobs`. This is called out explicitly in `videojob-http-api`'s delta (new scenario, no requirement-text change) and in `docs/flows.md`/`docs/architecture.md`.
 
-## Risks / Trade-offs
+### 8. `CompleteJob` moves to the caller, after output artifact ownership is durably recorded
+
+Original design had `ProcessVideoJob` call `CompleteJob` itself as the last step on extraction success, before returning to `handleVideoUpload`, which then did its own post-processing (delete the original upload, record the output zip's ownership sidecar) — unchanged from `processVideo`'s old structure. That ordering has a real bug: if `recordArtifactOwner("outputs", ...)` fails *after* the job is already `completed`, the handler deletes the now-unowned zip and returns a failure response, but the `VideoJob` stays `completed` forever with a `StorageKey` pointing at a file that no longer exists — and there's no way to correct it, because `completed` is terminal in the canonical state machine (`CanTransitionTo` returns false for every edge out of `completed`, including to `failed`).
+
+Fixed by moving the `CompleteJob` call out of `ProcessVideoJob` and into `handleVideoUpload`, called only after `recordArtifactOwner("outputs", ...)` succeeds. If it fails instead, the job is still `processing` — a state `FailJob` *can* validly leave — so the handler calls `FailJob` with a reason describing the ownership failure, keeping the job's persisted status accurate. The residual risk (a crash or DB failure between recording ownership and the `CompleteJob` call itself leaves the job stuck in `processing` forever, since there's no worker to reconcile it) is accepted for the same reason the rest of this phase accepts synchronous, no-queue processing: Phase 6 replaces this with real orchestration.
 
 - **Frontend impact**: none — `cmd/api/web/app.js` still only calls `/upload`/`/api/status`, unaffected by the internal refactor or by `/api/video-jobs` rows changing status, since the frontend never reads that endpoint.
 - **Test double drift**: `cmd/api/video_test.go`'s `newTestVideoModule(t)` is reachable from `cmd/api/main_test.go`'s `/upload` tests (via `startTestServer`). It must wire the **real** `ffmpeg` adapter (tests already require `ffmpeg` on `PATH` per the repo's existing test-suite precondition) — a fake `FrameExtractor` is only appropriate for `video_test.go`'s own `/api/video-jobs` route tests and for `internal/video/application`'s new use-case-level unit tests (their own fakes, mirroring `fakes_test.go`'s existing pattern), never for `newTestVideoModule`.
 - **`inMemoryVideoJobRepository`** (in `cmd/api/video_test.go`) needs an `Update` method to keep implementing `domain.VideoJobRepository`.
-- **gosec**: the `#nosec G204` on the `ffmpeg` `exec.Command` call and the path-prefix guards in the zip-writing code must both be carried into the new `ffmpeg` package verbatim — dropping either fails the required `SAST (gosec)` check.
+- **gosec**: the `#nosec G204` on the `ffmpeg` `exec.CommandContext` call and the path-prefix guards in the zip-writing code must both be carried into the new `ffmpeg` package verbatim — dropping either fails the required `SAST (gosec)` check.
 - **`Fail(reason)` empty-string trap**: `RestoreVideoJob` enforces `failed ⇔ non-empty ErrorReason`. If `FrameExtractor.ExtractFrames` ever returns an error whose `.Error()` is empty, `ProcessVideoJob` substitutes a fixed fallback reason string before calling `FailJob`, so the aggregate never becomes un-persistable.
 
 ## Migration Plan

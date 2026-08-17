@@ -1,14 +1,14 @@
 ## ADDED Requirements
 
-### Requirement: ProcessVideoJob Runs a VideoJob's Full Processing Sequence Synchronously
+### Requirement: ProcessVideoJob Runs a VideoJob's Enqueue/Start/Extract Sequence Synchronously
 
-The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID and a video file path, call `EnqueueVideoJob`, then `StartProcessing`, then `FrameExtractor.ExtractFrames`, then `CompleteJob` (on extraction success) or `FailJob` (on extraction failure) — synchronously, in-process, with no queue or worker involved.
+The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID and a video file path, call `EnqueueVideoJob`, then `StartProcessing`, then `FrameExtractor.ExtractFrames`, synchronously, in-process, with no queue or worker involved. On extraction failure it SHALL call `FailJob` and leave the job `failed`. On extraction success it SHALL NOT call `CompleteJob` itself — the job SHALL remain `processing`, and the caller is responsible for completing it once any further steps it performs with the result (e.g. `cmd/api/video.go`'s `handleVideoUpload` recording output artifact ownership) have themselves succeeded. This split exists specifically so the caller can still call `FailJob` — a valid `processing → failed` transition — if its own further steps fail, rather than being stuck with an already-`completed` job pointing at a result that never became usable (`completed → failed` is not a valid transition).
 
-#### Scenario: Successful processing completes the job
+#### Scenario: Successful extraction leaves the job processing, with the result available to the caller
 
 - **GIVEN** a `VideoJob` in `pending` status and a video file `ffmpeg` can decode
 - **WHEN** `ProcessVideoJob.Execute` is called with that job's ID and the file's path
-- **THEN** the job ends in `completed` status with a non-zero `StorageKey` and a `FrameCount` matching the number of extracted frames
+- **THEN** it returns a non-zero `StorageKey` and a `FrameCount` matching the number of extracted frames, and the job's persisted status is still `processing`
 
 #### Scenario: Failed extraction fails the job
 
@@ -21,6 +21,22 @@ The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID an
 - **GIVEN** `FrameExtractor.ExtractFrames` returns an error whose message is empty
 - **WHEN** `ProcessVideoJob.Execute` processes that failure
 - **THEN** `FailJob` is called with a non-empty fallback reason, never an empty string
+
+### Requirement: POST /upload Completes The Job Only After Its Result Is Durably Usable
+
+`POST /upload`'s handler (`cmd/api/video.go`'s `handleVideoUpload`) SHALL call `CompleteJob` only after every step it performs with `ProcessVideoJob`'s successful result (recording the output artifact's ownership) has itself succeeded. If any such step fails, the handler SHALL call `FailJob` instead, so the job's persisted status never claims `completed` for a result the caller could not make durably usable.
+
+#### Scenario: Successful processing and successful ownership recording completes the job
+
+- **GIVEN** `ProcessVideoJob` extracted frames successfully and recording the output artifact's ownership also succeeds
+- **WHEN** the request finishes
+- **THEN** the job's persisted status is `completed`, with the `StorageKey` and `FrameCount` `ProcessVideoJob` returned
+
+#### Scenario: A failure recording output ownership fails the job instead of leaving it completed
+
+- **GIVEN** `ProcessVideoJob` extracted frames successfully but recording the output artifact's ownership fails
+- **WHEN** the request finishes
+- **THEN** the job's persisted status is `failed`, not `completed`, and `GetJobStatus` never reports a `StorageKey` for the now-deleted output artifact
 
 ### Requirement: FrameExtractor Extracts Frames And Reports Their Names
 
