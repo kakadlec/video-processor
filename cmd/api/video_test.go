@@ -106,6 +106,8 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 	repo := newInMemoryVideoJobRepository()
 	ids := videoidgen.New()
 	extractor := videoffmpeg.New()
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
 	module := newVideoModule(
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
@@ -113,11 +115,12 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 		videoapplication.NewProcessVideoJob(
 			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
-			videoapplication.NewCompleteJob(repo, ids),
-			videoapplication.NewFailJob(repo, ids),
+			failJob,
 			extractor,
 			ids,
 		),
+		completeJob,
+		failJob,
 	)
 	return module, repo
 }

@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"video-processor/internal/video/domain"
 	"video-processor/internal/video/infrastructure/ffmpeg"
@@ -130,6 +132,59 @@ func TestExtractor_ExtractFrames_AlwaysRemovesTempDir(t *testing.T) {
 		}
 		assertNoLeftoverTempDir(t, jobID)
 	})
+}
+
+// TestExtractor_ExtractFrames_ContextCancellation_StopsFfmpegAndCleansUp
+// guards the exec.CommandContext wiring: a canceled context must kill the
+// ffmpeg subprocess (not just abandon it running in the background) and
+// still clean up the temp directory, so an abandoned upload can't keep
+// consuming CPU/disk for the full video duration.
+func TestExtractor_ExtractFrames_ContextCancellation_StopsFfmpegAndCleansUp(t *testing.T) {
+	requireFfmpeg(t)
+	prepareOutputDirs(t)
+
+	// A synthetic video (e.g. testsrc) decodes too fast to reliably still
+	// be running when a short-lived context is canceled, regardless of
+	// duration/resolution — timing against real decode speed would be
+	// flaky across machines. A named pipe with no data written makes
+	// ffmpeg block in read() indefinitely, deterministically guaranteeing
+	// it's still running at cancellation time on any hardware.
+	fifoPath := filepath.Join(t.TempDir(), "blocking-input.mp4")
+	if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
+		t.Fatalf("failed to create fifo: %v", err)
+	}
+	// Opening O_RDWR never blocks and satisfies the "a writer exists"
+	// condition for ffmpeg's own open(O_RDONLY) call, so ffmpeg proceeds
+	// straight to read() and blocks there forever, since nothing is ever
+	// written to the pipe.
+	keepAlive, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("failed to open fifo: %v", err)
+	}
+	t.Cleanup(func() { keepAlive.Close() })
+
+	jobID := testJobID(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	e := ffmpeg.New()
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := e.ExtractFrames(ctx, jobID, fifoPath)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("expected an error from a canceled context, got nil")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("ExtractFrames did not return after context cancellation; ffmpeg was not stopped")
+	}
+
+	assertNoLeftoverTempDir(t, jobID)
 }
 
 func assertNoLeftoverTempDir(t *testing.T, jobID domain.VideoJobID) {
