@@ -161,7 +161,7 @@ GET /api/video-jobs?offset=0&limit=20
 - The frontend (`cmd/api/web/app.js`) does not call these routes; it keeps using `POST /upload` exclusively.
 - Deliberately not named `/jobs`/`GET /jobs/{id}/status` — those paths are reserved for the real Phase 6 endpoint described above, which accepts a real upload and enqueues real processing. Reusing the name here would misrepresent this preview API as that endpoint.
 
-See `openspec/specs/videojob-http-api/spec.md` for the full contract, and `docs/roadmap.md`'s `migrate-ffmpeg-execution-to-videojob-application` row for what eventually gives jobs created here a processing trigger (still leaving `POST /upload` as the frontend's only path, per that row's own scope note).
+See `openspec/specs/videojob-http-api/spec.md` for the full contract. `migrate-ffmpeg-execution-to-videojob-application` — the next planned Change Backlog row — does **not** give jobs created here a processing trigger; it only migrates the legacy `POST /upload` handler's `ffmpeg` call, per its own scope note in `docs/roadmap.md`. A job created via `POST /api/video-jobs` stays `pending` indefinitely even after that row ships; giving this preview API its own trigger would need a separate, not-yet-proposed future change.
 
 ---
 
