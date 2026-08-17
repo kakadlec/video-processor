@@ -81,7 +81,7 @@ Browser                   Go server (cmd/api/main.go)              Filesystem
 
 ## Target: Asynchronous Processing Flow (Phase 6+)
 
-> **This flow does not yet exist.** It is introduced in Phase 6 (`implement-rabbitmq-and-worker`), after Phases 2–5 lay the authentication, persistence, caching, and storage foundations.
+> **This flow does not yet exist.** It is introduced in Phase 6 (`implement-rabbitmq-and-worker`), after Phases 2–5 lay the authentication, persistence, caching, and storage foundations. Phase 3's `wire-videojob-http-endpoints` added a separate, unrelated preview API (`POST /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /api/video-jobs` — see below) that shares the underlying `VideoJob` aggregate but accepts no file content and triggers no processing; it is not this flow and does not become it.
 
 ```
 Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    MinIO
@@ -136,6 +136,32 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
 - Job state is persisted in PostgreSQL (authoritative); Redis caches status reads.
 - Files are stored in MinIO (S3-compatible) instead of the local filesystem.
 - On completion, the Notification context is triggered via a domain event over RabbitMQ (Phase 7).
+
+---
+
+## Preview: VideoJob HTTP API (Phase 3, no processing trigger)
+
+Phase 3's `wire-videojob-http-endpoints` wired `internal/video/application`'s `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs` use cases into three new, bearer-authenticated routes, entirely separate from both flows above:
+
+```
+POST /api/video-jobs        { "original_filename": "movie.mp4" }
+  → 201 { job_id, original_filename, status: "pending", created_at }
+
+GET /api/video-jobs/:id
+  → 200 { job_id, status, frame_count, error_reason, storage_key }
+  (non-owner or nonexistent id: 404, identical either way)
+
+GET /api/video-jobs?offset=0&limit=20
+  → 200 { jobs: [ { job_id, original_filename, status }, … ] }
+```
+
+**This is not the Target Asynchronous Processing Flow above, even though it shares the same `VideoJob` aggregate:**
+- `POST /api/video-jobs` takes a JSON filename string, not a multipart video file — no file content is ever accepted or stored.
+- No code path reachable from these routes triggers processing: `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` don't exist yet, so every job created here stays `status: "pending"` forever within this row's scope.
+- The frontend (`cmd/api/web/app.js`) does not call these routes; it keeps using `POST /upload` exclusively.
+- Deliberately not named `/jobs`/`GET /jobs/{id}/status` — those paths are reserved for the real Phase 6 endpoint described above, which accepts a real upload and enqueues real processing. Reusing the name here would misrepresent this preview API as that endpoint.
+
+See `openspec/specs/videojob-http-api/spec.md` for the full contract. `migrate-ffmpeg-execution-to-videojob-application` — the next planned Change Backlog row — does **not** give jobs created here a processing trigger; it only migrates the legacy `POST /upload` handler's `ffmpeg` call, per its own scope note in `docs/roadmap.md`. A job created via `POST /api/video-jobs` stays `pending` indefinitely even after that row ships; giving this preview API its own trigger would need a separate, not-yet-proposed future change.
 
 ---
 
@@ -202,3 +228,4 @@ User submits form
 | `GET /download/:filename` | Serves ZIP from `outputs/`; owner-only (a non-owner gets the same 404 as a missing file) | Serves from MinIO (via redirect or proxy) | No |
 | `GET /jobs/{id}/status` | Does not exist | Per-job polling endpoint | N/A — new in Phase 6 |
 | `POST /jobs` | Does not exist | Canonical async upload endpoint | N/A — new in Phase 6 |
+| `POST /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /api/video-jobs` | Preview job-lifecycle API (Phase 3); JSON metadata only, no processing trigger | Unrelated to this migration — not the same endpoints as `/jobs` above | Not applicable — separate, unreplaced capability |
