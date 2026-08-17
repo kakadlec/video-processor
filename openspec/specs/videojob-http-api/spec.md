@@ -58,7 +58,7 @@ Define the HTTP-layer contract for `POST /api/video-jobs`, `GET /api/video-jobs/
 
 ### Requirement: GET /api/video-jobs Lists the Caller's Own Jobs, Paginated
 
-`GET /api/video-jobs` SHALL require a valid bearer token and return a page of the authenticated user's own jobs via `ListUserJobs`, ordered newest first. `offset` and `limit` query parameters SHALL default to `0` and `20` respectively when absent. An explicitly supplied `limit` outside `1`-`100` or a negative `offset` SHALL be rejected with `400`, not silently clamped.
+`GET /api/video-jobs` SHALL require a valid bearer token and return a page of the authenticated user's own jobs via `ListUserJobs`, ordered newest first. `offset` and `limit` query parameters SHALL default to `0` and `20` respectively when absent or present-but-empty (e.g. `?limit=`). A present, non-empty value that is not a valid integer (e.g. `?limit=abc`, `?offset=1.5`) SHALL be rejected with `400`, exactly like an in-range-but-invalid value below — it SHALL NOT be treated as absent. An explicitly supplied `limit` outside `1`-`100` or a negative `offset` SHALL be rejected with `400`, not silently clamped.
 
 #### Scenario: Listing with no query parameters uses defaults
 
@@ -71,6 +71,12 @@ Define the HTTP-layer contract for `POST /api/video-jobs`, `GET /api/video-jobs/
 - **GIVEN** an authenticated request supplies a `limit` of `0` or greater than `100`
 - **WHEN** `GET /api/video-jobs` is called
 - **THEN** the response is `400`, and the requested limit is not silently clamped into range
+
+#### Scenario: Non-integer query value is rejected, not defaulted
+
+- **GIVEN** an authenticated request supplies a non-empty, non-integer `limit` or `offset` (e.g. `limit=abc`, `offset=1.5`)
+- **WHEN** `GET /api/video-jobs` is called
+- **THEN** the response is `400` — the value is never silently treated as absent and defaulted
 
 #### Scenario: Listing never includes another user's jobs
 
