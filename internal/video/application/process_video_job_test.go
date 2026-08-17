@@ -30,14 +30,13 @@ func newProcessVideoJobUseCase(repo *fakeVideoJobRepository, extractor domain.Fr
 	return application.NewProcessVideoJob(
 		application.NewEnqueueVideoJob(repo, parser),
 		application.NewStartProcessing(repo, parser),
-		application.NewCompleteJob(repo, parser),
 		application.NewFailJob(repo, parser),
 		extractor,
 		parser,
 	)
 }
 
-func TestProcessVideoJob_Success_CompletesJob(t *testing.T) {
+func TestProcessVideoJob_Success_ExtractsAndLeavesJobProcessing(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newPendingRepoJob(t, repo, "job-1", "user-1")
 
@@ -62,12 +61,16 @@ func TestProcessVideoJob_Success_CompletesJob(t *testing.T) {
 		t.Fatalf("result.StorageKey = %q, want %q", result.StorageKey, "outputs/frames_job-1.zip")
 	}
 
+	// ProcessVideoJob deliberately does not call CompleteJob itself — the
+	// job is left "processing" so a caller with further work to do (e.g.
+	// recording output artifact ownership) can still call FailJob if that
+	// work fails, instead of being stuck with an already-"completed" job.
 	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if job.Status() != domain.JobStatusCompleted {
-		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusCompleted)
+	if job.Status() != domain.JobStatusProcessing {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusProcessing)
 	}
 }
 

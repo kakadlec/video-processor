@@ -10,8 +10,11 @@ import (
 // message is empty, since VideoJob.Fail rejects an empty reason.
 const fallbackFailureReason = "video processing failed"
 
-// ProcessVideoJobResult describes the outcome of running a VideoJob's full
-// processing sequence.
+// ProcessVideoJobResult describes the outcome of running a VideoJob's
+// enqueue/start/extract sequence. On success the job is left in
+// "processing" status, not "completed" — see ProcessVideoJob's doc comment
+// for why the caller, not this use case, is responsible for calling
+// CompleteJob.
 type ProcessVideoJobResult struct {
 	JobID         string
 	Success       bool
@@ -21,27 +24,31 @@ type ProcessVideoJobResult struct {
 	FailureReason string
 }
 
-// ProcessVideoJob runs a VideoJob's full processing sequence synchronously,
-// in-process: enqueue, start processing, extract frames, then complete or
-// fail depending on the extraction outcome. It composes the four standalone
-// transition use cases rather than mutating the aggregate directly, so each
-// step stays independently usable (e.g. by a future queue-driven worker).
+// ProcessVideoJob runs a VideoJob's enqueue/start-processing/extract
+// sequence synchronously, in-process, failing the job if extraction errors.
+// It deliberately does NOT call CompleteJob itself on success: a caller
+// that has further work to do before the job can be considered truly done
+// (e.g. cmd/api/video.go recording output artifact ownership) needs the job
+// to still be in "processing" — the only status FailJob can validly move it
+// out of — so it can fail the job if that further work fails, instead of
+// being stuck with an already-"completed" job pointing at an artifact that
+// never became reachable. The caller calls CompleteJob itself once it's
+// sure the result is durably usable.
 type ProcessVideoJob struct {
 	enqueue   *EnqueueVideoJob
 	start     *StartProcessing
-	complete  *CompleteJob
 	fail      *FailJob
 	extractor domain.FrameExtractor
 	idsFor    domain.VideoJobIDParser
 }
 
 // NewProcessVideoJob wires the ProcessVideoJob use case to its dependencies.
-func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, complete *CompleteJob, fail *FailJob, extractor domain.FrameExtractor, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
-	return &ProcessVideoJob{enqueue: enqueue, start: start, complete: complete, fail: fail, extractor: extractor, idsFor: idsFor}
+func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
+	return &ProcessVideoJob{enqueue: enqueue, start: start, fail: fail, extractor: extractor, idsFor: idsFor}
 }
 
-// Execute runs jobID's full processing sequence against the video file at
-// videoPath.
+// Execute runs jobID's enqueue/start-processing/extract sequence against
+// the video file at videoPath.
 func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath string) (ProcessVideoJobResult, error) {
 	id, err := uc.idsFor.ParseVideoJobID(jobID)
 	if err != nil {
@@ -65,14 +72,6 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 			return ProcessVideoJobResult{}, err
 		}
 		return ProcessVideoJobResult{JobID: jobID, Success: false, FailureReason: reason}, nil
-	}
-
-	if _, err := uc.complete.Execute(ctx, CompleteJobInput{
-		JobID:      jobID,
-		StorageKey: storageKey.String(),
-		FrameCount: frameCount,
-	}); err != nil {
-		return ProcessVideoJobResult{}, err
 	}
 
 	return ProcessVideoJobResult{

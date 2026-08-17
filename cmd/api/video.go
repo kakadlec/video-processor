@@ -41,10 +41,18 @@ type videoModule struct {
 	getJobStatus    *videoapplication.GetJobStatus
 	listUserJobs    *videoapplication.ListUserJobs
 	processVideoJob *videoapplication.ProcessVideoJob
+	// completeJob and failJob are called directly by handleVideoUpload,
+	// not just composed inside processVideoJob: ProcessVideoJob leaves a
+	// successfully-extracted job in "processing" specifically so the
+	// handler can call completeJob only once output artifact ownership is
+	// durably recorded, or failJob (a still-valid processing -> failed
+	// transition) if that recording fails.
+	completeJob *videoapplication.CompleteJob
+	failJob     *videoapplication.FailJob
 }
 
-func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob) *videoModule {
-	return &videoModule{createVideoJob: createVideoJob, getJobStatus: getJobStatus, listUserJobs: listUserJobs, processVideoJob: processVideoJob}
+func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob) *videoModule {
+	return &videoModule{createVideoJob: createVideoJob, getJobStatus: getJobStatus, listUserJobs: listUserJobs, processVideoJob: processVideoJob, completeJob: completeJob, failJob: failJob}
 }
 
 // setupVideo builds the production Video Processing module from environment
@@ -73,6 +81,8 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
 	repo := videopostgres.NewRepository(db, ids)
 	clock := systemClock{}
 	extractor := videoffmpeg.New()
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
 
 	module := newVideoModule(
 		videoapplication.NewCreateVideoJob(repo, ids, clock),
@@ -81,11 +91,12 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
 		videoapplication.NewProcessVideoJob(
 			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
-			videoapplication.NewCompleteJob(repo, ids),
-			videoapplication.NewFailJob(repo, ids),
+			failJob,
 			extractor,
 			ids,
 		),
+		completeJob,
+		failJob,
 	)
 	return module, db, nil
 }
@@ -259,15 +270,39 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// If ownership can't be recorded, the zip would otherwise be reported
 	// as a success the owner can never actually retrieve (every
 	// ownership-checked read path fails closed on a missing sidecar).
-	// Treat it as a processing failure instead.
+	// Treat it as a processing failure instead. The VideoJob is still
+	// "processing" at this point — ProcessVideoJob deliberately doesn't
+	// call CompleteJob — so failJob (processing -> failed) is a valid
+	// transition here, unlike trying to fail an already-completed job.
 	if err := recordArtifactOwner("outputs", result.ZipPath, userID.String()); err != nil {
 		log.Printf("Failed to record owner for output %s: %v", result.ZipPath, err)
 		if removeErr := os.Remove(filepath.Join("outputs", result.ZipPath)); removeErr != nil {
 			log.Printf("Failed to remove orphaned output %s: %v", result.ZipPath, removeErr)
 		}
+		if _, failErr := m.failJob.Execute(c.Request.Context(), videoapplication.FailJobInput{
+			JobID:  created.JobID,
+			Reason: "failed to record artifact ownership after processing",
+		}); failErr != nil {
+			log.Printf("Failed to mark video job %s failed after ownership error: %v", created.JobID, failErr)
+		}
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Failed to record artifact ownership",
+		})
+		return
+	}
+
+	// Only now — once the result is durably reachable — is the job
+	// actually complete.
+	if _, err := m.completeJob.Execute(c.Request.Context(), videoapplication.CompleteJobInput{
+		JobID:      created.JobID,
+		StorageKey: processed.StorageKey,
+		FrameCount: processed.FrameCount,
+	}); err != nil {
+		log.Printf("complete video job %s: %v", created.JobID, err)
+		c.JSON(500, ProcessingResult{
+			Success: false,
+			Message: "Erro ao finalizar o processamento",
 		})
 		return
 	}
