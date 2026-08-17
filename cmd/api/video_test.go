@@ -315,6 +315,43 @@ func TestHandleListVideoJobs_NegativeOffset_ReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestHandleListVideoJobs_NonIntegerLimit_ReturnsBadRequest(t *testing.T) {
+	srv, tokens := startTestVideoServer(t)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	resp := getWithAuthorization(t, srv.URL+"/api/video-jobs?limit=abc", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (a non-integer limit must not be treated as absent/defaulted)", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestHandleListVideoJobs_NonIntegerOffset_ReturnsBadRequest(t *testing.T) {
+	srv, tokens := startTestVideoServer(t)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	resp := getWithAuthorization(t, srv.URL+"/api/video-jobs?offset=1.5", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (a non-integer offset must not be treated as absent/defaulted)", resp.StatusCode, http.StatusBadRequest)
+	}
+}
+
+func TestHandleListVideoJobs_EmptyLimitQueryValue_UsesDefault(t *testing.T) {
+	srv, tokens := startTestVideoServer(t)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	createTestVideoJob(t, srv.URL, token, "one.mp4")
+
+	resp := getWithAuthorization(t, srv.URL+"/api/video-jobs?limit=&offset=", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (an explicitly-empty query value is indistinguishable from absent and must default, not 400)", resp.StatusCode, http.StatusOK)
+	}
+}
+
 func TestHandleListVideoJobs_ScopedToCaller(t *testing.T) {
 	srv, tokens := startTestVideoServer(t)
 	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
