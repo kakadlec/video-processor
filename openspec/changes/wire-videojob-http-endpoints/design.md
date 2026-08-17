@@ -1,6 +1,6 @@
 ## Context
 
-`internal/video/application` already has `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs`, each depending only on `domain.VideoJobRepository`/`domain.VideoJobIDGenerator`/`domain.VideoJobIDParser` ports (see `videojob-lifecycle` spec). `internal/video/infrastructure/postgres.Repository` implements the repository port, and `docker-compose.yml`/`.github/workflows/ci.yml` already define `VIDEO_POSTGRES_DSN`/`VIDEO_POSTGRES_TEST_DSN`, both explicitly commented as "unused until a video composition root calls `postgres.Open`/`Migrate`... wiring lands in `wire-videojob-http-endpoints`". This row is that wiring.
+`internal/video/application` already has `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs`, each depending only on `domain.VideoJobRepository`/`domain.VideoJobIDGenerator`/`domain.VideoJobIDParser` ports (see `videojob-lifecycle` spec). `internal/video/infrastructure/postgres.Repository` implements the repository port. `docker-compose.yml` already defines both `VIDEO_POSTGRES_DSN` (the runtime variable this row's `setupVideo` will read) and `VIDEO_POSTGRES_TEST_DSN` (already consumed by `internal/video/infrastructure/postgres/repository_test.go`'s existing skip-unless-set integration test), both explicitly commented as "unused [for the runtime one] until a video composition root calls `postgres.Open`/`Migrate`... wiring lands in `wire-videojob-http-endpoints`". `.github/workflows/ci.yml` defines only `VIDEO_POSTGRES_TEST_DSN` — CI's `go test ./...` step never calls `main()`/`setupVideo`, so it has no need for the runtime `VIDEO_POSTGRES_DSN`. This row is the wiring that makes `VIDEO_POSTGRES_DSN` load-bearing.
 
 `cmd/api/identity.go` is the direct template: `identityModule` struct + `setupIdentity(ctx)` (env-driven, fails startup clearly) + `registerRoutes(router)` + handler methods + a `requireBearerAuth()` middleware already used by every existing video-processing route. Nothing about auth needs to be re-invented — the new endpoints sit inside the same `videoRoutes := r.Group("/"); videoRoutes.Use(identity.requireBearerAuth())` group `handleVideoUpload`/`handleDownload`/`handleStatus` already use.
 
@@ -27,7 +27,26 @@
 
 **Test double: `inMemoryVideoJobRepository`, mirroring `inMemoryUserRepository`.** `cmd/api/identity_test.go`'s `newTestIdentityModule` already establishes the pattern (fake repository, real password/JWT/ID adapters since none do I/O) precisely so HTTP-level route tests don't need live PostgreSQL. The new `newTestVideoModule(t)` in `cmd/api/video_test.go` does the same: fake `domain.VideoJobRepository`, real `idgen.Adapter` (no I/O) and a fixed test clock. `internal/video/infrastructure/postgres/repository_test.go` (already existing, skipped unless `VIDEO_POSTGRES_TEST_DSN` is set) remains the only place the real Postgres adapter is exercised — this row adds no new Postgres-level tests, since `Repository`/`Migrate` are unchanged.
 
-**Pagination defaults: `offset=0`, `limit=20` when query params are absent; explicit values are validated exactly as `ListUserJobs` already validates them (400 on out-of-range), not silently clamped.** Matches `ListUserJobs`'s existing "rejected with an error rather than silently clamped" requirement — a caller-supplied out-of-range value must fail loudly, but an *absent* value isn't a caller error, so it gets a sane default instead of a 400.
+**Pagination defaults: `offset=0`, `limit=20` when query params are absent; explicit values are validated exactly as `ListUserJobs` already validates them (400 on out-of-range), not silently clamped.** Matches `ListUserJobs`'s existing "rejected with an error rather than silently clamped" requirement — a caller-supplied out-of-range value must fail loudly, but an *absent* value isn't a caller error, so it gets a sane default instead of a 400. An explicitly-empty query value (`?limit=`) is indistinguishable from an absent one at the HTTP layer (`gin`'s `c.Query` returns `""` for both) and is treated the same way — defaulted, not rejected. A present-but-non-integer value (`?limit=abc`, `?offset=1.5`) fails integer parsing and is rejected with `400`, same as an out-of-range integer — it is never silently treated as absent.
+
+**Exact JSON shapes** (Go struct field order below matches JSON key order):
+
+```
+POST /api/video-jobs
+  Request:  { "original_filename": string }
+  Response: 201 { "job_id": string, "original_filename": string, "status": string, "created_at": string (RFC 3339) }
+            400 { "error": string }   401 { "error": string }
+
+GET /api/video-jobs/:id
+  Response: 200 { "job_id": string, "status": string, "frame_count": int, "error_reason": string (omitted if empty), "storage_key": string (omitted if empty) }
+            400 { "error": string }   401 { "error": string }   404 { "error": string }
+
+GET /api/video-jobs?offset=&limit=
+  Response: 200 { "jobs": [ { "job_id": string, "original_filename": string, "status": string }, … ] }
+            400 { "error": string }   401 { "error": string }
+```
+
+`jobs` is always present as an array (possibly empty `[]`), never `null` or omitted, so callers don't need a nil-check before iterating.
 
 **Ownership/not-found mapping: reuse `GetJobStatus`'s existing collapse.** `GetJobStatus` already returns the same `ErrVideoJobNotFound` for both "doesn't exist" and "isn't yours" (see `videojob-lifecycle` spec). The HTTP handler maps that one error to one `404` — no separate `403` path to preserve that indistinguishability at the API boundary too, not just inside the use case.
 
