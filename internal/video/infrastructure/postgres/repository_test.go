@@ -333,3 +333,79 @@ func TestRepository_Create_OutboxInsertFailure_RollsBackJobRow(t *testing.T) {
 		t.Fatalf("video_jobs row count = %d, want 0 (the transaction must roll back the job insert too)", count)
 	}
 }
+
+func TestRepository_Update_PersistsTransitionedState(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error starting processing: %v", err)
+	}
+	storageKey, err := domain.NewStorageKey("outputs/frames_" + job.ID().String() + ".zip")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.Complete(storageKey, 7); err != nil {
+		t.Fatalf("unexpected error completing: %v", err)
+	}
+
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found.Status() != domain.JobStatusCompleted {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusCompleted)
+	}
+	if found.FrameCount() != 7 {
+		t.Fatalf("FrameCount = %d, want 7", found.FrameCount())
+	}
+	if found.StorageKey() != storageKey {
+		t.Fatalf("StorageKey = %v, want %v", found.StorageKey(), storageKey)
+	}
+}
+
+func TestRepository_Update_DoesNotWriteOutboxRow(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var before int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&before); err != nil {
+		t.Fatalf("unexpected error counting outbox rows: %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var after int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&after); err != nil {
+		t.Fatalf("unexpected error counting outbox rows: %v", err)
+	}
+	if after != before {
+		t.Fatalf("outbox row count changed from %d to %d; Update must not write an outbox row", before, after)
+	}
+}

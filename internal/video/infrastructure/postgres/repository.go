@@ -133,6 +133,27 @@ func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, off
 	return jobs, nil
 }
 
+// Update persists job's current status, frame count, error reason, and
+// storage key to its existing row, identified by its unchanging id. Unlike
+// Create, it writes no video_job_outbox row.
+func (r *Repository) Update(ctx context.Context, job *domain.VideoJob) error {
+	const query = `
+		UPDATE video_jobs
+		SET status = $1, frame_count = $2, error_reason = $3, storage_key = $4
+		WHERE id = $5
+	`
+	if _, err := r.db.ExecContext(ctx, query,
+		string(job.Status()),
+		job.FrameCount(),
+		job.ErrorReason(),
+		job.StorageKey().String(),
+		job.ID().String(),
+	); err != nil {
+		return fmt.Errorf("video: update video job: %w", err)
+	}
+	return nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }

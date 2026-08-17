@@ -15,6 +15,7 @@ import (
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
+	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 )
@@ -48,6 +49,16 @@ func (r *inMemoryVideoJobRepository) FindByID(_ context.Context, id videodomain.
 		return nil, videodomain.ErrVideoJobNotFound
 	}
 	return job, nil
+}
+
+func (r *inMemoryVideoJobRepository) Update(_ context.Context, job *videodomain.VideoJob) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.byID[job.ID().String()]; !ok {
+		return videodomain.ErrVideoJobNotFound
+	}
+	r.byID[job.ID().String()] = job
+	return nil
 }
 
 func (r *inMemoryVideoJobRepository) FindByUserID(_ context.Context, userID videodomain.UserID, offset, limit int) ([]*videodomain.VideoJob, error) {
@@ -86,14 +97,27 @@ func newTestVideoModule(t *testing.T) *videoModule {
 	return module
 }
 
+// newTestVideoModuleWithRepo wires a videoModule whose ProcessVideoJob use
+// case runs a real ffmpeg extractor, not a fake: this module is reachable
+// from main_test.go's POST /upload tests via startTestServer, which upload
+// real generated test videos and assert on real extracted frame counts.
 func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRepository) {
 	t.Helper()
 	repo := newInMemoryVideoJobRepository()
 	ids := videoidgen.New()
+	extractor := videoffmpeg.New()
 	module := newVideoModule(
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewProcessVideoJob(
+			videoapplication.NewEnqueueVideoJob(repo, ids),
+			videoapplication.NewStartProcessing(repo, ids),
+			videoapplication.NewCompleteJob(repo, ids),
+			videoapplication.NewFailJob(repo, ids),
+			extractor,
+			ids,
+		),
 	)
 	return module, repo
 }

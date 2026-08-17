@@ -16,4 +16,8 @@ type VideoJobRepository interface {
 	Create(ctx context.Context, job *VideoJob) error
 	FindByID(ctx context.Context, id VideoJobID) (*VideoJob, error)
 	FindByUserID(ctx context.Context, userID UserID, offset, limit int) ([]*VideoJob, error)
+	// Update persists an already-loaded VideoJob's current status,
+	// frame count, error reason, and storage key. Unlike Create, it does
+	// not write a transactional-outbox row.
+	Update(ctx context.Context, job *VideoJob) error
 }

@@ -70,6 +70,17 @@ func (r *fakeVideoJobRepository) FindByUserID(_ context.Context, userID domain.U
 	return matches[offset:end], nil
 }
 
+func (r *fakeVideoJobRepository) Update(_ context.Context, job *domain.VideoJob) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.byID[job.ID().String()]; !ok {
+		return domain.ErrVideoJobNotFound
+	}
+	r.byID[job.ID().String()] = job
+	return nil
+}
+
 // fakeVideoJobIDGenerator always returns the same pre-set VideoJobID, for deterministic assertions.
 type fakeVideoJobIDGenerator struct {
 	id domain.VideoJobID
