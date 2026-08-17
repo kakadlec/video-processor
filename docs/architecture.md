@@ -2,7 +2,7 @@
 
 ## Current Implementation
 
-The video-processing HTTP surface lives in `cmd/api/main.go` (package `main`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own.
+The video-processing HTTP surface lives in `cmd/api/main.go` (package `main`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own. Phase 3's `wire-videojob-http-endpoints` wired `internal/video` in the same way, behind a preview `/api/video-jobs` HTTP surface — see the Routes table below.
 
 ```
 video-processor/
@@ -10,8 +10,10 @@ video-processor/
     api/
       main.go          # HTTP server, router, video-processing handlers, business logic
       identity.go       # Identity composition root: wires internal/identity into main.go's router
+      video.go          # Video Processing composition root: wires internal/video into main.go's router
       main_test.go     # Integration tests (drive the real handlers via httptest)
       identity_test.go # Identity HTTP/middleware/ownership tests
+      video_test.go     # Video job HTTP route/setup tests
       web/
         index.html   # Upload form + login/register panel
         styles.css
@@ -21,6 +23,10 @@ video-processor/
       domain/         # User, UserID, ports (repository, password hasher, token issuer/verifier)
       application/    # RegisterUser, AuthenticateUser use cases
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
+    video/
+      domain/         # VideoJob aggregate, value objects, repository interface
+      application/    # CreateVideoJob, GetJobStatus, ListUserJobs use cases
+      infrastructure/ # PostgreSQL adapter, UUID generator
   go.mod / go.sum  # Module definition: gin, pgx, golang-jwt, bcrypt, google/uuid
   Dockerfile       # Multi-stage build: builder -> test -> runtime (non-root)
   docker-compose.yml # Local dev stack: postgres, app, and the app-test service used to run the suite
@@ -80,8 +86,13 @@ No cache, no message broker.
 | `GET /api/status` | `handleStatus` | JSON list of ZIPs in `outputs/`; scoped to the caller's own uploads |
 | `GET /uploads/*` | `gin.Static` | Static file serving of `uploads/`; owner-only; `.owner` sidecar files are never served regardless |
 | `GET /outputs/*` | `gin.Static` | Static file serving of `outputs/`; owner-only; `.owner` sidecar files are never served regardless |
+| `POST /api/video-jobs` | `handleCreateVideoJob` | Create a `VideoJob` record (JSON `original_filename`, no file content); requires a bearer token; preview API, see below |
+| `GET /api/video-jobs/:id` | `handleGetVideoJobStatus` | Get a `VideoJob`'s status; owner-only (non-owner and nonexistent both 404) |
+| `GET /api/video-jobs` | `handleListVideoJobs` | Paginated list of the caller's own `VideoJob`s |
 
-`IDENTITY_POSTGRES_DSN` and `IDENTITY_JWT_SIGNING_KEY` are both required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, and `VIDEO_POSTGRES_DSN` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
+
+**`/api/video-jobs` is a preview API, not the async processing flow.** It was wired by Phase 3's `wire-videojob-http-endpoints`, alongside (not replacing) the legacy synchronous `/upload` flow above. A `VideoJob` created through it has no processing trigger — nothing calls `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` — so it stays `pending` indefinitely until a later Change Backlog row (`migrate-ffmpeg-execution-to-videojob-application`) wires that. The frontend does not consume these routes. It is deliberately not named `/jobs`: see [docs/flows.md](flows.md) for why that path is reserved for the real Phase 6 async endpoint, and `openspec/specs/videojob-http-api/spec.md` for the full contract.
 
 CORS headers (`Access-Control-Allow-Origin: *`) are applied globally.
 
@@ -101,14 +112,14 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) is implemented as described below, as is the `cmd/api` split (Phase 3's `extract-cmd-api-entrypoint`). Video Processing's HTTP wiring, Notification, and `cmd/worker` remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) is implemented as described below, as is the `cmd/api` split (Phase 3's `extract-cmd-api-entrypoint`). Video Processing's HTTP wiring is implemented (Phase 3's `wire-videojob-http-endpoints`) but has no processing trigger yet. Notification, `cmd/worker`, and Video Processing's own async execution remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
 | Context | Responsibility | Status |
 |---|---|---|
 | **Identity** | User registration, authentication, JWT issuance and verification | Implemented (Phase 2) |
-| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Planned (Phase 3+) |
+| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Partially implemented (Phase 3: creation/status/listing wired into HTTP; queueing/async execution/result storage planned, Phases 5–6) |
 | **Notification** | Reacting to domain events and delivering notifications (email, webhook) | Planned (Phase 7) |
 
 ### Target Package Topology
@@ -129,8 +140,8 @@ video-processor/
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
     video/
       domain/         # VideoJob aggregate, value objects, events, repository interface
-      application/    # Use cases: CreateVideoJob, EnqueueVideoJob, GetJobStatus, …
-      infrastructure/ # PostgreSQL adapter (implemented, Phase 3 — not yet wired into a composition root), MinIO adapter, RabbitMQ publisher (Phases 5–6)
+      application/    # Use cases: CreateVideoJob, GetJobStatus, ListUserJobs (implemented, Phase 3); EnqueueVideoJob, StartProcessing, CompleteJob, FailJob (planned)
+      infrastructure/ # PostgreSQL adapter (implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints), MinIO adapter, RabbitMQ publisher (Phases 5–6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
@@ -143,7 +154,7 @@ video-processor/
 
 | Component | Role | Status |
 |---|---|---|
-| PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, not yet wired into a composition root), required at deployment time — see [docs/operations.md](operations.md) |
+| PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints`), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache, distributed locks | Planned (Phase 4) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
@@ -155,7 +166,7 @@ See [docs/roadmap.md](roadmap.md) for the full phase plan.
 1. `domain` packages MUST NOT import `application`, `infrastructure`, or transport packages.
 2. `application` packages depend only on repository/port **interfaces** defined in `domain`.
 3. `infrastructure` packages implement interfaces from `domain` and may import third-party drivers.
-4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). `cmd/api/main.go`/`cmd/api/identity.go` play that role for Identity today; `cmd/worker` doesn't exist yet (Phase 6).
+4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). `cmd/api/identity.go` plays that role for Identity, and `cmd/api/video.go` for Video Processing's `CreateVideoJob`/`GetJobStatus`/`ListUserJobs` slice, today; `cmd/worker` doesn't exist yet (Phase 6).
 5. No bounded context may import another context's `domain` or `application` packages directly. Each context defines and owns its own local value object for any identifier that crosses a boundary (e.g. `identity.UserID` and `video.UserID` are distinct types) — cross-context communication uses domain events or translation at the composition root, never a package shared between contexts' `domain` layers. There is no `pkg/` directory; a shared kernel was considered for the crossing `UserID` and rejected as tighter coupling than this architecture's context-independence goal justifies (see `add-videojob-domain-and-application`'s `design.md` in `openspec/changes/archive/`).
 
 Rules 1–3 for `internal/identity/{domain,application}` and `internal/video/{domain,application}` are each enforced by an automated test (`internal/identity/dependency_rules_test.go`, `internal/video/dependency_rules_test.go`), not just convention.
