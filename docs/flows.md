@@ -36,43 +36,43 @@ Browser                        Go server (cmd/api/main.go / identity.go)     Pos
 The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, `/api/status`, `/uploads/*`, and `/outputs/*` carries a valid bearer token; there is no unauthenticated mode.
 
 ```
-Browser                   Go server (cmd/api/main.go)              Filesystem
-  │                             │                               │
-  │  POST /upload (multipart)   │                               │
-  │────────────────────────────►│                               │
-  │                             │  Validate extension           │
-  │                             │  Save to uploads/             │
-  │                             │──────────────────────────────►│
-  │                             │                               │
-  │                             │  exec ffmpeg -i <video>       │
-  │                             │    -vf fps=1                  │
-  │                             │    temp/<ts>/frame_%04d.png   │
-  │                             │──────────────────────────────►│
-  │                             │  (blocks until complete)      │
-  │                             │                               │
-  │                             │  Glob PNGs from temp/<ts>/    │
-  │                             │◄──────────────────────────────│
-  │                             │                               │
-  │                             │  Write outputs/frames_<ts>.zip│
-  │                             │──────────────────────────────►│
-  │                             │                               │
-  │                             │  Remove temp/<ts>/            │
-  │                             │  Remove uploads/<file>        │
-  │                             │──────────────────────────────►│
-  │                             │                               │
-  │◄────────────────────────────│                               │
-  │  200 { success, zip_path,   │                               │
-  │        frame_count, images }│                               │
-  │                             │                               │
-  │  GET /download/<zip_path>   │                               │
-  │────────────────────────────►│                               │
-  │◄────────────────────────────│  Serve outputs/<zip>          │
-  │  ZIP file                   │                               │
+Browser              cmd/api/video.go       internal/video/application   Filesystem
+  │                        │                          │                    │
+  │  POST /upload           │                          │                   │
+  │  (multipart)            │                          │                   │
+  │───────────────────────►│                          │                    │
+  │                        │  Validate extension       │                   │
+  │                        │  Save to uploads/         │                   │
+  │                        │──────────────────────────────────────────────►│
+  │                        │  CreateVideoJob            │                  │
+  │                        │───────────────────────────►│                  │
+  │                        │  ProcessVideoJob:           │                 │
+  │                        │    Enqueue → StartProcessing│                 │
+  │                        │───────────────────────────►│                  │
+  │                        │                            │  ffmpeg exec,    │
+  │                        │                            │  zip frames      │
+  │                        │                            │─────────────────►│
+  │                        │                            │  (blocks)        │
+  │                        │                            │◄─────────────────│
+  │                        │    Complete / Fail          │                 │
+  │                        │───────────────────────────►│                  │
+  │                        │  Remove temp/, uploads/<file>│                │
+  │                        │───────────────────────────────────────────────►│
+  │◄───────────────────────│                            │                  │
+  │  200 { success, zip_path,│                           │                 │
+  │        frame_count, images}│                         │                 │
+  │                        │                            │                  │
+  │  GET /download/<zip_path>│                           │                 │
+  │───────────────────────►│                            │                  │
+  │◄───────────────────────│  Serve outputs/<zip>       │                  │
+  │  ZIP file               │                           │                  │
 ```
 
+The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/infrastructure/ffmpeg`'s `Extractor`, called through the `FrameExtractor` port `ProcessVideoJob` depends on — see `openspec/specs/videojob-execution/spec.md`.
+
 **Key characteristics (current):**
-- Single HTTP request blocks for the full duration of `ffmpeg` execution.
-- No job ID, no status polling, no notifications.
+- Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous, in-process, no queue or worker (that's Phase 6).
+- No status polling, no notifications, at this HTTP surface — but the `VideoJob` created for the upload does progress through the real `pending → queued → processing → completed`/`failed` state machine internally (see `openspec/specs/videojob-lifecycle/spec.md`), and is queryable via `GET /api/video-jobs/:id` below.
 - On success, the original upload file is deleted; the ZIP in `outputs/` is the only durable artifact.
 - On failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`).
 - Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and enforced identically on `/download`, `/api/status`, and the `/uploads`/`/outputs` static mounts.
@@ -139,7 +139,7 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
 
 ---
 
-## Preview: VideoJob HTTP API (Phase 3, no processing trigger)
+## Preview: VideoJob HTTP API (Phase 3)
 
 Phase 3's `wire-videojob-http-endpoints` wired `internal/video/application`'s `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs` use cases into three new, bearer-authenticated routes, entirely separate from both flows above:
 
@@ -157,11 +157,13 @@ GET /api/video-jobs?offset=0&limit=20
 
 **This is not the Target Asynchronous Processing Flow above, even though it shares the same `VideoJob` aggregate:**
 - `POST /api/video-jobs` takes a JSON filename string, not a multipart video file — no file content is ever accepted or stored.
-- No code path reachable from these routes triggers processing: `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` don't exist yet, so every job created here stays `status: "pending"` forever within this row's scope.
+- No code path reachable from these three routes triggers processing: `handleCreateVideoJob`/`handleGetVideoJobStatus`/`handleListVideoJobs` never call `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob`, so every job created via `POST /api/video-jobs` stays `status: "pending"` forever.
 - The frontend (`cmd/api/web/app.js`) does not call these routes; it keeps using `POST /upload` exclusively.
 - Deliberately not named `/jobs`/`GET /jobs/{id}/status` — those paths are reserved for the real Phase 6 endpoint described above, which accepts a real upload and enqueues real processing. Reusing the name here would misrepresent this preview API as that endpoint.
 
-See `openspec/specs/videojob-http-api/spec.md` for the full contract. `migrate-ffmpeg-execution-to-videojob-application` — the next planned Change Backlog row — does **not** give jobs created here a processing trigger; it only migrates the legacy `POST /upload` handler's `ffmpeg` call, per its own scope note in `docs/roadmap.md`. A job created via `POST /api/video-jobs` stays `pending` indefinitely even after that row ships; giving this preview API its own trigger would need a separate, not-yet-proposed future change.
+**`EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` do exist now**, added by `migrate-ffmpeg-execution-to-videojob-application`, but they're driven from `POST /upload`, not from these routes. Because `POST /upload` also calls `CreateVideoJob` (see the Synchronous Upload Flow above), `GET /api/video-jobs`/`GET /api/video-jobs/:id` now legitimately show `completed`/`failed` jobs for a user who has used `/upload`, alongside any still-`pending` jobs created directly via `POST /api/video-jobs` itself — both are the same `VideoJob` aggregate in the same repository, scoped by owner the same way. See `openspec/specs/videojob-http-api/spec.md`'s "Listing includes jobs created outside this API" scenario.
+
+See `openspec/specs/videojob-http-api/spec.md` for the full contract and `openspec/specs/videojob-execution/spec.md` for how `POST /upload` now drives those four transition use cases.
 
 ---
 
