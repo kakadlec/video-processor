@@ -1,6 +1,6 @@
-# Local development/test infrastructure. Scoped to what the Identity
-# context needs today (PostgreSQL only); later roadmap phases extend this
-# file with Redis, RabbitMQ, and MinIO rather than replacing it.
+# Local development/test infrastructure. Scoped to what the Identity and
+# Video contexts need today (PostgreSQL, Redis); later roadmap phases extend
+# this file with RabbitMQ and MinIO rather than replacing it.
 #
 # The credentials below are fixed, non-secret local-only defaults — this
 # service is never reachable from anywhere but the developer's own machine
@@ -22,6 +22,22 @@ services:
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U identity"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # No named volume: this instance backs idempotency keys, rate-limit
+  # counters, and a status cache — all explicitly non-authoritative (see
+  # ddd-architecture spec's "PostgreSQL is authoritative on cache miss").
+  # Losing its contents on restart is a correctness non-event by design.
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Loopback-only: this instance is unauthenticated, same rationale as
+      # the "app" service's port binding below.
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -94,8 +110,13 @@ services:
       # identical to the IDENTITY_* values.
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # Exercises internal/platform/redis's own test suite against a real
+      # instance — not yet consumed by cmd/api itself (see proposal.md).
+      REDIS_TEST_ADDR: redis:6379
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:
