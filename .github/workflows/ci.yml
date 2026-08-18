@@ -26,6 +26,16 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        # Matches the image pinned in docker-compose.yml.
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -49,6 +59,7 @@ jobs:
           # Same CI Postgres service and database as IDENTITY_POSTGRES_TEST_DSN —
           # video_jobs/video_job_outbox coexist with identity_users there.
           VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
+          REDIS_TEST_ADDR: localhost:6379
         run: go test ./... -v
 
   sast:
