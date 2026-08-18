@@ -60,7 +60,7 @@ The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/w
 
 - **GIVEN** `main.go`, `identity.go`, and their test files have been moved into `cmd/api/`
 - **WHEN** the server is built or run
-- **THEN** `cmd/api` is what gets built and deployed as the API binary
+- **THEN** `go build -o app ./cmd/api` and `go run ./cmd/api` produce the same HTTP behavior the repo-root `main.go` produced before the move, and no `main.go` exists at the repo root anymore
 
 #### Scenario: Shared infrastructure with no owning context lives under internal/platform
 

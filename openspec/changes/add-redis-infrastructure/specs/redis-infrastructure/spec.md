@@ -18,13 +18,13 @@
 
 ### Requirement: Open Constructs A Client Without Blocking On Connectivity
 
-`internal/platform/redis.Open` SHALL construct and return a Redis client from a `Config` without itself verifying connectivity — matching `internal/identity/infrastructure/postgres.Open`'s lazy-connection behavior. Callers are responsible for verifying connectivity (e.g. via the health check below) before relying on the client.
+`internal/platform/redis.Open` SHALL construct and return a Redis client from a `Config` without itself verifying connectivity — matching `internal/identity/infrastructure/postgres.Open`'s lazy-connection behavior. Because constructing the underlying client from an unparsed `Addr` string cannot fail, `Open` SHALL return only the client, with no `error` result. Callers are responsible for verifying connectivity (e.g. via the health check below) before relying on the client.
 
 #### Scenario: Open succeeds even when Redis is unreachable
 
 - **GIVEN** a `Config` whose `Addr` does not correspond to a running Redis instance
 - **WHEN** `Open` is called with it
-- **THEN** it returns a non-nil client and no error — the unreachability only surfaces on a subsequent command
+- **THEN** it returns a non-nil client — the unreachability only surfaces on a subsequent command
 
 ### Requirement: Health Check Confirms Connectivity
 
