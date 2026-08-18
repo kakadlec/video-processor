@@ -80,7 +80,7 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 
 ## Planned Infrastructure (Not Yet Implemented)
 
-> The components below are planned for future phases. They do not exist in the current deployment. Each is labeled with the phase that introduces it.
+> The components below are planned for future phases and do not exist in the current deployment. Each is labeled with the phase that introduces it. Redis is a partial exception: its connection adapter exists in the codebase (see below) but is not wired into the deployed application, so nothing in this deployment actually talks to Redis yet.
 
 ### Redis — Connection adapter implemented, features Planned (Phase 4)
 

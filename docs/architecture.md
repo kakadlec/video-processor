@@ -122,7 +122,7 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 ---
 
-## Target Architecture (Partially implemented — Phase 3 of 8 done)
+## Target Architecture (Partially implemented — Phase 3 of 8 done, Phase 4 started)
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 

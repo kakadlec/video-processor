@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define `internal/platform/redis`, the shared, low-level Redis connection adapter used across bounded contexts: configuration, connection lifecycle, and health check. This is bare connection plumbing only — no idempotency store, rate limiter, cache decorator, or distributed lock. Those are owned by whichever future change actually implements each Phase 4 feature; see `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement for the target behavior this adapter unblocks.
+Define `internal/platform/redis`, the shared, low-level Redis connection adapter used across bounded contexts: configuration, connection lifecycle, and health check. This is bare connection plumbing only — no idempotency store, rate limiter, or cache decorator (owned by whichever future change implements each Phase 4 feature) and no distributed lock (Phase 6, not Phase 4 — see `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement for the target behavior this adapter unblocks).
 
 ## Requirements
 
