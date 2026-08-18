@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh pr create *)",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/check-copilot-review.py\"",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 950,
+            "rewakeSummary": "Copilot review posted",
+            "statusMessage": "Waiting for Copilot's automatic PR review to post..."
+          }
+        ]
+      }
+    ]
+  }
+}
