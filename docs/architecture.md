@@ -2,15 +2,15 @@
 
 ## Current Implementation
 
-The video-processing HTTP surface lives in `cmd/api/main.go` (package `main`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own. Phase 3's `wire-videojob-http-endpoints` wired `internal/video` in the same way, behind a preview `/api/video-jobs` HTTP surface — see the Routes table below.
+The video-processing HTTP surface lives in `cmd/api` (package `main`, split across `main.go`, `identity.go`, and `video.go`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own. Phase 3's `wire-videojob-http-endpoints` wired `internal/video` in the same way, behind a preview `/api/video-jobs` HTTP surface, and `migrate-ffmpeg-execution-to-videojob-application` then cut `POST /upload`'s own `ffmpeg` execution over to run through that same `internal/video` application layer — see the Routes table below.
 
 ```
 video-processor/
   cmd/
     api/
-      main.go          # HTTP server, router, video-processing handlers, business logic
+      main.go          # HTTP server, router, static file serving, /download+/api/status, ownership helpers
       identity.go       # Identity composition root: wires internal/identity into main.go's router
-      video.go          # Video Processing composition root: wires internal/video into main.go's router
+      video.go          # Video Processing composition root + handlers: wires internal/video into main.go's router, handles POST /upload and /api/video-jobs
       main_test.go     # Integration tests (drive the real handlers via httptest)
       identity_test.go # Identity HTTP/middleware/ownership tests
       video_test.go     # Video job HTTP route/setup tests
@@ -24,9 +24,9 @@ video-processor/
       application/    # RegisterUser, AuthenticateUser use cases
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
     video/
-      domain/         # VideoJob aggregate, value objects, repository interface
-      application/    # CreateVideoJob, GetJobStatus, ListUserJobs use cases
-      infrastructure/ # PostgreSQL adapter, UUID generator
+      domain/         # VideoJob aggregate + transition methods, value objects, repository/FrameExtractor ports
+      application/    # CreateVideoJob, GetJobStatus, ListUserJobs, EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, ProcessVideoJob use cases
+      infrastructure/ # PostgreSQL adapter, UUID generator, ffmpeg-backed FrameExtractor adapter
   go.mod / go.sum  # Module definition: gin, pgx, golang-jwt, bcrypt, google/uuid
   Dockerfile       # Multi-stage build: builder -> test -> runtime (non-root)
   docker-compose.yml # Local dev stack: postgres, app, and the app-test service used to run the suite
@@ -41,7 +41,7 @@ video-processor/
 
 ### Request pipeline (current)
 
-All processing happens synchronously inside the HTTP handler:
+All processing happens synchronously inside the HTTP handler, but the actual work now runs through `internal/video`'s application layer rather than an inline `exec.Command` call in `cmd/api`:
 
 ```
 Browser / client
@@ -49,16 +49,27 @@ Browser / client
   └─► POST /upload (multipart)
         │
         ├─ Validate extension (.mp4, .avi, .mov, .mkv, .wmv, .flv, .webm)
-        ├─ Save to uploads/<timestamp>_<filename>
-        ├─ exec ffmpeg -i <video> -vf fps=1 temp/<timestamp>/frame_%04d.png
-        ├─ Glob PNGs from temp/<timestamp>/
-        ├─ Write outputs/frames_<timestamp>.zip
-        ├─ Remove temp/<timestamp>/   (defer)
-        ├─ Remove uploads/<file>      (on success only)
+        ├─ Save to uploads/<uploadID>_<filename>
+        ├─ CreateVideoJob                          (application, status: pending)
+        ├─ ProcessVideoJob:
+        │    ├─ EnqueueVideoJob                     (pending → queued)
+        │    ├─ StartProcessing                      (queued → processing)
+        │    ├─ FrameExtractor.ExtractFrames (infrastructure/ffmpeg):
+        │    │    ├─ exec.CommandContext ffmpeg -i <video> -vf fps=1 temp/<jobID>/frame_%04d.png
+        │    │    ├─ Glob PNGs from temp/<jobID>/
+        │    │    ├─ Write outputs/frames_<jobID>.zip
+        │    │    └─ Remove temp/<jobID>/            (defer, always)
+        │    └─ FailJob if extraction failed          (processing → failed)
+        │         (on success, job stays "processing" — see below)
+        ├─ Remove uploads/<file>                    (on success only)
+        ├─ Record output artifact ownership
+        ├─ CompleteJob if that succeeded, else FailJob (processing → completed/failed)
         └─ Return JSON { success, message, zip_path, frame_count, images }
 ```
 
-The handler returns only after `ffmpeg` completes and the ZIP is written. There is no queue, no worker, and no async signalling.
+`ProcessVideoJob` deliberately doesn't call `CompleteJob` itself on extraction success: the job stays `processing` until `handleVideoUpload`'s own remaining step (recording who owns the output artifact) has also succeeded. This matters because `completed → failed` isn't a valid transition — calling `CompleteJob` any earlier would make a later failure in that step unrecoverable (the job would stay `completed` forever, pointing at a `StorageKey` for an artifact that got deleted).
+
+The handler returns only after the full sequence completes and the ZIP is written. There is still no queue, no worker, and no async signalling — see `openspec/specs/videojob-execution/spec.md` for the full contract. The `VideoJob` created for the upload is queryable afterward via `GET /api/video-jobs/:id`/`GET /api/video-jobs` (see the preview API note below).
 
 ### State (current)
 
@@ -71,6 +82,7 @@ Video-processing artifacts still live in the local filesystem; user accounts liv
 | `outputs/` | Durable ZIP results; served by `/download/:filename` | Persistent across restarts |
 | `uploads/*.owner`, `outputs/*.owner` | Sidecar files recording which authenticated `UserID` owns an artifact | Same lifecycle as the artifact they accompany |
 | PostgreSQL `users` table | User accounts (normalized email, password hash) | Persistent, external to the container |
+| PostgreSQL `video_jobs` table | `VideoJob` rows — created both by `POST /upload` (this pipeline) and by `POST /api/video-jobs` (the preview API below); the two share the same repository and owner-scoping | Persistent, external to the container |
 
 No cache, no message broker.
 
@@ -92,7 +104,9 @@ No cache, no message broker.
 
 `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, and `VIDEO_POSTGRES_DSN` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
 
-**`/api/video-jobs` is a preview API, not the async processing flow.** It was wired by Phase 3's `wire-videojob-http-endpoints`, alongside (not replacing) the legacy synchronous `/upload` flow above. A `VideoJob` created through it has no processing trigger — nothing calls `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` — and none is currently planned for it: `migrate-ffmpeg-execution-to-videojob-application` (the next Change Backlog row) only migrates the legacy `POST /upload` handler's `ffmpeg` call and does not touch `/api/video-jobs`, so a job created here stays `pending` indefinitely even after that row ships. Giving this preview API its own trigger would need a separate, not-yet-proposed future change. The frontend does not consume these routes. It is deliberately not named `/jobs`: see [docs/flows.md](flows.md) for why that path is reserved for the real Phase 6 async endpoint, and `openspec/specs/videojob-http-api/spec.md` for the full contract.
+**`/api/video-jobs` is a preview API, not the async processing flow.** It was wired by Phase 3's `wire-videojob-http-endpoints`, alongside (not replacing) the legacy synchronous `/upload` flow above. A `VideoJob` created *through this API* has no processing trigger — `handleCreateVideoJob` never calls `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` — and none is currently planned for it: `migrate-ffmpeg-execution-to-videojob-application` gave those four use cases a real caller, but it's `POST /upload`, not `POST /api/video-jobs`, so a job created via this API still stays `pending` indefinitely. Giving this preview API its own trigger would need a separate, not-yet-proposed future change. The frontend does not consume these routes. It is deliberately not named `/jobs`: see [docs/flows.md](flows.md) for why that path is reserved for the real Phase 6 async endpoint, and `openspec/specs/videojob-http-api/spec.md` for the full contract.
+
+**`GET /api/video-jobs`/`GET /api/video-jobs/:id` do show non-`pending` jobs, though** — `POST /upload` also calls `CreateVideoJob`, so a user who has uploaded via `/upload` will see those jobs (real `completed`/`failed` status, real `frame_count`/`storage_key`) alongside any still-`pending` jobs they created directly via `POST /api/video-jobs`. Same aggregate, same repository, same owner-scoping — not a bug, see `openspec/specs/videojob-execution/spec.md` for how `/upload` drives that state machine.
 
 CORS headers (`Access-Control-Allow-Origin: *`) are applied globally.
 
@@ -108,18 +122,18 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 ---
 
-## Target Architecture (Partially implemented — Phase 2 of 8 done)
+## Target Architecture (Partially implemented — Phase 3 of 8 done)
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) is implemented as described below, as is the `cmd/api` split (Phase 3's `extract-cmd-api-entrypoint`). Video Processing's HTTP wiring is implemented (Phase 3's `wire-videojob-http-endpoints`) but has no processing trigger yet. Notification, `cmd/worker`, and Video Processing's own async execution remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (Redis/MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
 | Context | Responsibility | Status |
 |---|---|---|
 | **Identity** | User registration, authentication, JWT issuance and verification | Implemented (Phase 2) |
-| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Partially implemented (Phase 3: creation/status/listing wired into HTTP; queueing/async execution/result storage planned, Phases 5–6) |
+| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Partially implemented (Phase 3: creation/status/listing wired into HTTP, and synchronous in-process execution driven by `POST /upload`, both done; real queueing/async execution/result storage via RabbitMQ/`cmd/worker`/MinIO planned, Phases 5–6) |
 | **Notification** | Reacting to domain events and delivering notifications (email, webhook) | Planned (Phase 7) |
 
 ### Target Package Topology
@@ -139,9 +153,9 @@ video-processor/
       application/    # Use cases: RegisterUser, AuthenticateUser
       infrastructure/ # PostgreSQL adapter, bcrypt adapter, JWT adapter, UUID generator
     video/
-      domain/         # VideoJob aggregate, value objects, events, repository interface
-      application/    # Use cases: CreateVideoJob, GetJobStatus, ListUserJobs (implemented, Phase 3); EnqueueVideoJob, StartProcessing, CompleteJob, FailJob (planned)
-      infrastructure/ # PostgreSQL adapter (implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints), MinIO adapter, RabbitMQ publisher (Phases 5–6)
+      domain/         # VideoJob aggregate + transition methods, value objects, events, repository/FrameExtractor ports (all implemented, Phase 3)
+      application/    # Use cases: CreateVideoJob, GetJobStatus, ListUserJobs, EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, ProcessVideoJob (all implemented, Phase 3)
+      infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application), MinIO adapter, RabbitMQ publisher (Phases 5–6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
@@ -154,7 +168,7 @@ video-processor/
 
 | Component | Role | Status |
 |---|---|---|
-| PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints`), required at deployment time — see [docs/operations.md](operations.md) |
+| PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache, distributed locks | Planned (Phase 4) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
@@ -166,7 +180,7 @@ See [docs/roadmap.md](roadmap.md) for the full phase plan.
 1. `domain` packages MUST NOT import `application`, `infrastructure`, or transport packages.
 2. `application` packages depend only on repository/port **interfaces** defined in `domain`.
 3. `infrastructure` packages implement interfaces from `domain` and may import third-party drivers.
-4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). `cmd/api/identity.go` plays that role for Identity, and `cmd/api/video.go` for Video Processing's `CreateVideoJob`/`GetJobStatus`/`ListUserJobs` slice, today; `cmd/worker` doesn't exist yet (Phase 6).
+4. `cmd/api` and `cmd/worker` are the only places where `infrastructure` adapters are instantiated and wired (composition root). `cmd/api/identity.go` plays that role for Identity, and `cmd/api/video.go` for all of Video Processing's use cases (`CreateVideoJob`/`GetJobStatus`/`ListUserJobs`/`EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob`/`ProcessVideoJob`), today; `cmd/worker` doesn't exist yet (Phase 6).
 5. No bounded context may import another context's `domain` or `application` packages directly. Each context defines and owns its own local value object for any identifier that crosses a boundary (e.g. `identity.UserID` and `video.UserID` are distinct types) — cross-context communication uses domain events or translation at the composition root, never a package shared between contexts' `domain` layers. There is no `pkg/` directory; a shared kernel was considered for the crossing `UserID` and rejected as tighter coupling than this architecture's context-independence goal justifies (see `add-videojob-domain-and-application`'s `design.md` in `openspec/changes/archive/`).
 
 Rules 1–3 for `internal/identity/{domain,application}` and `internal/video/{domain,application}` are each enforced by an automated test (`internal/identity/dependency_rules_test.go`, `internal/video/dependency_rules_test.go`), not just convention.
