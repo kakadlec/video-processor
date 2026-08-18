@@ -1,36 +1,19 @@
 package main
 
 import (
-	"archive/zip"
 	"context"
 	"embed"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 //go:embed web
 var webFS embed.FS
-
-type VideoRequest struct {
-	VideoPath string `json:"video_path"`
-	OutputDir string `json:"output_dir"`
-}
-
-type ProcessingResult struct {
-	Success    bool     `json:"success"`
-	Message    string   `json:"message"`
-	ZipPath    string   `json:"zip_path,omitempty"`
-	FrameCount int      `json:"frame_count,omitempty"`
-	Images     []string `json:"images,omitempty"`
-}
 
 func main() {
 	createDirs()
@@ -111,7 +94,6 @@ func setupRouter(identity *identityModule, video *videoModule) *gin.Engine {
 	outputsRoutes.Use(requireArtifactOwnership("outputs"))
 	outputsRoutes.Static("/", "./outputs")
 
-	videoRoutes.POST("/upload", handleVideoUpload)
 	videoRoutes.GET("/download/:filename", handleDownload)
 	videoRoutes.GET("/api/status", handleStatus)
 
@@ -210,222 +192,6 @@ func createDirs() {
 			log.Printf("Failed to create directory %s: %v", dir, err)
 		}
 	}
-}
-
-func handleVideoUpload(c *gin.Context) {
-	file, header, err := c.Request.FormFile("video")
-	if err != nil {
-		c.JSON(400, ProcessingResult{
-			Success: false,
-			Message: "Erro ao receber arquivo: " + err.Error(),
-		})
-		return
-	}
-	defer file.Close()
-
-	if !isValidVideoFile(header.Filename) {
-		c.JSON(400, ProcessingResult{
-			Success: false,
-			Message: "Formato de arquivo não suportado. Use: mp4, avi, mov, mkv",
-		})
-		return
-	}
-
-	// requestID must be collision-resistant, not just distinct-looking: it
-	// names the temp dir, the output zip, and (when authenticated) the
-	// ownership sidecar for both. A colliding ID from two concurrent
-	// requests would let one user's upload overwrite another's artifact and
-	// its ownership record — a UUID keeps that probability negligible,
-	// unlike the second-precision timestamp this used to be.
-	requestID := uuid.NewString()
-	safeFilename := filepath.Base(header.Filename)
-	filename := fmt.Sprintf("%s_%s", requestID, safeFilename)
-	videoPath := filepath.Clean(filepath.Join("uploads", filename))
-	if !strings.HasPrefix(videoPath, "uploads"+string(os.PathSeparator)) {
-		c.JSON(400, ProcessingResult{
-			Success: false,
-			Message: "Nome de arquivo inválido",
-		})
-		return
-	}
-
-	out, err := os.Create(videoPath)
-	if err != nil {
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Erro ao salvar arquivo: " + err.Error(),
-		})
-		return
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, file)
-	if err != nil {
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Erro ao salvar arquivo: " + err.Error(),
-		})
-		return
-	}
-
-	userID, authenticated := authenticatedUserID(c)
-	if authenticated {
-		if err := recordArtifactOwner("uploads", filename, userID.String()); err != nil {
-			log.Printf("Failed to record owner for upload %s: %v", filename, err)
-		}
-	}
-
-	result := processVideo(videoPath, requestID)
-
-	if result.Success {
-		if err := os.Remove(videoPath); err != nil {
-			log.Printf("Failed to remove original upload %s: %v", videoPath, err)
-		}
-		if authenticated {
-			if err := removeArtifactOwner("uploads", filename); err != nil {
-				log.Printf("Failed to remove owner record for upload %s: %v", filename, err)
-			}
-			// If ownership can't be recorded, the zip would otherwise be
-			// reported as a success the owner can never actually retrieve
-			// (every ownership-checked read path fails closed on a missing
-			// sidecar). Treat it as a processing failure instead.
-			if err := recordArtifactOwner("outputs", result.ZipPath, userID.String()); err != nil {
-				log.Printf("Failed to record owner for output %s: %v", result.ZipPath, err)
-				if removeErr := os.Remove(filepath.Join("outputs", result.ZipPath)); removeErr != nil {
-					log.Printf("Failed to remove orphaned output %s: %v", result.ZipPath, removeErr)
-				}
-				c.JSON(500, ProcessingResult{
-					Success: false,
-					Message: "Failed to record artifact ownership",
-				})
-				return
-			}
-		}
-	}
-
-	c.JSON(200, result)
-}
-
-func processVideo(videoPath, requestID string) ProcessingResult {
-	fmt.Printf("Iniciando processamento: %s\n", videoPath)
-
-	tempDir := filepath.Join("temp", requestID)
-	if err := os.MkdirAll(tempDir, 0750); err != nil {
-		log.Printf("Failed to create temp directory %s: %v", tempDir, err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	framePattern := filepath.Join(tempDir, "frame_%04d.png")
-
-	cmd := exec.Command("ffmpeg", // #nosec G204
-		"-i", videoPath,
-		"-vf", "fps=1",
-		"-y",
-		framePattern,
-	)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return ProcessingResult{
-			Success: false,
-			Message: fmt.Sprintf("Erro no ffmpeg: %s\nOutput: %s", err.Error(), string(output)),
-		}
-	}
-
-	frames, err := filepath.Glob(filepath.Join(tempDir, "*.png"))
-	if err != nil || len(frames) == 0 {
-		return ProcessingResult{
-			Success: false,
-			Message: "Nenhum frame foi extraído do vídeo",
-		}
-	}
-
-	fmt.Printf("📸 Extraídos %d frames\n", len(frames))
-
-	zipFilename := fmt.Sprintf("frames_%s.zip", requestID)
-	zipPath := filepath.Join("outputs", zipFilename)
-
-	err = createZipFile(frames, zipPath)
-	if err != nil {
-		return ProcessingResult{
-			Success: false,
-			Message: "Erro ao criar arquivo ZIP: " + err.Error(),
-		}
-	}
-
-	fmt.Printf("✅ ZIP criado: %s\n", zipPath)
-
-	imageNames := make([]string, len(frames))
-	for i, frame := range frames {
-		imageNames[i] = filepath.Base(frame)
-	}
-
-	return ProcessingResult{
-		Success:    true,
-		Message:    fmt.Sprintf("Processamento concluído! %d frames extraídos.", len(frames)),
-		ZipPath:    zipFilename,
-		FrameCount: len(frames),
-		Images:     imageNames,
-	}
-}
-
-func createZipFile(files []string, zipPath string) error {
-	zipPath = filepath.Clean(zipPath)
-	if !strings.HasPrefix(zipPath, "outputs"+string(os.PathSeparator)) {
-		return fmt.Errorf("invalid zip path: %s", zipPath)
-	}
-
-	zipFile, err := os.Create(zipPath)
-	if err != nil {
-		return err
-	}
-	defer zipFile.Close()
-
-	zipWriter := zip.NewWriter(zipFile)
-	defer zipWriter.Close()
-
-	for _, file := range files {
-		err := addFileToZip(zipWriter, file)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func addFileToZip(zipWriter *zip.Writer, filename string) error {
-	filename = filepath.Clean(filename)
-	if !strings.HasPrefix(filename, "temp"+string(os.PathSeparator)) {
-		return fmt.Errorf("invalid frame path: %s", filename)
-	}
-
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-
-	header.Name = filepath.Base(filename)
-	header.Method = zip.Deflate
-
-	writer, err := zipWriter.CreateHeader(header)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(writer, file)
-	return err
 }
 
 func handleDownload(c *gin.Context) {

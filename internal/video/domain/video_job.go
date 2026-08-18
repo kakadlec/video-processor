@@ -41,6 +41,14 @@ var ErrErrorReasonRequiresFailedStatus = errors.New("video: error reason and fai
 // for the result is set only on completion" scenario ties the two together.
 var ErrStorageKeyRequiresCompletedStatus = errors.New("video: storage key and completed status must be set together")
 
+// ErrInvalidStatusTransition is returned by a VideoJob transition method
+// (Enqueue, StartProcessing, Complete, Fail) when the job's current status
+// cannot legally make that transition.
+var ErrInvalidStatusTransition = errors.New("video: invalid status transition")
+
+// ErrFailureReasonRequired is returned by Fail when called with an empty reason.
+var ErrFailureReasonRequired = errors.New("video: failure reason is required")
+
 // VideoJob is the Video Processing bounded context's aggregate root.
 // FrameCount and ErrorReason are aggregate-validated primitive fields rather
 // than standalone value objects: their invariants are cross-field (they
@@ -149,4 +157,54 @@ func (j *VideoJob) Status() JobStatus {
 // CreatedAt returns when the job was created.
 func (j *VideoJob) CreatedAt() time.Time {
 	return j.createdAt
+}
+
+// Enqueue transitions the job from pending to queued.
+func (j *VideoJob) Enqueue() error {
+	return j.transitionTo(JobStatusQueued)
+}
+
+// StartProcessing transitions the job from queued to processing.
+func (j *VideoJob) StartProcessing() error {
+	return j.transitionTo(JobStatusProcessing)
+}
+
+// Complete transitions the job from processing to completed, recording its
+// result storage key and extracted frame count.
+func (j *VideoJob) Complete(storageKey StorageKey, frameCount int) error {
+	if storageKey.IsZero() {
+		return ErrStorageKeyRequiresCompletedStatus
+	}
+	if frameCount < 0 {
+		return ErrFrameCountNegative
+	}
+	if err := j.transitionTo(JobStatusCompleted); err != nil {
+		return err
+	}
+	j.storageKey = storageKey
+	j.frameCount = frameCount
+	return nil
+}
+
+// Fail transitions the job from processing to failed, recording a non-empty
+// failure reason.
+func (j *VideoJob) Fail(reason string) error {
+	if reason == "" {
+		return ErrFailureReasonRequired
+	}
+	if err := j.transitionTo(JobStatusFailed); err != nil {
+		return err
+	}
+	j.errorReason = reason
+	return nil
+}
+
+// transitionTo moves the job to next if the state machine allows it from
+// the job's current status, leaving the job unchanged otherwise.
+func (j *VideoJob) transitionTo(next JobStatus) error {
+	if !j.status.CanTransitionTo(next) {
+		return ErrInvalidStatusTransition
+	}
+	j.status = next
+	return nil
 }

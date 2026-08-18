@@ -180,3 +180,123 @@ func TestRestoreVideoJob_FailedJobWithErrorReason(t *testing.T) {
 		t.Fatalf("job.ErrorReason() = %q, want %q", job.ErrorReason(), "ffmpeg exploded")
 	}
 }
+
+func newPendingVideoJob(t *testing.T) *domain.VideoJob {
+	t.Helper()
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	if err != nil {
+		t.Fatalf("unexpected error building pending job: %v", err)
+	}
+	return job
+}
+
+func TestVideoJob_Enqueue_PendingToQueued(t *testing.T) {
+	job := newPendingVideoJob(t)
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusQueued {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusQueued)
+	}
+}
+
+func TestVideoJob_StartProcessing_QueuedToProcessing(t *testing.T) {
+	job := newPendingVideoJob(t)
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusProcessing {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusProcessing)
+	}
+}
+
+func TestVideoJob_Complete_ProcessingToCompleted(t *testing.T) {
+	job := newPendingVideoJob(t)
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	storageKey, _ := domain.NewStorageKey("outputs/frames_123.zip")
+	if err := job.Complete(storageKey, 5); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusCompleted {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusCompleted)
+	}
+	if job.StorageKey() != storageKey {
+		t.Fatalf("job.StorageKey() = %v, want %v", job.StorageKey(), storageKey)
+	}
+	if job.FrameCount() != 5 {
+		t.Fatalf("job.FrameCount() = %d, want 5", job.FrameCount())
+	}
+}
+
+func TestVideoJob_Complete_ZeroStorageKeyRejected(t *testing.T) {
+	job := newPendingVideoJob(t)
+	_ = job.Enqueue()
+	_ = job.StartProcessing()
+	if err := job.Complete(domain.StorageKey{}, 5); err == nil {
+		t.Fatalf("expected error for zero StorageKey, got nil")
+	}
+	if job.Status() != domain.JobStatusProcessing {
+		t.Fatalf("job.Status() = %v, want unchanged %v", job.Status(), domain.JobStatusProcessing)
+	}
+}
+
+func TestVideoJob_Complete_NegativeFrameCountRejected(t *testing.T) {
+	job := newPendingVideoJob(t)
+	_ = job.Enqueue()
+	_ = job.StartProcessing()
+	storageKey, _ := domain.NewStorageKey("outputs/frames_123.zip")
+	if err := job.Complete(storageKey, -1); !errors.Is(err, domain.ErrFrameCountNegative) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrFrameCountNegative)
+	}
+}
+
+func TestVideoJob_Fail_ProcessingToFailed(t *testing.T) {
+	job := newPendingVideoJob(t)
+	_ = job.Enqueue()
+	_ = job.StartProcessing()
+	if err := job.Fail("ffmpeg exploded"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusFailed {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusFailed)
+	}
+	if job.ErrorReason() != "ffmpeg exploded" {
+		t.Fatalf("job.ErrorReason() = %q, want %q", job.ErrorReason(), "ffmpeg exploded")
+	}
+}
+
+func TestVideoJob_Fail_EmptyReasonRejected(t *testing.T) {
+	job := newPendingVideoJob(t)
+	_ = job.Enqueue()
+	_ = job.StartProcessing()
+	if err := job.Fail(""); !errors.Is(err, domain.ErrFailureReasonRequired) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrFailureReasonRequired)
+	}
+}
+
+func TestVideoJob_OutOfOrderTransition_RejectedWithoutMutation(t *testing.T) {
+	job := newPendingVideoJob(t)
+
+	if err := job.StartProcessing(); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrInvalidStatusTransition)
+	}
+	storageKey, _ := domain.NewStorageKey("outputs/frames_123.zip")
+	if err := job.Complete(storageKey, 1); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrInvalidStatusTransition)
+	}
+	if err := job.Fail("boom"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrInvalidStatusTransition)
+	}
+	if job.Status() != domain.JobStatusPending {
+		t.Fatalf("job.Status() = %v, want unchanged %v", job.Status(), domain.JobStatusPending)
+	}
+}

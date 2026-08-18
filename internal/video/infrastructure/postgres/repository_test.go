@@ -333,3 +333,118 @@ func TestRepository_Create_OutboxInsertFailure_RollsBackJobRow(t *testing.T) {
 		t.Fatalf("video_jobs row count = %d, want 0 (the transaction must roll back the job insert too)", count)
 	}
 }
+
+func TestRepository_Update_PersistsTransitionedState(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error starting processing: %v", err)
+	}
+	storageKey, err := domain.NewStorageKey("outputs/frames_" + job.ID().String() + ".zip")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.Complete(storageKey, 7); err != nil {
+		t.Fatalf("unexpected error completing: %v", err)
+	}
+
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found.Status() != domain.JobStatusCompleted {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusCompleted)
+	}
+	if found.FrameCount() != 7 {
+		t.Fatalf("FrameCount = %d, want 7", found.FrameCount())
+	}
+	if found.StorageKey() != storageKey {
+		t.Fatalf("StorageKey = %v, want %v", found.StorageKey(), storageKey)
+	}
+}
+
+func TestRepository_Update_DoesNotWriteOutboxRow(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var before int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&before); err != nil {
+		t.Fatalf("unexpected error counting outbox rows: %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var after int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&after); err != nil {
+		t.Fatalf("unexpected error counting outbox rows: %v", err)
+	}
+	if after != before {
+		t.Fatalf("outbox row count changed from %d to %d; Update must not write an outbox row", before, after)
+	}
+}
+
+// TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds
+// demonstrates the exact risk application.NewFinalizationContext exists
+// for: reusing a request context that's already canceled by the time a
+// terminal state transition needs to be persisted makes that persistence
+// write itself fail, leaving the job stuck wherever it was — a fresh,
+// independent context succeeds where the canceled one fails.
+func TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := repo.Update(canceledCtx, job); err == nil {
+		t.Fatalf("expected an error updating with an already-canceled context, got nil")
+	}
+
+	if err := repo.Update(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error updating with a fresh context: %v", err)
+	}
+
+	found, err := repo.FindByID(context.Background(), job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found.Status() != domain.JobStatusQueued {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
+	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 )
@@ -23,7 +24,10 @@ import (
 // these HTTP tests don't need a live PostgreSQL instance, mirroring
 // inMemoryUserRepository in identity_test.go. Ordering matches
 // videodomain.VideoJobRepository's documented contract: CreatedAt
-// descending, VideoJobID ascending as a tie-breaker.
+// descending, VideoJobID ascending as a tie-breaker. Create/FindByID/Update
+// all store and return independent clones, like the real PostgreSQL
+// adapter, so mutating a job a caller holds never changes what's stored
+// unless the caller actually calls Update.
 type inMemoryVideoJobRepository struct {
 	mu   sync.Mutex
 	byID map[string]*videodomain.VideoJob
@@ -33,10 +37,18 @@ func newInMemoryVideoJobRepository() *inMemoryVideoJobRepository {
 	return &inMemoryVideoJobRepository{byID: make(map[string]*videodomain.VideoJob)}
 }
 
+func cloneVideoJob(job *videodomain.VideoJob) *videodomain.VideoJob {
+	clone, err := videodomain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	if err != nil {
+		panic("inMemoryVideoJobRepository: failed to clone video job: " + err.Error())
+	}
+	return clone
+}
+
 func (r *inMemoryVideoJobRepository) Create(_ context.Context, job *videodomain.VideoJob) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.byID[job.ID().String()] = job
+	r.byID[job.ID().String()] = cloneVideoJob(job)
 	return nil
 }
 
@@ -47,7 +59,17 @@ func (r *inMemoryVideoJobRepository) FindByID(_ context.Context, id videodomain.
 	if !ok {
 		return nil, videodomain.ErrVideoJobNotFound
 	}
-	return job, nil
+	return cloneVideoJob(job), nil
+}
+
+func (r *inMemoryVideoJobRepository) Update(_ context.Context, job *videodomain.VideoJob) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.byID[job.ID().String()]; !ok {
+		return videodomain.ErrVideoJobNotFound
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return nil
 }
 
 func (r *inMemoryVideoJobRepository) FindByUserID(_ context.Context, userID videodomain.UserID, offset, limit int) ([]*videodomain.VideoJob, error) {
@@ -57,7 +79,7 @@ func (r *inMemoryVideoJobRepository) FindByUserID(_ context.Context, userID vide
 	var matches []*videodomain.VideoJob
 	for _, job := range r.byID {
 		if job.UserID().Equal(userID) {
-			matches = append(matches, job)
+			matches = append(matches, cloneVideoJob(job))
 		}
 	}
 	sort.Slice(matches, func(i, j int) bool {
@@ -86,14 +108,30 @@ func newTestVideoModule(t *testing.T) *videoModule {
 	return module
 }
 
+// newTestVideoModuleWithRepo wires a videoModule whose ProcessVideoJob use
+// case runs a real ffmpeg extractor, not a fake: this module is reachable
+// from main_test.go's POST /upload tests via startTestServer, which upload
+// real generated test videos and assert on real extracted frame counts.
 func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRepository) {
 	t.Helper()
 	repo := newInMemoryVideoJobRepository()
 	ids := videoidgen.New()
+	extractor := videoffmpeg.New()
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
 	module := newVideoModule(
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewProcessVideoJob(
+			videoapplication.NewEnqueueVideoJob(repo, ids),
+			videoapplication.NewStartProcessing(repo, ids),
+			failJob,
+			extractor,
+			ids,
+		),
+		completeJob,
+		failJob,
 	)
 	return module, repo
 }
@@ -108,6 +146,27 @@ func startTestVideoServer(t *testing.T) (*httptest.Server, jwtauth.Adapter) {
 	srv := httptest.NewServer(setupRouter(identity, video))
 	t.Cleanup(srv.Close)
 	return srv, tokens
+}
+
+func TestExtractionFailureMessage_MapsSentinelErrorsToDistinctPtBRMessages(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"no frames", videoffmpeg.ErrNoFramesExtracted, "Nenhum frame foi extraído do vídeo"},
+		{"ffmpeg exec failed", videoffmpeg.ErrFfmpegExecFailed, "Erro no ffmpeg: boom"},
+		{"zip creation failed", videoffmpeg.ErrZipCreationFailed, "Erro ao criar arquivo ZIP: boom"},
+		{"unclassified", errors.New("something else"), "Erro no processamento: boom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractionFailureMessage(tc.err, "boom")
+			if got != tc.want {
+				t.Fatalf("extractionFailureMessage() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestHandleCreateVideoJob_Success(t *testing.T) {
