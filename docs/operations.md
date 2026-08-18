@@ -82,14 +82,13 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 
 > The components below are planned for future phases. They do not exist in the current deployment. Each is labeled with the phase that introduces it.
 
-### Redis — Planned (Phase 4)
+### Redis — Connection adapter implemented, features Planned (Phase 4)
 
-Four explicit responsibilities, all additive to PostgreSQL (not a replacement):
+`internal/platform/redis` (`add-redis-infrastructure`) provides bare connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close` — not yet wired into `cmd/api`. Three explicit feature responsibilities remain planned, all additive to PostgreSQL (not a replacement):
 
 1. **Idempotency keys** — Prevent duplicate job creation from client retries.
 2. **Rate limiting** — Sliding-window counter per user at the API layer.
 3. **Status cache** — Short-TTL cache for `GET /jobs/{id}/status` to reduce PostgreSQL read pressure.
-4. **Distributed locks** — Belt-and-suspenders alongside RabbitMQ acknowledgement to prevent concurrent worker pickup of the same job.
 
 ### MinIO — Planned (Phase 5)
 
@@ -98,6 +97,8 @@ S3-compatible object storage for uploaded video files and processed ZIP results.
 ### RabbitMQ — Planned (Phase 6)
 
 Durable async message broker for dispatching `VideoJob` processing tasks to the worker. Key properties: per-message acknowledgement, dead-letter queues, durable queues that survive broker restarts. The API publishes a job message after `CreateVideoJob`; the worker (`cmd/worker`) dequeues, runs `ffmpeg`, and calls `CompleteJob` or `FailJob`. The transactional outbox table in PostgreSQL ensures no messages are lost if the API crashes between the DB write and the broker publish.
+
+A fourth Redis-backed responsibility — a **distributed lock**, belt-and-suspenders alongside RabbitMQ acknowledgement to prevent concurrent worker pickup of the same job — is also planned here rather than in Phase 4: there is no `cmd/worker` to contend over job pickup until this phase.
 
 ### Email / Webhook delivery — Planned (Phase 7)
 

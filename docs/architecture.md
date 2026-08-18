@@ -126,7 +126,7 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (Redis/MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 has started: `internal/platform/redis` provides bare connection plumbing (`add-redis-infrastructure`), but none of Phase 4's three features (idempotency keys, rate limiting, status cache) are wired in yet. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
@@ -148,6 +148,8 @@ video-processor/
         app.js
     worker/     # Async frame-extraction worker (Phase 6)
   internal/
+    platform/
+      redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close only, no cmd/api wiring yet
     identity/                        # Implemented (Phase 2), wired into cmd/api
       domain/         # User aggregate, value objects, repository/password/token ports
       application/    # Use cases: RegisterUser, AuthenticateUser
@@ -169,9 +171,11 @@ video-processor/
 | Component | Role | Status |
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
-| Redis | Idempotency keys, rate limiting, status cache, distributed locks | Planned (Phase 4) |
+| Redis | Idempotency keys, rate limiting, status cache | Connection adapter implemented (`internal/platform/redis`), features planned (Phase 4) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
+
+A fourth Redis-backed responsibility — a distributed lock preventing concurrent `cmd/worker` instances from picking up the same job — is planned for Phase 6 (not Phase 4): there is no worker to contend over job pickup until then.
 
 See [docs/roadmap.md](roadmap.md) for the full phase plan.
 

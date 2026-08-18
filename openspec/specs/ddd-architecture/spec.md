@@ -148,7 +148,7 @@ Domain events emitted by one bounded context and consumed by another SHALL be de
 
 ### Requirement: Redis Responsibilities Are Additive, Not a Replacement for PostgreSQL or RabbitMQ
 
-Redis SHALL be used as a mandatory performance and reliability layer with four defined responsibilities. It SHALL NOT replace PostgreSQL as the authoritative state store, and it SHALL NOT replace RabbitMQ as the durable job queue.
+Redis SHALL be used as a mandatory performance and reliability layer with three defined responsibilities in Phase 4: idempotency keys, rate limiting, and a status cache. It SHALL NOT replace PostgreSQL as the authoritative state store, and it SHALL NOT replace RabbitMQ as the durable job queue. A fourth Redis-backed responsibility — a distributed lock coordinating concurrent `cmd/worker` instances picking up jobs — is deferred to Phase 6, since no worker exists to contend over job pickup until then; it is not in scope for Phase 4.
 
 #### Scenario: Idempotency key prevents duplicate job creation
 
@@ -180,9 +180,15 @@ Redis SHALL be used as a mandatory performance and reliability layer with four d
 - **WHEN** a status request arrives
 - **THEN** the application falls back to PostgreSQL, returns the correct current state, and may repopulate the cache
 
+#### Scenario: Distributed worker lock is deferred, not dropped
+
+- **GIVEN** Phase 6 introduces `cmd/worker` and RabbitMQ-driven job pickup
+- **WHEN** more than one worker instance runs concurrently
+- **THEN** a Redis-backed distributed lock (proposed as part of Phase 6, not Phase 4) SHALL prevent two workers from processing the same job
+
 ### Requirement: Monorepo Package Topology Is the Target Structure
 
-The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/worker` as separate entrypoints sharing `internal/` packages. This topology SHALL NOT require a big-bang rewrite; `main.go` MAY remain functional during incremental migration.
+The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/worker` as separate entrypoints sharing `internal/` packages. This topology SHALL NOT require a big-bang rewrite; `main.go` MAY remain functional during incremental migration. Cross-cutting **infrastructure** plumbing that no single bounded context owns (e.g. a shared Redis connection used by more than one context) lives under `internal/platform/`, distinct from any bounded context's own `internal/<context>/infrastructure/`. This is infrastructure sharing only — it does NOT permit sharing `domain` or `application` logic between contexts, which remains forbidden by the "No direct cross-context domain imports" scenario above.
 
 #### Scenario: API and worker share domain and application packages
 
@@ -201,6 +207,12 @@ The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/w
 - **GIVEN** `main.go`, `identity.go`, and their test files have been moved into `cmd/api/`
 - **WHEN** the server is built or run
 - **THEN** `go build -o app ./cmd/api` and `go run ./cmd/api` produce the same HTTP behavior the repo-root `main.go` produced before the move, and no `main.go` exists at the repo root anymore
+
+#### Scenario: Shared infrastructure with no owning context lives under internal/platform
+
+- **GIVEN** a piece of infrastructure (e.g. a Redis connection) is used by more than one bounded context or by transport-level middleware with no bounded-context relationship at all
+- **WHEN** it is added to the codebase
+- **THEN** it lives under `internal/platform/`, not under any single `internal/<context>/infrastructure/`, and it contains only connection/lifecycle plumbing — never domain or application logic for a specific context's use case
 
 ### Requirement: Frontend as Presentation/Delivery Layer
 
