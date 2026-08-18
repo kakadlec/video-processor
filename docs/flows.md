@@ -58,7 +58,7 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
   │                        │    (job stays "processing"  │                 │
   │                        │     if extraction succeeded)│                 │
   │                        │───────────────────────────►│                  │
-  │                        │  Remove temp/, uploads/<file>,│               │
+  │                        │  Remove uploads/<file>,    │                 │
   │                        │  record output artifact ownership│            │
   │                        │───────────────────────────────────────────────►│
   │                        │    Complete if ownership recorded,│           │
@@ -80,7 +80,7 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 - Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous, in-process, no queue or worker (that's Phase 6).
 - No status polling, no notifications, at this HTTP surface — but the `VideoJob` created for the upload does progress through the real `pending → queued → processing → completed`/`failed` state machine internally (see `openspec/specs/videojob-lifecycle/spec.md`), and is queryable via `GET /api/video-jobs/:id` below.
 - On success, the original upload file is deleted; the ZIP in `outputs/` is the only durable artifact.
-- On failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`).
+- On extraction failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`). This does not hold for a failure in the later ownership-recording/`CompleteJob` step — the upload has already been removed by the time that runs, alongside a successful extraction.
 - Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and enforced identically on `/download`, `/api/status`, and the `/uploads`/`/outputs` static mounts.
 
 ---
