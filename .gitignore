@@ -12,3 +12,4 @@
 /video-processor
 
 .claude/worktrees
+__pycache__/
