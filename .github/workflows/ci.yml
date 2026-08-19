@@ -46,9 +46,58 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.25'
+          # setup-go's built-in cache only restores on an exact match of
+          # resolved Go patch version + go.sum hash (also scoped by runner
+          # OS/arch/image, unchanged here since this always runs on
+          # ubuntu-latest) — confirmed against this repo's own cache
+          # entries, which fragment across 1.25.12/1.25.13/1.26.x as the
+          # runner image's toolchain updates. That, plus this repo's high
+          # branch/dependency churn on go.sum, misses often. Cache it
+          # explicitly below instead, with a restore-keys fallback so a
+          # near match still warm-starts.
+          cache: false
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Cache apt packages
+        # /var/cache/apt/archives is root-owned, so actions/cache (running
+        # unprivileged) can't extract a restored cache into it — confirmed
+        # by an actual "Permission denied" failure on every .deb when this
+        # was tried directly. Point apt at a runner-owned staging dir
+        # instead via dir::cache::archives, so it's never touched.
+        # Cache only the finished *.deb files, not the whole staging dir —
+        # apt also creates a `lock` file and `partial/` dir in there with
+        # root-only permissions while downloading, which the unprivileged
+        # save step can't read either (confirmed: also failed with
+        # "Permission denied", just on those two paths instead).
+        # Static, manually-bumped key (same convention as the
+        # gosec/govulncheck caches below) rather than an auto-derived one —
+        # bump the suffix if ffmpeg's resolved package set changes and the
+        # cache goes stale.
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache/*.deb
+          key: ${{ runner.os }}-apt-ffmpeg-v1
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          # apt's internal unprivileged `_apt` download user also needs
+          # access to the redirected cache dir — without this it silently
+          # falls back to fetching unsandboxed as root, which observably
+          # serializes the downloads and made this step ~10x slower than
+          # the original /var/cache/apt/archives path.
+          mkdir -p ~/apt-cache/partial
+          chmod -R 777 ~/apt-cache
+          sudo apt-get -o dir::cache::archives="$HOME/apt-cache" update
+          sudo apt-get -o dir::cache::archives="$HOME/apt-cache" install -y ffmpeg
 
       - name: Vet
         run: go vet ./...
