@@ -46,10 +46,15 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.25'
-          # setup-go's built-in cache only restores on an exact go.sum-hash +
-          # Go-patch-version match, which this repo's high branch/dependency
-          # churn misses often. Cache it explicitly below instead, with a
-          # restore-keys fallback so a near match still warm-starts.
+          # setup-go's built-in cache only restores on an exact match of
+          # resolved Go patch version + go.sum hash (also scoped by runner
+          # OS/arch/image, unchanged here since this always runs on
+          # ubuntu-latest) — confirmed against this repo's own cache
+          # entries, which fragment across 1.25.12/1.25.13/1.26.x as the
+          # runner image's toolchain updates. That, plus this repo's high
+          # branch/dependency churn on go.sum, misses often. Cache it
+          # explicitly below instead, with a restore-keys fallback so a
+          # near match still warm-starts.
           cache: false
 
       - name: Cache Go modules and build cache
@@ -63,16 +68,24 @@ jobs:
             ${{ runner.os }}-go-
 
       - name: Cache apt packages
-        # Caches the downloaded .deb files, not the package index — apt-get
-        # update still runs so dependency resolution stays correct, but a
-        # cache hit skips re-fetching ffmpeg's ~90MB of shared libraries.
+        # /var/cache/apt/archives is root-owned, so actions/cache (running
+        # unprivileged) can't extract a restored cache into it — confirmed
+        # by an actual "Permission denied" failure on every .deb when this
+        # was tried directly. Point apt at a runner-owned staging dir
+        # instead via dir::cache::archives, so it's never touched. Static,
+        # manually-bumped key (same convention as the gosec/govulncheck
+        # caches below) rather than an auto-derived one — bump the suffix
+        # if ffmpeg's resolved package set changes and the cache goes stale.
         uses: actions/cache@v6
         with:
-          path: /var/cache/apt/archives/*.deb
+          path: ~/apt-cache
           key: ${{ runner.os }}-apt-ffmpeg-v1
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          mkdir -p ~/apt-cache
+          sudo apt-get -o dir::cache::archives="$HOME/apt-cache" update
+          sudo apt-get -o dir::cache::archives="$HOME/apt-cache" install -y ffmpeg
 
       - name: Vet
         run: go vet ./...
