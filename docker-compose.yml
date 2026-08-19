@@ -78,8 +78,14 @@ services:
       # infra-only; wiring lands in wire-videojob-http-endpoints).
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # Required as of add-upload-idempotency-keys: cmd/api's composition
+      # root now opens a Redis client for POST /upload's idempotency
+      # mechanism, the first real (non-test-only) consumer of this service.
+      REDIS_ADDR: redis:6379
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       - ./uploads:/app/uploads
@@ -111,8 +117,11 @@ services:
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
       # Exercises internal/platform/redis's own test suite against a real
-      # instance — not yet consumed by cmd/api itself (see proposal.md).
+      # instance.
       REDIS_TEST_ADDR: redis:6379
+      # See the "app" service above — cmd/api's composition root now
+      # requires this at startup, matching app's own value.
+      REDIS_ADDR: redis:6379
     depends_on:
       postgres:
         condition: service_healthy

@@ -3,14 +3,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	videoapplication "video-processor/internal/video/application"
@@ -19,6 +26,70 @@ import (
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 )
+
+// fakeIdempotencyStore is an in-memory videodomain.IdempotencyStore so HTTP
+// tests don't need a live Redis instance, mirroring
+// inMemoryVideoJobRepository. It implements the same token-owned
+// reserve/finalize/lookup/clear semantics as the real Redis-backed adapter.
+type fakeIdempotencyStore struct {
+	mu      sync.Mutex
+	entries map[string]fakeIdempotencyEntry
+}
+
+type fakeIdempotencyEntry struct {
+	token string
+	jobID videodomain.VideoJobID
+	final bool
+}
+
+func newFakeIdempotencyStore() *fakeIdempotencyStore {
+	return &fakeIdempotencyStore{entries: make(map[string]fakeIdempotencyEntry)}
+}
+
+func (s *fakeIdempotencyStore) Reserve(_ context.Context, key videodomain.IdempotencyKey) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.entries[key.String()]; exists {
+		return "", false, nil
+	}
+	token := uuid.NewString()
+	s.entries[key.String()] = fakeIdempotencyEntry{token: token}
+	return token, true, nil
+}
+
+func (s *fakeIdempotencyStore) Finalize(_ context.Context, key videodomain.IdempotencyKey, token string, jobID videodomain.VideoJobID) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.entries[key.String()]
+	if !exists || entry.token != token {
+		return false, nil
+	}
+	entry.jobID = jobID
+	entry.final = true
+	s.entries[key.String()] = entry
+	return true, nil
+}
+
+func (s *fakeIdempotencyStore) Lookup(_ context.Context, key videodomain.IdempotencyKey) (videodomain.VideoJobID, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.entries[key.String()]
+	if !exists || !entry.final {
+		return videodomain.VideoJobID{}, false, nil
+	}
+	return entry.jobID, true, nil
+}
+
+func (s *fakeIdempotencyStore) Clear(_ context.Context, key videodomain.IdempotencyKey, token string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.entries[key.String()]
+	if !exists || entry.token != token {
+		return false, nil
+	}
+	delete(s.entries, key.String())
+	return true, nil
+}
 
 // inMemoryVideoJobRepository is a fake videodomain.VideoJobRepository so
 // these HTTP tests don't need a live PostgreSQL instance, mirroring
@@ -132,6 +203,7 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 		),
 		completeJob,
 		failJob,
+		newFakeIdempotencyStore(),
 	)
 	return module, repo
 }
@@ -496,5 +568,254 @@ func TestSetupVideo_UnreachablePostgres_ReturnsError(t *testing.T) {
 	}
 	if strings.TrimSpace(err.Error()) == "" {
 		t.Fatal("expected a non-empty error message")
+	}
+}
+
+// blockingFrameExtractor blocks ExtractFrames until release is closed, then
+// returns a fixed result (or failWith, if set) — used to deterministically
+// control how long a job stays "processing" without relying on real ffmpeg
+// timing, for tests exercising the idempotency mechanism's concurrent-
+// duplicate and retry-after-failure paths.
+type blockingFrameExtractor struct {
+	release    chan struct{}
+	storageKey string
+	frameCount int
+	failWith   error
+}
+
+func newImmediateFrameExtractor(storageKey string, frameCount int) *blockingFrameExtractor {
+	e := &blockingFrameExtractor{release: make(chan struct{}), storageKey: storageKey, frameCount: frameCount}
+	close(e.release)
+	return e
+}
+
+func newFailingFrameExtractor(failWith error) *blockingFrameExtractor {
+	e := &blockingFrameExtractor{release: make(chan struct{}), failWith: failWith}
+	close(e.release)
+	return e
+}
+
+func (f *blockingFrameExtractor) ExtractFrames(ctx context.Context, _ videodomain.VideoJobID, _ string) (videodomain.StorageKey, int, []string, error) {
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+		return videodomain.StorageKey{}, 0, nil, ctx.Err()
+	}
+	if f.failWith != nil {
+		return videodomain.StorageKey{}, 0, nil, f.failWith
+	}
+	key, err := videodomain.NewStorageKey(f.storageKey)
+	if err != nil {
+		panic(err)
+	}
+	return key, f.frameCount, []string{"frame_0001.png"}, nil
+}
+
+// newIdempotencyTestVideoModule wires a videoModule backed by an in-memory
+// repository and idempotency store, with a caller-supplied extractor for
+// deterministic control over processing timing — unlike
+// newTestVideoModuleWithRepo, which always uses a real ffmpeg extractor.
+func newIdempotencyTestVideoModule(extractor videodomain.FrameExtractor) (*videoModule, *fakeIdempotencyStore, *inMemoryVideoJobRepository) {
+	repo := newInMemoryVideoJobRepository()
+	ids := videoidgen.New()
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
+	store := newFakeIdempotencyStore()
+	module := newVideoModule(
+		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewGetJobStatus(repo, ids),
+		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewProcessVideoJob(
+			videoapplication.NewEnqueueVideoJob(repo, ids),
+			videoapplication.NewStartProcessing(repo, ids),
+			failJob,
+			extractor,
+			ids,
+		),
+		completeJob,
+		failJob,
+		store,
+	)
+	return module, store, repo
+}
+
+func startIdempotencyTestServer(t *testing.T, extractor videodomain.FrameExtractor) (*httptest.Server, jwtauth.Adapter, *fakeIdempotencyStore) {
+	t.Helper()
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	module, store, _ := newIdempotencyTestVideoModule(extractor)
+	srv := httptest.NewServer(setupRouter(identity, module))
+	t.Cleanup(srv.Close)
+	return srv, tokens, store
+}
+
+// writeTestUploadContent writes content to a temp file so uploadVideo (from
+// main_test.go) can multipart-upload it — content is caller-controlled, so
+// tests can force two uploads to be byte-identical (or deliberately not).
+func writeTestUploadContent(t *testing.T, content []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		t.Fatalf("failed to write test upload content: %v", err)
+	}
+	return path
+}
+
+func sha256Hex(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestHandleVideoUpload_DuplicateWhileProcessing_ReturnsExistingJobWithoutReprocessing(t *testing.T) {
+	extractor := &blockingFrameExtractor{release: make(chan struct{}), storageKey: "frames_dup.zip", frameCount: 3}
+	srv, tokens, store := startIdempotencyTestServer(t, extractor)
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("identical video content for concurrency test")
+	videoPath := writeTestUploadContent(t, content)
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		resp, result := uploadVideo(t, srv.URL, token, videoPath, "first.mp4")
+		defer resp.Body.Close()
+		if !result.Success {
+			t.Errorf("first upload should succeed once released, got: %+v", result)
+		}
+	}()
+
+	// Wait until the first request has reserved and finalized its
+	// idempotency key (deterministic — no arbitrary sleep) before firing
+	// the duplicate, so the duplicate resolves via the wait-and-retry
+	// path rather than racing the reservation itself.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, found, _ := store.Lookup(context.Background(), idemKey); found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the first request to finalize its idempotency key")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "duplicate.mp4")
+	defer resp.Body.Close()
+	if result.Success {
+		t.Fatal("duplicate arriving while the original is still processing should not report success")
+	}
+	if result.ZipPath != "" {
+		t.Fatalf("duplicate response should not carry a zip path while still processing, got %q", result.ZipPath)
+	}
+
+	close(extractor.release)
+	<-firstDone
+}
+
+func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameResultWithoutReprocessing(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_completed.zip", 5)
+	srv, tokens, _ := startIdempotencyTestServer(t, extractor)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("identical video content for completed-duplicate test")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp1, result1 := uploadVideo(t, srv.URL, token, videoPath, "first.mp4")
+	defer resp1.Body.Close()
+	if !result1.Success {
+		t.Fatalf("first upload should succeed, got: %+v", result1)
+	}
+
+	resp2, result2 := uploadVideo(t, srv.URL, token, videoPath, "duplicate.mp4")
+	defer resp2.Body.Close()
+	if !result2.Success {
+		t.Fatalf("duplicate of a completed upload should report success, got: %+v", result2)
+	}
+	if result2.ZipPath != result1.ZipPath {
+		t.Fatalf("duplicate's zip path = %q, want %q (the original job's)", result2.ZipPath, result1.ZipPath)
+	}
+	if result2.FrameCount != result1.FrameCount {
+		t.Fatalf("duplicate's frame count = %d, want %d", result2.FrameCount, result1.FrameCount)
+	}
+}
+
+func TestHandleVideoUpload_RetryAfterFailure_CreatesNewJob(t *testing.T) {
+	failingExtractor := newFailingFrameExtractor(errors.New("simulated extraction failure"))
+	srv, tokens, _ := startIdempotencyTestServer(t, failingExtractor)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("identical video content for retry-after-failure test")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp1, result1 := uploadVideo(t, srv.URL, token, videoPath, "fails.mp4")
+	defer resp1.Body.Close()
+	if result1.Success {
+		t.Fatalf("first upload should fail, got: %+v", result1)
+	}
+
+	resp2, result2 := uploadVideo(t, srv.URL, token, videoPath, "retry.mp4")
+	defer resp2.Body.Close()
+	if resp2.StatusCode == http.StatusConflict {
+		t.Fatal("a retry after failure should not be blocked with 409")
+	}
+	if result2.Success {
+		// The retry hits the same failing extractor, so it fails too —
+		// what matters is that it was treated as a fresh attempt
+		// (reached ProcessVideoJob again), not blocked as a duplicate.
+		t.Fatalf("retry should also reach the (still failing) extractor and fail the same way, got: %+v", result2)
+	}
+}
+
+func TestHandleVideoUpload_DifferentUsersSameContent_BothSucceedIndependently(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_multi_user.zip", 2)
+	srv, tokens, _ := startIdempotencyTestServer(t, extractor)
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "7c9e6679-7425-40de-944b-e07fc1f90ae7")
+
+	content := []byte("identical video content shared by two different users")
+	videoPath := writeTestUploadContent(t, content)
+
+	respA, resultA := uploadVideo(t, srv.URL, tokenA, videoPath, "userA.mp4")
+	defer respA.Body.Close()
+	if !resultA.Success {
+		t.Fatalf("user A's upload should succeed, got: %+v", resultA)
+	}
+
+	respB, resultB := uploadVideo(t, srv.URL, tokenB, videoPath, "userB.mp4")
+	defer respB.Body.Close()
+	if !resultB.Success {
+		t.Fatalf("user B's upload should succeed independently, got: %+v", resultB)
+	}
+}
+
+func TestHandleVideoUpload_ReservationNeverResolves_ReturnsConflict(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_unused.zip", 1)
+	srv, tokens, store := startIdempotencyTestServer(t, extractor)
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("content whose reservation is pre-seeded and never resolved")
+	videoPath := writeTestUploadContent(t, content)
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Pre-seed a reservation directly, bypassing a real request, and
+	// never finalize or clear it — simulating a handler that crashed
+	// mid-flight.
+	if _, reserved, err := store.Reserve(context.Background(), idemKey); err != nil || !reserved {
+		t.Fatalf("failed to pre-seed reservation: reserved=%v err=%v", reserved, err)
+	}
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "conflict.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+	if result.Success {
+		t.Fatal("expected Success=false for a 409 response")
 	}
 }

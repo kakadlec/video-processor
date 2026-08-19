@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,11 +19,23 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	platformredis "video-processor/internal/platform/redis"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
+	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
+)
+
+// Bounds for the wait-and-retry loop handleVideoUpload runs against
+// idempotency.Lookup after a failed Reserve — see add-upload-idempotency-keys'
+// design.md Decision 2a. Named constants so the adapter test suite's own
+// sentinel-TTL assertion (which this bound must stay comfortably under) has
+// something concrete to compare against.
+const (
+	idempotencyLookupRetryInterval = 100 * time.Millisecond
+	idempotencyLookupRetryBound    = 2 * time.Second
 )
 
 // videoPostgresDSNEnv is the environment variable holding the Video
@@ -49,15 +63,20 @@ type videoModule struct {
 	// transition) if that recording fails.
 	completeJob *videoapplication.CompleteJob
 	failJob     *videoapplication.FailJob
+	// idempotency backs POST /upload's content-hash duplicate detection —
+	// see internal/video/domain.IdempotencyStore.
+	idempotency videodomain.IdempotencyStore
 }
 
-func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob) *videoModule {
-	return &videoModule{createVideoJob: createVideoJob, getJobStatus: getJobStatus, listUserJobs: listUserJobs, processVideoJob: processVideoJob, completeJob: completeJob, failJob: failJob}
+func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore) *videoModule {
+	return &videoModule{createVideoJob: createVideoJob, getJobStatus: getJobStatus, listUserJobs: listUserJobs, processVideoJob: processVideoJob, completeJob: completeJob, failJob: failJob, idempotency: idempotency}
 }
 
 // setupVideo builds the production Video Processing module from environment
 // configuration, mirroring setupIdentity's fail-clearly-on-misconfiguration
-// posture. VIDEO_POSTGRES_DSN is always required.
+// posture. VIDEO_POSTGRES_DSN and REDIS_ADDR are always required — the
+// latter as of add-upload-idempotency-keys, whose idempotency mechanism is
+// this videoModule's first real Redis consumer.
 func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
 	pgConfig, err := videopostgres.LoadConfigFromEnv()
 	if err != nil {
@@ -76,6 +95,17 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
 		closeDB(db)
 		return nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
 	}
+
+	redisConfig, err := platformredis.LoadConfigFromEnv()
+	if err != nil {
+		closeDB(db)
+		return nil, nil, fmt.Errorf("video: %w", err)
+	}
+	// Open never itself connects (platformredis.Open's own contract) — a
+	// Ping/command failure surfaces at request time instead of here, per
+	// add-upload-idempotency-keys' design.md.
+	redisClient := platformredis.Open(redisConfig)
+	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
 
 	ids := videoidgen.New()
 	repo := videopostgres.NewRepository(db, ids)
@@ -97,6 +127,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
 		),
 		completeJob,
 		failJob,
+		idempotencyStore,
 	)
 	return module, db, nil
 }
@@ -210,10 +241,27 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, file); err != nil {
+	// Hashing through the same io.Copy pass that saves the file costs no
+	// extra I/O — see add-upload-idempotency-keys' design.md Decision 1.
+	hasher := sha256.New()
+	if _, err := io.Copy(out, io.TeeReader(file, hasher)); err != nil {
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Erro ao salvar arquivo: " + err.Error(),
+		})
+		return
+	}
+	contentHash := hex.EncodeToString(hasher.Sum(nil))
+
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), contentHash)
+	if err != nil {
+		// Unreachable in practice: userID.String() is already validated
+		// non-empty above, and contentHash is always a 64-char SHA-256
+		// digest. Handled defensively rather than assumed.
+		log.Printf("build idempotency key for upload %s: %v", filename, err)
+		c.JSON(500, ProcessingResult{
+			Success: false,
+			Message: "Internal error building idempotency key",
 		})
 		return
 	}
@@ -222,11 +270,52 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		log.Printf("Failed to record owner for upload %s: %v", filename, err)
 	}
 
+	token, reserved, err := m.idempotency.Reserve(c.Request.Context(), idemKey)
+	if err != nil {
+		log.Printf("idempotency reserve for upload %s: %v", filename, err)
+		cleanupRedundantUpload(videoPath, filename)
+		c.JSON(500, ProcessingResult{
+			Success: false,
+			Message: "Failed to check upload idempotency",
+		})
+		return
+	}
+	if !reserved {
+		cleanupRedundantUpload(videoPath, filename)
+		if jobID, found := m.waitForFinalizedIdempotencyKey(c.Request.Context(), idemKey); found {
+			status, err := m.getJobStatus.Execute(c.Request.Context(), videoapplication.GetJobStatusInput{
+				RequestingUserID: userID.String(),
+				JobID:            jobID.String(),
+			})
+			if err != nil {
+				log.Printf("get job status for duplicate upload %s: %v", filename, err)
+				c.JSON(500, ProcessingResult{
+					Success: false,
+					Message: "Failed to retrieve existing job status",
+				})
+				return
+			}
+			c.JSON(200, duplicateProcessingResult(status))
+			return
+		}
+		// The reservation never resolved within the bound — a genuine
+		// edge case (the original request is abnormally slow or crashed
+		// before finalizing/clearing), not the common duplicate path.
+		c.JSON(http.StatusConflict, ProcessingResult{
+			Success: false,
+			Message: "Identical content is already being processed for this user; try again shortly.",
+		})
+		return
+	}
+
 	created, err := m.createVideoJob.Execute(c.Request.Context(), videoapplication.CreateVideoJobInput{
 		UserID:           userID.String(),
 		OriginalFilename: safeFilename,
 	})
 	if err != nil {
+		if cleared, clearErr := m.idempotency.Clear(c.Request.Context(), idemKey, token); clearErr != nil || !cleared {
+			log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", filename, cleared, clearErr)
+		}
 		log.Printf("create video job for upload %s: %v", filename, err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -235,8 +324,20 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		return
 	}
 
+	// A Finalize failure is non-fatal — the job just created is still
+	// valid in PostgreSQL either way; see design.md Decision 7.
+	if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
+		log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", filename, err)
+	} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
+		log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
+	}
+
 	processed, err := m.processVideoJob.Execute(c.Request.Context(), created.JobID, videoPath)
 	if err != nil {
+		// The job's state here isn't confirmed failed (ProcessVideoJob's
+		// own FailJob call may itself have errored) — leave the
+		// idempotency key for its own TTL rather than clear it for an
+		// uncertain job state.
 		log.Printf("process video job %s: %v", created.JobID, err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -246,6 +347,12 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	}
 
 	if !processed.Success {
+		// ProcessVideoJob only returns Success:false once FailJob has
+		// already succeeded internally (processing -> failed) — safe to
+		// clear, so a retry with the same content isn't blocked.
+		if cleared, clearErr := m.idempotency.Clear(c.Request.Context(), idemKey, token); clearErr != nil || !cleared {
+			log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
+		}
 		c.JSON(200, ProcessingResult{
 			Success: false,
 			Message: extractionFailureMessage(processed.ExtractionError, processed.FailureReason),
@@ -289,6 +396,8 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 			Reason: "failed to record artifact ownership after processing",
 		}); failErr != nil {
 			log.Printf("Failed to mark video job %s failed after ownership error: %v", created.JobID, failErr)
+		} else if cleared, clearErr := m.idempotency.Clear(finalizeCtx, idemKey, token); clearErr != nil || !cleared {
+			log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
 		}
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -331,6 +440,71 @@ func extractionFailureMessage(extractionErr error, reason string) string {
 		return "Erro ao criar arquivo ZIP: " + reason
 	default:
 		return "Erro no processamento: " + reason
+	}
+}
+
+// cleanupRedundantUpload removes an upload that turned out to be a
+// duplicate — this request's own saved file and owner sidecar, never the
+// original request's artifacts (each request writes under its own
+// uploadID-prefixed path).
+func cleanupRedundantUpload(videoPath, filename string) {
+	if err := os.Remove(videoPath); err != nil {
+		log.Printf("Failed to remove redundant upload %s: %v", videoPath, err)
+	}
+	if err := removeArtifactOwner("uploads", filename); err != nil {
+		log.Printf("Failed to remove owner record for redundant upload %s: %v", filename, err)
+	}
+}
+
+// waitForFinalizedIdempotencyKey polls idempotency.Lookup for up to
+// idempotencyLookupRetryBound after a failed Reserve, so a near-simultaneous
+// duplicate resolves to the original request's job instead of an immediate
+// 409 — see design.md Decision 2a.
+func (m *videoModule) waitForFinalizedIdempotencyKey(ctx context.Context, key videodomain.IdempotencyKey) (videodomain.VideoJobID, bool) {
+	deadline := time.Now().Add(idempotencyLookupRetryBound)
+	for {
+		jobID, found, err := m.idempotency.Lookup(ctx, key)
+		if err != nil {
+			log.Printf("idempotency lookup while waiting for reservation to resolve: %v", err)
+		} else if found {
+			return jobID, true
+		}
+		if time.Now().After(deadline) {
+			return videodomain.VideoJobID{}, false
+		}
+		select {
+		case <-ctx.Done():
+			return videodomain.VideoJobID{}, false
+		case <-time.After(idempotencyLookupRetryInterval):
+		}
+	}
+}
+
+// duplicateProcessingResult translates an existing job's status into
+// ProcessingResult — the same response shape a non-duplicate POST /upload
+// returns, never GetJobStatusResult's own field names (see design.md
+// Decision 8). Per-frame Images names aren't persisted anywhere this status
+// lookup can reach, so they're omitted; the frontend never reads that field
+// regardless.
+func duplicateProcessingResult(status videoapplication.GetJobStatusResult) ProcessingResult {
+	switch status.Status {
+	case string(videodomain.JobStatusCompleted):
+		return ProcessingResult{
+			Success:    true,
+			Message:    fmt.Sprintf("Processing already completed for this content (%d frames extracted).", status.FrameCount),
+			ZipPath:    status.StorageKey,
+			FrameCount: status.FrameCount,
+		}
+	case string(videodomain.JobStatusFailed):
+		return ProcessingResult{
+			Success: false,
+			Message: "Processing already failed for this content: " + status.ErrorReason,
+		}
+	default:
+		return ProcessingResult{
+			Success: false,
+			Message: "This content is already being processed; try again shortly.",
+		}
 	}
 }
 
