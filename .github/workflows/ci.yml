@@ -72,13 +72,19 @@ jobs:
         # unprivileged) can't extract a restored cache into it — confirmed
         # by an actual "Permission denied" failure on every .deb when this
         # was tried directly. Point apt at a runner-owned staging dir
-        # instead via dir::cache::archives, so it's never touched. Static,
-        # manually-bumped key (same convention as the gosec/govulncheck
-        # caches below) rather than an auto-derived one — bump the suffix
-        # if ffmpeg's resolved package set changes and the cache goes stale.
+        # instead via dir::cache::archives, so it's never touched.
+        # Cache only the finished *.deb files, not the whole staging dir —
+        # apt also creates a `lock` file and `partial/` dir in there with
+        # root-only permissions while downloading, which the unprivileged
+        # save step can't read either (confirmed: also failed with
+        # "Permission denied", just on those two paths instead).
+        # Static, manually-bumped key (same convention as the
+        # gosec/govulncheck caches below) rather than an auto-derived one —
+        # bump the suffix if ffmpeg's resolved package set changes and the
+        # cache goes stale.
         uses: actions/cache@v6
         with:
-          path: ~/apt-cache
+          path: ~/apt-cache/*.deb
           key: ${{ runner.os }}-apt-ffmpeg-v1
 
       - name: Install ffmpeg
