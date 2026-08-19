@@ -89,7 +89,13 @@ jobs:
 
       - name: Install ffmpeg
         run: |
-          mkdir -p ~/apt-cache
+          # apt's internal unprivileged `_apt` download user also needs
+          # access to the redirected cache dir — without this it silently
+          # falls back to fetching unsandboxed as root, which observably
+          # serializes the downloads and made this step ~10x slower than
+          # the original /var/cache/apt/archives path.
+          mkdir -p ~/apt-cache/partial
+          chmod -R 777 ~/apt-cache
           sudo apt-get -o dir::cache::archives="$HOME/apt-cache" update
           sudo apt-get -o dir::cache::archives="$HOME/apt-cache" install -y ffmpeg
 
