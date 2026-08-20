@@ -57,15 +57,33 @@ jobs:
           # near match still warm-starts.
           cache: false
 
+      - name: Get resolved Go version
+        # go.mod's "go 1.25" only pins the minor version, so the actual
+        # toolchain patch (1.25.12 vs 1.25.13 etc.) drifts as the runner
+        # image updates — same thing the comment above says invalidates
+        # setup-go's own cache. The build cache below needs this in its key
+        # too: GOCACHE entries are internally keyed by the compiler's own
+        # build ID, so restoring a cache built under a different patch
+        # version is a silent no-op — the directory restores fine and
+        # actions/cache reports a hit, but `go vet`/`go test` reject every
+        # cached object as stale and recompile from scratch anyway. Caught
+        # this by comparing two real runs: a hit restored 117MB yet `go
+        # vet` still took ~46s (confirmed as a full cold compile locally:
+        # ~20s at 6-7 cores, which scales to CI's more limited cores) —
+        # the run that saved the cache had resolved Go 1.25.12, the run
+        # that "hit" it had 1.25.13.
+        id: go-version
+        run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Cache Go modules and build cache
         uses: actions/cache@v6
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-go-${{ steps.go-version.outputs.version }}-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-go-
+            ${{ runner.os }}-go-${{ steps.go-version.outputs.version }}-
 
       - name: Cache apt packages
         # /var/cache/apt/archives is root-owned, so actions/cache (running
