@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,11 @@ import (
 type fakeIdempotencyStore struct {
 	mu      sync.Mutex
 	entries map[string]fakeIdempotencyEntry
+	// finalizeGate, if non-nil, blocks Finalize until closed — lets a test
+	// hold a reservation open (unfinalized) while a concurrent duplicate
+	// polls Lookup, so the bounded wait-and-retry path is genuinely
+	// exercised rather than always seeing an already-finalized key.
+	finalizeGate chan struct{}
 }
 
 type fakeIdempotencyEntry struct {
@@ -57,7 +63,14 @@ func (s *fakeIdempotencyStore) Reserve(_ context.Context, key videodomain.Idempo
 	return token, true, nil
 }
 
-func (s *fakeIdempotencyStore) Finalize(_ context.Context, key videodomain.IdempotencyKey, token string, jobID videodomain.VideoJobID) (bool, error) {
+func (s *fakeIdempotencyStore) Finalize(ctx context.Context, key videodomain.IdempotencyKey, token string, jobID videodomain.VideoJobID) (bool, error) {
+	if s.finalizeGate != nil {
+		select {
+		case <-s.finalizeGate:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry, exists := s.entries[key.String()]
@@ -89,6 +102,16 @@ func (s *fakeIdempotencyStore) Clear(_ context.Context, key videodomain.Idempote
 	}
 	delete(s.entries, key.String())
 	return true, nil
+}
+
+// hasReservation reports whether key has any entry (reserved or finalized)
+// — test-only, for synchronizing on "a reservation exists" independent of
+// whether it has finalized yet.
+func (s *fakeIdempotencyStore) hasReservation(key videodomain.IdempotencyKey) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.entries[key.String()]
+	return exists
 }
 
 // inMemoryVideoJobRepository is a fake videodomain.VideoJobRepository so
@@ -575,12 +598,17 @@ func TestSetupVideo_UnreachablePostgres_ReturnsError(t *testing.T) {
 // returns a fixed result (or failWith, if set) — used to deterministically
 // control how long a job stays "processing" without relying on real ffmpeg
 // timing, for tests exercising the idempotency mechanism's concurrent-
-// duplicate and retry-after-failure paths.
+// duplicate and retry-after-failure paths. invocations counts calls, so
+// tests can prove a duplicate did (or didn't) actually reach ffmpeg, rather
+// than only comparing response fields a buggy reprocessed run could also
+// produce identically (the fixed storageKey/frameCount would match either
+// way).
 type blockingFrameExtractor struct {
-	release    chan struct{}
-	storageKey string
-	frameCount int
-	failWith   error
+	release     chan struct{}
+	storageKey  string
+	frameCount  int
+	failWith    error
+	invocations int32
 }
 
 func newImmediateFrameExtractor(storageKey string, frameCount int) *blockingFrameExtractor {
@@ -596,6 +624,7 @@ func newFailingFrameExtractor(failWith error) *blockingFrameExtractor {
 }
 
 func (f *blockingFrameExtractor) ExtractFrames(ctx context.Context, _ videodomain.VideoJobID, _ string) (videodomain.StorageKey, int, []string, error) {
+	atomic.AddInt32(&f.invocations, 1)
 	select {
 	case <-f.release:
 	case <-ctx.Done():
@@ -609,6 +638,10 @@ func (f *blockingFrameExtractor) ExtractFrames(ctx context.Context, _ videodomai
 		panic(err)
 	}
 	return key, f.frameCount, []string{"frame_0001.png"}, nil
+}
+
+func (f *blockingFrameExtractor) Invocations() int {
+	return int(atomic.LoadInt32(&f.invocations))
 }
 
 // newIdempotencyTestVideoModule wires a videoModule backed by an in-memory
@@ -670,6 +703,14 @@ func TestHandleVideoUpload_DuplicateWhileProcessing_ReturnsExistingJobWithoutRep
 	srv, tokens, store := startIdempotencyTestServer(t, extractor)
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
+	// Gate Finalize so the first request's reservation stays unfinalized
+	// until this test explicitly releases it — otherwise the duplicate
+	// below would always find an already-finalized key on its very first
+	// Lookup, never actually exercising the bounded wait-and-retry loop
+	// against an in-flight reservation that finalizes mid-wait.
+	finalizeGate := make(chan struct{})
+	store.finalizeGate = finalizeGate
+
 	content := []byte("identical video content for concurrency test")
 	videoPath := writeTestUploadContent(t, content)
 	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
@@ -687,32 +728,53 @@ func TestHandleVideoUpload_DuplicateWhileProcessing_ReturnsExistingJobWithoutRep
 		}
 	}()
 
-	// Wait until the first request has reserved and finalized its
-	// idempotency key (deterministic — no arbitrary sleep) before firing
-	// the duplicate, so the duplicate resolves via the wait-and-retry
-	// path rather than racing the reservation itself.
+	// Wait until the first request has reserved (but, thanks to the gate,
+	// not yet finalized) its idempotency key.
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, found, _ := store.Lookup(context.Background(), idemKey); found {
-			break
-		}
+	for !store.hasReservation(idemKey) {
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the first request to finalize its idempotency key")
+			t.Fatal("timed out waiting for the first request to reserve its idempotency key")
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	resp, result := uploadVideo(t, srv.URL, token, videoPath, "duplicate.mp4")
-	defer resp.Body.Close()
-	if result.Success {
+	// Start the duplicate now: it must fail to reserve (the key is
+	// already reserved) and enter the bounded wait-and-retry loop against
+	// Lookup, which keeps returning found=false while Finalize stays
+	// gated.
+	duplicateDone := make(chan struct{})
+	var dupResp *http.Response
+	var dupResult ProcessingResult
+	go func() {
+		defer close(duplicateDone)
+		dupResp, dupResult = uploadVideo(t, srv.URL, token, videoPath, "duplicate.mp4")
+	}()
+
+	// Give the duplicate's poll loop time to actually run at least one
+	// iteration against the still-unfinalized key before releasing
+	// Finalize, so this genuinely covers a mid-wait transition rather
+	// than an immediate hit on the loop's first check.
+	time.Sleep(idempotencyLookupRetryInterval * 2)
+	close(finalizeGate)
+
+	<-duplicateDone
+	defer dupResp.Body.Close()
+	if dupResult.Success {
 		t.Fatal("duplicate arriving while the original is still processing should not report success")
 	}
-	if result.ZipPath != "" {
-		t.Fatalf("duplicate response should not carry a zip path while still processing, got %q", result.ZipPath)
+	if dupResult.ZipPath != "" {
+		t.Fatalf("duplicate response should not carry a zip path while still processing, got %q", dupResult.ZipPath)
 	}
 
 	close(extractor.release)
 	<-firstDone
+
+	// Checked only now that the first request has fully completed
+	// (extraction is guaranteed to have run): the duplicate must never
+	// have reached the extractor itself.
+	if got := extractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1 (the duplicate must not reach ffmpeg)", got)
+	}
 }
 
 func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameResultWithoutReprocessing(t *testing.T) {
@@ -740,6 +802,13 @@ func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameResultWithoutRepr
 	if result2.FrameCount != result1.FrameCount {
 		t.Fatalf("duplicate's frame count = %d, want %d", result2.FrameCount, result1.FrameCount)
 	}
+	// The fixed extractor always returns the same storageKey/frameCount
+	// regardless of which job invokes it, so the response comparisons
+	// above would still pass even if the duplicate incorrectly
+	// reprocessed — this is the assertion that actually rules that out.
+	if got := extractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1 (the duplicate must not be reprocessed)", got)
+	}
 }
 
 func TestHandleVideoUpload_RetryAfterFailure_CreatesNewJob(t *testing.T) {
@@ -766,6 +835,13 @@ func TestHandleVideoUpload_RetryAfterFailure_CreatesNewJob(t *testing.T) {
 		// what matters is that it was treated as a fresh attempt
 		// (reached ProcessVideoJob again), not blocked as a duplicate.
 		t.Fatalf("retry should also reach the (still failing) extractor and fail the same way, got: %+v", result2)
+	}
+	// A duplicate blocked by 409 (or one that returned the first job's
+	// stale failure without a new attempt) would also produce
+	// Success=false here — this is what actually proves the retry
+	// reached the extractor a second time, rather than being blocked.
+	if got := failingExtractor.Invocations(); got != 2 {
+		t.Fatalf("extractor invocations = %d, want 2 (the retry must create and process a fresh job)", got)
 	}
 }
 

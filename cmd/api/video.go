@@ -313,9 +313,15 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		OriginalFilename: safeFilename,
 	})
 	if err != nil {
-		if cleared, clearErr := m.idempotency.Clear(c.Request.Context(), idemKey, token); clearErr != nil || !cleared {
+		// A detached context: c.Request.Context() may already be canceled
+		// (e.g. client disconnect, which could itself be why
+		// CreateVideoJob failed), and this cleanup must still succeed so
+		// an immediate retry isn't blocked for the sentinel's full TTL.
+		clearCtx, cancel := videoapplication.NewFinalizationContext()
+		if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
 			log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", filename, cleared, clearErr)
 		}
+		cancel()
 		log.Printf("create video job for upload %s: %v", filename, err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -349,10 +355,17 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	if !processed.Success {
 		// ProcessVideoJob only returns Success:false once FailJob has
 		// already succeeded internally (processing -> failed) — safe to
-		// clear, so a retry with the same content isn't blocked.
-		if cleared, clearErr := m.idempotency.Clear(c.Request.Context(), idemKey, token); clearErr != nil || !cleared {
+		// clear, so a retry with the same content isn't blocked. A
+		// detached context, like above: the extraction error itself may
+		// be a symptom of c.Request.Context() already being canceled
+		// (ProcessVideoJob uses its own detached context for the same
+		// reason when it calls FailJob internally), and this cleanup must
+		// still succeed for the retry to actually work.
+		clearCtx, cancel := videoapplication.NewFinalizationContext()
+		if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
 			log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
 		}
+		cancel()
 		c.JSON(200, ProcessingResult{
 			Success: false,
 			Message: extractionFailureMessage(processed.ExtractionError, processed.FailureReason),
