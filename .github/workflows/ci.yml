@@ -127,6 +127,10 @@ jobs:
           # video_jobs/video_job_outbox coexist with identity_users there.
           VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
           REDIS_TEST_ADDR: localhost:6379
+          # cmd/api's composition root now requires this at startup
+          # (add-upload-idempotency-keys) — same CI redis service as
+          # REDIS_TEST_ADDR above.
+          REDIS_ADDR: localhost:6379
         run: go test ./... -v
 
   sast:
