@@ -52,13 +52,13 @@ Define the Redis-backed idempotency-key mechanism for `POST /upload`: key deriva
 
 ### Requirement: Reservation Is Finalized To The Real VideoJobID Only By Its Owning Token
 
-Once `CreateVideoJob` succeeds for a request that holds a reservation, `handleVideoUpload` SHALL overwrite the idempotency key's value with the created `VideoJobID` and extend its TTL to the full idempotency window (24 hours), but only if the key still holds that same request's own ownership token — a stale request whose token no longer matches (because its reservation already expired and was reclaimed) SHALL NOT overwrite a newer reservation or finalized value.
+Once `CreateVideoJob` succeeds for a request that holds a reservation, `handleVideoUpload` SHALL overwrite the idempotency key's value with a finalized value that embeds both the created `VideoJobID` and the request's own ownership token, and extend its TTL to the full idempotency window (24 hours), but only if the key still holds that same request's reservation under that token — a stale request whose token no longer matches (because its reservation already expired and was reclaimed) SHALL NOT overwrite a newer reservation or finalized value. Embedding the token in the finalized value (not just the reservation) is what lets a later `Clear` call (see below) verify ownership after finalization too, not only while a reservation is still in flight.
 
 #### Scenario: Key is finalized after job creation
 
 - **GIVEN** a request holds a reservation under its own ownership token and `CreateVideoJob` has just succeeded
 - **WHEN** the handler finalizes the key
-- **THEN** the key's value becomes the created `VideoJobID` and its TTL becomes the full 24-hour window
+- **THEN** the key's value becomes a finalized value embedding both the request's ownership token and the created `VideoJobID`, its TTL becomes the full 24-hour window, and `Lookup` against this key returns that `VideoJobID`
 
 #### Scenario: A stale request cannot finalize over a newer reservation
 
