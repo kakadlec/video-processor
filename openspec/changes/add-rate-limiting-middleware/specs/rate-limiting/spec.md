@@ -14,7 +14,13 @@
 
 - **GIVEN** an authenticated user who has already made `RATE_LIMIT_MAX_REQUESTS` requests within the current window
 - **WHEN** they make one more request to any route in `videoRoutes`
-- **THEN** the response is `429 Too Many Requests` with an English-language JSON error body and a `Retry-After` header giving the number of seconds until the window resets, and no handler-specific logic runs
+- **THEN** the response is `429 Too Many Requests` with an English-language JSON error body and a `Retry-After` header giving a strictly positive number of whole seconds until the window resets, and no handler-specific logic runs
+
+#### Scenario: Retry-After rounds a sub-second remainder up, never down to zero
+
+- **GIVEN** a denied request whose underlying window has less than one second of real time remaining before it expires
+- **WHEN** the rate-limit middleware computes the `Retry-After` header
+- **THEN** the value is rounded up to at least `1`, never `0` — a `0` would incorrectly tell the client to retry immediately against a window that is, in fact, still active
 
 #### Scenario: Different users are limited independently
 
@@ -30,7 +36,7 @@
 
 ### Requirement: Rate Limit Thresholds Are Configurable With Safe Defaults
 
-`internal/platform/ratelimit.LoadConfigFromEnv` SHALL read `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` from the environment, applying documented defaults (60 requests, 60 seconds respectively) when either is unset or empty — unlike `REDIS_ADDR`, their absence SHALL NOT be a startup failure.
+`internal/platform/ratelimit.LoadConfigFromEnv` SHALL read `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` from the environment, applying documented defaults (60 requests, 60 seconds respectively) when either is unset or empty — unlike `REDIS_ADDR`, their absence SHALL NOT be a startup failure. Both values, whether defaulted or explicitly set, SHALL be strictly positive integers (`>= 1`); a zero or negative value SHALL be rejected with the same class of error as a non-integer value, since a non-positive `WindowSeconds` would disable limiting outright (the counter key expires immediately) and a non-positive `MaxRequests` would reject every request.
 
 #### Scenario: Both variables unset falls back to defaults
 
@@ -50,12 +56,24 @@
 - **WHEN** `LoadConfigFromEnv` is called
 - **THEN** it returns an error and no usable `Config`
 
-### Requirement: Limiter Failure Fails Open
+#### Scenario: Zero or negative value returns an error
 
-If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Redis error) rather than returning a normal allow/deny result, `cmd/api`'s rate-limit middleware SHALL allow the request to proceed (fail open) and log the error, rather than rejecting an otherwise-valid request due to an unrelated infrastructure hiccup.
+- **GIVEN** `RATE_LIMIT_MAX_REQUESTS` or `RATE_LIMIT_WINDOW_SECONDS` is set to `"0"` or a negative integer (e.g. `"-1"`)
+- **WHEN** `LoadConfigFromEnv` is called
+- **THEN** it returns an error and no usable `Config`
+
+### Requirement: Limiter Failure Fails Open Within A Bounded Latency
+
+If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Redis error) rather than returning a normal allow/deny result, `cmd/api`'s rate-limit middleware SHALL allow the request to proceed (fail open) and log the error, rather than rejecting an otherwise-valid request due to an unrelated infrastructure hiccup. The middleware SHALL bound how long it waits on the `Allow` call with a short, fixed per-request timeout (independent of the shared Redis client's own connection/retry policy), so a Redis outage degrades to "fail open quickly" rather than "every authenticated request stalls for the client's default timeout before proceeding."
 
 #### Scenario: Redis error does not block the request
 
 - **GIVEN** the Redis client used by the rate limiter returns an error (e.g. connection failure) when `Allow` is called
 - **WHEN** an authenticated user makes a request to a rate-limited route
 - **THEN** the request proceeds to its handler as if the rate limit check had passed, and the error is logged
+
+#### Scenario: An unresponsive Redis does not stall the request past the bounded timeout
+
+- **GIVEN** the Redis client used by the rate limiter neither succeeds nor errors within the middleware's configured timeout (e.g. a network partition where connections hang rather than fail fast)
+- **WHEN** an authenticated user makes a request to a rate-limited route
+- **THEN** the middleware's `Allow` call is bounded by that timeout, after which the request proceeds to its handler (fail open) rather than hanging indefinitely
