@@ -1046,6 +1046,9 @@ func TestHandleVideoUpload_DuplicateAfterFailure_ReturnsFailedResultBeforeClear(
 	if !strings.Contains(dupResult.Message, "already failed") {
 		t.Fatalf("duplicate message = %q, want it to mention the job already failed", dupResult.Message)
 	}
+	if !strings.Contains(dupResult.Message, "simulated extraction failure") {
+		t.Fatalf("duplicate message = %q, want it to incorporate the original job's failure reason", dupResult.Message)
+	}
 
 	close(clearGate)
 	<-firstDone
