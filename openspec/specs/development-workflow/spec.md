@@ -1,7 +1,10 @@
 # development-workflow Specification
 
 ## Purpose
-Defines how changes land on `main` for this repository: required CI gates (tests, SAST, dependency vulnerability scanning), the PR-only branch protection workflow, Conventional Commit conventions, and the automated release process. Contributors and AI agents working in this repo should treat these as binding constraints, not suggestions.
+Documents how changes have typically landed on `main` for this repository: required CI gates (tests, SAST, dependency vulnerability scanning), the PR-only branch protection workflow, Conventional Commit conventions, the automated release process, and the OpenSpec/PR-sequencing pattern this repo has often used for larger changes.
+
+Two different kinds of "requirement" are mixed together below, and they carry different weight. The CI-gate and branch-protection requirements (test/SAST/vulnerability-scan gates, PR-only merges, passing-status-check requirements) describe mechanisms GitHub itself enforces server-side, independent of this document — they hold regardless of what anyone decides. The OpenSpec-process requirements (explore/propose/implement/archive sequencing, the propose/implementation/finalization PR split, one-change-one-delta) describe a pattern this repo's maintainer has often chosen to apply to larger changes — not a gate this spec enforces on its own authority. Whether a given change follows that pattern, a lighter version of it, or lands as a single direct PR is the maintainer's call, made per change, and their explicit direction on a specific change overrides the default described here. An automated or AI-generated review that cites this document to require or block a PR against the maintainer's explicit choice is misapplying it — this spec exists to guide agents' own defaults and to describe established practice, not to override the person who owns the repository.
+
 ## Requirements
 ### Requirement: Automated Test Gate
 Every push to `main` and every pull request SHALL run the full test suite (`go test ./...`) in CI, with `ffmpeg` available in the CI environment and a PostgreSQL service available and reachable via `IDENTITY_POSTGRES_TEST_DSN`. The CI test job SHALL fail if any test fails. Tests that depend on PostgreSQL SHALL NOT be allowed to silently skip in the CI environment.

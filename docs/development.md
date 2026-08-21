@@ -155,26 +155,26 @@ Versioning is **not** manual — nobody runs `git tag` by hand. On every push to
 
 ### OpenSpec Workflow
 
-Non-trivial changes (new features, behavior changes, bug fixes with real design decisions, refactors, infra/workflow/CI changes) follow the spec-driven process:
+For larger changes, this repo has often organized work through a spec-driven process ([OpenSpec](https://github.com/Fission-AI/OpenSpec)):
 
-1. **Explore (when warranted):** `/opsx:explore` → for changes that are complex or ambiguous (cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or open design questions), before proposing. A simple, already-scoped change may skip straight to propose.
+1. **Explore (when warranted):** `/opsx:explore` → for changes that are complex or ambiguous (cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or open design questions), before proposing.
 2. **Propose:** `/opsx:propose` → creates `openspec/changes/<name>/proposal.md`, `design.md`, `tasks.md`
 3. **Implement:** `/opsx:apply` → work through `tasks.md`
 4. **Archive:** `/opsx:archive` → folds the change into `openspec/specs/`
 
-Skip this flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps). This is a separate question from the test-run requirement above: a dependency bump can still skip OpenSpec/the 3-PR split, but if it's reported as a completed change it still needs a passing local test run first. When in doubt about whether something is trivial, don't skip the flow.
+This documents a pattern the repo has used, not a gate this file enforces. Whether a given change warrants this process, a lighter version of it, or a single direct PR is the maintainer's call, made per change — not something this document or an automated review decides on the maintainer's behalf.
 
-For Claude Code specifically, the `change-lifecycle` skill (`.claude/skills/change-lifecycle/SKILL.md`) encodes this sequence and its gates (wait for the propose PR to merge before implementing, verify done-ness before reporting a task complete, do finalization work before running archive) so it can be invoked directly instead of re-deriving it each time; `repo-workflow` (`.claude/skills/repo-workflow/SKILL.md`) carries the compact version of everything else in this "Contribution Conventions" section.
+For Claude Code specifically, the `change-lifecycle` skill (`.claude/skills/change-lifecycle/SKILL.md`) and `repo-workflow` skill (`.claude/skills/repo-workflow/SKILL.md`) are where the actual scoping/sequencing judgment lives for Claude Code's own work — that's what decides how to approach a given change, deferring to the maintainer's explicit direction when given. Update those skills, not this section, if that judgment needs to change.
 
 ### PR Separation Rule
 
-Non-trivial changes use three PR roles, in this order:
+When the process above is in use for a given change, it has commonly used three PR roles, in this order:
 
-1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
-2. **Implementation PR** — only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`.
-3. **Finalization PR** — after implementation merges, one PR bundling *all* of: marking the completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, updating any permanent documentation (`README`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and, if the change has a `docs/roadmap.md` Change Backlog row (only product/architecture-scope changes do — see `docs/roadmap.md`), flipping it to `archived`. Do not split these into separate docs/archive/roadmap PRs. It must not contain application source or tests.
+1. **Propose PR** — the new `openspec/changes/<name>/` artifacts. Merges before implementation begins.
+2. **Implementation PR** — the files that implement the change's declared scope.
+3. **Finalization PR** — after implementation merges, marking completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, and updating any permanent documentation that needs to reflect the shipped change.
 
-`tasks.md` checkoffs belong in the finalization PR, not in the implementation PR. Note that the vendored `openspec-apply-change` skill checks off tasks immediately as it completes them — when applying implementation-scoped tasks, keep those checkoff edits out of the implementation PR's commit and re-apply them during finalization instead.
+This keeps a spec-driven change's PRs individually reviewable; it isn't a requirement for every PR in this repo, and a single direct PR (a bugfix, a small CI/config change, anything the maintainer chooses to just ship) is a legitimate, normal way to contribute here.
 
 Green CI does not authorize a merge. An agent may merge only when the user explicitly authorizes that specific PR in the current session; authorization for one PR does not extend to later PRs.
 
