@@ -24,19 +24,20 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity and Video Processing configuration are both required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, and `VIDEO_POSTGRES_DSN` are all set (see [docs/operations.md](operations.md) for all three variables). Start PostgreSQL (`docker compose up -d postgres`) and export all three before `go run ./cmd/api`:
+Identity, Video Processing, and Redis configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and `REDIS_ADDR` are all set (see [docs/operations.md](operations.md) for all four variables). Start PostgreSQL and Redis (`docker compose up -d postgres redis`) and export all four before `go run ./cmd/api`:
 
 ```bash
 # Download dependencies
 go mod download
 
-# Start PostgreSQL for the identity and video modules
-docker compose up -d postgres
+# Start PostgreSQL and Redis for the identity, video, and idempotency-key modules
+docker compose up -d postgres redis
 
-# Set required identity and video configuration
+# Set required identity, video, and Redis configuration
 export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
 export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
+export REDIS_ADDR="localhost:6379"
 
 # Start the server (listens on :8080)
 go run ./cmd/api
@@ -115,7 +116,7 @@ A change whose diff includes a Go module input file (`.go` source, `go.mod`, or 
 ```bash
 docker compose up --build
 # Access the UI by opening http://127.0.0.1:8080 in a browser —
-# identity is already configured (PostgreSQL + JWT signing key)
+# identity, video, and Redis are already configured (PostgreSQL, JWT signing key, REDIS_ADDR)
 ```
 
 `docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.

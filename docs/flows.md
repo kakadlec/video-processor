@@ -42,8 +42,13 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
   │  (multipart)            │                          │                   │
   │───────────────────────►│                          │                    │
   │                        │  Validate extension       │                   │
-  │                        │  Save to uploads/         │                   │
+  │                        │  Save to uploads/, hashing│                   │
+  │                        │  the stream (SHA-256)      │                  │
   │                        │──────────────────────────────────────────────►│
+  │                        │  Reserve idempotency key (Redis: UserID+hash) │
+  │                        │  reserved=false → poll for the winner's job   │
+  │                        │  status (bounded) → return it, or 409 if the  │
+  │                        │  bound elapses — no CreateVideoJob below      │
   │                        │  CreateVideoJob            │                  │
   │                        │───────────────────────────►│                  │
   │                        │  ProcessVideoJob:           │                 │
@@ -77,6 +82,7 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
 The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/infrastructure/ffmpeg`'s `Extractor`, called through the `FrameExtractor` port `ProcessVideoJob` depends on — see `openspec/specs/videojob-execution/spec.md`.
 
 **Key characteristics (current):**
+- Content-hash idempotency: identical bytes uploaded twice by the same user reuse the first request's `VideoJob` rather than running `ffmpeg` again (Phase 4, `add-upload-idempotency-keys`) — see `docs/architecture.md`'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md` for the full reserve/finalize/clear protocol. `REDIS_ADDR` is required at startup for this.
 - Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous, in-process, no queue or worker (that's Phase 6).
 - No status polling, no notifications, at this HTTP surface — but the `VideoJob` created for the upload does progress through the real `pending → queued → processing → completed`/`failed` state machine internally (see `openspec/specs/videojob-lifecycle/spec.md`), and is queryable via `GET /api/video-jobs/:id` below.
 - On success, the original upload file is deleted; the ZIP in `outputs/` is the only durable artifact.
