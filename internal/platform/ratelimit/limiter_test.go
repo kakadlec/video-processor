@@ -74,6 +74,52 @@ func TestAllow_RequestCrossingLimitIsDenied(t *testing.T) {
 	}
 }
 
+func TestAllow_RequestCrossingLimitIsDenied_SubSecondRemainder(t *testing.T) {
+	limiter := newTestLimiter(t, ratelimit.Config{MaxRequests: 1, WindowSeconds: 1})
+	key := uniqueKey(t)
+
+	allowed, _, err := limiter.Allow(context.Background(), key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !allowed {
+		t.Fatal("expected first request to be allowed")
+	}
+
+	// Wait until only a sub-second remainder of the 1s window is left, so
+	// the denial below exercises PTTL's millisecond precision instead of
+	// happening to run right after EXPIRE set a fresh whole-second TTL. An
+	// implementation deriving retryAfter from TTL (whole seconds) instead
+	// of PTTL (milliseconds) would see 0 remaining here and either return 0
+	// or floor to a different value than the exact ceiling this asserts.
+	time.Sleep(900 * time.Millisecond)
+
+	deniedAllowed, retryAfter, err := limiter.Allow(context.Background(), key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deniedAllowed {
+		t.Fatal("expected the second request to be denied")
+	}
+	if retryAfter != time.Second {
+		t.Fatalf("retryAfter = %v, want exactly 1s (ceiling of the ~100ms PTTL remainder) — a truncating implementation would fail this", retryAfter)
+	}
+}
+
+// Note on what's deliberately NOT tested here: an already-expired context
+// passed to Allow fails fast regardless of whether the shared client honors
+// context deadlines mid-flight — go-redis rejects an already-canceled
+// context up front either way, so that alone can't distinguish "the client
+// is bounded by this context" from "the client ignores it after replacing it
+// with context.Background()." The real proof that internal/platform/redis's
+// shared client actually honors an in-flight deadline (which is what
+// add-rate-limiting-middleware's fail-open latency bound depends on) lives
+// in internal/platform/redis/client_test.go's
+// TestOpen_ClientHonorsContextDeadlineDuringInFlightCommand, which uses a
+// genuinely blocking command (BLPop) to verify it — an earlier version of
+// this file had a same-package test that looked like it proved this but
+// didn't (verified: it passed identically with the fix reverted).
+
 func TestAllow_DifferentKeysTrackedIndependently(t *testing.T) {
 	limiter := newTestLimiter(t, ratelimit.Config{MaxRequests: 1, WindowSeconds: 10})
 	keyA := uniqueKey(t)

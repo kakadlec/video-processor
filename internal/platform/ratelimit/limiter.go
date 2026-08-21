@@ -70,16 +70,23 @@ func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool, retryAft
 	if count <= int64(l.cfg.MaxRequests) {
 		return true, 0, nil
 	}
+	return false, msToRetryAfter(ttlMs), nil
+}
+
+// msToRetryAfter rounds a PTTL result (milliseconds, possibly negative for
+// an already-expired key) up to the next whole second, clamped to a minimum
+// of 1s — so a denied response's Retry-After header is never 0, which would
+// incorrectly tell the client to retry immediately against a window that,
+// in fact, hasn't reset yet (see allowScript's doc comment above).
+func msToRetryAfter(ttlMs int64) time.Duration {
 	if ttlMs < 0 {
 		ttlMs = 0
 	}
-	// Round up to the next whole second so a sub-second remainder never
-	// reports a Retry-After of 0 (see allowScript's doc comment above).
 	retrySeconds := (ttlMs + 999) / 1000
 	if retrySeconds < 1 {
 		retrySeconds = 1
 	}
-	return false, time.Duration(retrySeconds) * time.Second, nil
+	return time.Duration(retrySeconds) * time.Second
 }
 
 func toInt64(v interface{}) (int64, error) {
