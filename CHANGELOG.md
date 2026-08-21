@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/kakadlec/video-processor/compare/v0.8.0...v0.9.0) (2026-08-21)
+
+
+### Features
+
+* add content-hash idempotency keys to POST /upload ([#144](https://github.com/kakadlec/video-processor/issues/144)) ([9da9167](https://github.com/kakadlec/video-processor/commit/9da9167dc439c1402fe33e6ce33edaacdbdcb07b))
+* add internal/platform/redis connection adapter ([#138](https://github.com/kakadlec/video-processor/issues/138)) ([0954a36](https://github.com/kakadlec/video-processor/commit/0954a3656a35f75d85ad40a47f5a4720057ffbb8))
+* migrate ffmpeg execution to VideoJob application layer ([#132](https://github.com/kakadlec/video-processor/issues/132)) ([2a624af](https://github.com/kakadlec/video-processor/commit/2a624afd3e90b9997c1059357e0bb1e19628e059))
+
+
+### Bug Fixes
+
+* include resolved Go toolchain version in the Go cache key ([#145](https://github.com/kakadlec/video-processor/issues/145)) ([761b95b](https://github.com/kakadlec/video-processor/commit/761b95bd92090b1438ac25e0a7e3d8cd67a87334))
+* key gosec/govulncheck caches by resolved Go version ([#148](https://github.com/kakadlec/video-processor/issues/148)) ([7f166c4](https://github.com/kakadlec/video-processor/commit/7f166c407df7033cc471e9b31a0588eea20fdd1e))
+
 ## [0.8.0](https://github.com/kakadlec/video-processor/compare/v0.7.0...v0.8.0) (2026-08-17)
 
 
