@@ -126,6 +126,15 @@ func (s *fakeIdempotencyStore) hasReservation(key videodomain.IdempotencyKey) bo
 	return exists
 }
 
+// alwaysAllowRateLimiter is a fake videoRateLimiter so HTTP tests unrelated
+// to rate limiting itself don't need a live Redis instance and are
+// unaffected by it, mirroring fakeIdempotencyStore's role for idempotency.
+type alwaysAllowRateLimiter struct{}
+
+func (alwaysAllowRateLimiter) Allow(context.Context, string) (bool, time.Duration, error) {
+	return true, 0, nil
+}
+
 // inMemoryVideoJobRepository is a fake videodomain.VideoJobRepository so
 // these HTTP tests don't need a live PostgreSQL instance, mirroring
 // inMemoryUserRepository in identity_test.go. Ordering matches
@@ -276,7 +285,7 @@ func startTestVideoServer(t *testing.T) (*httptest.Server, jwtauth.Adapter) {
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video))
+	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens
 }
@@ -603,7 +612,7 @@ func postJSONWithAuthorization(t *testing.T, url, authorizationHeader string, pa
 func TestSetupVideo_DSNMissing_ReturnsError(t *testing.T) {
 	t.Setenv("VIDEO_POSTGRES_DSN", "")
 
-	module, db, err := setupVideo(context.Background())
+	module, db, _, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when VIDEO_POSTGRES_DSN is not set")
 	}
@@ -623,7 +632,7 @@ func TestSetupVideo_UnreachablePostgres_ReturnsError(t *testing.T) {
 	// refused) rather than hanging, so this stays a fast unit-style test.
 	t.Setenv("VIDEO_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/video?sslmode=disable&connect_timeout=1")
 
-	_, _, err := setupVideo(context.Background())
+	_, _, _, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when configured PostgreSQL is unreachable")
 	}
@@ -714,7 +723,7 @@ func startIdempotencyTestServer(t *testing.T, extractor videodomain.FrameExtract
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store, _ := newIdempotencyTestVideoModule(extractor)
-	srv := httptest.NewServer(setupRouter(identity, module))
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens, store
 }
@@ -751,7 +760,7 @@ func startIdempotencyTestServerWithRepo(t *testing.T, extractor videodomain.Fram
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store := newIdempotencyTestVideoModuleWithRepo(extractor, repo)
-	srv := httptest.NewServer(setupRouter(identity, module))
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens, store
 }
@@ -975,7 +984,7 @@ func TestHandleVideoUpload_DuplicateAfterFailure_ReturnsFailedResultBeforeClear(
 	failingExtractor := newFailingFrameExtractor(errors.New("simulated extraction failure"))
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store, repo := newIdempotencyTestVideoModule(failingExtractor)
-	srv := httptest.NewServer(setupRouter(identity, module))
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
