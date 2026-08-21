@@ -81,6 +81,8 @@ Browser / client
 
 **Idempotency (Phase 4, `add-upload-idempotency-keys`):** `POST /upload` deduplicates by content, not just by request. The upload's SHA-256 hash plus the authenticated `UserID` form a Redis-backed `IdempotencyKey` (`internal/video/domain`, implemented by `internal/video/infrastructure/idempotency.RedisStore`). A `Reserve` call wins the race for a given key with a short-lived sentinel; the loser polls `Lookup` for up to a bounded window and returns the winner's job status instead of starting a second `ffmpeg` run. The reservation is `Finalize`d (24h TTL) once `CreateVideoJob` succeeds, or `Clear`ed immediately if `CreateVideoJob` fails or the job later fails — either way freeing an immediate retry. Two different users uploading identical content each get their own key and their own job (the key includes `UserID`). See `openspec/specs/upload-idempotency/spec.md` for the full contract.
 
+**Rate limiting (Phase 4, `add-rate-limiting-middleware`):** every route gated by `identity.requireBearerAuth()` is also gated by a per-user, Redis-backed fixed-window rate limiter (`internal/platform/ratelimit.Limiter`, mounted as `cmd/api/ratelimit.go`'s `rateLimitMiddleware` on the `videoRoutes` group, immediately after the auth middleware). A request that crosses the configured limit within the current window is rejected with `429` and a `Retry-After` header before any handler runs, keyed independently per authenticated `UserID`. Thresholds are configurable via optional `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (defaults 60 requests / 60 seconds) — unlike `REDIS_ADDR`, neither is required at startup. If the Redis check itself fails or exceeds a short internal timeout, the middleware fails open (allows the request, logs the error) rather than blocking otherwise-healthy traffic on an infrastructure hiccup. That timeout only actually bounds the real Redis call because `internal/platform/redis.Open` sets `ContextTimeoutEnabled: true` on the shared client — go-redis v9 otherwise silently discards a passed context's deadline on every command, a subtlety this change had to fix and cover with a real-client test (`internal/platform/redis/client_test.go`) after an initial fix attempt turned out not to work. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, static assets) are out of scope. See `openspec/specs/rate-limiting/spec.md` for the full contract.
+
 The handler returns only after the full sequence completes and the ZIP is written. There is still no queue, no worker, and no async signalling — see `openspec/specs/videojob-execution/spec.md` for the full contract. The `VideoJob` created for the upload is queryable afterward via `GET /api/video-jobs/:id`/`GET /api/video-jobs` (see the preview API note below).
 
 ### State (current)
@@ -114,7 +116,7 @@ No cache, no message broker.
 | `GET /api/video-jobs/:id` | `handleGetVideoJobStatus` | Get a `VideoJob`'s status; owner-only (non-owner and nonexistent both 404) |
 | `GET /api/video-jobs` | `handleListVideoJobs` | Paginated list of the caller's own `VideoJob`s |
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and (as of `add-upload-idempotency-keys`) `REDIS_ADDR` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and (as of `add-upload-idempotency-keys`) `REDIS_ADDR` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (as of `add-rate-limiting-middleware`) are optional, with defaults. See [docs/operations.md](operations.md) for configuration.
 
 **`/api/video-jobs` is a preview API, not the async processing flow.** It was wired by Phase 3's `wire-videojob-http-endpoints`, alongside (not replacing) the legacy synchronous `/upload` flow above. A `VideoJob` created *through this API* has no processing trigger — `handleCreateVideoJob` never calls `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` — and none is currently planned for it: `migrate-ffmpeg-execution-to-videojob-application` gave those four use cases a real caller, but it's `POST /upload`, not `POST /api/video-jobs`, so a job created via this API still stays `pending` indefinitely. Giving this preview API its own trigger would need a separate, not-yet-proposed future change. The frontend does not consume these routes. It is deliberately not named `/jobs`: see [docs/flows.md](flows.md) for why that path is reserved for the real Phase 6 async endpoint, and `openspec/specs/videojob-http-api/spec.md` for the full contract.
 
@@ -138,7 +140,7 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 has started: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and the first of Phase 4's three features — idempotency keys on `POST /upload` — is now wired in (`add-upload-idempotency-keys`); rate limiting and the status cache remain planned. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 has started: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and two of Phase 4's three features are now wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`) and per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`); the status cache remains planned. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
@@ -162,6 +164,7 @@ video-processor/
   internal/
     platform/
       redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close, wired into cmd/api by add-upload-idempotency-keys
+      ratelimit/      # Redis-backed fixed-window rate Limiter (implemented, Phase 4 — add-rate-limiting-middleware), wired into cmd/api's rateLimitMiddleware on every authenticated route
     identity/                        # Implemented (Phase 2), wired into cmd/api
       domain/         # User aggregate, value objects, repository/password/token ports
       application/    # Use cases: RegisterUser, AuthenticateUser
@@ -185,7 +188,7 @@ video-processor/
 | Component | Role | Status |
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
-| Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`) and idempotency keys **implemented** (`add-upload-idempotency-keys`, Phase 4); rate limiting and status cache still planned |
+| Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), and rate limiting (`add-rate-limiting-middleware`) **implemented** (Phase 4); status cache still planned |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
 
