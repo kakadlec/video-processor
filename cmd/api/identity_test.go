@@ -129,7 +129,7 @@ func registerTestAccount(t *testing.T, baseURL, email, password string) {
 }
 
 func TestHandleRegister_Success(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "User@Example.com", Password: "correct-horse"})
@@ -152,7 +152,7 @@ func TestHandleRegister_Success(t *testing.T) {
 }
 
 func TestHandleRegister_InvalidEmail(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "not-an-email", Password: "correct-horse"})
@@ -164,7 +164,7 @@ func TestHandleRegister_InvalidEmail(t *testing.T) {
 }
 
 func TestHandleRegister_PasswordTooShort(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "user@example.com", Password: "short"})
@@ -176,7 +176,7 @@ func TestHandleRegister_PasswordTooShort(t *testing.T) {
 }
 
 func TestHandleRegister_DuplicateEmail(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")
@@ -190,7 +190,7 @@ func TestHandleRegister_DuplicateEmail(t *testing.T) {
 }
 
 func TestHandleRegister_MalformedBody(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/api/auth/register", "application/json", bytes.NewReader([]byte("not json")))
@@ -205,7 +205,7 @@ func TestHandleRegister_MalformedBody(t *testing.T) {
 }
 
 func TestHandleLogin_Success(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")
@@ -230,7 +230,7 @@ func TestHandleLogin_Success(t *testing.T) {
 }
 
 func TestHandleLogin_UnknownEmail(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp := postJSON(t, srv.URL+"/api/auth/login", authenticateUserRequest{Email: "nobody@example.com", Password: "correct-horse"})
@@ -242,7 +242,7 @@ func TestHandleLogin_UnknownEmail(t *testing.T) {
 }
 
 func TestHandleLogin_WrongPassword(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")
@@ -256,7 +256,7 @@ func TestHandleLogin_WrongPassword(t *testing.T) {
 }
 
 func TestHandleLogin_MalformedBody(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/api/auth/login", "application/json", bytes.NewReader([]byte("not json")))
@@ -450,7 +450,7 @@ func uploadWithAuth(t *testing.T, baseURL, token, videoPath, filename string) *h
 
 func TestVideoRoutes_PublicGetRoot(t *testing.T) {
 	module, _ := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/")
@@ -466,7 +466,7 @@ func TestVideoRoutes_PublicGetRoot(t *testing.T) {
 
 func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 	module, _ := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	getCases := []string{
@@ -494,7 +494,7 @@ func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 
 func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	userID, err := domain.NewUserID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -578,7 +578,7 @@ func uploadAsUser(t *testing.T, baseURL, token string) string {
 
 func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -601,7 +601,7 @@ func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
 
 func TestArtifactOwnership_StatusScopedToOwner(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -651,7 +651,7 @@ func containsFilename(files []struct {
 
 func TestArtifactOwnership_StaticOutputsEnforcesOwnership(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -679,7 +679,7 @@ func TestArtifactOwnership_StaticOutputsEnforcesOwnership(t *testing.T) {
 // TestProcessing_Failure_LeavesUploadedFileBehind in main_test.go).
 func TestArtifactOwnership_StaticUploadsEnforcesOwnership(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -729,7 +729,7 @@ func TestArtifactOwnership_StaticUploadsEnforcesOwnership(t *testing.T) {
 // owner — since it's blocked before the ownership check even runs.
 func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t)))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")

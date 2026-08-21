@@ -18,6 +18,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	platformredis "video-processor/internal/platform/redis"
 	videoapplication "video-processor/internal/video/application"
@@ -76,30 +77,32 @@ func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatu
 // configuration, mirroring setupIdentity's fail-clearly-on-misconfiguration
 // posture. VIDEO_POSTGRES_DSN and REDIS_ADDR are always required — the
 // latter as of add-upload-idempotency-keys, whose idempotency mechanism is
-// this videoModule's first real Redis consumer.
-func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
+// this videoModule's first real Redis consumer. The opened *redis.Client is
+// also returned so callers (main's rate-limiter wiring) can reuse the same
+// connection instead of opening a second one.
+func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, error) {
 	pgConfig, err := videopostgres.LoadConfigFromEnv()
 	if err != nil {
-		return nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 
 	db, err := videopostgres.Open(pgConfig)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := videopostgres.Migrate(ctx, db); err != nil {
 		closeDB(db)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := db.PingContext(ctx); err != nil {
 		closeDB(db)
-		return nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
+		return nil, nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
 	}
 
 	redisConfig, err := platformredis.LoadConfigFromEnv()
 	if err != nil {
 		closeDB(db)
-		return nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 	// Open never itself connects (platformredis.Open's own contract) — a
 	// Ping/command failure surfaces at request time instead of here, per
@@ -129,7 +132,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, error) {
 		failJob,
 		idempotencyStore,
 	)
-	return module, db, nil
+	return module, db, redisClient, nil
 }
 
 func (m *videoModule) registerRoutes(videoRoutes *gin.RouterGroup) {

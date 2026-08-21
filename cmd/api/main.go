@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	platformratelimit "video-processor/internal/platform/ratelimit"
 )
 
 //go:embed web
@@ -25,12 +27,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	video, _, err := setupVideo(ctx)
+	video, _, redisClient, err := setupVideo(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	r := setupRouter(identity, video)
+	rateLimitConfig, err := platformratelimit.LoadConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	limiter := platformratelimit.NewLimiter(redisClient, rateLimitConfig)
+
+	r := setupRouter(identity, video, limiter)
 
 	fmt.Println("🎬 Servidor iniciado na porta 8080")
 	fmt.Println("📂 Acesse: http://localhost:8080")
@@ -47,7 +55,7 @@ func serveEmbeddedFile(c *gin.Context, path, contentType string) {
 	c.Data(200, contentType, data)
 }
 
-func setupRouter(identity *identityModule, video *videoModule) *gin.Engine {
+func setupRouter(identity *identityModule, video *videoModule, limiter videoRateLimiter) *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -74,9 +82,11 @@ func setupRouter(identity *identityModule, video *videoModule) *gin.Engine {
 	})
 
 	// videoRoutes holds every route that serves or accepts video-processing
-	// artifacts. All of them require a valid bearer token.
+	// artifacts. All of them require a valid bearer token and are subject to
+	// per-user rate limiting.
 	videoRoutes := r.Group("/")
 	videoRoutes.Use(identity.requireBearerAuth())
+	videoRoutes.Use(rateLimitMiddleware(limiter))
 
 	// The /uploads and /outputs static mounts serve the exact same artifacts
 	// as handleDownload by filename, so they need the same per-owner check —
