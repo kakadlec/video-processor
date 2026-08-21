@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is a single Go binary (or `go run ./cmd/api`) behind a Docker container. There is no orchestration. External services are limited to a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module — everything else still runs with no environment-specific configuration beyond the port.
+The application is a single Go binary (or `go run ./cmd/api`) behind a Docker container. There is no orchestration. External services are a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module, and (as of Phase 4's `add-upload-idempotency-keys`) a required Redis instance backing `POST /upload`'s idempotency keys — everything else still runs with no environment-specific configuration beyond the port.
 
 ### Docker
 
@@ -10,11 +10,12 @@ The application is a single Go binary (or `go run ./cmd/api`) behind a Docker co
 # Build
 docker build -t video-processor .
 
-# Run (identity and video configuration are both required — see Environment Variables below)
+# Run (identity, video, and Redis configuration are all required — see Environment Variables below)
 docker run -p 8080:8080 \
   -e IDENTITY_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e IDENTITY_JWT_SIGNING_KEY="change-me" \
   -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
+  -e REDIS_ADDR="host:6379" \
   video-processor
 ```
 
@@ -29,8 +30,9 @@ The Dockerfile is a multi-stage build. The default (final) stage — used by the
 | `IDENTITY_POSTGRES_DSN` | unset | PostgreSQL connection string for the Identity module (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). Required at startup. |
 | `IDENTITY_JWT_SIGNING_KEY` | unset | Symmetric key used to sign/verify access tokens (HMAC-SHA256). Required at startup. There is no default signing key — startup fails clearly rather than falling back to one. |
 | `VIDEO_POSTGRES_DSN` | unset | PostgreSQL connection string for the Video Processing module's `VideoJob` repository (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable` — same instance/database as `IDENTITY_POSTGRES_DSN` by design, not a separate one). Required at startup as of Phase 3's `wire-videojob-http-endpoints`, which wires `cmd/api/video.go`'s `setupVideo` into `main()`. |
+| `REDIS_ADDR` | unset | Address (`host:port`) of the Redis instance backing `POST /upload`'s idempotency keys (e.g. `redis:6379`). Required at startup as of Phase 4's `add-upload-idempotency-keys`, which wires `internal/platform/redis` and `internal/video/infrastructure/idempotency.RedisStore` into `setupVideo`. |
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, and `VIDEO_POSTGRES_DSN` are all required: the process exits at startup with a clear configuration error if any is missing or invalid, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md) and [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md)).
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and `REDIS_ADDR` are all required: the process exits at startup with a clear configuration error if any is missing or invalid, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)).
 
 ## Runtime Directory Structure
 
@@ -76,19 +78,19 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 - **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
 - **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
 
+### Redis — Connection adapter and idempotency keys implemented (Phase 4), rate limiting/status cache Planned
+
+`internal/platform/redis` (`add-redis-infrastructure`) provides connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close`. It is wired into `cmd/api`'s `setupVideo` as of `add-upload-idempotency-keys`, which requires `REDIS_ADDR` at startup like the PostgreSQL DSNs above. Of Redis's three planned feature responsibilities (all additive to PostgreSQL, not a replacement), one is now implemented and two remain planned:
+
+1. **Idempotency keys** — **Implemented.** `internal/video/infrastructure/idempotency.RedisStore` deduplicates `POST /upload` requests by content hash + `UserID`: a `Reserve`/`Finalize`/`Clear`/`Lookup` protocol backs the "prevent duplicate job creation from client retries" goal. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md`.
+2. **Rate limiting** — Planned. Sliding-window counter per user at the API layer.
+3. **Status cache** — Planned. Short-TTL cache for `GET /jobs/{id}/status` to reduce PostgreSQL read pressure.
+
 ---
 
 ## Planned Infrastructure (Not Yet Implemented)
 
-> The components below are planned for future phases and do not exist in the current deployment. Each is labeled with the phase that introduces it. Redis is a partial exception: its connection adapter exists in the codebase (see below) but is not wired into the deployed application, so nothing in this deployment actually talks to Redis yet.
-
-### Redis — Connection adapter implemented, features Planned (Phase 4)
-
-`internal/platform/redis` (`add-redis-infrastructure`) provides bare connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close` — not yet wired into `cmd/api`. Three explicit feature responsibilities remain planned, all additive to PostgreSQL (not a replacement):
-
-1. **Idempotency keys** — Prevent duplicate job creation from client retries.
-2. **Rate limiting** — Sliding-window counter per user at the API layer.
-3. **Status cache** — Short-TTL cache for `GET /jobs/{id}/status` to reduce PostgreSQL read pressure.
+> The components below are planned for future phases and do not exist in the current deployment. Each is labeled with the phase that introduces it.
 
 ### MinIO — Planned (Phase 5)
 

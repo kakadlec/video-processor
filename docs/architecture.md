@@ -49,8 +49,16 @@ Browser / client
   └─► POST /upload (multipart)
         │
         ├─ Validate extension (.mp4, .avi, .mov, .mkv, .wmv, .flv, .webm)
-        ├─ Save to uploads/<uploadID>_<filename>
+        ├─ Save to uploads/<uploadID>_<filename>, hashing the stream (SHA-256) in the same pass
+        ├─ Reserve(userID + content hash)          (Redis, idempotency)
+        │    ├─ reserved=false → poll Lookup up to a bounded 2s window; a
+        │    │    resolved duplicate returns the existing job's status
+        │    │    (200), an unresolved one returns 409 — no CreateVideoJob call
+        │    └─ reserved=true  → proceed below
         ├─ CreateVideoJob                          (application, status: pending)
+        │    ├─ on failure: Clear the idempotency reservation, return 500
+        │    └─ on success: Finalize the reservation → real VideoJobID,
+        │         24h TTL (non-fatal if this write itself fails — see below)
         ├─ ProcessVideoJob:
         │    ├─ EnqueueVideoJob                     (pending → queued)
         │    ├─ StartProcessing                      (queued → processing)
@@ -60,14 +68,18 @@ Browser / client
         │    │    ├─ Write outputs/frames_<jobID>.zip
         │    │    └─ Remove temp/<jobID>/            (defer, always)
         │    └─ FailJob if extraction failed          (processing → failed)
+        │         → also clears the idempotency reservation
         │         (on success, job stays "processing" — see below)
         ├─ Remove uploads/<file>                    (on success only)
         ├─ Record output artifact ownership
         ├─ CompleteJob if that succeeded, else FailJob (processing → completed/failed)
+        │    → FailJob here also clears the idempotency reservation
         └─ Return JSON { success, message, zip_path, frame_count, images }
 ```
 
 `ProcessVideoJob` deliberately doesn't call `CompleteJob` itself on extraction success: the job stays `processing` until `handleVideoUpload`'s own remaining step (recording who owns the output artifact) has also succeeded. This matters because `completed → failed` isn't a valid transition — calling `CompleteJob` any earlier would make a later failure in that step unrecoverable (the job would stay `completed` forever, pointing at a `StorageKey` for an artifact that got deleted).
+
+**Idempotency (Phase 4, `add-upload-idempotency-keys`):** `POST /upload` deduplicates by content, not just by request. The upload's SHA-256 hash plus the authenticated `UserID` form a Redis-backed `IdempotencyKey` (`internal/video/domain`, implemented by `internal/video/infrastructure/idempotency.RedisStore`). A `Reserve` call wins the race for a given key with a short-lived sentinel; the loser polls `Lookup` for up to a bounded window and returns the winner's job status instead of starting a second `ffmpeg` run. The reservation is `Finalize`d (24h TTL) once `CreateVideoJob` succeeds, or `Clear`ed immediately if `CreateVideoJob` fails or the job later fails — either way freeing an immediate retry. Two different users uploading identical content each get their own key and their own job (the key includes `UserID`). See `openspec/specs/upload-idempotency/spec.md` for the full contract.
 
 The handler returns only after the full sequence completes and the ZIP is written. There is still no queue, no worker, and no async signalling — see `openspec/specs/videojob-execution/spec.md` for the full contract. The `VideoJob` created for the upload is queryable afterward via `GET /api/video-jobs/:id`/`GET /api/video-jobs` (see the preview API note below).
 
@@ -102,7 +114,7 @@ No cache, no message broker.
 | `GET /api/video-jobs/:id` | `handleGetVideoJobStatus` | Get a `VideoJob`'s status; owner-only (non-owner and nonexistent both 404) |
 | `GET /api/video-jobs` | `handleListVideoJobs` | Paginated list of the caller's own `VideoJob`s |
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, and `VIDEO_POSTGRES_DSN` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and (as of `add-upload-idempotency-keys`) `REDIS_ADDR` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. See [docs/operations.md](operations.md) for configuration.
 
 **`/api/video-jobs` is a preview API, not the async processing flow.** It was wired by Phase 3's `wire-videojob-http-endpoints`, alongside (not replacing) the legacy synchronous `/upload` flow above. A `VideoJob` created *through this API* has no processing trigger — `handleCreateVideoJob` never calls `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` — and none is currently planned for it: `migrate-ffmpeg-execution-to-videojob-application` gave those four use cases a real caller, but it's `POST /upload`, not `POST /api/video-jobs`, so a job created via this API still stays `pending` indefinitely. Giving this preview API its own trigger would need a separate, not-yet-proposed future change. The frontend does not consume these routes. It is deliberately not named `/jobs`: see [docs/flows.md](flows.md) for why that path is reserved for the real Phase 6 async endpoint, and `openspec/specs/videojob-http-api/spec.md` for the full contract.
 
@@ -126,7 +138,7 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 has started: `internal/platform/redis` provides bare connection plumbing (`add-redis-infrastructure`), but none of Phase 4's three features (idempotency keys, rate limiting, status cache) are wired in yet. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 has started: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and the first of Phase 4's three features — idempotency keys on `POST /upload` — is now wired in (`add-upload-idempotency-keys`); rate limiting and the status cache remain planned. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
@@ -149,7 +161,7 @@ video-processor/
     worker/     # Async frame-extraction worker (Phase 6)
   internal/
     platform/
-      redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close only, no cmd/api wiring yet
+      redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close, wired into cmd/api by add-upload-idempotency-keys
     identity/                        # Implemented (Phase 2), wired into cmd/api
       domain/         # User aggregate, value objects, repository/password/token ports
       application/    # Use cases: RegisterUser, AuthenticateUser
@@ -157,7 +169,9 @@ video-processor/
     video/
       domain/         # VideoJob aggregate + transition methods, value objects, events, repository/FrameExtractor ports (all implemented, Phase 3)
       application/    # Use cases: CreateVideoJob, GetJobStatus, ListUserJobs, EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, ProcessVideoJob (all implemented, Phase 3)
-      infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application), MinIO adapter, RabbitMQ publisher (Phases 5–6)
+      infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application)
+        idempotency/  # Redis-backed IdempotencyStore adapter (implemented, Phase 4 — add-upload-idempotency-keys), wired into cmd/api's POST /upload handler
+        # MinIO adapter, RabbitMQ publisher planned (Phases 5–6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
@@ -171,7 +185,7 @@ video-processor/
 | Component | Role | Status |
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
-| Redis | Idempotency keys, rate limiting, status cache | Connection adapter implemented (`internal/platform/redis`), features planned (Phase 4) |
+| Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`) and idempotency keys **implemented** (`add-upload-idempotency-keys`, Phase 4); rate limiting and status cache still planned |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
 
