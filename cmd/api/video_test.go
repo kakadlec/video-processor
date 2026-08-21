@@ -40,6 +40,11 @@ type fakeIdempotencyStore struct {
 	// polls Lookup, so the bounded wait-and-retry path is genuinely
 	// exercised rather than always seeing an already-finalized key.
 	finalizeGate chan struct{}
+	// clearGate, if non-nil, blocks Clear until closed — lets a test hold
+	// a finalized-but-failed key in place while a concurrent duplicate
+	// observes it, so the narrow pre-Clear window is genuinely exercised
+	// rather than racing a Clear that usually wins.
+	clearGate chan struct{}
 }
 
 type fakeIdempotencyEntry struct {
@@ -93,7 +98,14 @@ func (s *fakeIdempotencyStore) Lookup(_ context.Context, key videodomain.Idempot
 	return entry.jobID, true, nil
 }
 
-func (s *fakeIdempotencyStore) Clear(_ context.Context, key videodomain.IdempotencyKey, token string) (bool, error) {
+func (s *fakeIdempotencyStore) Clear(ctx context.Context, key videodomain.IdempotencyKey, token string) (bool, error) {
+	if s.clearGate != nil {
+		select {
+		case <-s.clearGate:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry, exists := s.entries[key.String()]
@@ -191,6 +203,32 @@ func (r *inMemoryVideoJobRepository) FindByUserID(_ context.Context, userID vide
 		end = len(matches)
 	}
 	return matches[offset:end], nil
+}
+
+// createFailingRepository wraps inMemoryVideoJobRepository so a test can
+// force Create to fail a fixed number of times before delegating to the
+// wrapped repository normally — used to exercise the idempotency
+// reservation-is-cleared-on-CreateVideoJob-failure path without needing a
+// real PostgreSQL failure. Every other repository method is unaffected.
+type createFailingRepository struct {
+	*inMemoryVideoJobRepository
+	mu       sync.Mutex
+	failLeft int
+}
+
+func newCreateFailingRepository(failN int) *createFailingRepository {
+	return &createFailingRepository{inMemoryVideoJobRepository: newInMemoryVideoJobRepository(), failLeft: failN}
+}
+
+func (r *createFailingRepository) Create(ctx context.Context, job *videodomain.VideoJob) error {
+	r.mu.Lock()
+	if r.failLeft > 0 {
+		r.failLeft--
+		r.mu.Unlock()
+		return errors.New("simulated CreateVideoJob failure")
+	}
+	r.mu.Unlock()
+	return r.inMemoryVideoJobRepository.Create(ctx, job)
 }
 
 // newTestVideoModule returns a videoModule backed by an in-memory
@@ -681,6 +719,43 @@ func startIdempotencyTestServer(t *testing.T, extractor videodomain.FrameExtract
 	return srv, tokens, store
 }
 
+// newIdempotencyTestVideoModuleWithRepo is newIdempotencyTestVideoModule but
+// with a caller-supplied repository — lets a test inject a repository whose
+// Create fails on demand (createFailingRepository), which
+// newIdempotencyTestVideoModule's always-succeeding in-memory repository
+// can't do.
+func newIdempotencyTestVideoModuleWithRepo(extractor videodomain.FrameExtractor, repo videodomain.VideoJobRepository) (*videoModule, *fakeIdempotencyStore) {
+	ids := videoidgen.New()
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
+	store := newFakeIdempotencyStore()
+	module := newVideoModule(
+		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewGetJobStatus(repo, ids),
+		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewProcessVideoJob(
+			videoapplication.NewEnqueueVideoJob(repo, ids),
+			videoapplication.NewStartProcessing(repo, ids),
+			failJob,
+			extractor,
+			ids,
+		),
+		completeJob,
+		failJob,
+		store,
+	)
+	return module, store
+}
+
+func startIdempotencyTestServerWithRepo(t *testing.T, extractor videodomain.FrameExtractor, repo videodomain.VideoJobRepository) (*httptest.Server, jwtauth.Adapter, *fakeIdempotencyStore) {
+	t.Helper()
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	module, store := newIdempotencyTestVideoModuleWithRepo(extractor, repo)
+	srv := httptest.NewServer(setupRouter(identity, module))
+	t.Cleanup(srv.Close)
+	return srv, tokens, store
+}
+
 // writeTestUploadContent writes content to a temp file so uploadVideo (from
 // main_test.go) can multipart-upload it — content is caller-controlled, so
 // tests can force two uploads to be byte-identical (or deliberately not).
@@ -893,5 +968,138 @@ func TestHandleVideoUpload_ReservationNeverResolves_ReturnsConflict(t *testing.T
 	}
 	if result.Success {
 		t.Fatal("expected Success=false for a 409 response")
+	}
+}
+
+func TestHandleVideoUpload_DuplicateAfterFailure_ReturnsFailedResultBeforeClear(t *testing.T) {
+	failingExtractor := newFailingFrameExtractor(errors.New("simulated extraction failure"))
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	module, store, repo := newIdempotencyTestVideoModule(failingExtractor)
+	srv := httptest.NewServer(setupRouter(identity, module))
+	t.Cleanup(srv.Close)
+
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	// Gate Clear so the first request's failed job stays indexed by its
+	// idempotency key until this test explicitly releases it — otherwise
+	// the duplicate below would race the real Clear call and could land
+	// on either side of it depending on scheduling, rather than
+	// deterministically exercising the narrow pre-Clear window this test
+	// targets (see design.md Decision 8 / the "Duplicate after the
+	// original failed" scenario in openspec/specs/upload-idempotency).
+	clearGate := make(chan struct{})
+	store.clearGate = clearGate
+
+	content := []byte("identical video content for duplicate-after-failure test")
+	videoPath := writeTestUploadContent(t, content)
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		resp, result := uploadVideo(t, srv.URL, token, videoPath, "first.mp4")
+		defer resp.Body.Close()
+		if result.Success {
+			t.Errorf("first upload should fail, got: %+v", result)
+		}
+	}()
+
+	// Finalize runs right after CreateVideoJob succeeds, before extraction
+	// even starts, so wait for the key to resolve to a real job first...
+	var jobID videodomain.VideoJobID
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if id, found, lookupErr := store.Lookup(context.Background(), idemKey); lookupErr == nil && found {
+			jobID = id
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the first request to finalize its idempotency key")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// ...then wait further until that job's own status has actually
+	// reached "failed" (FailJob runs later, inside ProcessVideoJob).
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		job, findErr := repo.FindByID(context.Background(), jobID)
+		if findErr == nil && job.Status() == videodomain.JobStatusFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the first request's job to reach failed status")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The job is failed and the idempotency key still resolves to it
+	// (Clear is gated) — a duplicate arriving now must see that failure
+	// translated into ProcessingResult, not create a new job.
+	dupResp, dupResult := uploadVideo(t, srv.URL, token, videoPath, "duplicate.mp4")
+	defer dupResp.Body.Close()
+	if dupResult.Success {
+		t.Fatalf("duplicate observing a failed job should not report success, got: %+v", dupResult)
+	}
+	if !strings.Contains(dupResult.Message, "already failed") {
+		t.Fatalf("duplicate message = %q, want it to mention the job already failed", dupResult.Message)
+	}
+
+	close(clearGate)
+	<-firstDone
+
+	if got := failingExtractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1 (the duplicate must not have been reprocessed)", got)
+	}
+}
+
+func TestHandleVideoUpload_CreateVideoJobFailure_ClearsReservationForImmediateRetry(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_after_create_failure.zip", 2)
+	repo := newCreateFailingRepository(1)
+	srv, tokens, store := startIdempotencyTestServerWithRepo(t, extractor, repo)
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("identical video content for create-failure retry test")
+	videoPath := writeTestUploadContent(t, content)
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp1, result1 := uploadVideo(t, srv.URL, token, videoPath, "first.mp4")
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("first upload status = %d, want %d (CreateVideoJob is forced to fail)", resp1.StatusCode, http.StatusInternalServerError)
+	}
+	if result1.Success {
+		t.Fatalf("first upload should fail, got: %+v", result1)
+	}
+
+	// Check directly, not just via the retry's outcome below: a leftover
+	// reservation here would still let the retry pass this test through a
+	// different, unintended path — a broken Clear could leave the key
+	// reserved (not finalized), sending the retry through the
+	// bounded-retry-then-lookup loop, which would eventually time out and
+	// return 409 rather than proving the reservation was actually cleared.
+	if store.hasReservation(idemKey) {
+		t.Fatal("CreateVideoJob failure must have cleared the reservation, but one is still present")
+	}
+
+	// An immediate retry with identical content must not be blocked by a
+	// leftover reservation — CreateVideoJob's failure must have cleared
+	// it. repo.failLeft is now 0, so this retry's own CreateVideoJob call
+	// succeeds.
+	resp2, result2 := uploadVideo(t, srv.URL, token, videoPath, "retry.mp4")
+	defer resp2.Body.Close()
+	if resp2.StatusCode == http.StatusConflict {
+		t.Fatal("a retry after a CreateVideoJob failure should not be blocked with 409")
+	}
+	if !result2.Success {
+		t.Fatalf("retry after CreateVideoJob failure should succeed, got: %+v", result2)
+	}
+	if got := extractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1 (only the successful retry should have reached ffmpeg)", got)
 	}
 }
