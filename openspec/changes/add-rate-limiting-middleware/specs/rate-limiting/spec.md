@@ -64,7 +64,7 @@
 
 ### Requirement: Limiter Failure Fails Open Within A Bounded Latency
 
-If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Redis error) rather than returning a normal allow/deny result, `cmd/api`'s rate-limit middleware SHALL allow the request to proceed (fail open) and log the error, rather than rejecting an otherwise-valid request due to an unrelated infrastructure hiccup. The middleware SHALL bound how long it waits on the `Allow` call with a short, fixed per-request timeout (independent of the shared Redis client's own connection/retry policy), so a Redis outage degrades to "fail open quickly" rather than "every authenticated request stalls for the client's default timeout before proceeding."
+If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Redis error) rather than returning a normal allow/deny result, `cmd/api`'s rate-limit middleware SHALL allow the request to proceed (fail open) and log the error, rather than rejecting an otherwise-valid request due to an unrelated infrastructure hiccup. The middleware SHALL bound how long it waits on the `Allow` call with a short, fixed per-request timeout, and the shared Redis client SHALL be configured to actually honor that timeout (`ContextTimeoutEnabled: true` — see design.md Decision 2's correction; a passed context has no effect on go-redis v9's real command I/O without it), so a Redis outage degrades to "fail open quickly" rather than "every authenticated request stalls for the client's own default timeout before proceeding."
 
 #### Scenario: Redis error does not block the request
 
@@ -76,4 +76,4 @@ If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Re
 
 - **GIVEN** the Redis client used by the rate limiter neither succeeds nor errors within the middleware's configured timeout (e.g. a network partition where connections hang rather than fail fast)
 - **WHEN** an authenticated user makes a request to a rate-limited route
-- **THEN** the middleware's `Allow` call is bounded by that timeout, after which the request proceeds to its handler (fail open) rather than hanging indefinitely
+- **THEN** the middleware's `Allow` call is bounded by that timeout, after which the request proceeds to its handler (fail open) rather than hanging indefinitely — verified against a real (non-fake) Redis client, not only a fake that honors `ctx.Done()` by construction
