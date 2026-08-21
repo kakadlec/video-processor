@@ -150,12 +150,23 @@ jobs:
         with:
           go-version: 'stable'
 
+      - name: Get resolved Go version
+        # 'stable' drifts as new Go releases ship (e.g. 1.26 -> 1.27), and a
+        # cached gosec binary built under an older toolchain can mismatch a
+        # newer one now on PATH — same staleness class the "Build & Test"
+        # job's Go cache key already accounts for (see its own "Get resolved
+        # Go version" step above; PR #145 fixed that job but didn't extend
+        # the fix here). Folded into the cache key below so a toolchain
+        # bump forces a fresh `go install` instead of reusing a stale binary.
+        id: go-version
+        run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Cache gosec binary
         id: cache-gosec
         uses: actions/cache@v6
         with:
           path: ~/go/bin/gosec
-          key: ${{ runner.os }}-${{ runner.arch }}-gosec-v${{ env.GOSEC_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-gosec-v${{ env.GOSEC_VERSION }}-${{ steps.go-version.outputs.version }}
 
       - name: Install gosec
         # Pinned (not @latest) so the cache key above is stable across runs;
@@ -183,12 +194,28 @@ jobs:
         with:
           go-version: 'stable'
 
+      - name: Get resolved Go version
+        # 'stable' drifts as new Go releases ship (e.g. 1.26 -> 1.27).
+        # govulncheck bundles its own source-loading logic tied to the Go
+        # version it was built with, so a binary cached under an older
+        # toolchain fails hard (not just silently stale like the Build &
+        # Test job's compile cache — see PR #145) once the runner's "stable"
+        # Go moves past it: "Loading packages failed... application uses
+        # version go1.26 of the source-processing packages but runs version
+        # go1.27 of 'go list'" — observed in CI on 2026-08-21 after the
+        # runner's stable toolchain moved from go1.26.6 (last known-good
+        # run, 2026-08-20) to go1.27.0. Folding the resolved version into
+        # the cache key below forces a fresh `go install` whenever it
+        # drifts, instead of reusing an incompatible binary.
+        id: go-version
+        run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Cache govulncheck binary
         id: cache-govulncheck
         uses: actions/cache@v6
         with:
           path: ~/go/bin/govulncheck
-          key: ${{ runner.os }}-${{ runner.arch }}-govulncheck-v${{ env.GOVULNCHECK_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-govulncheck-v${{ env.GOVULNCHECK_VERSION }}-${{ steps.go-version.outputs.version }}
 
       - name: Install govulncheck
         # Pinned (not @latest) so the cache key above is stable across runs;
