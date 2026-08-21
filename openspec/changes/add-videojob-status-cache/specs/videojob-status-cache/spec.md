@@ -18,7 +18,13 @@
 
 ### Requirement: Cache Reflects The Latest State Transition Write
 
-`CachedVideoJobRepository`'s `Update` SHALL write to PostgreSQL first, and only once that write succeeds, write the job's new serialized state to its cache entry (write-through), overwriting rather than merely deleting any prior entry. This SHALL apply to every state transition (`Enqueue`, `StartProcessing`, `Complete`, `Fail`), since all four already converge on the same `Update` call.
+`CachedVideoJobRepository`'s `Update` SHALL write to PostgreSQL first, and only once that write succeeds, write the job's new serialized state to its cache entry (write-through), overwriting rather than merely deleting any prior entry. This SHALL apply to every state transition (`Enqueue`, `StartProcessing`, `Complete`, `Fail`), since all four already converge on the same `Update` call. A concurrent cache-miss repopulation (the "PostgreSQL Is Authoritative On Cache Miss" requirement below) SHALL NOT be able to overwrite a write-through entry with an older value it read before the transition committed.
+
+#### Scenario: A concurrent stale read cannot overwrite a newer write-through value
+
+- **GIVEN** a `FindByID` call misses the cache and reads a job's pre-transition state from PostgreSQL
+- **WHEN** a concurrent `Update` commits a newer state and write-through-updates the cache before that first call's own cache repopulation runs
+- **THEN** the first call's repopulation SHALL NOT overwrite the newer cached entry with its own stale value — a subsequent read still observes the newer, write-through state
 
 #### Scenario: A poll immediately after a transition observes the new state
 
