@@ -233,12 +233,14 @@ func videoFilePart(req *http.Request) (*multipart.Part, string, error) {
 // backed by the VideoJob application layer instead of an inline ffmpeg call.
 func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// Streamed via MultipartReader rather than c.Request.FormFile: FormFile
-	// calls ParseMultipartForm under the hood, which reads the entire
-	// request body up front (spilling anything past Gin's 32MiB default
-	// MaxMultipartMemory to a temp file) before the filename is even
-	// available — so a large upload with an invalid extension would pay
-	// the full transfer cost before being rejected. Reading part-by-part
-	// lets the filename gate the body read instead.
+	// calls net/http's own ParseMultipartForm under the hood (this bypasses
+	// Gin's c.FormFile/c.MultipartForm wrapper entirely, so Gin's
+	// MaxMultipartMemory is never consulted here), which reads the entire
+	// request body up front — spilling anything past net/http's own 32MiB
+	// defaultMaxMemory to a temp file — before the filename is even
+	// available. A large upload with an invalid extension would pay the
+	// full transfer cost before being rejected. Reading part-by-part lets
+	// the filename gate the body read instead.
 	file, originalFilename, err := videoFilePart(c.Request)
 	if err != nil {
 		c.JSON(400, ProcessingResult{
