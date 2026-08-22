@@ -45,6 +45,15 @@ type fakeIdempotencyStore struct {
 	// observes it, so the narrow pre-Clear window is genuinely exercised
 	// rather than racing a Clear that usually wins.
 	clearGate chan struct{}
+	// reserveErr, if non-nil, makes Reserve return it instead of ever
+	// touching entries — simulates a Redis-layer failure, for
+	// fail-open-upload-idempotency's tests.
+	reserveErr error
+	// finalizeCalls/clearCalls count invocations, so a test can assert
+	// they were never called (e.g. after a Reserve error, per
+	// fail-open-upload-idempotency's design.md Decision 1).
+	finalizeCalls int
+	clearCalls    int
 }
 
 type fakeIdempotencyEntry struct {
@@ -60,6 +69,9 @@ func newFakeIdempotencyStore() *fakeIdempotencyStore {
 func (s *fakeIdempotencyStore) Reserve(_ context.Context, key videodomain.IdempotencyKey) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.reserveErr != nil {
+		return "", false, s.reserveErr
+	}
 	if _, exists := s.entries[key.String()]; exists {
 		return "", false, nil
 	}
@@ -78,6 +90,7 @@ func (s *fakeIdempotencyStore) Finalize(ctx context.Context, key videodomain.Ide
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.finalizeCalls++
 	entry, exists := s.entries[key.String()]
 	if !exists || entry.token != token {
 		return false, nil
@@ -108,6 +121,7 @@ func (s *fakeIdempotencyStore) Clear(ctx context.Context, key videodomain.Idempo
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.clearCalls++
 	entry, exists := s.entries[key.String()]
 	if !exists || entry.token != token {
 		return false, nil
@@ -124,6 +138,14 @@ func (s *fakeIdempotencyStore) hasReservation(key videodomain.IdempotencyKey) bo
 	defer s.mu.Unlock()
 	_, exists := s.entries[key.String()]
 	return exists
+}
+
+// callCounts reports Finalize/Clear invocation counts, for asserting a
+// request that proceeded without a reservation never touches either.
+func (s *fakeIdempotencyStore) callCounts() (finalize, clear int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finalizeCalls, s.clearCalls
 }
 
 // alwaysAllowRateLimiter is a fake videoRateLimiter so HTTP tests unrelated
@@ -1113,5 +1135,148 @@ func TestHandleVideoUpload_CreateVideoJobFailure_ClearsReservationForImmediateRe
 	}
 	if got := extractor.Invocations(); got != 1 {
 		t.Fatalf("extractor invocations = %d, want 1 (only the successful retry should have reached ffmpeg)", got)
+	}
+}
+
+// TestHandleVideoUpload_ReserveError_ProceedsWithoutIdempotencyProtection
+// covers fail-open-upload-idempotency: a Reserve error (Redis down/erroring)
+// must not block the upload — the request should succeed exactly as it
+// would with no idempotency layer at all, instead of the old 500 "Failed to
+// check upload idempotency".
+func TestHandleVideoUpload_ReserveError_ProceedsWithoutIdempotencyProtection(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_reserve_error.zip", 4)
+	srv, tokens, store := startIdempotencyTestServer(t, extractor)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	store.reserveErr = errors.New("simulated redis outage")
+
+	content := []byte("content uploaded while the idempotency store is erroring")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "reserve-error.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a Reserve error must not block the upload)", resp.StatusCode, http.StatusOK)
+	}
+	if !result.Success {
+		t.Fatalf("upload should succeed despite the Reserve error, got: %+v", result)
+	}
+	if got := extractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1", got)
+	}
+}
+
+// TestHandleVideoUpload_ReserveError_NeverCallsFinalizeOrClear proves the
+// guard in handleVideoUpload actually skips Finalize/Clear when there was
+// never a valid reservation, rather than calling them with an empty token
+// (see fail-open-upload-idempotency's design.md Decision 1).
+func TestHandleVideoUpload_ReserveError_NeverCallsFinalizeOrClear(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_reserve_error_2.zip", 2)
+	srv, tokens, store := startIdempotencyTestServer(t, extractor)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	store.reserveErr = errors.New("simulated redis outage")
+
+	content := []byte("content whose Finalize/Clear must never be invoked")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "no-finalize.mp4")
+	defer resp.Body.Close()
+	if !result.Success {
+		t.Fatalf("upload should succeed despite the Reserve error, got: %+v", result)
+	}
+	if finalizeCalls, clearCalls := store.callCounts(); finalizeCalls != 0 || clearCalls != 0 {
+		t.Fatalf("finalizeCalls=%d clearCalls=%d, want 0/0 (no reservation to finalize or clear)", finalizeCalls, clearCalls)
+	}
+}
+
+// TestHandleVideoUpload_ReserveError_CreateVideoJobFailureStillSkipsClear
+// confirms the guard on the CreateVideoJob-failure Clear call site: with no
+// valid reservation (Reserve errored), Clear must never be called there
+// either, and the response must reflect the CreateVideoJob failure itself
+// (not the old Reserve-error 500).
+func TestHandleVideoUpload_ReserveError_CreateVideoJobFailureStillSkipsClear(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_unused_create_failure.zip", 1)
+	repo := newCreateFailingRepository(1)
+	srv, tokens, store := startIdempotencyTestServerWithRepo(t, extractor, repo)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	store.reserveErr = errors.New("simulated redis outage")
+
+	content := []byte("content whose CreateVideoJob failure must still skip Clear")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "reserve-error-create-failure.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (CreateVideoJob is forced to fail)", resp.StatusCode, http.StatusInternalServerError)
+	}
+	if result.Success {
+		t.Fatalf("CreateVideoJob was forced to fail, expected Success=false, got: %+v", result)
+	}
+	if strings.Contains(result.Message, "idempotency") {
+		t.Fatalf("message = %q, should reflect the CreateVideoJob failure, not the old Reserve-error message", result.Message)
+	}
+	if finalizeCalls, clearCalls := store.callCounts(); finalizeCalls != 0 || clearCalls != 0 {
+		t.Fatalf("finalizeCalls=%d clearCalls=%d, want 0/0 (no reservation to finalize or clear)", finalizeCalls, clearCalls)
+	}
+}
+
+// TestHandleVideoUpload_ReserveError_ExtractionFailureStillSkipsClear
+// confirms the guard also holds on the failure path (extraction fails after
+// a Reserve error) — Clear must still never be called, since there was
+// never a reservation to clear.
+func TestHandleVideoUpload_ReserveError_ExtractionFailureStillSkipsClear(t *testing.T) {
+	failingExtractor := newFailingFrameExtractor(errors.New("simulated extraction failure"))
+	srv, tokens, store := startIdempotencyTestServer(t, failingExtractor)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	store.reserveErr = errors.New("simulated redis outage")
+
+	content := []byte("content whose failed processing must still skip Clear")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "reserve-error-fail.mp4")
+	defer resp.Body.Close()
+	if result.Success {
+		t.Fatalf("extraction was forced to fail, expected Success=false, got: %+v", result)
+	}
+	// The discriminating assertion: pre-fix code returns 500 for the
+	// Reserve error itself, before ever reaching CreateVideoJob/extraction
+	// — which would make finalizeCalls/clearCalls == 0 trivially true for
+	// the wrong reason (never got that far), not because the guard
+	// worked. Checking the extractor actually ran proves this request
+	// really did proceed past Reserve and reach the failure path the
+	// Clear guard is meant to cover.
+	if got := failingExtractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1 (the request must proceed past the Reserve error into extraction)", got)
+	}
+	if finalizeCalls, clearCalls := store.callCounts(); finalizeCalls != 0 || clearCalls != 0 {
+		t.Fatalf("finalizeCalls=%d clearCalls=%d, want 0/0 (no reservation to finalize or clear)", finalizeCalls, clearCalls)
+	}
+}
+
+// TestHandleVideoUpload_GenuineConflict_StillReturns409 guards against a
+// regression where the fail-open-upload-idempotency change could
+// accidentally widen its "proceed anyway" behavior to the unrelated,
+// already-correct reserved=false/err=nil conflict path.
+func TestHandleVideoUpload_GenuineConflict_StillReturns409(t *testing.T) {
+	extractor := newImmediateFrameExtractor("frames_unused_conflict.zip", 1)
+	srv, tokens, store := startIdempotencyTestServer(t, extractor)
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("content whose reservation is pre-seeded and never resolved (regression guard)")
+	videoPath := writeTestUploadContent(t, content)
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, reserved, err := store.Reserve(context.Background(), idemKey); err != nil || !reserved {
+		t.Fatalf("failed to pre-seed reservation: reserved=%v err=%v", reserved, err)
+	}
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "still-conflict.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d (a genuine conflict must be unaffected by the fail-open change)", resp.StatusCode, http.StatusConflict)
+	}
+	if result.Success {
+		t.Fatal("expected Success=false for a 409 response")
 	}
 }
