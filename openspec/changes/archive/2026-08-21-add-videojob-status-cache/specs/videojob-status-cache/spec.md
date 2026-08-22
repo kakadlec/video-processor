@@ -46,7 +46,7 @@
 
 ### Requirement: PostgreSQL Is Authoritative On Cache Miss Or Cache Failure
 
-If Redis has no entry for a job, or the cache read itself fails (a Redis error, or a value that fails to deserialize), `CachedVideoJobRepository.FindByID` SHALL fall back to the inner repository's PostgreSQL lookup, return its result, and repopulate the cache with it.
+If Redis has no entry for a job, or the cache read itself fails (a Redis error, or a value that fails to deserialize), `CachedVideoJobRepository.FindByID` SHALL fall back to the inner repository's PostgreSQL lookup and return its result — this fallback is unconditional and never itself fails the lookup. `FindByID` SHALL also attempt to repopulate the cache with that result via `SET NX`. That repopulation is **guaranteed** to succeed on a true miss (no entry) or a malformed-but-string value (self-healed first via a compare-and-delete, so `SET NX` finds the key genuinely absent) — but is only **best-effort** when the cache read failed with a Redis error, since `SET NX` cannot replace an existing key holding an incompatible type (e.g. a `WRONGTYPE` error from a key that was somehow written to as a non-string). In that narrow case, the PostgreSQL fallback still succeeds every time, but the cache entry for that job may remain unrepopulated until whatever produced the incompatible value is externally resolved.
 
 #### Scenario: Cache miss falls back to PostgreSQL and repopulates the cache
 
@@ -56,9 +56,9 @@ If Redis has no entry for a job, or the cache read itself fails (a Redis error, 
 
 #### Scenario: A cache read error falls back to PostgreSQL rather than failing the lookup
 
-- **GIVEN** the Redis client returns an error when `FindByID` checks the cache (e.g. a transient connection failure)
+- **GIVEN** the Redis client returns an error when `FindByID` checks the cache (e.g. a transient connection failure, or a `WRONGTYPE` error from a key holding an incompatible value)
 - **WHEN** `FindByID` is called
-- **THEN** the lookup still succeeds via PostgreSQL, and the error from the cache read is logged rather than returned to the caller
+- **THEN** the lookup still succeeds via PostgreSQL, and the error from the cache read is logged rather than returned to the caller — repopulating the cache with the fresh result is attempted but not guaranteed to succeed in this case (see the requirement text above)
 
 #### Scenario: Cache entries carry a bounded, fixed lifetime
 
