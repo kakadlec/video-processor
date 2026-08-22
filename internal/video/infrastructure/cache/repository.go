@@ -17,6 +17,26 @@ import (
 	"video-processor/internal/video/domain"
 )
 
+// detachedCleanupTimeout bounds a context deliberately independent of the
+// caller's own request context — used only for Update's post-commit cache
+// maintenance (see detachedCleanupContext), so that maintenance still gets
+// a real chance to run even if the caller's context is already canceled or
+// about to expire by the time PostgreSQL's write has committed.
+const detachedCleanupTimeout = 3 * time.Second
+
+// detachedCleanupContext returns a short-lived context independent of ctx,
+// for Redis writes that must still be attempted after a PostgreSQL write
+// has already committed — reusing the (possibly already-canceled or
+// about-to-expire) caller context for that cleanup would make it fail for
+// a reason unrelated to Redis itself, leaving a stale cache entry in place
+// (caught during review, Copilot PR #155). Mirrors the reasoning behind
+// internal/video/application.NewFinalizationContext, kept local to this
+// package rather than imported from there so infrastructure doesn't take on
+// an application-layer dependency for one small helper.
+func detachedCleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), detachedCleanupTimeout)
+}
+
 // keyPrefix namespaces this package's Redis keys, matching the
 // "<domain>:<purpose>:<id>" shape already used elsewhere in this codebase
 // (e.g. internal/platform/ratelimit's "ratelimit:" + userID.String()).
@@ -144,14 +164,42 @@ end
 return 1
 `)
 
-// readCache returns (job, true) on a cache hit that deserializes cleanly.
-// Any other outcome (miss, Redis error, corrupted value) returns (nil,
-// false) and, for the latter two, logs the error — the caller always falls
+// deleteIfWrongTypeScript removes key only if it currently exists and holds
+// a non-string value. Unlike deleteMalformedIfUnchangedScript, this covers
+// a genuine Redis command error on GET (e.g. WRONGTYPE from a key that was
+// somehow written to as a list, hash, etc.) — GET never returns the
+// offending value in that case, so there's nothing to compare against; a
+// TYPE check is the next best thing. It's still safe against the same
+// clobber race SET NX closes: a legitimate write-through only ever writes a
+// string (see Update below), so this can never delete a value a concurrent
+// write-through just placed — it only ever removes a type write-through
+// itself could never have produced (caught during review, Copilot PR #155:
+// without this, a WRONGTYPE key never self-heals and permanently falls
+// back to PostgreSQL for that job).
+var deleteIfWrongTypeScript = redis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 1 then
+	if redis.call("TYPE", KEYS[1])["ok"] ~= "string" then
+		redis.call("DEL", KEYS[1])
+	end
+end
+return 1
+`)
+
+// readCache returns (job, true) on a cache hit that deserializes cleanly
+// AND whose stored ID matches the requested one. Any other outcome (miss,
+// Redis error, corrupted value, or an ID/key mismatch) returns (nil, false)
+// and, for the non-miss cases, logs the error — the caller always falls
 // back to the inner repository rather than surfacing a cache-layer problem
-// as a lookup failure. A corrupted value (fails to unmarshal or to
-// reconstruct into a valid aggregate) is also best-effort removed via
-// deleteMalformedIfUnchangedScript, so the caller's subsequent SET NX
-// repopulation isn't blocked by a key that will never deserialize.
+// as a lookup failure. A corrupted string value (fails to unmarshal, to
+// reconstruct into a valid aggregate, or whose ID doesn't match the
+// requested key — caught during review, Copilot PR #155: without this
+// check, a structurally valid record stored under the wrong key would be
+// silently accepted and returned for a different job) is best-effort
+// removed via deleteMalformedIfUnchangedScript; a non-string value (a
+// genuine Redis type error) is best-effort removed via
+// deleteIfWrongTypeScript instead, since there's no string to compare
+// against. Either way, the caller's subsequent SET NX repopulation isn't
+// blocked by a key that will never deserialize.
 func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.VideoJobID) (*domain.VideoJob, bool) {
 	key := cacheKey(id)
 	raw, err := r.client.Get(ctx, key).Result()
@@ -160,12 +208,20 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 	}
 	if err != nil {
 		log.Printf("video: cache: get %s: %v", id.String(), err)
+		if delErr := deleteIfWrongTypeScript.Run(ctx, r.client, []string{key}).Err(); delErr != nil {
+			log.Printf("video: cache: delete wrong-type entry %s: %v", key, delErr)
+		}
 		return nil, false
 	}
 
 	var rec cachedJobRecord
 	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
 		log.Printf("video: cache: unmarshal %s: %v", id.String(), err)
+		r.deleteMalformedIfUnchanged(ctx, key, raw)
+		return nil, false
+	}
+	if rec.ID != id.String() {
+		log.Printf("video: cache: id mismatch for key %s: stored id %q", key, rec.ID)
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
@@ -210,10 +266,18 @@ func (r *CachedVideoJobRepository) writeCacheIfAbsent(ctx context.Context, job *
 
 // Update implements domain.VideoJobRepository as write-through: the inner
 // repository's write must succeed first (PostgreSQL is the authority), and
-// only then is the cache entry overwritten with job's new state. A cache
-// write failure falls back to a best-effort delete, so the entry degrades
-// to a miss (falls back to PostgreSQL next time) rather than staying stale;
-// either failure is logged, and Update still reports success, since the
+// only then is the cache entry overwritten with job's new state. The cache
+// write (and its fallback delete on failure) deliberately use a detached
+// context (see detachedCleanupContext), not ctx: PostgreSQL has already
+// committed by this point, so this maintenance must still get a real chance
+// to run even if ctx is already canceled or about to expire — reusing ctx
+// here would make the SET fail for a reason unrelated to Redis, and then
+// the fallback DEL would immediately fail the exact same way, leaving a
+// stale entry cached for up to entryTTL despite the committed update
+// (caught during review, Copilot PR #155). A cache write failure still
+// falls back to a best-effort delete, so the entry degrades to a miss
+// (falls back to PostgreSQL next time) rather than staying stale; either
+// failure is logged, and Update still reports success, since the
 // PostgreSQL write it's responsible for already committed.
 func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.VideoJob) error {
 	if err := r.inner.Update(ctx, job); err != nil {
@@ -225,9 +289,11 @@ func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.Video
 		log.Printf("video: cache: marshal %s: %v", job.ID().String(), err)
 		return nil
 	}
-	if err := r.client.Set(ctx, cacheKey(job.ID()), data, entryTTL).Err(); err != nil {
+	cleanupCtx, cancel := detachedCleanupContext()
+	defer cancel()
+	if err := r.client.Set(cleanupCtx, cacheKey(job.ID()), data, entryTTL).Err(); err != nil {
 		log.Printf("video: cache: write-through set %s: %v", job.ID().String(), err)
-		if delErr := r.client.Del(ctx, cacheKey(job.ID())).Err(); delErr != nil {
+		if delErr := r.client.Del(cleanupCtx, cacheKey(job.ID())).Err(); delErr != nil {
 			log.Printf("video: cache: write-through fallback delete %s: %v", job.ID().String(), delErr)
 		}
 	}

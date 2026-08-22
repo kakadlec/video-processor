@@ -2,6 +2,7 @@ package cache_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -396,6 +397,111 @@ func TestCachedVideoJobRepository_FindByID_GenuineRedisErrorFallsBackLikeAMiss(t
 	}
 	if fake.findByIDCalls != 1 {
 		t.Fatalf("findByIDCalls = %d, want 1 (fell back to inner)", fake.findByIDCalls)
+	}
+
+	// The WRONGTYPE key must have self-healed: a second call should be a
+	// genuine cache hit now that SET NX had a genuinely empty slot to fill.
+	fake.mu.Lock()
+	fake.findByIDErr = errors.New("must be served from the now-repaired cache")
+	fake.mu.Unlock()
+
+	if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+		t.Fatalf("second FindByID (expected cache hit after wrong-type self-heal): %v", err)
+	}
+}
+
+func TestCachedVideoJobRepository_FindByID_IDMismatchTreatedAsMalformed(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	jobA := newTestJob(t)
+	jobB := newTestJob(t)
+	if err := fake.Create(context.Background(), jobA); err != nil {
+		t.Fatalf("fake.Create jobA: %v", err)
+	}
+	if err := fake.Create(context.Background(), jobB); err != nil {
+		t.Fatalf("fake.Create jobB: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	ctx := context.Background()
+
+	// Store a structurally valid record for jobB under jobA's key —
+	// simulating corruption/a key collision, not a normal code path.
+	keyA := "videojob:status:" + jobA.ID().String()
+	data, err := json.Marshal(map[string]any{
+		"id":                jobB.ID().String(),
+		"user_id":           jobB.UserID().String(),
+		"original_filename": jobB.OriginalFilename().String(),
+		"frame_count":       0,
+		"status":            string(domain.JobStatusPending),
+		"created_at":        jobB.CreatedAt(),
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := client.Set(ctx, keyA, data, 0).Err(); err != nil {
+		t.Fatalf("Set (setup): %v", err)
+	}
+
+	got, err := repo.FindByID(ctx, jobA.ID())
+	if err != nil {
+		t.Fatalf("FindByID (expected fallback past the ID-mismatched entry): %v", err)
+	}
+	if !got.ID().Equal(jobA.ID()) {
+		t.Fatalf("FindByID(jobA) returned job %q, want %q — a mismatched cache entry was returned as a hit", got.ID().String(), jobA.ID().String())
+	}
+	if fake.findByIDCalls != 1 {
+		t.Fatalf("findByIDCalls = %d, want 1 (fell back to inner)", fake.findByIDCalls)
+	}
+
+	// The mismatched entry must have been replaced by a valid one for jobA.
+	fake.mu.Lock()
+	fake.findByIDErr = errors.New("must be served from the now-repaired cache")
+	fake.mu.Unlock()
+
+	if _, err := repo.FindByID(ctx, jobA.ID()); err != nil {
+		t.Fatalf("second FindByID (expected cache hit after repair): %v", err)
+	}
+}
+
+func TestCachedVideoJobRepository_Update_WriteThroughSurvivesACanceledCallerContext(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	if err := fake.Create(context.Background(), job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+
+	// Populate the cache with the pending state via a normal, live context.
+	if _, err := repo.FindByID(context.Background(), job.ID()); err != nil {
+		t.Fatalf("FindByID (populate cache): %v", err)
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+
+	// The caller's own context is already canceled by the time Update
+	// runs — modeling a request/finalization deadline expiring right as
+	// PostgreSQL's write commits. The fake's inner.Update ignores ctx (as
+	// the real postgres.Repository would already have committed via its
+	// own transaction by this point), so this isolates the cache layer's
+	// own handling of a dead incoming context.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := repo.Update(canceledCtx, job); err != nil {
+		t.Fatalf("Update with a canceled caller context: %v", err)
+	}
+
+	// The write-through must still have landed via its own detached
+	// context — a fresh, live context observes the new state.
+	got, err := repo.FindByID(context.Background(), job.ID())
+	if err != nil {
+		t.Fatalf("FindByID after Update: %v", err)
+	}
+	if got.Status() != domain.JobStatusQueued {
+		t.Fatalf("status = %q, want queued (write-through must survive a canceled caller context)", got.Status())
 	}
 }
 
