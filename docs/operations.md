@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is a single Go binary (or `go run ./cmd/api`) behind a Docker container. There is no orchestration. External services are a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module, and (as of Phase 4's `add-upload-idempotency-keys`) a required Redis instance backing `POST /upload`'s idempotency keys and, as of `add-rate-limiting-middleware`, every authenticated route's per-user rate limiting — everything else still runs with no environment-specific configuration beyond the port.
+The application is a single Go binary (or `go run ./cmd/api`) behind a Docker container. There is no orchestration. External services are a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module, and (as of Phase 4's `add-upload-idempotency-keys`) a required Redis instance backing `POST /upload`'s idempotency keys, every authenticated route's per-user rate limiting (`add-rate-limiting-middleware`), and, as of `add-videojob-status-cache`, a non-authoritative `VideoJob` status cache — everything else still runs with no environment-specific configuration beyond the port.
 
 ### Docker
 
@@ -80,13 +80,13 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 - **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
 - **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
 
-### Redis — Connection adapter, idempotency keys, and rate limiting implemented (Phase 4), status cache Planned
+### Redis — Connection adapter, idempotency keys, rate limiting, and status cache all implemented (Phase 4 complete)
 
-`internal/platform/redis` (`add-redis-infrastructure`) provides connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close`. It is wired into `cmd/api`'s `setupVideo` as of `add-upload-idempotency-keys`, which requires `REDIS_ADDR` at startup like the PostgreSQL DSNs above. Of Redis's three planned feature responsibilities (all additive to PostgreSQL, not a replacement), two are now implemented and one remains planned:
+`internal/platform/redis` (`add-redis-infrastructure`) provides connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close`. It is wired into `cmd/api`'s `setupVideo` as of `add-upload-idempotency-keys`, which requires `REDIS_ADDR` at startup like the PostgreSQL DSNs above. All three of Redis's planned Phase 4 feature responsibilities (all additive to PostgreSQL, not a replacement) are now implemented:
 
 1. **Idempotency keys** — **Implemented.** `internal/video/infrastructure/idempotency.RedisStore` deduplicates `POST /upload` requests by content hash + `UserID`: a `Reserve`/`Finalize`/`Clear`/`Lookup` protocol backs the "prevent duplicate job creation from client retries" goal. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md`.
 2. **Rate limiting** — **Implemented.** `internal/platform/ratelimit.Limiter` enforces a per-user, fixed-window request cap (`RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`, both optional with defaults) on every authenticated route, mounted via `cmd/api/ratelimit.go`'s `rateLimitMiddleware`. Denied requests get `429` + `Retry-After`; a limiter failure (or an internal bounded timeout) fails open. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/rate-limiting/spec.md`.
-3. **Status cache** — Planned. Short-TTL cache for `GET /jobs/{id}/status` to reduce PostgreSQL read pressure.
+3. **Status cache** — **Implemented.** `internal/video/infrastructure/cache.CachedVideoJobRepository` decorates the PostgreSQL `VideoJobRepository` with a cache-aside/write-through cache for `FindByID` lookups (backing `GetJobStatus`'s repeated polling reads via `GET /api/video-jobs/:id`), wired into `setupVideo` ahead of every use case. No new environment variable — the cache TTL is a fixed constant, not configurable. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/videojob-status-cache/spec.md`.
 
 ---
 
