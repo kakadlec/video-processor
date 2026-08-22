@@ -83,6 +83,8 @@ Browser / client
 
 **Rate limiting (Phase 4, `add-rate-limiting-middleware`):** every route gated by `identity.requireBearerAuth()` is also gated by a per-user, Redis-backed fixed-window rate limiter (`internal/platform/ratelimit.Limiter`, mounted as `cmd/api/ratelimit.go`'s `rateLimitMiddleware` on the `videoRoutes` group, immediately after the auth middleware). A request that crosses the configured limit within the current window is rejected with `429` and a `Retry-After` header before any handler runs, keyed independently per authenticated `UserID`. Thresholds are configurable via optional `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (defaults 60 requests / 60 seconds) — unlike `REDIS_ADDR`, neither is required at startup. If the Redis check itself fails or exceeds a short internal timeout, the middleware fails open (allows the request, logs the error) rather than blocking otherwise-healthy traffic on an infrastructure hiccup. That timeout only actually bounds the real Redis call because `internal/platform/redis.Open` sets `ContextTimeoutEnabled: true` on the shared client — go-redis v9 otherwise silently discards a passed context's deadline on every command, a subtlety this change had to fix and cover with a real-client test (`internal/platform/redis/client_test.go`) after an initial fix attempt turned out not to work. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, static assets) are out of scope. See `openspec/specs/rate-limiting/spec.md` for the full contract.
 
+**Status cache (Phase 4, `add-videojob-status-cache`):** `internal/video/infrastructure/cache.CachedVideoJobRepository` decorates the PostgreSQL `VideoJobRepository` with a Redis-backed cache for `FindByID` lookups, wired into `cmd/api/video.go`'s `setupVideo` so every use case that touches a `VideoJob` — including `GetJobStatus`, which backs `GET /api/video-jobs/:id`'s repeated polling reads — shares one cached repository instance. Reads are cache-aside (a hit skips PostgreSQL; a miss, Redis error, or corrupted entry falls back to PostgreSQL, always unconditionally — the fallback read never itself fails); the four state-transition use cases' writes are write-through (`Update` writes PostgreSQL first, then overwrites the cache entry with the confirmed new state). Miss-repopulation uses `SET NX`, not a plain `SET`, so a slow reader that read a pre-transition value can never clobber a fresher write-through entry a concurrent transition already wrote — a race caught during review and covered by a dedicated concurrency test. A malformed-but-string cache entry is removed via a compare-and-delete Lua script (mirroring the idempotency store's own atomicity pattern) before repopulation, so it's guaranteed to self-heal without reopening that same race — but a generic Redis error on the read (e.g. `WRONGTYPE` from a key holding an incompatible value) only gets a best-effort repopulation attempt, since `SET NX` can't replace an existing key of the wrong type; PostgreSQL correctness is unaffected either way, only that job's caching benefit is what's at risk. Entries carry a fixed 5-minute TTL as a safety net, not the source of correctness. `FindByUserID` (the `GET /api/video-jobs` list endpoint) and `Create` are intentionally left uncached. This closes out all three of Phase 4's planned Redis responsibilities. See `openspec/specs/videojob-status-cache/spec.md` for the full contract.
+
 The handler returns only after the full sequence completes and the ZIP is written. There is still no queue, no worker, and no async signalling — see `openspec/specs/videojob-execution/spec.md` for the full contract. The `VideoJob` created for the upload is queryable afterward via `GET /api/video-jobs/:id`/`GET /api/video-jobs` (see the preview API note below).
 
 ### State (current)
@@ -98,7 +100,7 @@ Video-processing artifacts still live in the local filesystem; user accounts liv
 | PostgreSQL `users` table | User accounts (normalized email, password hash) | Persistent, external to the container |
 | PostgreSQL `video_jobs` table | `VideoJob` rows — created both by `POST /upload` (this pipeline) and by `POST /api/video-jobs` (the preview API below); the two share the same repository and owner-scoping | Persistent, external to the container |
 
-No cache, no message broker.
+No message broker. Redis backs idempotency keys, rate limiting, and (as of `add-videojob-status-cache`) a non-authoritative `VideoJob` status cache — PostgreSQL remains the source of truth on any cache miss.
 
 ### Routes (current)
 
@@ -136,11 +138,11 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 ---
 
-## Target Architecture (Partially implemented — Phase 3 of 8 done, Phase 4 started)
+## Target Architecture (Partially implemented — Phases 1–4 of 8 done)
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 has started: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and two of Phase 4's three features are now wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`) and per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`); the status cache remains planned. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
@@ -174,6 +176,7 @@ video-processor/
       application/    # Use cases: CreateVideoJob, GetJobStatus, ListUserJobs, EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, ProcessVideoJob (all implemented, Phase 3)
       infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application)
         idempotency/  # Redis-backed IdempotencyStore adapter (implemented, Phase 4 — add-upload-idempotency-keys), wired into cmd/api's POST /upload handler
+        cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4 — add-videojob-status-cache), wired into cmd/api's setupVideo ahead of every use case
         # MinIO adapter, RabbitMQ publisher planned (Phases 5–6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
@@ -188,7 +191,7 @@ video-processor/
 | Component | Role | Status |
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
-| Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), and rate limiting (`add-rate-limiting-middleware`) **implemented** (Phase 4); status cache still planned |
+| Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), rate limiting (`add-rate-limiting-middleware`), and the `VideoJob` status cache (`add-videojob-status-cache`) — all three **implemented** (Phase 4 complete) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
 
