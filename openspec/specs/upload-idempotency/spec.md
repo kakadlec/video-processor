@@ -32,6 +32,8 @@ Define the Redis-backed idempotency-key mechanism for `POST /upload`: key deriva
 
 `handleVideoUpload` SHALL atomically reserve its idempotency key in Redis (a conditional set that fails if the key already exists) before calling `CreateVideoJob`, storing a short-lived sentinel value that embeds a unique ownership token generated for that reservation. A second request that fails this reservation SHALL NOT immediately return an error; it SHALL instead look up the key's current value in a short bounded retry loop, and only return `409 Conflict` (without creating a `VideoJob` or invoking `ffmpeg`) if that bound is exceeded without the key resolving to a real `VideoJobID`.
 
+If the reservation attempt itself fails with a store-level error (e.g. Redis is unreachable or times out) rather than resolving to either a successful reservation or a genuine conflict, `handleVideoUpload` SHALL NOT treat this as a conflict or return an error to the caller. It SHALL log the error and proceed directly to `CreateVideoJob` as if no idempotency protection were available for this request. A request that proceeds this way holds no valid reservation token, and SHALL NOT attempt to finalize or clear an idempotency key at any later point in its own handling.
+
 #### Scenario: First of two concurrent identical requests proceeds
 
 - **GIVEN** two requests from the same user with identical content arrive concurrently, and neither has an existing idempotency key
@@ -49,6 +51,18 @@ Define the Redis-backed idempotency-key mechanism for `POST /upload`: key deriva
 - **GIVEN** a request has reserved the key but never finalizes or clears it (e.g. it crashed) before a second, near-simultaneous request's bounded retry window elapses
 - **WHEN** the second request's bounded retry window elapses without the key resolving to a real `VideoJobID`
 - **THEN** the second request returns `409 Conflict` without creating a `VideoJob` or invoking `ffmpeg`
+
+#### Scenario: A Reserve error does not block the upload
+
+- **GIVEN** the idempotency store's `Reserve` call returns a store-level error (e.g. Redis is unreachable) rather than a successful reservation or a genuine conflict
+- **WHEN** `handleVideoUpload` handles that error
+- **THEN** it logs the error and proceeds to `CreateVideoJob`/`ProcessVideoJob` for this upload, returning the same success/failure response an upload with no idempotency layer at all would return, rather than an error referencing idempotency
+
+#### Scenario: A request that proceeded without a reservation does not attempt to finalize or clear one
+
+- **GIVEN** a request proceeded through `CreateVideoJob` after a `Reserve` error, holding no valid reservation token
+- **WHEN** that request later reaches a point in `handleVideoUpload` that would otherwise call `Finalize` or `Clear`
+- **THEN** it skips that call entirely, without attempting it against an empty or invalid token
 
 ### Requirement: Reservation Is Finalized To The Real VideoJobID Only By Its Owning Token
 
