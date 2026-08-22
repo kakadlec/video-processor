@@ -23,6 +23,7 @@ import (
 	platformredis "video-processor/internal/platform/redis"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
+	videocache "video-processor/internal/video/infrastructure/cache"
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
@@ -111,7 +112,12 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
 
 	ids := videoidgen.New()
-	repo := videopostgres.NewRepository(db, ids)
+	// Wrapping once here means every use case below — including
+	// CreateVideoJob — shares the same cache-aside/write-through
+	// decorator, per add-videojob-status-cache's design.md: Create is a
+	// pure pass-through on the decorator, so there's no reason to keep a
+	// separate uncached repo reference around just for it.
+	repo := videocache.NewCachedVideoJobRepository(videopostgres.NewRepository(db, ids), redisClient, ids)
 	clock := systemClock{}
 	extractor := videoffmpeg.New()
 	completeJob := videoapplication.NewCompleteJob(repo, ids)
