@@ -2,7 +2,7 @@
 
 ### Requirement: Extension Validation Precedes Any Body Read
 
-`POST /upload` SHALL determine the uploaded file's extension (via the multipart part's filename) and reject an unsupported one with `400` before reading any bytes of that part's body, regardless of the request's declared or actual content length.
+`POST /upload` SHALL determine the uploaded file's extension (via the multipart part's filename) and reject an unsupported one with `400` without buffering or persisting any of that part's payload, regardless of the request's declared or actual content length. This bounds the request to the cost of parsing the multipart part's own header framing (bounded, buffered I/O internal to `mime/multipart`'s reader) — it does not require literally zero bytes of read-ahead past the header boundary, only that none of the part's payload is read, copied, or written to disk before the extension is known to be valid.
 
 #### Scenario: A large upload with an invalid extension is rejected without buffering its body
 
