@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -193,12 +194,52 @@ type ProcessingResult struct {
 	Images     []string `json:"images,omitempty"`
 }
 
+// videoFilePart returns the "video" part of a multipart request without
+// buffering its body, so a caller can validate the part's filename (e.g.
+// via isValidVideoFile) before reading any of its content — unlike
+// (*http.Request).FormFile, which calls ParseMultipartForm internally and
+// therefore reads the entire request body before returning. Any part
+// encountered before a match (or a non-file "video" field, i.e. one with
+// no filename) is drained and closed so the underlying reader can advance;
+// a request with no matching part reports the same not-found error
+// FormFile itself would have returned.
+func videoFilePart(req *http.Request) (*multipart.Part, string, error) {
+	mr, err := req.MultipartReader()
+	if err != nil {
+		return nil, "", err
+	}
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, "", http.ErrMissingFile
+			}
+			return nil, "", err
+		}
+		if part.FormName() == "video" && part.FileName() != "" {
+			return part, part.FileName(), nil
+		}
+		// Best-effort drain so the underlying reader can advance to the
+		// next part; a failure here just means NextPart's own next call
+		// will surface the same underlying error.
+		_, _ = io.Copy(io.Discard, part)
+		_ = part.Close()
+	}
+}
+
 // handleVideoUpload accepts a multipart video upload, creates a VideoJob
 // for it, and drives that job through ProcessVideoJob synchronously before
 // responding — the same external contract POST /upload always had, now
 // backed by the VideoJob application layer instead of an inline ffmpeg call.
 func (m *videoModule) handleVideoUpload(c *gin.Context) {
-	file, header, err := c.Request.FormFile("video")
+	// Streamed via MultipartReader rather than c.Request.FormFile: FormFile
+	// calls ParseMultipartForm under the hood, which reads the entire
+	// request body up front (spilling anything past Gin's 32MiB default
+	// MaxMultipartMemory to a temp file) before the filename is even
+	// available — so a large upload with an invalid extension would pay
+	// the full transfer cost before being rejected. Reading part-by-part
+	// lets the filename gate the body read instead.
+	file, originalFilename, err := videoFilePart(c.Request)
 	if err != nil {
 		c.JSON(400, ProcessingResult{
 			Success: false,
@@ -206,15 +247,21 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		})
 		return
 	}
-	defer file.Close()
 
-	if !isValidVideoFile(header.Filename) {
+	if !isValidVideoFile(originalFilename) {
+		// Deliberately not closing file here: (*multipart.Part).Close
+		// drains the rest of the part's body via io.Copy(io.Discard, p)
+		// so the underlying multipart stream can advance to the next
+		// part — exactly the full-body read this fix exists to avoid.
+		// Leaving it unclosed is safe: a Part holds no OS-level resource
+		// of its own, only a view into the request body reader.
 		c.JSON(400, ProcessingResult{
 			Success: false,
 			Message: "Formato de arquivo não suportado. Use: mp4, avi, mov, mkv",
 		})
 		return
 	}
+	defer file.Close()
 
 	userID, ok := authenticatedUserID(c)
 	if !ok {
@@ -229,7 +276,7 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// VideoJob's own ID (minted afterward, once the file is safely on
 	// disk) — so a save failure below never leaves a dangling VideoJob row.
 	uploadID := uuid.NewString()
-	safeFilename := filepath.Base(header.Filename)
+	safeFilename := filepath.Base(originalFilename)
 	filename := fmt.Sprintf("%s_%s", uploadID, safeFilename)
 	videoPath := filepath.Clean(filepath.Join("uploads", filename))
 	if !strings.HasPrefix(videoPath, "uploads"+string(os.PathSeparator)) {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -240,6 +241,75 @@ func TestUpload_UnsupportedExtension_Rejected(t *testing.T) {
 	if result.ZipPath != "" {
 		t.Fatal("expected no zip to be created for a rejected upload")
 	}
+}
+
+// countingReader wraps an io.Reader and records the total bytes actually
+// read from it, so a test can assert on how much of a request body a
+// handler consumed rather than just on the response it produced.
+type countingReader struct {
+	r     io.Reader
+	total atomic.Int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.total.Add(int64(n))
+	return n, err
+}
+
+// TestUpload_LargeInvalidExtension_RejectsWithoutReadingFullBody proves the
+// fix for the bug where a large, invalid-extension upload took as long to
+// reject as a real upload takes to process: c.Request.FormFile calls
+// ParseMultipartForm internally, which reads the entire body up front
+// (spilling past Gin's 32MiB default MaxMultipartMemory to a temp file)
+// before the filename is even available. A test asserting only on the
+// response status would pass identically whether or not that full read
+// happens, so this asserts on bytes actually consumed from the request
+// body instead — the discriminating signal.
+func TestUpload_LargeInvalidExtension_RejectsWithoutReadingFullBody(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	router := setupRouter(identity, newTestVideoModule(t), alwaysAllowRateLimiter{})
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	var headerBuf bytes.Buffer
+	mw := multipart.NewWriter(&headerBuf)
+	if _, err := mw.CreateFormFile("video", "not-a-video.txt"); err != nil {
+		t.Fatalf("failed to write multipart part header: %v", err)
+	}
+	// headerBuf now holds the multipart preamble plus the "video" part's
+	// Content-Disposition/Content-Type headers, with none of the part's
+	// body written yet (and the multipart writer deliberately never
+	// closed) — a fixed handler should never need to read past this.
+
+	const fillerSize = 64 << 20 // far past Gin's 32MiB MaxMultipartMemory default
+	body := io.MultiReader(bytes.NewReader(headerBuf.Bytes()), io.LimitReader(zeroReader{}, fillerSize))
+	counting := &countingReader{r: body}
+
+	req := httptest.NewRequest(http.MethodPost, "/upload", counting)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	const readBudget = 1 << 20 // generous allowance for header/bufio read-ahead
+	if got := counting.total.Load(); got >= readBudget {
+		t.Fatalf("expected rejection before reading the %d-byte filler body, but the handler read %d bytes", fillerSize, got)
+	}
+}
+
+// zeroReader yields an endless stream of zero bytes, standing in for a
+// large file body that a fixed handler should never actually read.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
 
 func TestUpload_MissingFileField_Rejected(t *testing.T) {
