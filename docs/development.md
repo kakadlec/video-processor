@@ -86,9 +86,9 @@ docker compose down       # stop
 docker compose down -v    # stop and drop the local data volume(s)
 ```
 
-## Code Quality Gates
+## CI checks
 
-The CI pipeline runs three checks — `Build & Test` (`go vet` + `go test`), `SAST` (`gosec`), `Vulnerability Scan` (`govulncheck`) — on every push and pull request, regardless of what the diff touches; that's the branch-protection gate, not a diff-conditional one.
+The CI pipeline runs three checks — `Build & Test` (`go vet` + `go test`), `SAST` (`gosec`), and `Vulnerability Scan` (`govulncheck`) — on every push and pull request.
 
 ```bash
 # Static analysis
@@ -103,13 +103,7 @@ go install golang.org/x/vuln/cmd/govulncheck@latest
 govulncheck ./...
 ```
 
-Locally, only run `go vet`/`go test` when the diff includes a Go module input (`.go`/`go.mod`/`go.sum` — see "Change Completion Requires A Passing Test Run" below); `gosec`/`govulncheck` scan the whole codebase, so a docs/skill-only change rarely needs a fresh local run of those two, but running them costs little and CI catches anything missed regardless.
-
-All three must pass in CI. The CI build fails on **any** `gosec` finding — deliberate policy, not a bug. `#nosec` is a last resort, not the default response to a finding: check the rule's own docs (e.g. `securego.io/docs/rules/g304.html` — lowercase, case-sensitive path) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression — several findings that looked like they needed `#nosec` turned out to be fixable with a real containment check instead. Only suppress a finding that's genuinely a false positive or an accepted risk with no recognized fix pattern, using a bare inline `#nosec G<rule-id>` comment (no restated prose — that's what commit messages and PR descriptions are for). Never disable the SAST job or exclude whole files/rules to make it pass. `govulncheck` failures are resolved by upgrading the implicated dependency — generally by bumping the direct dependency that pulls it in transitively (see `go mod graph`) — then `go mod tidy`. Dependabot alerts should be resolved the same way, as soon as they're opened, not left to accumulate.
-
-### Change Completion Requires A Passing Test Run
-
-A change whose diff includes a Go module input file (`.go` source, `go.mod`, or `go.sum`) is not complete until `go test ./...` has been run and passes locally — this applies before reporting the change done, not just before pushing, and it applies to a dependency-only bump (`go.mod`/`go.sum` with no `.go` file touched) just as much as a source change, since that can still change compiled/runtime behavior. A change whose diff has no Go module input file (documentation, OpenSpec artifacts, agent/skill configuration) is exempt from this specific requirement — don't claim a test run that didn't happen.
+These commands can also be run locally. `gosec` and `govulncheck` scan the full codebase; CI reports their results for every push and pull request. The SAST job fails when `gosec` reports a finding, and the vulnerability scan fails for reachable known vulnerabilities.
 
 ## Docker Workflow
 
@@ -132,86 +126,12 @@ docker compose up --build
 go mod tidy
 ```
 
-## Contribution Conventions
+## Optional workflow skills
 
-### Commit Messages
+The user chooses whether a change uses a workflow. Do not impose OpenSpec, tests, branches, pull requests, commits, or review procedures unless the user explicitly requests that workflow.
 
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
+- Invoke `.claude/skills/change-lifecycle/SKILL.md` for the full OpenSpec lifecycle.
+- Invoke `.claude/skills/repo-workflow/SKILL.md` for the repository PR, validation, commit, and release procedure.
+- The `openspec-explore`, `openspec-propose`, `openspec-apply-change`, and `openspec-archive-change` skills remain available individually.
 
-```
-feat: short description of new capability
-fix: short description of bug fix
-chore: dependency bump or tooling change
-docs: documentation only
-ci: CI workflow change
-test: test additions or changes
-refactor: internal restructuring, no behavior change
-```
-
-Use `!` after the type (e.g. `feat!:`) or a `BREAKING CHANGE:` footer for breaking changes. Commit messages drive automated versioning via `release-please` — do not version manually.
-
-### Releases
-
-Versioning is **not** manual — nobody runs `git tag` by hand. On every push to `main`, `release-please` (`.github/workflows/release-please.yml`) maintains a single up-to-date "Release PR" aggregating unreleased Conventional Commits, showing the computed next version and changelog. Merging that PR is what actually cuts a release: it creates the git tag, publishes a GitHub Release with generated notes, and updates `CHANGELOG.md`. Until it's merged, nothing is tagged or released. Config: `release-please-config.json` (`release-type: simple` — this app has no package-manager manifest to version-bump) and `.release-please-manifest.json` (tracks the current released version per path).
-
-### OpenSpec Workflow
-
-Non-trivial changes (new features, behavior changes, bug fixes with real design decisions, refactors, infra/workflow/CI changes) follow the spec-driven process:
-
-1. **Explore (when warranted):** `/opsx:explore` → for changes that are complex or ambiguous (cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or open design questions), before proposing. A simple, already-scoped change may skip straight to propose.
-2. **Propose:** `/opsx:propose` → creates `openspec/changes/<name>/proposal.md`, `design.md`, `tasks.md`
-3. **Implement:** `/opsx:apply` → work through `tasks.md`
-4. **Archive:** `/opsx:archive` → folds the change into `openspec/specs/`
-
-Skip this flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps). This is a separate question from the test-run requirement above: a dependency bump can still skip OpenSpec/the 3-PR split, but if it's reported as a completed change it still needs a passing local test run first. When in doubt about whether something is trivial, don't skip the flow.
-
-For Claude Code specifically, the `change-lifecycle` skill (`.claude/skills/change-lifecycle/SKILL.md`) encodes this sequence and its gates (wait for the propose PR to merge before implementing, verify done-ness before reporting a task complete, do finalization work before running archive) so it can be invoked directly instead of re-deriving it each time; `repo-workflow` (`.claude/skills/repo-workflow/SKILL.md`) carries the compact version of everything else in this "Contribution Conventions" section.
-
-### PR Separation Rule
-
-Non-trivial changes use three PR roles, in this order:
-
-1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
-2. **Implementation PR** — only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`.
-3. **Finalization PR** — after implementation merges, one PR bundling *all* of: marking the completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, updating any permanent documentation (`README`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and, if the change has a `docs/roadmap.md` Change Backlog row (only product/architecture-scope changes do — see `docs/roadmap.md`), flipping it to `archived`. Do not split these into separate docs/archive/roadmap PRs. It must not contain application source or tests.
-
-`tasks.md` checkoffs belong in the finalization PR, not in the implementation PR. Note that the vendored `openspec-apply-change` skill checks off tasks immediately as it completes them — when applying implementation-scoped tasks, keep those checkoff edits out of the implementation PR's commit and re-apply them during finalization instead.
-
-Green CI does not authorize a merge. An agent may merge only when the user explicitly authorizes that specific PR in the current session; authorization for one PR does not extend to later PRs.
-
-### Branch Protection
-
-`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. All review conversations must also be resolved before merge, including inline threads opened by GitHub Copilot. A PR is not mergeable until all three checks pass, the branch is up to date with `main`, and no review thread remains unresolved. This protection is enforced for administrators too.
-
-```bash
-git fetch origin
-git checkout -b feat/short-description origin/main
-git push -u origin feat/short-description
-gh pr create --fill
-```
-
-Branch from freshly-fetched `origin/main` rather than from whatever is currently checked out. Changes here land as PR sequences, so the working tree is frequently on an earlier branch of the same sequence or on an unrelated open PR; branching from there carries those commits into the new PR's diff and breaks its declared file scope.
-
-### PR Review Comments
-
-This repository has a `copilot_code_review` branch ruleset that automatically requests a GitHub Copilot review the first time each pull request opens. `review_on_push` is off, so later commits pushed to an already-reviewed PR do **not** trigger a fresh automatic review — request one manually if a substantial follow-up change warrants a new pass.
-
-Before reporting a PR-related task complete, check that PR for review comments (automatic and human), inspect the merge state, and address the findings that make sense:
-
-```bash
-gh pr view <n> --json reviews,mergeable,mergeStateStatus
-gh api repos/{owner}/{repo}/pulls/{n}/comments
-```
-
-Fix genuine findings and resolve their threads (`resolveReviewThread` GraphQL mutation). If a finding doesn't warrant a code change, document why and still resolve the conversation rather than leaving it silently open. `gh pr checks` does not report unresolved conversations as a failed CI check; GitHub exposes the condition through the PR's blocked merge state and enforces it server-side when merging. Copilot's review can take a short while to post after a push — an empty check immediately after opening the PR doesn't mean there's nothing coming.
-
-### Validation and Handoff
-
-Before opening or handing off a PR:
-
-```bash
-git diff --check
-npx --yes @fission-ai/openspec validate <change-id> --strict --no-interactive   # only if an OpenSpec change is involved
-```
-
-Before reporting implementation complete, run the repository's required tests and checks (see "Change Completion Requires A Passing Test Run" above). Report the PR number, URL, changed-file scope, and check results. Never direct-push to `main`.
+CI runs `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` for pushes and pull requests. `release-please` maintains a release PR from commits on `main`; merging it publishes the release and updates `CHANGELOG.md`.

@@ -8,13 +8,11 @@ A minimal Go web service ("FIAP X - Processador de Vídeos") that accepts a vide
 
 The HTTP composition root lives in `cmd/api/main.go` (package `main`), alongside `identity.go` and their `_test.go` files; `internal/identity` and `internal/video` hold the DDD bounded contexts introduced in later phases (see `docs/architecture.md`). CI runs on GitHub Actions (`.github/workflows/ci.yml`); there is no linter config beyond `go vet` and `gosec`.
 
-## Development workflow
+## Optional workflows
 
-Non-trivial changes (new features, behavior changes, bug fixes with real design decisions, refactors, infra/workflow/CI changes) go through [OpenSpec](https://github.com/Fission-AI/OpenSpec) (`/opsx:propose` → `/opsx:apply` → `/opsx:archive`, with `/opsx:explore` first for complex/ambiguous ones) and land as a 3-PR sequence (propose / implementation / finalization). `main` has no direct pushes — every change lands via a feature branch + PR, gated by three required CI checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`). Commit messages follow Conventional Commits, which drives automated versioning via `release-please`.
+The user decides how each change is performed. Do not impose OpenSpec, tests, branches, pull requests, commits, or another workflow unless the user explicitly asks for it.
 
-The full rules (PR role boundaries, branch protection, quality-gate triage incl. `#nosec` policy, PR review-comment checking, merge authorization, commit/release mechanics) are **not** repeated here — they live in `docs/development.md`'s "Code Quality Gates" and "Contribution Conventions" sections for human contributors and non-Claude-Code agents, and are auto-applied for Claude Code by the `repo-workflow` and `change-lifecycle` skills (`.claude/skills/`) at the right moments (opening/merging a PR, wrapping up a change, writing a commit, running quality gates), so this file stays out of the way for simple, direct tasks. `AGENTS.md` carries the same pointers for non-Claude-Code agents. Specs live in `openspec/specs/`; in-flight proposals in `openspec/changes/`; completed ones in `openspec/changes/archive/`.
-
-One rule worth restating because it applies to every change, trivial or not: **`go test ./... -v` must pass locally before reporting a change complete, whenever the diff includes a Go module input (`.go`/`go.mod`/`go.sum`)** — tests require `ffmpeg` on `PATH`, or run via `docker compose run --build --rm app-test go test ./... -v`.
+Optional workflows are provided as skills under `.claude/skills/`: invoke `change-lifecycle` for the complete OpenSpec flow and `repo-workflow` for PR, validation, commit, and release procedures. Specs live in `openspec/specs/`; active proposals live in `openspec/changes/`; completed ones live in `openspec/changes/archive/`.
 
 ## Commands
 

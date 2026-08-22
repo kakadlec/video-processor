@@ -1,11 +1,11 @@
 ---
 name: change-lifecycle
-description: Use when starting work on a docs/roadmap.md Change Backlog item or any comparable non-trivial change, when deciding whether /opsx:explore is needed before /opsx:propose, when deciding whether implementation can start yet, or when sequencing a change through explore/propose/apply/archive end to end. Skip for a single trivial edit with no OpenSpec change involved, or for work already mid-sequence where the next step is unambiguous.
+description: Use only when the user explicitly requests the complete OpenSpec lifecycle or invokes this skill. It sequences explore, propose, apply, and archive for users who choose that optional workflow.
 ---
 
 # Change lifecycle (FIAP X video-processor)
 
-This orchestrates *when* to run each OpenSpec step and what gates sit between them — it does not replace the vendored `openspec-{explore,propose,apply-change,archive-change}` skills, which do the actual work of each step. Use this to decide which step comes next and whether it's safe to proceed; use those skills (or `/opsx:explore`, `/opsx:propose`, `/opsx:apply`, `/opsx:archive`) to execute it.
+This optional skill orchestrates *when* to run each OpenSpec step and what gates sit between them. It does not replace the vendored `openspec-{explore,propose,apply-change,archive-change}` skills, which do the actual work of each step. Do not apply this sequence unless the user has chosen it; direct changes do not need OpenSpec.
 
 ## The sequence
 
