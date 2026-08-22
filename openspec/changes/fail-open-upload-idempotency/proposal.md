@@ -7,6 +7,7 @@ Idempotency here is a pure cost-efficiency optimization (skip re-running `ffmpeg
 ## What Changes
 
 - `cmd/api/video.go`'s `handleVideoUpload`: on a `Reserve` error (Redis unreachable/erroring — distinct from the existing, unchanged "key already exists" conflict path signaled via the `reserved bool` return with no error), log the error and proceed directly to `CreateVideoJob` as if no idempotency protection were available for this request, instead of returning `500`. `domain.IdempotencyStore.Reserve`'s contract and `RedisStore.Reserve`'s implementation are unchanged — they keep faithfully reporting the Redis error; only the caller's response to that error changes.
+- The same handler's four downstream `Finalize`/`Clear` call sites (after `CreateVideoJob` failure, after `Finalize` itself, after an extraction failure, and after an artifact-ownership failure) are each guarded so a request that proceeded without a valid reservation never calls them with an empty/invalid token.
 - No change to the `409 Conflict` path for a genuine reservation conflict between two concurrent identical uploads while Redis is healthy — that behavior is correct today and stays as-is.
 
 ## Capabilities
@@ -15,11 +16,11 @@ Idempotency here is a pure cost-efficiency optimization (skip re-running `ffmpeg
 (none)
 
 ### Modified Capabilities
-- `upload-idempotency`: adds a new requirement describing that Redis unavailability during reservation degrades idempotency protection for that single request (falls through to normal job creation) instead of blocking `POST /upload` entirely.
+- `upload-idempotency`: modifies the existing "Concurrent Identical Requests Are Serialized Via Token-Owned Atomic Reservation" requirement to add an explicit exception for a `Reserve` error — the reservation is no longer unconditionally required before `CreateVideoJob`. This must be a `MODIFIED Requirements` delta (not an additional `ADDED` requirement), since an added requirement alongside the existing unconditional one would leave the canonical spec simultaneously requiring and forbidding the fail-open path.
 
 ## Impact
 
-- **Changed code**: `cmd/api/video.go`'s `handleVideoUpload` Reserve-error branch (currently lines ~282-291) only. `internal/video/infrastructure/idempotency/redis_store.go` and `internal/video/domain/idempotency_store.go` are unchanged.
-- **No changes** to `Finalize`/`Clear` (already non-fatal on error, per existing spec) or to the conflict-detection path (`reserved == false` with no error).
-- **Docs** (finalization PR only): `CLAUDE.md`'s existing idempotency bullet under "Notable constraints / gotchas" (currently silent on `Reserve`'s failure mode — needs a clause, not a rewrite); `openspec/specs/upload-idempotency/spec.md`'s promoted version once the delta lands.
+- **Changed code**: `cmd/api/video.go`'s `handleVideoUpload` — the `Reserve`-error branch (currently lines ~282-291), plus its four downstream `Finalize`/`Clear` call sites, each guarded on whether a valid reservation was actually obtained. `internal/video/infrastructure/idempotency/redis_store.go` and `internal/video/domain/idempotency_store.go` are unchanged.
+- **No changes** to `Finalize`/`Clear`'s own error handling (already non-fatal, per existing spec) or to the conflict-detection path (`reserved == false` with no error).
+- **Docs** (finalization PR only): `CLAUDE.md`'s existing idempotency bullet under "Notable constraints / gotchas" (currently silent on `Reserve`'s failure mode — needs a clause, not a rewrite); `docs/architecture.md`'s request-flow description of the idempotency path (currently presents only the `reserved: true`/`reserved: false` cases and unconditional finalize/clear behavior); `openspec/specs/upload-idempotency/spec.md`'s promoted version once the delta lands; `docs/roadmap.md`'s Change Backlog row for this change, flipped to `archived`.
 - **Dependencies**: none new.
