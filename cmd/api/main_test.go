@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -237,9 +238,124 @@ func TestUpload_UnsupportedExtension_Rejected(t *testing.T) {
 	if result.Success {
 		t.Fatal("expected success=false for an unsupported extension")
 	}
+	const wantMessage = "Formato de arquivo não suportado. Use: mp4, avi, mov, mkv"
+	if result.Message != wantMessage {
+		t.Fatalf("expected message %q, got %q", wantMessage, result.Message)
+	}
 	if result.ZipPath != "" {
 		t.Fatal("expected no zip to be created for a rejected upload")
 	}
+}
+
+// TestUpload_VideoFieldNotFirst_StillFound proves the "video" part doesn't
+// need to be the first field in the multipart body: videoFilePart's
+// NextPart loop must skip (drain and close) any preceding non-matching
+// part rather than assuming the file is the very first one.
+func TestUpload_VideoFieldNotFirst_StillFound(t *testing.T) {
+	srv, token := startTestServer(t)
+	videoPath := generateTestVideo(t, 1)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("note", "this field comes before the video part"); err != nil {
+		t.Fatalf("failed to write leading field: %v", err)
+	}
+	part, err := writer.CreateFormFile("video", "test-video.mp4")
+	if err != nil {
+		t.Fatalf("failed to create form file: %v", err)
+	}
+	file, err := os.Open(videoPath)
+	if err != nil {
+		t.Fatalf("failed to open test video: %v", err)
+	}
+	defer file.Close()
+	if _, err := io.Copy(part, file); err != nil {
+		t.Fatalf("failed to copy video into form: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	resp, result := doUpload(t, srv.URL, token, body, writer.FormDataContentType())
+	cleanupOutputZip(t, result.ZipPath)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d (message: %s)", resp.StatusCode, result.Message)
+	}
+	if !result.Success {
+		t.Fatalf("expected success=true when the video part follows another field, got message: %s", result.Message)
+	}
+}
+
+// countingReader wraps an io.Reader and records the total bytes actually
+// read from it, so a test can assert on how much of a request body a
+// handler consumed rather than just on the response it produced.
+type countingReader struct {
+	r     io.Reader
+	total atomic.Int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.total.Add(int64(n))
+	return n, err
+}
+
+// TestUpload_LargeInvalidExtension_RejectsWithoutReadingFullBody proves the
+// fix for the bug where a large, invalid-extension upload took as long to
+// reject as a real upload takes to process: c.Request.FormFile calls
+// net/http's own ParseMultipartForm internally (bypassing Gin's own
+// FormFile/MultipartForm wrapper, so Gin's MaxMultipartMemory setting is
+// never consulted), which reads the entire body up front — spilling past
+// net/http's own 32MiB defaultMaxMemory to a temp file — before the
+// filename is even available. A test asserting only on the response status
+// would pass identically whether or not that full read happens, so this
+// asserts on bytes actually consumed from the request body instead — the
+// discriminating signal.
+func TestUpload_LargeInvalidExtension_RejectsWithoutReadingFullBody(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	router := setupRouter(identity, newTestVideoModule(t), alwaysAllowRateLimiter{})
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	var headerBuf bytes.Buffer
+	mw := multipart.NewWriter(&headerBuf)
+	if _, err := mw.CreateFormFile("video", "not-a-video.txt"); err != nil {
+		t.Fatalf("failed to write multipart part header: %v", err)
+	}
+	// headerBuf now holds the multipart preamble plus the "video" part's
+	// Content-Disposition/Content-Type headers, with none of the part's
+	// body written yet (and the multipart writer deliberately never
+	// closed) — a fixed handler should never need to read past this.
+
+	const fillerSize = 64 << 20 // far past net/http's own 32MiB defaultMaxMemory
+	body := io.MultiReader(bytes.NewReader(headerBuf.Bytes()), io.LimitReader(zeroReader{}, fillerSize))
+	counting := &countingReader{r: body}
+
+	req := httptest.NewRequest(http.MethodPost, "/upload", counting)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	const readBudget = 1 << 20 // generous allowance for header/bufio read-ahead
+	if got := counting.total.Load(); got >= readBudget {
+		t.Fatalf("expected rejection before reading the %d-byte filler body, but the handler read %d bytes", fillerSize, got)
+	}
+}
+
+// zeroReader yields an endless stream of zero bytes, standing in for a
+// large file body that a fixed handler should never actually read.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
 
 func TestUpload_MissingFileField_Rejected(t *testing.T) {
@@ -252,6 +368,14 @@ func TestUpload_MissingFileField_Rejected(t *testing.T) {
 	}
 	if result.Success {
 		t.Fatal("expected success=false when no video field is sent")
+	}
+	// Locks in that a terminal NextPart io.EOF (no matching part found) is
+	// mapped to http.ErrMissingFile, matching FormFile's own error exactly
+	// — not passed through as a raw "EOF", which would silently change
+	// this response's wording.
+	const wantMessage = "Erro ao receber arquivo: http: no such file"
+	if result.Message != wantMessage {
+		t.Fatalf("expected message %q, got %q", wantMessage, result.Message)
 	}
 }
 
