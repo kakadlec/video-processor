@@ -328,17 +328,20 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		log.Printf("Failed to record owner for upload %s: %v", filename, err)
 	}
 
+	// hasReservation tracks whether this request actually holds a valid
+	// reservation token — false both when Reserve erred (Redis down: we
+	// fail open and proceed without dedup protection, see
+	// fail-open-upload-idempotency's design.md) and, trivially, whenever
+	// we don't reach CreateVideoJob at all. Every later Finalize/Clear
+	// call is guarded on this rather than on token's zero value, so a
+	// Reserve error never triggers a doomed Redis call against an empty
+	// token downstream.
 	token, reserved, err := m.idempotency.Reserve(c.Request.Context(), idemKey)
-	if err != nil {
+	var hasReservation bool
+	switch {
+	case err != nil:
 		log.Printf("idempotency reserve for upload %s: %v", filename, err)
-		cleanupRedundantUpload(videoPath, filename)
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Failed to check upload idempotency",
-		})
-		return
-	}
-	if !reserved {
+	case !reserved:
 		cleanupRedundantUpload(videoPath, filename)
 		if jobID, found := m.waitForFinalizedIdempotencyKey(c.Request.Context(), idemKey); found {
 			status, err := m.getJobStatus.Execute(c.Request.Context(), videoapplication.GetJobStatusInput{
@@ -364,6 +367,8 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 			Message: "Identical content is already being processed for this user; try again shortly.",
 		})
 		return
+	default:
+		hasReservation = true
 	}
 
 	created, err := m.createVideoJob.Execute(c.Request.Context(), videoapplication.CreateVideoJobInput{
@@ -375,11 +380,13 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		// (e.g. client disconnect, which could itself be why
 		// CreateVideoJob failed), and this cleanup must still succeed so
 		// an immediate retry isn't blocked for the sentinel's full TTL.
-		clearCtx, cancel := videoapplication.NewFinalizationContext()
-		if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-			log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", filename, cleared, clearErr)
+		if hasReservation {
+			clearCtx, cancel := videoapplication.NewFinalizationContext()
+			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
+				log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", filename, cleared, clearErr)
+			}
+			cancel()
 		}
-		cancel()
 		log.Printf("create video job for upload %s: %v", filename, err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
@@ -389,11 +396,15 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	}
 
 	// A Finalize failure is non-fatal — the job just created is still
-	// valid in PostgreSQL either way; see design.md Decision 7.
-	if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
-		log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", filename, err)
-	} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
-		log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
+	// valid in PostgreSQL either way; see design.md Decision 7. Skipped
+	// entirely when hasReservation is false: there is no reservation to
+	// finalize.
+	if hasReservation {
+		if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
+			log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", filename, err)
+		} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
+			log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
+		}
 	}
 
 	processed, err := m.processVideoJob.Execute(c.Request.Context(), created.JobID, videoPath)
@@ -419,11 +430,13 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		// (ProcessVideoJob uses its own detached context for the same
 		// reason when it calls FailJob internally), and this cleanup must
 		// still succeed for the retry to actually work.
-		clearCtx, cancel := videoapplication.NewFinalizationContext()
-		if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-			log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
+		if hasReservation {
+			clearCtx, cancel := videoapplication.NewFinalizationContext()
+			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
+				log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
+			}
+			cancel()
 		}
-		cancel()
 		c.JSON(200, ProcessingResult{
 			Success: false,
 			Message: extractionFailureMessage(processed.ExtractionError, processed.FailureReason),
@@ -467,8 +480,10 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 			Reason: "failed to record artifact ownership after processing",
 		}); failErr != nil {
 			log.Printf("Failed to mark video job %s failed after ownership error: %v", created.JobID, failErr)
-		} else if cleared, clearErr := m.idempotency.Clear(finalizeCtx, idemKey, token); clearErr != nil || !cleared {
-			log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
+		} else if hasReservation {
+			if cleared, clearErr := m.idempotency.Clear(finalizeCtx, idemKey, token); clearErr != nil || !cleared {
+				log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
+			}
 		}
 		c.JSON(500, ProcessingResult{
 			Success: false,
