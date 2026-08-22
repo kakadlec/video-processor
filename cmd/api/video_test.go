@@ -1252,6 +1252,41 @@ func TestHandleVideoUpload_ReserveError_ExtractionFailureStillSkipsClear(t *test
 	}
 }
 
+// TestHandleVideoUpload_ReserveError_OwnershipFailureStillSkipsClear covers
+// the fourth guarded Clear call site (cmd/api/video.go's artifact-ownership
+// failure branch, after a successful extraction) — the one Copilot's second
+// review round on PR #158 pointed out was still untested. A StorageKey
+// containing ".." makes recordArtifactOwner("outputs", ...) fail its own
+// path-confinement check deterministically, without touching real
+// filesystem permissions.
+func TestHandleVideoUpload_ReserveError_OwnershipFailureStillSkipsClear(t *testing.T) {
+	extractor := newImmediateFrameExtractor("../escape-ownership-failure.zip", 1)
+	srv, tokens, store := startIdempotencyTestServer(t, extractor)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	store.reserveErr = errors.New("simulated redis outage")
+
+	content := []byte("content whose ownership-recording failure must still skip Clear")
+	videoPath := writeTestUploadContent(t, content)
+
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "reserve-error-ownership-failure.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (artifact ownership recording is forced to fail)", resp.StatusCode, http.StatusInternalServerError)
+	}
+	if result.Message != "Failed to record artifact ownership" {
+		t.Fatalf("message = %q, want the ownership-failure message", result.Message)
+	}
+	// Discriminating assertion: proves the request reached extraction (and
+	// thus the ownership-recording step) rather than stopping at the old
+	// Reserve-error 500.
+	if got := extractor.Invocations(); got != 1 {
+		t.Fatalf("extractor invocations = %d, want 1 (the request must reach extraction/completion before ownership recording)", got)
+	}
+	if finalizeCalls, clearCalls := store.callCounts(); finalizeCalls != 0 || clearCalls != 0 {
+		t.Fatalf("finalizeCalls=%d clearCalls=%d, want 0/0 (no reservation to finalize or clear)", finalizeCalls, clearCalls)
+	}
+}
+
 // TestHandleVideoUpload_GenuineConflict_StillReturns409 guards against a
 // regression where the fail-open-upload-idempotency change could
 // accidentally widen its "proceed anyway" behavior to the unrelated,
