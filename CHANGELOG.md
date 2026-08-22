@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.0](https://github.com/kakadlec/video-processor/compare/v0.9.0...v0.10.0) (2026-08-22)
+
+
+### Features
+
+* add per-user rate limiting middleware for video routes ([#151](https://github.com/kakadlec/video-processor/issues/151)) ([1ed5a1a](https://github.com/kakadlec/video-processor/commit/1ed5a1a691cb7942bc95a6a4c64f2262afc0129b))
+* add Redis-backed status cache for VideoJob lookups ([#155](https://github.com/kakadlec/video-processor/issues/155)) ([6487cc0](https://github.com/kakadlec/video-processor/commit/6487cc0f2101ea95d5612a7f7a36075c3a34359f))
+* fail open on Redis errors during upload idempotency reservation ([#162](https://github.com/kakadlec/video-processor/issues/162)) ([cede8a6](https://github.com/kakadlec/video-processor/commit/cede8a6047b637f98256c8868c1ad0d8553a3722))
+
+
+### Bug Fixes
+
+* reject invalid upload extension before reading file body ([#160](https://github.com/kakadlec/video-processor/issues/160)) ([476a6ec](https://github.com/kakadlec/video-processor/commit/476a6ec0746097cea8fb42f9743e844826be25d4))
+
 ## [0.9.0](https://github.com/kakadlec/video-processor/compare/v0.8.0...v0.9.0) (2026-08-21)
 
 
