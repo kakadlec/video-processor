@@ -51,14 +51,19 @@ Browser / client
         ├─ Validate extension (.mp4, .avi, .mov, .mkv, .wmv, .flv, .webm)
         ├─ Save to uploads/<uploadID>_<filename>, hashing the stream (SHA-256) in the same pass
         ├─ Reserve(userID + content hash)          (Redis, idempotency)
+        │    ├─ error (Redis down/erroring) → log, proceed without a
+        │    │    reservation (fail-open); Finalize/Clear below are
+        │    │    skipped for this request — see fail-open-upload-idempotency
         │    ├─ reserved=false → poll Lookup up to a bounded 2s window; a
         │    │    resolved duplicate returns the existing job's status
         │    │    (200), an unresolved one returns 409 — no CreateVideoJob call
         │    └─ reserved=true  → proceed below
         ├─ CreateVideoJob                          (application, status: pending)
-        │    ├─ on failure: Clear the idempotency reservation, return 500
-        │    └─ on success: Finalize the reservation → real VideoJobID,
-        │         24h TTL (non-fatal if this write itself fails — see below)
+        │    ├─ on failure: Clear the idempotency reservation if one was
+        │    │    obtained, return 500
+        │    └─ on success: Finalize the reservation if one was obtained
+        │         → real VideoJobID, 24h TTL (non-fatal if this write
+        │         itself fails — see below)
         ├─ ProcessVideoJob:
         │    ├─ EnqueueVideoJob                     (pending → queued)
         │    ├─ StartProcessing                      (queued → processing)
@@ -79,7 +84,7 @@ Browser / client
 
 `ProcessVideoJob` deliberately doesn't call `CompleteJob` itself on extraction success: the job stays `processing` until `handleVideoUpload`'s own remaining step (recording who owns the output artifact) has also succeeded. This matters because `completed → failed` isn't a valid transition — calling `CompleteJob` any earlier would make a later failure in that step unrecoverable (the job would stay `completed` forever, pointing at a `StorageKey` for an artifact that got deleted).
 
-**Idempotency (Phase 4, `add-upload-idempotency-keys`):** `POST /upload` deduplicates by content, not just by request. The upload's SHA-256 hash plus the authenticated `UserID` form a Redis-backed `IdempotencyKey` (`internal/video/domain`, implemented by `internal/video/infrastructure/idempotency.RedisStore`). A `Reserve` call wins the race for a given key with a short-lived sentinel; the loser polls `Lookup` for up to a bounded window and returns the winner's job status instead of starting a second `ffmpeg` run. The reservation is `Finalize`d (24h TTL) once `CreateVideoJob` succeeds, or `Clear`ed immediately if `CreateVideoJob` fails or the job later fails — either way freeing an immediate retry. Two different users uploading identical content each get their own key and their own job (the key includes `UserID`). See `openspec/specs/upload-idempotency/spec.md` for the full contract.
+**Idempotency (Phase 4, `add-upload-idempotency-keys`; fail-open correction, `fail-open-upload-idempotency`):** `POST /upload` deduplicates by content, not just by request. The upload's SHA-256 hash plus the authenticated `UserID` form a Redis-backed `IdempotencyKey` (`internal/video/domain`, implemented by `internal/video/infrastructure/idempotency.RedisStore`). A `Reserve` call wins the race for a given key with a short-lived sentinel; the loser polls `Lookup` for up to a bounded window and returns the winner's job status instead of starting a second `ffmpeg` run. The reservation is `Finalize`d (24h TTL) once `CreateVideoJob` succeeds, or `Clear`ed immediately if `CreateVideoJob` fails or the job later fails — either way freeing an immediate retry. Two different users uploading identical content each get their own key and their own job (the key includes `UserID`). If `Reserve` itself errors (Redis unreachable/erroring, as opposed to a normal reservation conflict), `handleVideoUpload` fails open: it logs the error and proceeds to `CreateVideoJob` without a reservation, rather than blocking the upload — the same posture already used by rate limiting and the status cache, so a Redis outage degrades deduplication instead of the critical upload path itself. See `openspec/specs/upload-idempotency/spec.md` for the full contract.
 
 **Rate limiting (Phase 4, `add-rate-limiting-middleware`):** every route gated by `identity.requireBearerAuth()` is also gated by a per-user, Redis-backed fixed-window rate limiter (`internal/platform/ratelimit.Limiter`, mounted as `cmd/api/ratelimit.go`'s `rateLimitMiddleware` on the `videoRoutes` group, immediately after the auth middleware). A request that crosses the configured limit within the current window is rejected with `429` and a `Retry-After` header before any handler runs, keyed independently per authenticated `UserID`. Thresholds are configurable via optional `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (defaults 60 requests / 60 seconds) — unlike `REDIS_ADDR`, neither is required at startup. If the Redis check itself fails or exceeds a short internal timeout, the middleware fails open (allows the request, logs the error) rather than blocking otherwise-healthy traffic on an infrastructure hiccup. That timeout only actually bounds the real Redis call because `internal/platform/redis.Open` sets `ContextTimeoutEnabled: true` on the shared client — go-redis v9 otherwise silently discards a passed context's deadline on every command, a subtlety this change had to fix and cover with a real-client test (`internal/platform/redis/client_test.go`) after an initial fix attempt turned out not to work. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, static assets) are out of scope. See `openspec/specs/rate-limiting/spec.md` for the full contract.
 
