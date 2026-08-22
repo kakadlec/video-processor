@@ -4,13 +4,13 @@
 
 ## What Changes
 
-- `handleVideoUpload` reads the upload via `c.Request.MultipartReader()` and `NextPart()` instead of `c.Request.FormFile("video")`, so the "video" part's filename is available (and validated) before any of its body is read — an invalid extension is now rejected immediately regardless of upload size.
+- `handleVideoUpload` reads the upload via `c.Request.MultipartReader()` and `NextPart()` instead of `c.Request.FormFile("video")`, so the "video" part's filename is available (and validated) before the handler consumes, drains, or persists any of its body — an invalid extension is now rejected immediately regardless of upload size.
 - No change to the endpoint's external contract: same status codes, same response messages, same accepted extensions, same behavior for a valid upload (still saved to `uploads/`, still hashed in the same `io.Copy` pass).
 
 ## Capabilities
 
 ### New Capabilities
-- `upload-file-validation`: `POST /upload` validates the uploaded file's extension before reading any of its body — a resource-bound guarantee no existing spec currently asserts (today it's an accidental side effect of implementation, and demonstrably broken by `FormFile`'s eager whole-body read).
+- `upload-file-validation`: `POST /upload` validates the uploaded file's extension before the handler consumes, drains, or persists any of its body — a resource-bound guarantee no existing spec currently asserts (today it's an accidental side effect of implementation, and demonstrably broken by `FormFile`'s eager whole-body read).
 
 ### Modified Capabilities
 (none)
