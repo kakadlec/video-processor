@@ -117,6 +117,40 @@ jobs:
           sudo apt-get -o dir::cache::archives="$HOME/apt-cache" update
           sudo apt-get -o dir::cache::archives="$HOME/apt-cache" install -y ffmpeg
 
+      - name: Start MinIO
+        # Deliberately a step, not a `services:` entry: the image's
+        # ENTRYPOINT is /usr/bin/docker-entrypoint.sh with CMD [minio] and
+        # no "server /data", and a service container has no field to supply
+        # command arguments — run bare it prints its usage banner and exits.
+        # Verified directly against this exact tag. Don't "fix" this back
+        # into a service container; it cannot work.
+        #
+        # The flags below cover what a services: block would have provided:
+        # the published port the test env vars point at, and root
+        # credentials matching VIDEO_MINIO_TEST_ACCESS_KEY/SECRET_KEY.
+        run: |
+          docker run -d --name minio \
+            -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            server /data
+
+      - name: Wait for MinIO
+        # Bounded: a container that never becomes ready fails here with a
+        # clear message instead of surfacing as confusing test failures.
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready within 60s" >&2
+          docker logs minio >&2 || true
+          exit 1
+
       - name: Vet
         run: go vet ./...
 
@@ -131,6 +165,13 @@ jobs:
           # (add-upload-idempotency-keys) — same CI redis service as
           # REDIS_TEST_ADDR above.
           REDIS_ADDR: localhost:6379
+          # Exercises internal/video/infrastructure/storage's own tests
+          # against the MinIO container started above. No non-test
+          # VIDEO_MINIO_* variable is set: cmd/api reads none of them yet.
+          VIDEO_MINIO_TEST_ENDPOINT: 127.0.0.1:9000
+          VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
+          VIDEO_MINIO_TEST_SECRET_KEY: minioadmin
+          VIDEO_MINIO_TEST_BUCKET: video-test
         run: go test ./... -v
 
   sast:
