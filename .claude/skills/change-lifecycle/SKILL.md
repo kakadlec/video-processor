@@ -1,74 +1,67 @@
 ---
 name: change-lifecycle
-description: Use when starting work on a docs/roadmap.md Change Backlog item or any comparable non-trivial change, when deciding whether /opsx:explore is needed before /opsx:propose, when deciding whether implementation can start yet, or when sequencing a change through explore/propose/apply/archive end to end. Skip for a single trivial edit with no OpenSpec change involved, or for work already mid-sequence where the next step is unambiguous.
+description: Use only when the user explicitly asks to use OpenSpec, invokes an `/opsx:*` command, or explicitly continues a named active OpenSpec change. Guides the complete OpenSpec lifecycle from explore through proposal, implementation, and archive. Do not trigger it for task lookup, direct implementation, a backlog item, or perceived change complexity alone.
 ---
 
-# Change lifecycle (FIAP X video-processor)
+# OpenSpec lifecycle (FIAP X video-processor)
 
-This orchestrates *when* to run each OpenSpec step and what gates sit between them — it does not replace the vendored `openspec-{explore,propose,apply-change,archive-change}` skills, which do the actual work of each step. Use this to decide which step comes next and whether it's safe to proceed; use those skills (or `/opsx:explore`, `/opsx:propose`, `/opsx:apply`, `/opsx:archive`) to execute it.
+This skill is an explicitly selected workflow. It orchestrates when to use the vendored `openspec-{explore,propose,apply-change,archive-change}` skills; it does not replace them.
 
 ## The sequence
 
 ```
-pick a Change Backlog row (or comparable non-trivial idea)
+explicit OpenSpec request or named active change
         │
         ▼
-   complex or ambiguous?  ──yes──▶  /opsx:explore, discuss
-        │ no                              │
-        │◀─────────────────────────────────┘
+orient: new, proposed, implementing, or finalizing?
+        │ (new)
         ▼
-   /opsx:propose
+complex or ambiguous? ──yes──▶ /opsx:explore, discuss
+        │ no                         │
+        │◀────────────────────────────┘
+        ▼
+/opsx:propose
         │
         ▼
-   open the propose PR ──▶ WAIT for it to be merged, not just approved
-        │ (merged)
-        ▼
-   /opsx:apply
+open the propose PR ──▶ wait for it to merge
         │
         ▼
-   before reporting any task or the change done: run repo-workflow's
-   definition-of-done checklist (tests if Go changed, PR review
-   comments, etc.) — don't restate that checklist here, invoke it
+/opsx:apply
         │
         ▼
-   open the implementation PR, scoped to the proposal's declared files only
-   (tasks.md checkoffs excluded — see Step 3's override)
-        │ (merged, after explicit user authorization)
+open and complete the implementation PR
+        │
         ▼
-   finalize: task checkoffs → doc updates → roadmap status (if applicable) → THEN
-   /opsx:archive → finalization PR (all of the above together)
+finalize documentation/specs/tasks → /opsx:archive → finalization PR
 ```
 
-## Orientation: which step is this change actually on?
+## 1. Orient to the current lifecycle state
 
-Not a step and not a gate — just the diagnostic worth reaching for when the sequence below has to be entered somewhere other than the beginning. Which step you owe depends on where the change actually is, and a backlog row's status cell, a task list, and someone's recollection all go stale independently: a change described as "just proposed" can already have its implementation on `main`, and taking the stated position at face value either re-does merged work or skips past a gate. The cheap signals, when you want them: whether the change folder sits under `openspec/changes/` or `openspec/changes/archive/`, whether the delta is already promoted into `openspec/specs/`, `git log --oneline origin/main -- <the change's files>`, and `gh pr list --state all --search <change-id>`. If the repo and the request disagree, saying so beats quietly picking one.
+Before choosing a command, determine whether the selected change is new, proposed, implementing, or ready for finalization. Check its folder under `openspec/changes/` or `openspec/changes/archive/`, `openspec status --change <name>`, relevant files and task state, git history, and associated PRs. Resume from the next incomplete stage; do not recreate a proposal or repeat merged work. If the repository state and the user's description disagree, report the discrepancy before proceeding.
 
-## Step 1: decide if `/opsx:explore` is warranted
+## 2. Decide whether explore is warranted
 
-Same criteria as `openspec/specs/development-workflow/spec.md`'s "Explore Precedes Propose For Complex Or Ambiguous Changes" requirement: cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions not already settled by the change's own scoping description — a `docs/roadmap.md` Change Backlog row's description for product/architecture-scope work, or the idea's own stated scope for a workflow/process-only change that has no such row (see `docs/roadmap.md`'s scoping rule). Already-unambiguously-scoped work may skip straight to `/opsx:propose`, row or no row. This is a judgment call made when picking up the work, not a mechanical gate — when genuinely unsure, explore.
+Use `/opsx:explore` before proposing when a new opted-in change has cross-cutting impact, a new architectural pattern or dependency, security/performance/migration complexity, or unresolved design questions. A simple, already-scoped opted-in change may proceed directly to `/opsx:propose`.
 
-One open question is easy to read past because both sides sound authoritative: the scoping description and the permanent docs/canonical specs describing the same future state can disagree about mechanism. A row that names one implementation while `docs/` or `openspec/specs/` describes another has not settled that decision — it has recorded two of them, and picking the one you happen to read second is a design decision made by accident. Treat that contradiction as an open design question and explore, rather than reconciling it silently in the proposal.
+## 3. Propose, then wait for merge
 
-## Step 2: `/opsx:propose`, then wait for the merge — not the approval
+Create the proposal artifacts with `/opsx:propose`. Open a proposal-only PR and wait until it is actually merged before beginning implementation. Approval alone is insufficient.
 
-An approved-but-still-open propose PR does **not** authorize starting implementation. `/opsx:apply` (and any hand-edit toward implementation) waits until the propose PR is actually **merged**. This is easy to get backwards under time pressure — don't.
+## 4. Apply
 
-## Step 3: `/opsx:apply`
+Use `/opsx:apply` to work through `tasks.md`. When tasks separate implementation and finalization work, do only the implementation-scoped tasks before the implementation PR merges. The vendored apply skill checks off tasks as it works; keep implementation-task checkoffs out of the implementation PR and restore them for finalization.
 
-Work through `tasks.md`. If tasks are grouped by which PR they belong to (implementation vs. finalization — check the task group headers), only do the implementation-scoped groups now; finalization-scoped groups (docs, `CLAUDE.md`, `AGENTS.md`, archive, roadmap status) wait until after the implementation PR merges.
+## 5. PR actions
 
-**Override for this repo**: the vendored `openspec-apply-change` skill checks off each task's `- [ ]` → `- [x]` in `tasks.md` immediately as it completes it — that conflicts with this repo's rule that `tasks.md` checkoffs belong only in the finalization PR. When applying implementation-scoped tasks, keep `tasks.md`'s checkoff edits out of the implementation PR's commit/diff (leave them uncommitted, or revert just that file before committing) and re-apply the same checkoffs during finalization instead. Do not let checked implementation-task boxes ride into the implementation PR.
+Whenever this lifecycle asks for a PR to be opened, updated, handed off, or merged, invoke `repo-workflow` for that PR's quality and merge requirements.
 
-## Step 4: done-verification gate
+## 6. Finalize
 
-At every point where a task, a PR, or the whole change needs to be reported done, invoke `repo-workflow`'s "Definition of done" checklist rather than re-deriving it here. This includes before opening the implementation PR and before opening the finalization PR.
+After the implementation PR merges:
 
-## Step 5: finalization
-
-The vendored `/opsx:archive` skill only assesses/syncs delta specs and moves the change folder — it does **not** check off tasks, edit permanent docs, or flip the `docs/roadmap.md` status, and it will let you archive even with incomplete tasks (warns, doesn't block). Invoking it as the first action of this step can leave the rest of finalization undone. Do the work in this order instead:
-
-1. Check off all completed tasks in `tasks.md` (including any implementation-scoped ones deferred per Step 3's override).
-2. Update permanent docs (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that need to reflect the shipped change.
-3. If the change has a `docs/roadmap.md` Change Backlog row (only product/architecture-scope changes do — workflow/process-only changes never gain one, see `docs/roadmap.md`), flip it to `archived`, with links to the archive folder and promoted spec(s). No row means this step is skipped, not missed.
-4. Only then run `/opsx:archive` (or the `openspec-archive-change` skill) to promote the delta spec and move the change folder.
-5. Open the finalization PR containing all of the above together, per `repo-workflow`'s PR-sequence section.
+1. Check off completed tasks.
+2. Update permanent documentation and agent instructions that reflect the shipped change.
+3. Update `docs/roadmap.md` only if the opted-in change has a roadmap row.
+4. Run `npx --yes @fission-ai/openspec validate <change-id> --strict --no-interactive` and fix every validation error.
+5. Only after strict validation passes, run `/opsx:archive` to promote delta specs and archive the change folder.
+6. Open one finalization PR containing those closure artifacts and no application code or tests.
