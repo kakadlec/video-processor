@@ -1,4 +1,10 @@
-## ADDED Requirements
+# minio-infrastructure Specification
+
+## Purpose
+
+Define `internal/video/infrastructure/storage`, the Video Processing context's MinIO connection adapter: configuration loading, client construction, a connectivity health check, and bucket provisioning. This is connection plumbing only — the `StoragePort` adapter that carries artifacts into and out of the bucket is added by a later Phase 5 change, in this same package. The adapter lives inside the owning bounded context rather than under `internal/platform/`, because every consumer (uploads, results, presigned download URLs) belongs to Video Processing — the same reason `internal/identity/infrastructure/postgres` and `internal/video/infrastructure/postgres` are separate context-owned packages against one physical database.
+
+## Requirements
 
 ### Requirement: The MinIO Adapter Lives In The Video Processing Context
 
@@ -102,7 +108,11 @@ Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. 
 
 ### Requirement: Bucket Provisioning Is Idempotent And Concurrency-Safe
 
-`internal/video/infrastructure/storage` SHALL expose `EnsureBucket`, which creates the configured bucket only if it does not already exist and SHALL succeed when the bucket is already present. It SHALL treat a concurrent-creation outcome — another caller having created the same bucket between the existence check and the creation attempt — as success rather than as an error, so that multiple instances starting simultaneously do not fail startup. It SHALL NOT apply any versioning, retention, lifecycle, or access policy to the bucket.
+`internal/video/infrastructure/storage` SHALL expose `EnsureBucket`, which creates the configured bucket only if it does not already exist and SHALL succeed when the bucket is already present. It SHALL treat a concurrent-creation outcome — another caller **using the same credentials** having created the same bucket between the existence check and the creation attempt — as success rather than as an error, so that multiple instances starting simultaneously do not fail startup.
+
+It SHALL NOT extend that tolerance to a bucket owned by a different account. In the globally shared bucket namespace, "the name is already taken by someone else" (`BucketAlreadyExists`) means the configured bucket is unusable by this client, and reporting successful provisioning would defer the failure to the first object write. Only the owned-by-you outcome (`BucketAlreadyOwnedByYou`) is benign, and it is what same-credential replicas racing each other actually produce; every other failure SHALL propagate.
+
+`EnsureBucket` SHALL NOT apply any versioning, retention, lifecycle, or access policy to the bucket.
 
 #### Scenario: EnsureBucket creates a bucket that does not exist
 
@@ -119,8 +129,14 @@ Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. 
 #### Scenario: Concurrent EnsureBucket calls both succeed
 
 - **GIVEN** a reachable MinIO instance with no bucket of the configured name
-- **WHEN** two callers invoke `EnsureBucket` concurrently for that same bucket
+- **WHEN** two callers using the same credentials invoke `EnsureBucket` concurrently for that same bucket
 - **THEN** both return no error and exactly one bucket exists afterwards
+
+#### Scenario: A bucket owned by another account is not reported as provisioned
+
+- **GIVEN** the configured bucket name is already taken in the shared namespace by a different account
+- **WHEN** `EnsureBucket` is called
+- **THEN** it returns a non-nil error rather than reporting success, so the unusable configuration surfaces at provisioning time instead of at the first object write
 
 #### Scenario: EnsureBucket fails against an unreachable instance
 
