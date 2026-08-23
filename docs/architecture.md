@@ -69,15 +69,18 @@ Browser / client
         │    ├─ FrameExtractor.ExtractFrames (infrastructure/ffmpeg):
         │    │    ├─ exec.CommandContext ffmpeg -i <video> -vf fps=1 temp/<jobID>/frame_%04d.png
         │    │    ├─ Glob PNGs from temp/<jobID>/
-        │    │    ├─ Write outputs/frames_<jobID>.zip
+        │    │    ├─ Write temp/<jobID>.zip          (beside the frame dir, so
+        │    │    │    the defer below can't delete it)
         │    │    └─ Remove temp/<jobID>/            (defer, always)
-        │    └─ FailJob if extraction failed          (processing → failed)
+        │    ├─ ResultStorage.Put (infrastructure/storage):
+        │    │    ├─ FPutObject → bucket/frames_<jobID>.zip
+        │    │    └─ Remove temp/<jobID>.zip         (defer, always)
+        │    └─ FailJob if extraction OR storage failed (processing → failed)
         │         → also clears the idempotency reservation
         │         (on success, job stays "processing" — see below)
         ├─ Remove uploads/<file>                    (on success only)
-        ├─ Record output artifact ownership
-        ├─ CompleteJob if that succeeded, else FailJob (processing → completed/failed)
-        │    → FailJob here also clears the idempotency reservation
+        ├─ CompleteJob (processing → completed)
+        │    → the result is already durable in the bucket by this point
         └─ Return JSON { success, message, zip_path, frame_count, images }
 ```
 
@@ -93,14 +96,14 @@ The handler returns only after the full sequence completes and the ZIP is writte
 
 ### State (current)
 
-Video-processing artifacts still live in the local filesystem; user accounts live in PostgreSQL:
+Uploaded source videos still live in the local filesystem; results live in MinIO and user accounts in PostgreSQL:
 
 | Store | Purpose | Durability |
 |---|---|---|
 | `uploads/` | Transient input; deleted on successful processing | Lost on failure |
-| `temp/` | Per-request scratch; always cleaned up (defer) | Ephemeral |
-| `outputs/` | Durable ZIP results; served by `/download/:filename` | Persistent across restarts |
-| `uploads/*.owner`, `outputs/*.owner` | Sidecar files recording which authenticated `UserID` owns an artifact | Same lifecycle as the artifact they accompany |
+| `temp/` | Per-request scratch — extracted frames and the zip built from them; always cleaned up (defer) | Ephemeral |
+| MinIO bucket (`VIDEO_MINIO_BUCKET`) | Durable ZIP results, keyed `frames_<jobID>.zip`; streamed by `/download/:filename` | Persistent, external to the container |
+| `uploads/*.owner` | Sidecar files recording which authenticated `UserID` owns an uploaded video. Results have no sidecar — their owner is the `VideoJob` row. Retired for uploads too by `migrate-upload-storage-to-minio` | Same lifecycle as the upload they accompany |
 | PostgreSQL `users` table | User accounts (normalized email, password hash) | Persistent, external to the container |
 | PostgreSQL `video_jobs` table | `VideoJob` rows — created both by `POST /upload` (this pipeline) and by `POST /api/video-jobs` (the preview API below); the two share the same repository and owner-scoping | Persistent, external to the container |
 
@@ -114,15 +117,14 @@ No message broker. Redis backs idempotency keys, rate limiting, and (as of `add-
 | `POST /api/auth/register` | `handleRegister` | Create a user account |
 | `POST /api/auth/login` | `handleLogin` | Authenticate and issue a bearer JWT |
 | `POST /upload` | `handleVideoUpload` | Accept multipart video, process synchronously; requires a bearer token |
-| `GET /download/:filename` | `handleDownload` | Serve a ZIP from `outputs/`; owner-only |
-| `GET /api/status` | `handleStatus` | JSON list of ZIPs in `outputs/`; scoped to the caller's own uploads |
+| `GET /download/:filename` | `(*videoModule).handleDownload` | Stream a ZIP out of the MinIO bucket; owner-only, entitlement decided from the `VideoJob` row. Every rejection returns a byte-identical 404 |
+| `GET /api/status` | `(*videoModule).handleStatus` | JSON list of the caller's `completed` jobs' results; size and timestamp come from the stored object |
 | `GET /uploads/*` | `gin.Static` | Static file serving of `uploads/`; owner-only; `.owner` sidecar files are never served regardless |
-| `GET /outputs/*` | `gin.Static` | Static file serving of `outputs/`; owner-only; `.owner` sidecar files are never served regardless |
 | `POST /api/video-jobs` | `handleCreateVideoJob` | Create a `VideoJob` record (JSON `original_filename`, no file content); requires a bearer token; preview API, see below |
 | `GET /api/video-jobs/:id` | `handleGetVideoJobStatus` | Get a `VideoJob`'s status; owner-only (non-owner and nonexistent both 404) |
 | `GET /api/video-jobs` | `handleListVideoJobs` | Paginated list of the caller's own `VideoJob`s |
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and (as of `add-upload-idempotency-keys`) `REDIS_ADDR` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (as of `add-rate-limiting-middleware`) are optional, with defaults. See [docs/operations.md](operations.md) for configuration.
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, (as of `add-upload-idempotency-keys`) `REDIS_ADDR`, and (as of `migrate-result-storage-to-minio`) `VIDEO_MINIO_ENDPOINT`/`VIDEO_MINIO_ACCESS_KEY`/`VIDEO_MINIO_SECRET_KEY`/`VIDEO_MINIO_BUCKET` are all required at startup — the API composition root fails to start otherwise. There is no unauthenticated fallback mode. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (as of `add-rate-limiting-middleware`) are optional, with defaults. See [docs/operations.md](operations.md) for configuration.
 
 **`/api/video-jobs` is a preview API, not the async processing flow.** It was wired by Phase 3's `wire-videojob-http-endpoints`, alongside (not replacing) the legacy synchronous `/upload` flow above. A `VideoJob` created *through this API* has no processing trigger — `handleCreateVideoJob` never calls `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` — and none is currently planned for it: `migrate-ffmpeg-execution-to-videojob-application` gave those four use cases a real caller, but it's `POST /upload`, not `POST /api/video-jobs`, so a job created via this API still stays `pending` indefinitely. Giving this preview API its own trigger would need a separate, not-yet-proposed future change. The frontend does not consume these routes. It is deliberately not named `/jobs`: see [docs/flows.md](flows.md) for why that path is reserved for the real Phase 6 async endpoint, and `openspec/specs/videojob-http-api/spec.md` for the full contract.
 
@@ -146,14 +148,14 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Phase 5 has started: `add-minio-infrastructure` added `internal/video/infrastructure/storage`, the MinIO connection adapter, but nothing is wired into `cmd/api` and no artifact is stored in a bucket yet — uploads and results still live on the local filesystem. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Phase 5 is in progress: `add-minio-infrastructure` added `internal/video/infrastructure/storage`, and `migrate-result-storage-to-minio` wired it into `cmd/api` — processed ZIP results now live in a MinIO bucket, `outputs/` is gone, and MinIO is a fail-closed startup dependency. Uploaded source videos still live in `uploads/`, and downloads are still proxied through the API rather than presigned; those are Phase 5's two remaining changes. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
 | Context | Responsibility | Status |
 |---|---|---|
 | **Identity** | User registration, authentication, JWT issuance and verification | Implemented (Phase 2) |
-| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Partially implemented (Phase 3: creation/status/listing wired into HTTP, and synchronous in-process execution driven by `POST /upload`, both done; real queueing/async execution/result storage via RabbitMQ/`cmd/worker`/MinIO planned, Phases 5–6) |
+| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Partially implemented (Phase 3: creation/status/listing wired into HTTP, and synchronous in-process execution driven by `POST /upload`; Phase 5: result storage in MinIO. Real queueing/async execution via RabbitMQ/`cmd/worker` planned, Phase 6) |
 | **Notification** | Reacting to domain events and delivering notifications (email, webhook) | Planned (Phase 7) |
 
 ### Target Package Topology
@@ -181,7 +183,7 @@ video-processor/
       infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application)
         idempotency/  # Redis-backed IdempotencyStore adapter (implemented, Phase 4 — add-upload-idempotency-keys), wired into cmd/api's POST /upload handler
         cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4 — add-videojob-status-cache), wired into cmd/api's setupVideo ahead of every use case
-        storage/      # MinIO connection adapter (implemented, Phase 5 — add-minio-infrastructure) — Config/Open/Ping/EnsureBucket, no cmd/api wiring yet; gains the StoragePort adapter in migrate-result-storage-to-minio
+        storage/      # MinIO adapter (implemented, Phase 5) — Config/Open/Ping/EnsureBucket connection plumbing (add-minio-infrastructure) plus ResultStorage, the domain port carrying result artifacts into and out of the bucket (migrate-result-storage-to-minio)
         # RabbitMQ publisher planned (Phase 6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
@@ -197,7 +199,7 @@ video-processor/
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), rate limiting (`add-rate-limiting-middleware`), and the `VideoJob` status cache (`add-videojob-status-cache`) — all three **implemented** (Phase 4 complete) |
-| MinIO | Object storage for uploads and ZIP results (S3-compatible) | Connection adapter implemented (`internal/video/infrastructure/storage`, `add-minio-infrastructure`); no `cmd/api` wiring and no artifact stored there yet — the three migration changes that do that are Phase 5's remaining work |
+| MinIO | Object storage for uploads and ZIP results (S3-compatible) | ZIP results implemented (`migrate-result-storage-to-minio`): stored, listed, and downloaded through `internal/video/domain.ResultStorage`, with configuration required at startup. Uploaded source videos and presigned download URLs are Phase 5's remaining work |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
 
 A fourth Redis-backed responsibility — a distributed lock preventing concurrent `cmd/worker` instances from picking up the same job — is planned for Phase 6 (not Phase 4): there is no worker to contend over job pickup until then.

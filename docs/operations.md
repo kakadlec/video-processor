@@ -33,13 +33,17 @@ The Dockerfile is a multi-stage build. The default (final) stage — used by the
 | `REDIS_ADDR` | unset | Address (`host:port`) of the Redis instance backing `POST /upload`'s idempotency keys and every authenticated route's rate limiting (e.g. `redis:6379`). Required at startup as of Phase 4's `add-upload-idempotency-keys`, which wires `internal/platform/redis` and `internal/video/infrastructure/idempotency.RedisStore` into `setupVideo`. |
 | `RATE_LIMIT_MAX_REQUESTS` | `60` | Maximum requests per authenticated user within one rate-limit window before `429` responses start. Optional as of Phase 4's `add-rate-limiting-middleware` — unlike `REDIS_ADDR`, absence is not a startup failure, it just uses the default. |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Length (seconds) of the fixed rate-limit window `RATE_LIMIT_MAX_REQUESTS` applies to. Optional, same as above. |
-| `VIDEO_MINIO_ENDPOINT` | unset | Address (`host:port`) of the MinIO instance for the Video Processing context (e.g. `minio:9000`). **Not read at startup yet** — see the note below. |
-| `VIDEO_MINIO_ACCESS_KEY` | unset | MinIO access key. **Not read at startup yet.** |
-| `VIDEO_MINIO_SECRET_KEY` | unset | MinIO secret key. **Not read at startup yet.** |
-| `VIDEO_MINIO_BUCKET` | unset | Bucket holding video artifacts. **Not read at startup yet.** |
+| `VIDEO_MINIO_ENDPOINT` | unset | Address (`host:port`) of the MinIO instance for the Video Processing context (e.g. `minio:9000`). Required at startup as of Phase 5's `migrate-result-storage-to-minio`. |
+| `VIDEO_MINIO_ACCESS_KEY` | unset | MinIO access key. Required at startup. |
+| `VIDEO_MINIO_SECRET_KEY` | unset | MinIO secret key. Required at startup. |
+| `VIDEO_MINIO_BUCKET` | unset | Bucket holding processed ZIP results, keyed `frames_<jobID>.zip`. Required at startup; created automatically if absent. |
 | `VIDEO_MINIO_USE_SSL` | `false` | Whether to connect over TLS. Optional, but a value that is *set* and not parseable as a boolean is a configuration error, never a silent `false` — a typo must not quietly downgrade an intended TLS connection to plaintext. |
 
-The five `VIDEO_MINIO_*` variables above are listed for completeness and are **not required to run the service**. As of Phase 5's `add-minio-infrastructure`, `internal/video/infrastructure/storage` exists but no composition root calls it: `cmd/api` opens no MinIO connection, so a deployment with none of them set starts and serves every route exactly as before. They become required when `migrate-result-storage-to-minio` wires the adapter in. Their `VIDEO_` prefix marks them as the Video Processing context's own configuration, matching `VIDEO_POSTGRES_DSN` and distinguishing them from `internal/platform/`'s unprefixed `REDIS_ADDR`.
+The first four `VIDEO_MINIO_*` variables are **required**; `VIDEO_MINIO_USE_SSL` is optional. `setupVideo` loads the configuration, opens the client, pings it, and ensures the bucket exists, and **any of those four steps failing stops startup**. This is deliberately fail-closed, unlike the Redis-backed features above, which degrade to a slower but correct system when Redis is down: a result that cannot be stored cannot be delivered, so there is nothing to degrade to.
+
+> **Deployment ordering:** MinIO must be reachable and these variables set *before* the new image starts, or the container exits immediately. Rolling back to a pre-Phase-5 image reverts to the local `outputs/` directory and ignores these variables entirely — results produced while the newer image was live then become unreachable, since they are in the bucket and the older code only looks at local disk.
+
+Their `VIDEO_` prefix marks them as the Video Processing context's own configuration, matching `VIDEO_POSTGRES_DSN` and distinguishing them from `internal/platform/`'s unprefixed `REDIS_ADDR`.
 
 `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and `REDIS_ADDR` are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`, unlike the four above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`).
 
@@ -50,19 +54,20 @@ The application creates and uses three directories relative to its working direc
 ```
 ./
   uploads/    Transient input: uploaded video files
-  temp/       Per-request scratch: extracted PNG frames
-  outputs/    Durable results: processed ZIP files
+  temp/       Per-request scratch: extracted PNG frames and the ZIP built from them
 ```
+
+Processed ZIP results are **not** on local disk — they are objects in the MinIO bucket named by `VIDEO_MINIO_BUCKET`.
 
 | Directory | Created by | Contents | Cleaned by |
 |---|---|---|---|
 | `uploads/` | `createDirs()` at startup | Uploaded video (named `<timestamp>_<original>`) | Deleted on successful processing |
 | `temp/` | Per request in `processVideo` | PNG frames from `ffmpeg` | Always deleted by `defer os.RemoveAll` |
-| `outputs/` | `createDirs()` at startup | `frames_<timestamp>.zip` files | Never (manual cleanup required) |
+| MinIO bucket | `EnsureBucket` at startup | `frames_<jobID>.zip` objects | Never (manual cleanup required) |
 
 > **Known gap:** If processing fails, the file in `uploads/` is NOT deleted. This is documented behavior in `main_test.go` (`TestProcessing_Failure_LeavesUploadedFileBehind`).
 
-The `outputs/` directory accumulates ZIPs indefinitely. There is no expiry, no cleanup job, and no size limit — disk space must be monitored manually in the current deployment.
+The bucket accumulates ZIPs indefinitely. There is no expiry, no lifecycle rule, no cleanup job, and no size limit — its growth must be monitored manually in the current deployment. Moving the results off local disk removes the container-disk pressure, not the retention gap.
 
 ## CI / CD
 
@@ -95,19 +100,21 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 2. **Rate limiting** — **Implemented.** `internal/platform/ratelimit.Limiter` enforces a per-user, fixed-window request cap (`RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`, both optional with defaults) on every authenticated route, mounted via `cmd/api/ratelimit.go`'s `rateLimitMiddleware`. Denied requests get `429` + `Retry-After`; a limiter failure (or an internal bounded timeout) fails open. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/rate-limiting/spec.md`.
 3. **Status cache** — **Implemented.** `internal/video/infrastructure/cache.CachedVideoJobRepository` decorates the PostgreSQL `VideoJobRepository` with a cache-aside/write-through cache for `FindByID` lookups (backing `GetJobStatus`'s repeated polling reads via `GET /api/video-jobs/:id`), wired into `setupVideo` ahead of every use case. No new environment variable — the cache TTL is a fixed constant, not configurable. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/videojob-status-cache/spec.md`.
 
-### MinIO — Connection adapter implemented (Phase 5, `add-minio-infrastructure`), not yet wired
+### MinIO — Result storage implemented (Phase 5)
 
-S3-compatible object storage for uploaded video files and processed ZIP results. It will replace the local `uploads/` and `outputs/` directories, let multiple API and worker instances share one storage backend, and serve results as presigned URLs instead of proxying ZIP bytes through the API.
+S3-compatible object storage. As of `migrate-result-storage-to-minio` it holds every processed ZIP result, so multiple API instances share one storage backend and a result survives its container. Uploaded source videos still live in `uploads/` (that is `migrate-upload-storage-to-minio`), and downloads are still proxied through the API rather than presigned (`add-presigned-download-urls`).
 
-`internal/video/infrastructure/storage` provides the connection plumbing today — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `EnsureBucket`. Three properties are worth knowing before wiring it up:
+`internal/video/infrastructure/storage` holds both the connection plumbing (`Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `EnsureBucket`) and `ResultStorage`, the adapter implementing the domain port. Properties worth knowing:
 
-- **Nothing calls it yet.** No composition root opens a MinIO connection, so the five `VIDEO_MINIO_*` variables are not required at startup and a deployment without MinIO behaves exactly as before. `migrate-result-storage-to-minio` is what makes them required.
+- **Startup is fail-closed.** `setupVideo` loads, opens, pings, and ensures the bucket; any failure stops the process. See the environment table above, including the deployment-ordering note.
+- **`GET /download/:filename` is authorized from the `VideoJob` row**, not from anything stored beside the artifact, and every rejection returns a byte-identical `404` so the endpoint cannot be used to probe for other users' results. `GET /api/status` lists a caller's `completed` jobs and reads each object's size and timestamp directly.
+- **Object keys are flat** (`frames_<jobID>.zip`) and must stay that way: the key is handed to the browser and used verbatim as that route's single path segment, so a `/` would percent-encode and break the match. Bucket prefixes require a frontend change.
 - **There is no teardown call**, unlike the Redis and PostgreSQL adapters above. `minio-go`'s client exposes none and keeps its transport unexported, so the package deliberately offers no `Close` rather than one that reports success while releasing nothing. Callers have no teardown obligation.
 - **`Open` does not validate credentials or reachability.** Its error covers endpoint parsing and transport construction; wrong credentials and an unreachable server both surface on the first operation. Use `Ping` (a real round trip) to check connectivity.
 
 Unlike Redis's, MinIO's contents are authoritative once results move there: `docker-compose.yml` gives the local service a named `minio_data` volume for that reason, since losing the bucket would leave `completed` `VideoJob` rows pointing at objects that no longer exist.
 
-- **Local/CI service:** `docker-compose.yml` starts a pinned `minio/minio` instance; CI starts the same image with a `docker run` step (a GitHub Actions service container cannot pass the `server /data` arguments the image requires). Both are consumed only by this package's own tests, via `VIDEO_MINIO_TEST_*`.
+- **Local/CI service:** `docker-compose.yml` starts a pinned `minio/minio` instance; CI starts the same image with a `docker run` step (a GitHub Actions service container cannot pass the `server /data` arguments the image requires). The adapter's own tests use `VIDEO_MINIO_TEST_*` against a separate bucket, since they create and delete buckets; `cmd/api`'s tests use the runtime variables.
 - **Local/CI credentials** (`minioadmin`/`minioadmin`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
 
 ---

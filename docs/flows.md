@@ -33,7 +33,7 @@ Browser                        Go server (cmd/api/main.go / identity.go)     Pos
   │                                     │  ... continues below ...        │
 ```
 
-The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, `/api/status`, `/uploads/*`, and `/outputs/*` carries a valid bearer token; there is no unauthenticated mode.
+The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, `/api/status`, and `/uploads/*` carries a valid bearer token; there is no unauthenticated mode.
 
 ```
 Browser              cmd/api/video.go       internal/video/application   Filesystem
@@ -75,7 +75,7 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
   │                        │                            │                  │
   │  GET /download/<zip_path>│                           │                 │
   │───────────────────────►│                            │                  │
-  │◄───────────────────────│  Serve outputs/<zip>       │                  │
+  │◄───────────────────────│  Stream bucket/<zip>       │                  │
   │  ZIP file               │                           │                  │
 ```
 
@@ -85,9 +85,9 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 - Content-hash idempotency: identical bytes uploaded twice by the same user reuse the first request's `VideoJob` rather than running `ffmpeg` again (Phase 4, `add-upload-idempotency-keys`) — see `docs/architecture.md`'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md` for the full reserve/finalize/clear protocol. `REDIS_ADDR` is required at startup for this.
 - Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous, in-process, no queue or worker (that's Phase 6).
 - No status polling, no notifications, at this HTTP surface — but the `VideoJob` created for the upload does progress through the real `pending → queued → processing → completed`/`failed` state machine internally (see `openspec/specs/videojob-lifecycle/spec.md`), and is queryable via `GET /api/video-jobs/:id` below.
-- On success, the original upload file is deleted; the ZIP in `outputs/` is the only durable artifact.
-- On extraction failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`). This does not hold for a failure in the later ownership-recording/`CompleteJob` step — the upload has already been removed by the time that runs, alongside a successful extraction.
-- Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and enforced identically on `/download`, `/api/status`, and the `/uploads`/`/outputs` static mounts.
+- On success, the original upload file is deleted; the ZIP object in the MinIO bucket is the only durable artifact (Phase 5, `migrate-result-storage-to-minio`).
+- On extraction or storage failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`). This does not hold for a failure in the later `CompleteJob` step — the upload has already been removed by the time that runs.
+- Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields. For results it comes from the `VideoJob` row (`/download`, `/api/status`); for uploads still on disk it comes from the `.owner` sidecar the `/uploads` static mount checks.
 
 ---
 
@@ -238,8 +238,8 @@ User submits form
 | `POST /api/auth/register` | Creates a user (Phase 2) | Unchanged | No |
 | `POST /api/auth/login` | Issues a bearer JWT (Phase 2) | Unchanged | No |
 | `POST /upload` | Blocks; returns ZIP download link; requires a bearer token | Returns immediately; returns job ID + status URL | No — kept for compatibility |
-| `GET /api/status` | Lists ZIPs in `outputs/`; scoped to the caller's own uploads | Lists outputs (compat) | No — kept for compatibility |
-| `GET /download/:filename` | Serves ZIP from `outputs/`; owner-only (a non-owner gets the same 404 as a missing file) | Serves from MinIO (via redirect or proxy) | No |
+| `GET /api/status` | Lists the caller's `completed` jobs' results, with size and timestamp read from MinIO | Unchanged (compat) | No — kept for compatibility |
+| `GET /download/:filename` | Streams the ZIP from MinIO; owner-only (a non-owner gets the same 404 as a missing key) | Presigned URL instead of a proxied stream (`add-presigned-download-urls`) | No |
 | `GET /jobs/{id}/status` | Does not exist | Per-job polling endpoint | N/A — new in Phase 6 |
 | `POST /jobs` | Does not exist | Canonical async upload endpoint | N/A — new in Phase 6 |
 | `POST /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /api/video-jobs` | Preview job-lifecycle API (Phase 3); JSON metadata only, no processing trigger | Unrelated to this migration — not the same endpoints as `/jobs` above | Not applicable — separate, unreplaced capability |

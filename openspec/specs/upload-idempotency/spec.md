@@ -5,7 +5,6 @@
 Define the Redis-backed idempotency-key mechanism for `POST /upload`: key derivation from per-user content hash, atomic reservation via ownership token, finalization/clearing semantics, TTL/expiry behavior, and the duplicate-request response contract. This is the first Phase 4 feature (of idempotency keys, rate limiting, status cache) to consume `internal/platform/redis` (`redis-infrastructure`), implementing the "Idempotency key prevents duplicate job creation" behavior `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement already documents at the target-state level.
 
 ## Requirements
-
 ### Requirement: Idempotency Key Is Derived From Per-User Content Hash
 
 `handleVideoUpload` SHALL derive an idempotency key by hashing the uploaded video's full content with SHA-256 while it is streamed to `uploads/`, and SHALL scope that hash per authenticated user (`idempotency:{userID}:{hash}`), not globally.
@@ -122,7 +121,7 @@ A `POST /upload` request whose idempotency key already holds a `VideoJobID` (not
 
 - **GIVEN** a duplicate request has saved its own file under its own `uploadID`-prefixed path before discovering the duplicate
 - **WHEN** the handler deletes that redundant file
-- **THEN** the original request's `uploads/`/`outputs/` artifacts (saved under a different `uploadID`) are left untouched
+- **THEN** the original request's uploaded file under `uploads/` (saved under a different `uploadID`) and its stored result object are both left untouched
 
 ### Requirement: A Failed Job Clears Its Idempotency Key Immediately
 
