@@ -130,15 +130,15 @@ No commit SHALL land on `main` except through a merged pull request. Direct push
 - **THEN** it is pushed to a feature branch, opened as a PR against `main`, and merged only once required checks pass
 
 ### Requirement: Merge Requires Passing Status Checks
-A pull request against `main` SHALL NOT be mergeable unless `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` all report success, and the PR branch is up to date with `main`.
+A pull request against `main` SHALL NOT be mergeable unless `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` all report success. The PR branch SHALL NOT be required to be up to date with `main` before merging.
 
 #### Scenario: Merge blocked by a failing required check
 - **WHEN** a PR has `Build & Test`, `SAST (gosec)`, or `Vulnerability Scan (govulncheck)` failing
 - **THEN** GitHub blocks the merge button/API for that PR
 
 #### Scenario: Merge allowed once all checks pass
-- **WHEN** a PR has `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` all passing and is up to date with `main`
-- **THEN** the PR is mergeable
+- **WHEN** a PR has `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)` all passing
+- **THEN** the PR is mergeable even if its branch is behind `main`
 
 #### Scenario: Automated release PRs are subject to the same gate
 - **WHEN** `release-please` opens its own release PR against `main`
@@ -380,7 +380,7 @@ An agent SHALL NOT merge any pull request, or take any action that causes a pull
 
 ### Requirement: Claude Code Workflow Guidance Is Delivered Via An Auto-Triggered Skill
 
-Claude Code agents SHALL receive pull-request quality guidance through a dedicated skill under `.claude/skills/`, rather than through full prose duplicated in always-loaded project instructions. The skill SHALL activate when a developer asks to open, update, hand off, or merge a pull request, and when the agent creates a pull request itself. It SHALL cover applicable local tests, required CI checks, review comments, branch freshness, commit conventions, and explicit merge authorization. It SHALL NOT activate OpenSpec or require an OpenSpec lifecycle.
+Claude Code agents SHALL receive pull-request quality guidance through a dedicated skill under `.claude/skills/`, rather than through full prose duplicated in always-loaded project instructions. The skill SHALL activate when a developer asks to open, update, hand off, or merge a pull request, and when the agent creates a pull request itself. It SHALL cover applicable local tests, required CI checks, review comments, mergeability, commit conventions, and explicit merge authorization. It SHALL NOT activate OpenSpec or require an OpenSpec lifecycle.
 
 #### Scenario: Agent-created PR activates quality workflow
 

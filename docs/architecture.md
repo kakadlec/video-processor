@@ -34,7 +34,6 @@ video-processor/
     workflows/
       ci.yml                      # Build & Test, SAST (gosec), Vulnerability Scan
       release-please.yml          # Automated release management
-      auto-update-pr-branches.yml # Keeps open PR branches current with their base
   docs/            # Project documentation (this directory)
   openspec/        # Spec-driven change governance artifacts
 ```

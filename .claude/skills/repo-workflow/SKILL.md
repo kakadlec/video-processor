@@ -13,7 +13,7 @@ Before reporting **any** change complete:
 
 - If the diff includes a Go module input file (`.go` source, `go.mod`, or `go.sum`): `go test ./... -v` passes locally — this is the canonical "change complete" requirement. CI's `Build & Test` job also runs `go vet ./...`, so run that too before pushing. Tests are integration tests requiring `ffmpeg` on `PATH`; if unavailable, run via `docker compose run --build --rm app-test go test ./... -v`. A dependency-only bump (`go.mod`/`go.sum` with no `.go` file touched) still requires this — it can change compiled/runtime behavior.
 - If the diff has no Go module input file (documentation or agent/skill configuration only): this requirement doesn't apply — don't claim a test run that didn't happen, and don't skip reporting the change done because of it either.
-- If a PR is open for this work, confirm all three required checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`) are passing and the branch is up to date with `main` (`gh pr checks <n>`) — a PR isn't done with failing or stale checks even if reviews look clean.
+- If a PR is open for this work, confirm all three required checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`) are passing (`gh pr checks <n>`) — a PR isn't done with failing checks even if reviews look clean. The branch does not need to be up to date with `main`.
 - If a PR is open for this work, check for review comments (automatic Copilot review + human) and address genuine findings first:
   ```bash
   gh pr view <n> --json reviews
@@ -38,7 +38,7 @@ gh pr create --fill
 
 Branch from freshly-fetched `origin/main`, not from whatever happens to be checked out. Branching from stale or unrelated work can carry unrelated commits into the new PR's diff.
 
-Not mergeable until all three required checks pass **and** the branch is up to date with `main`: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. This applies to every PR, including `release-please`'s own release PR — no special-casing.
+Not mergeable until all three required checks pass: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. The branch does not need to be up to date with `main`. This applies to every PR, including `release-please`'s own release PR — no special-casing.
 
 ## Quality gates
 
