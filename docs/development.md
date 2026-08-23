@@ -179,7 +179,7 @@ Direct work and its PRs are not assigned OpenSpec roles and do not require propo
 
 ### Branch Protection
 
-`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. All review conversations must also be resolved before merge, including inline threads opened by GitHub Copilot. A PR is not mergeable until all three checks pass, the branch is up to date with `main`, and no review thread remains unresolved. This protection is enforced for administrators too.
+`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. All review conversations must also be resolved before merge, including inline threads opened by GitHub Copilot. A PR is not mergeable until all three checks pass and no review thread remains unresolved, but its branch does not need to be up to date with `main`. This protection is enforced for administrators too.
 
 ```bash
 git fetch origin

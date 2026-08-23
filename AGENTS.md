@@ -13,7 +13,7 @@ Read the relevant files before acting:
 
 A change whose diff touches `.go`, `go.mod`, or `go.sum` is not complete until `go test ./... -v` passes locally. Run `go vet ./...` before pushing such a change. Documentation and agent-configuration-only changes are exempt from the local Go test requirement; do not claim tests that were not run.
 
-Every PR must use a feature branch and pass `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)`. Check reviews and inline comments, address valid findings, resolve review conversations, and ensure the branch is up to date with `main` before handoff or merge. Never push directly to `main`.
+Every PR must use a feature branch and pass `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)`. Check reviews and inline comments, address valid findings, and resolve review conversations before handoff or merge. PR branches do not need to be up to date with `main` before merging. Never push directly to `main`.
 
 ## Merge rule
 

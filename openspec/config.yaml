@@ -16,7 +16,7 @@ context: |
   error if absent — use Docker fallback). CI (.github/workflows/ci.yml) runs three required checks on
   every push/PR to main: Build & Test (go vet + go test), SAST (gosec),
   and Vulnerability Scan (govulncheck). Branch protection on main requires
-  all three to pass plus an up-to-date branch; no direct pushes to main.
+  all three to pass but does not require an up-to-date branch; no direct pushes to main.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
