@@ -80,7 +80,9 @@ The local zip SHALL be written under `temp/`, not `outputs/`; no directory named
 
 ### Requirement: MinIO Configuration Is Required At Application Startup
 
-`cmd/api` SHALL, during `setupVideo`, load the MinIO configuration, construct the client, confirm connectivity with a real round trip, and ensure the configured bucket exists — failing fatally and refusing to start if any of the four steps fails. The five `VIDEO_MINIO_*` variables SHALL be mandatory, in the same way `VIDEO_POSTGRES_DSN` already is.
+`cmd/api` SHALL, during `setupVideo`, load the MinIO configuration, construct the client, confirm connectivity with a real round trip, and ensure the configured bucket exists — failing fatally and refusing to start if any of the four steps fails.
+
+Startup SHALL use `minio-infrastructure`'s existing `LoadConfigFromEnv` unchanged, and therefore inherits its contract exactly: `VIDEO_MINIO_ENDPOINT`, `VIDEO_MINIO_ACCESS_KEY`, `VIDEO_MINIO_SECRET_KEY`, and `VIDEO_MINIO_BUCKET` are required, while `VIDEO_MINIO_USE_SSL` remains **optional** — unset means `false`, and a present-but-unparseable value is still an error. What changes here is only *when* that loader runs: it becomes a startup precondition rather than something no composition root calls. This capability SHALL NOT make `VIDEO_MINIO_USE_SSL` mandatory; doing so would require modifying the configuration contract, the loader, and its tests, none of which are in this change's scope.
 
 This posture is fail-closed, deliberately unlike every Redis-backed feature in this codebase (rate limiting, upload idempotency, and the job status cache all fail open). Those degrade to a slower but correct system when Redis is unavailable; a bucket that cannot be written leaves a completed job with nowhere to put its result, so there is nothing to degrade to.
 
@@ -89,6 +91,12 @@ This posture is fail-closed, deliberately unlike every Redis-backed feature in t
 - **GIVEN** any of the four required `VIDEO_MINIO_*` variables is unset or empty
 - **WHEN** `cmd/api` starts
 - **THEN** it exits with an error naming the missing variable, and does not begin serving requests
+
+#### Scenario: VIDEO_MINIO_USE_SSL stays optional
+
+- **GIVEN** the four required variables are set and `VIDEO_MINIO_USE_SSL` is unset
+- **WHEN** `cmd/api` starts
+- **THEN** it starts normally with TLS disabled, exactly as `minio-infrastructure` already specifies for that variable
 
 #### Scenario: An unreachable MinIO endpoint prevents startup
 
@@ -140,7 +148,9 @@ A caller SHALL NOT be able to distinguish these cases by status code, body, or h
 
 ### Requirement: The Result Listing Is Sourced From The Job Repository And The Bucket
 
-`GET /api/status` SHALL list the authenticated caller's `completed` `VideoJob`s, filtered by status in the repository query rather than by filtering a page of mixed-status jobs after retrieval, and SHALL report for each one a `filename` equal to the job's `StorageKey`, a `download_url` of `/download/<key>`, and a `size` and `created_at` obtained from the stored object.
+`GET /api/status` SHALL list the authenticated caller's `completed` `VideoJob`s, retrieved by a repository query that filters on status in SQL, and SHALL report for each one a `filename` equal to the job's `StorageKey`, a `download_url` of `/download/<key>`, and a `size` and `created_at` obtained from the stored object.
+
+That query SHALL NOT be paginated. `GET /api/status` accepts no pagination parameters and today returns every zip the caller owns through an unbounded `outputs/*.zip` glob; any hidden limit would silently make a user's older results unreachable through the only listing endpoint the frontend consumes, which is a regression rather than a refinement. Filtering on status in SQL is what makes an unpaginated query the right shape here — it returns exactly the rows the endpoint renders, instead of a page that non-completed jobs can crowd out. Introducing real pagination is a reasonable follow-up, but it requires a matching `app.js` change and therefore belongs to a change that touches the frontend, not to this one.
 
 `created_at` SHALL be the stored object's last-modified time, preserving the field's existing meaning as the artifact's timestamp rather than silently changing it to the job's creation time.
 
@@ -160,11 +170,17 @@ The route SHALL have no unauthenticated behavior, for the same reason as the dow
 - **WHEN** one of them requests `GET /api/status` with a valid bearer token
 - **THEN** the response lists only that caller's own results, and `total` counts only those
 
-#### Scenario: Pagination is applied after the status filter, not before it
+#### Scenario: Non-completed jobs never displace completed results
 
 - **GIVEN** a user whose most recent jobs are all `failed` or `pending`, with `completed` jobs older than them
 - **WHEN** they request `GET /api/status`
-- **THEN** their completed results are listed, rather than being displaced out of the page by non-completed jobs
+- **THEN** their completed results are listed, rather than being displaced by non-completed jobs
+
+#### Scenario: Every completed result is listed, regardless of how many there are
+
+- **GIVEN** a user with more completed jobs than any page size the job-listing API uses
+- **WHEN** they request `GET /api/status`
+- **THEN** every one of their completed results whose object can be stated is listed, matching the unbounded behavior the filesystem-backed endpoint had
 
 #### Scenario: An unreachable object is omitted, not fatal
 

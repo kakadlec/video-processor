@@ -61,13 +61,15 @@ Taking `created_at` from the object's `LastModified` — not from `VideoJob.Crea
 
 A `StatObject` that fails or reports a missing object causes the entry to be **omitted**, not to fail the request — mirroring `handleStatus`'s current `os.Stat` error handling, which `continue`s past unreadable files.
 
-*Alternatives considered.* **Storing the size on the `VideoJob` aggregate**, avoiding MinIO on this path entirely — rejected because it drags in a schema migration, a `RestoreVideoJob` invariant, and a `videojob-persistence` change to avoid one round trip per listed item. **One unprefixed `ListObjects` over the whole bucket**, filtered against the caller's key set — one round trip instead of N, but it scans every user's objects, so its cost grows with total system usage rather than with the caller's page. The per-item `StatObject` is bounded by the page size and maps one-to-one onto the `os.Stat` loop it replaces.
+*Alternatives considered.* **Storing the size on the `VideoJob` aggregate**, avoiding MinIO on this path entirely — rejected because it drags in a schema migration, a `RestoreVideoJob` invariant, and a `videojob-persistence` change to avoid one round trip per listed item. **One unprefixed `ListObjects` over the whole bucket**, filtered against the caller's key set — one round trip instead of N, but it scans every user's objects, so its cost grows with total system usage rather than with the caller's own result count. The per-item `StatObject` scales with the caller's completed jobs and maps one-to-one onto the `os.Stat` loop it replaces.
 
-### 5. A dedicated repository method and use case for completed jobs
+### 5. A dedicated, unpaginated repository method and use case for completed jobs
 
-`domain.VideoJobRepository` gains `FindCompletedByUserID(ctx, userID, offset, limit)`, implemented in the PostgreSQL adapter and passed straight through by the cache decorator (as `FindByUserID` already is). A new `ListUserResults` application use case composes it with `ResultStorage.Stat`.
+`domain.VideoJobRepository` gains `FindCompletedByUserID(ctx, userID)` — no offset, no limit — implemented in the PostgreSQL adapter and passed straight through by the cache decorator (as `FindByUserID` already is). A new `ListUserResults` application use case composes it with `ResultStorage.Stat`.
 
-*Alternative considered and rejected:* reusing `FindByUserID` and filtering `completed` in the use case. Pagination is applied by the database before the filter, so a page of 20 jobs that happen to be `pending`/`failed` yields an empty listing while completed results exist further down — a bug that only appears for users with many failures. Filtering in SQL is the only way the page size means what it says.
+*Alternative considered and rejected:* reusing `FindByUserID` and filtering `completed` in the use case. Pagination is applied by the database before the filter, so a page of 20 jobs that happen to be `pending`/`failed` yields an empty listing while completed results exist further down — a bug that only appears for users with many failures.
+
+*The pagination question itself.* `GET /api/status` accepts no pagination parameters, and its filesystem predecessor globbed `outputs/*.zip` with no bound at all. Giving the new query a limit — even a generous one — would silently make a heavy user's older results unreachable through the only listing endpoint `app.js` consumes, which is a regression dressed up as a refinement. So the method is unpaginated, and filtering on status in SQL is what makes that defensible: the rows it returns are exactly the rows the endpoint renders, with nothing fetched to be discarded. Real pagination is worth having, but it needs a matching frontend change and therefore belongs to a change that touches `app.js` — plausibly `add-presigned-download-urls`, which reopens this path anyway.
 
 This is a genuine widening of the persistence port and is declared as a `videojob-persistence` delta rather than smuggled in as an implementation detail.
 
@@ -101,11 +103,13 @@ Every rejection in `handleDownload` — unparseable key, no such job, wrong owne
 
 ### 10. Orphan objects are an accepted, pre-existing failure class
 
-If the upload succeeds and `CompleteJob` then fails, the bucket holds an object whose job is stuck in `processing` and which no listing will show. This is the same class of orphan the current code already produces when a zip is written and the subsequent ownership recording fails, so it is not a new failure mode and no reaper is introduced here. `handleVideoUpload` keeps its existing structure for the inverse case: `ProcessVideoJob` still leaves a successfully-extracted job in `processing`, and the handler still calls `FailJob` if its own remaining work fails — that remaining work is now "the object is in the bucket" instead of "the sidecar is on disk."
+If the upload succeeds and `CompleteJob` then fails, the bucket holds an object whose job is stuck in `processing` and which no listing will show. This is the same class of orphan the current code already produces when a zip is written and the subsequent ownership recording fails, so it is not a new failure mode and no reaper is introduced here.
+
+One thing this decision explicitly does *not* preserve: the handler's post-processing failure branch. `ProcessVideoJob` still leaves a successfully-extracted job in `processing` and the handler still calls `CompleteJob`, but the handler no longer has any fallible step of its own between the two — storing the result moved inside `ProcessVideoJob` (Decision 1), and a successful return from it already means the result is durable. The `FailJob` call that used to guard ownership recording is deleted rather than repointed at something else. The split between `ProcessVideoJob` and `CompleteJob` survives only because collapsing it is a separate refactor across this capability's callers and tests, not because a failure branch still needs it.
 
 ### 11. The implementation commit carries a breaking-change marker
 
-`feat!:`. Making the five `VIDEO_MINIO_*` variables mandatory stops an existing deployment from booting, which is a breaking operational change regardless of the API surface staying stable.
+`feat!:`. Making MinIO configuration a startup precondition stops an existing deployment from booting, which is a breaking operational change regardless of the API surface staying stable.
 
 The nearest precedent, `enforce-mandatory-identity-config`, shipped as `fix:` (`c77f136`) and therefore released as a patch despite making `IDENTITY_*` mandatory. That is treated here as a mistake not to repeat, not as a convention to follow.
 
@@ -116,7 +120,7 @@ That spec's "Unchanged External Contract" requirement asserts the application ca
 ## Risks / Trade-offs
 
 - **MinIO joins the critical path; an outage now takes uploads and downloads down.** → Accepted and deliberate (Decision 7). Mitigated by proving connectivity at startup instead of at first request, so a misconfiguration fails loudly at deploy time rather than as a 500 for the first user.
-- **Every request that lists results now performs N network round trips where it performed N `os.Stat` calls.** → Bounded by the page size, not by bucket contents (Decision 4). `add-presigned-download-urls` will revisit this path and may fold sizes into a single prefixed listing if the frontend is changed alongside it.
+- **Every request that lists results now performs N network round trips where it performed N `os.Stat` calls, and N is unbounded** — the listing is deliberately unpaginated (Decision 5), so a user with hundreds of completed jobs pays hundreds of `StatObject` calls per poll, and `app.js` polls this endpoint. → Accepted as the lesser evil: the alternative is a limit that silently hides a user's older results, and the current filesystem implementation is unbounded in exactly the same way. The cost scales with one caller's own history, not with total bucket contents. This is the strongest argument for `add-presigned-download-urls` to revisit the path — a single prefixed `ListObjects` plus real pagination would fix both halves at once, but needs the frontend change this scope excludes.
 - **The large `cmd/api` test files assert filesystem state that will no longer exist.** → Reworked against a real bucket, which CI and `docker compose` already provide. The specific risk is deleting rather than porting a test: `TestHandleVideoUpload_ReserveError_OwnershipFailureStillSkipsClear` covers a real invariant (a failed finalization step must not clear another request's idempotency reservation) and is rewritten around upload failure.
 - **Parsing a job ID out of a filename couples the download path to a naming convention.** → The convention is already public in `zip_path`, and the three-way re-verification in Decision 3 means a wrong parse cannot yield unauthorized access, only a 404.
 - **Deleting the `/outputs` static mount removes a route some client might use directly.** → It served exactly the same bytes as `/download/:filename` under the same ownership rule; the frontend never referenced it.
@@ -125,7 +129,7 @@ That spec's "Unchanged External Contract" requirement asserts the application ca
 
 There is no data migration. Zips already sitting in a deployment's `outputs/` directory are not copied into the bucket: this is a hackathon deliverable with no production data, the artifacts are reproducible by re-uploading, and a backfill would need to invent object keys for zips whose jobs may not exist. After deploy, previously-completed jobs will report `completed` from PostgreSQL while their objects are absent — `GET /api/status` omits them (Decision 4) and `GET /download/:filename` returns 404 (Decision 9), which is the correct observable outcome for an artifact that is genuinely gone.
 
-Deployment order matters: MinIO must be reachable and the operator must have set the five variables *before* the new image starts, or `cmd/api` exits at startup. Rollback is redeploying the previous image, which reverts to `outputs/` and ignores the MinIO variables entirely; jobs completed while the new image was live are then unreachable, since their artifacts are in the bucket and the old code only looks at the local directory.
+Deployment order matters: MinIO must be reachable and the operator must have set the four required `VIDEO_MINIO_*` variables *before* the new image starts, or `cmd/api` exits at startup. Rollback is redeploying the previous image, which reverts to `outputs/` and ignores the MinIO variables entirely; jobs completed while the new image was live are then unreachable, since their artifacts are in the bucket and the old code only looks at the local directory.
 
 ## Open Questions
 

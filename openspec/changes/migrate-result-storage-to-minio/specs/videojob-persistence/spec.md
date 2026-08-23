@@ -2,9 +2,11 @@
 
 ### Requirement: PostgreSQL Repository Implements VideoJobRepository
 
-`internal/video/infrastructure/postgres.Repository` SHALL implement `domain.VideoJobRepository`'s `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID` against a `video_jobs` table, using parameterized queries and reconstructing `*domain.VideoJob` via `domain.RestoreVideoJob` from stored rows.
+`internal/video/infrastructure/postgres.Repository` SHALL implement `domain.VideoJobRepository`'s `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID(ctx, userID)` against a `video_jobs` table, using parameterized queries and reconstructing `*domain.VideoJob` via `domain.RestoreVideoJob` from stored rows.
 
-`FindCompletedByUserID` SHALL restrict to `completed` jobs **in the query**, applying its offset and limit to the already-filtered result set. Filtering after pagination would let a page of recent `pending`/`failed` jobs displace a user's completed results out of the listing entirely, so the ordering-then-limiting must happen over completed rows only. It SHALL otherwise order identically to `FindByUserID`: `CreatedAt` descending with `VideoJobID` ascending as a tie-breaker.
+`FindCompletedByUserID` SHALL restrict to `completed` jobs **in the query** and SHALL return all of them, taking no offset or limit. It orders identically to `FindByUserID`: `CreatedAt` descending with `VideoJobID` ascending as a tie-breaker.
+
+The absence of pagination is deliberate and is the reason this method exists separately from `FindByUserID`. Its only caller is `GET /api/status`, which accepts no pagination parameters and whose filesystem-backed predecessor returned every zip the caller owned. Reusing `FindByUserID` and filtering afterwards would be wrong twice over: a page of recent `pending`/`failed` jobs would displace a user's completed results out of the listing, and any limit at all would make older results permanently unreachable through the only listing endpoint the frontend consumes. Filtering on status in SQL is what makes returning the full set reasonable — the rows returned are exactly the rows rendered.
 
 `internal/video/infrastructure/cache.CachedVideoJobRepository` SHALL pass `FindCompletedByUserID` straight through to the decorated repository without caching it, exactly as it already does for `FindByUserID` — the status cache is keyed by individual job ID and has nothing to offer a multi-row listing.
 
@@ -38,11 +40,17 @@
 - **WHEN** `Repository.FindCompletedByUserID` is called
 - **THEN** only the `completed` jobs are returned
 
-#### Scenario: Non-completed jobs do not consume the page
+#### Scenario: Non-completed jobs do not hide completed ones
 
 - **GIVEN** a `UserID` whose most recently created jobs are all non-`completed`, with `completed` jobs older than them
-- **WHEN** `Repository.FindCompletedByUserID` is called with an offset of 0 and a limit smaller than the number of non-completed jobs
-- **THEN** the completed jobs are returned, rather than an empty page
+- **WHEN** `Repository.FindCompletedByUserID` is called
+- **THEN** the completed jobs are returned, rather than an empty result
+
+#### Scenario: All completed jobs are returned, with no implicit limit
+
+- **GIVEN** a `UserID` with more `completed` jobs than `ListUserJobs`' maximum page size
+- **WHEN** `Repository.FindCompletedByUserID` is called
+- **THEN** every one of them is returned
 
 #### Scenario: FindCompletedByUserID is scoped to its user
 
