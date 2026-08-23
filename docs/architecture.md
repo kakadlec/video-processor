@@ -146,7 +146,7 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Notification, `cmd/worker`, and Video Processing's own async queueing/execution (MinIO/RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Phase 5 has started: `add-minio-infrastructure` added `internal/video/infrastructure/storage`, the MinIO connection adapter, but nothing is wired into `cmd/api` and no artifact is stored in a bucket yet — uploads and results still live on the local filesystem. Notification, `cmd/worker`, and Video Processing's own async queueing/execution (RabbitMQ, `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` driven by a real worker instead of in-process by `/upload`) remain planned — each is labeled with the phase that introduces it.
 
 ### Bounded Contexts
 
@@ -181,7 +181,8 @@ video-processor/
       infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application)
         idempotency/  # Redis-backed IdempotencyStore adapter (implemented, Phase 4 — add-upload-idempotency-keys), wired into cmd/api's POST /upload handler
         cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4 — add-videojob-status-cache), wired into cmd/api's setupVideo ahead of every use case
-        # MinIO adapter, RabbitMQ publisher planned (Phases 5–6)
+        storage/      # MinIO connection adapter (implemented, Phase 5 — add-minio-infrastructure) — Config/Open/Ping/EnsureBucket, no cmd/api wiring yet; gains the StoragePort adapter in migrate-result-storage-to-minio
+        # RabbitMQ publisher planned (Phase 6)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
@@ -196,7 +197,7 @@ video-processor/
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), rate limiting (`add-rate-limiting-middleware`), and the `VideoJob` status cache (`add-videojob-status-cache`) — all three **implemented** (Phase 4 complete) |
-| MinIO | Object storage for uploads and ZIP results (S3-compatible) | Planned (Phase 5) |
+| MinIO | Object storage for uploads and ZIP results (S3-compatible) | Connection adapter implemented (`internal/video/infrastructure/storage`, `add-minio-infrastructure`); no `cmd/api` wiring and no artifact stored there yet — the three migration changes that do that are Phase 5's remaining work |
 | RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
 
 A fourth Redis-backed responsibility — a distributed lock preventing concurrent `cmd/worker` instances from picking up the same job — is planned for Phase 6 (not Phase 4): there is no worker to contend over job pickup until then.

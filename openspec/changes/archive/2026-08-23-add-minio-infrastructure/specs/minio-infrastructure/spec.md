@@ -72,11 +72,17 @@ Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. 
 - **WHEN** `Open` is called with it
 - **THEN** it returns a non-nil client and no error — the unreachability only surfaces on a subsequent operation
 
-#### Scenario: Open reports a malformed endpoint
+#### Scenario: Open reports an endpoint the client constructor rejects
 
-- **GIVEN** a `Config` whose endpoint is not a valid `host:port` value
+- **GIVEN** a `Config` whose endpoint the underlying client constructor rejects — for example one carrying a path (`host:port/path`) or an invalid character in the host
 - **WHEN** `Open` is called with it
 - **THEN** it returns a non-nil error and no usable client
+
+#### Scenario: Endpoint validation is the client library's, not this adapter's
+
+- **GIVEN** a `Config` whose endpoint carries a URL scheme (`http://host:port`) rather than being a bare `host:port` value
+- **WHEN** `Open` is called with it
+- **THEN** it returns a client and no error, because the pinned client tolerates the scheme — this adapter SHALL NOT add endpoint validation of its own, so `Open` is not a guard against a mis-shaped endpoint the library accepts
 
 ### Requirement: Health Check Confirms Connectivity With A Real Round Trip
 
@@ -102,7 +108,11 @@ Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. 
 
 ### Requirement: Bucket Provisioning Is Idempotent And Concurrency-Safe
 
-`internal/video/infrastructure/storage` SHALL expose `EnsureBucket`, which creates the configured bucket only if it does not already exist and SHALL succeed when the bucket is already present. It SHALL treat a concurrent-creation outcome — another caller having created the same bucket between the existence check and the creation attempt — as success rather than as an error, so that multiple instances starting simultaneously do not fail startup. It SHALL NOT apply any versioning, retention, lifecycle, or access policy to the bucket.
+`internal/video/infrastructure/storage` SHALL expose `EnsureBucket`, which creates the configured bucket only if it does not already exist and SHALL succeed when the bucket is already present. It SHALL treat a concurrent-creation outcome — another caller **using the same credentials** having created the same bucket between the existence check and the creation attempt — as success rather than as an error, so that multiple instances starting simultaneously do not fail startup.
+
+It SHALL NOT extend that tolerance to a bucket owned by a different account. In the globally shared bucket namespace, "the name is already taken by someone else" (`BucketAlreadyExists`) means the configured bucket is unusable by this client, and reporting successful provisioning would defer the failure to the first object write. Only the owned-by-you outcome (`BucketAlreadyOwnedByYou`) is benign, and it is what same-credential replicas racing each other actually produce; every other failure SHALL propagate.
+
+`EnsureBucket` SHALL NOT apply any versioning, retention, lifecycle, or access policy to the bucket.
 
 #### Scenario: EnsureBucket creates a bucket that does not exist
 
@@ -119,8 +129,14 @@ Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. 
 #### Scenario: Concurrent EnsureBucket calls both succeed
 
 - **GIVEN** a reachable MinIO instance with no bucket of the configured name
-- **WHEN** two callers invoke `EnsureBucket` concurrently for that same bucket
+- **WHEN** two callers using the same credentials invoke `EnsureBucket` concurrently for that same bucket
 - **THEN** both return no error and exactly one bucket exists afterwards
+
+#### Scenario: A bucket owned by another account is not reported as provisioned
+
+- **GIVEN** the configured bucket name is already taken in the shared namespace by a different account
+- **WHEN** `EnsureBucket` is called
+- **THEN** it returns a non-nil error rather than reporting success, so the unusable configuration surfaces at provisioning time instead of at the first object write
 
 #### Scenario: EnsureBucket fails against an unreachable instance
 
