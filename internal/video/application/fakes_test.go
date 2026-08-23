@@ -1,7 +1,10 @@
 package application_test
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -84,6 +87,26 @@ func (r *fakeVideoJobRepository) FindByUserID(_ context.Context, userID domain.U
 	return matches[offset:end], nil
 }
 
+func (r *fakeVideoJobRepository) FindCompletedByUserID(_ context.Context, userID domain.UserID) ([]*domain.VideoJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var matches []*domain.VideoJob
+	for _, job := range r.byID {
+		if job.UserID().Equal(userID) && job.Status() == domain.JobStatusCompleted {
+			matches = append(matches, cloneVideoJob(job))
+		}
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		if !matches[i].CreatedAt().Equal(matches[j].CreatedAt()) {
+			return matches[i].CreatedAt().After(matches[j].CreatedAt())
+		}
+		return matches[i].ID().String() < matches[j].ID().String()
+	})
+	return matches, nil
+}
+
 func (r *fakeVideoJobRepository) Update(_ context.Context, job *domain.VideoJob) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -125,4 +148,69 @@ type fakeClock struct {
 
 func (f fakeClock) Now() time.Time {
 	return f.now
+}
+
+// fakeResultStorage is an in-memory domain.ResultStorage for use-case tests,
+// with injectable failures so the storage-failure path can be exercised
+// without an unreachable bucket.
+type fakeResultStorage struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	times   map[string]time.Time
+
+	putErr  error
+	statErr error
+	openErr error
+}
+
+func newFakeResultStorage() *fakeResultStorage {
+	return &fakeResultStorage{objects: make(map[string][]byte), times: make(map[string]time.Time)}
+}
+
+func (s *fakeResultStorage) Put(_ context.Context, key domain.StorageKey, localPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.putErr != nil {
+		return s.putErr
+	}
+	data, err := os.ReadFile(localPath) // #nosec G304
+	if err != nil {
+		return err
+	}
+	s.objects[key.String()] = data
+	s.times[key.String()] = time.Now()
+	return nil
+}
+
+func (s *fakeResultStorage) Open(_ context.Context, key domain.StorageKey) (io.ReadCloser, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.openErr != nil {
+		return nil, 0, s.openErr
+	}
+	data, ok := s.objects[key.String()]
+	if !ok {
+		return nil, 0, domain.ErrResultNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+}
+
+func (s *fakeResultStorage) Stat(_ context.Context, key domain.StorageKey) (int64, time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.statErr != nil {
+		return 0, time.Time{}, s.statErr
+	}
+	data, ok := s.objects[key.String()]
+	if !ok {
+		return 0, time.Time{}, domain.ErrResultNotFound
+	}
+	return int64(len(data)), s.times[key.String()], nil
+}
+
+func (s *fakeResultStorage) has(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.objects[key]
+	return ok
 }

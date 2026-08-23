@@ -52,14 +52,16 @@ type fakeRepository struct {
 	mu   sync.Mutex
 	byID map[string]*domain.VideoJob
 
-	findByIDCalls     int
-	findByUserIDCalls int
-	createCalls       int
-	updateCalls       int
+	findByIDCalls              int
+	findByUserIDCalls          int
+	findCompletedByUserIDCalls int
+	createCalls                int
+	updateCalls                int
 
-	findByIDErr     error
-	updateErr       error
-	findByUserIDErr error
+	findByIDErr              error
+	updateErr                error
+	findByUserIDErr          error
+	findCompletedByUserIDErr error
 }
 
 func newFakeRepository() *fakeRepository {
@@ -110,6 +112,16 @@ func (r *fakeRepository) FindByUserID(_ context.Context, _ domain.UserID, _, _ i
 	r.findByUserIDCalls++
 	if r.findByUserIDErr != nil {
 		return nil, r.findByUserIDErr
+	}
+	return nil, nil
+}
+
+func (r *fakeRepository) FindCompletedByUserID(_ context.Context, _ domain.UserID) ([]*domain.VideoJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.findCompletedByUserIDCalls++
+	if r.findCompletedByUserIDErr != nil {
+		return nil, r.findCompletedByUserIDErr
 	}
 	return nil, nil
 }
@@ -303,6 +315,10 @@ func (b *blockingFindByID) Create(ctx context.Context, job *domain.VideoJob) err
 
 func (b *blockingFindByID) FindByUserID(ctx context.Context, userID domain.UserID, offset, limit int) ([]*domain.VideoJob, error) {
 	return b.fake.FindByUserID(ctx, userID, offset, limit)
+}
+
+func (b *blockingFindByID) FindCompletedByUserID(ctx context.Context, userID domain.UserID) ([]*domain.VideoJob, error) {
+	return b.fake.FindCompletedByUserID(ctx, userID)
 }
 
 func (b *blockingFindByID) Update(ctx context.Context, job *domain.VideoJob) error {

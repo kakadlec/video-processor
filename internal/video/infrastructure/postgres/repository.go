@@ -133,6 +133,37 @@ func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, off
 	return jobs, nil
 }
 
+// FindCompletedByUserID returns all of userID's completed jobs, ordered
+// like FindByUserID. The status predicate is in the query rather than
+// applied to a retrieved page: filtering afterwards would let a run of
+// recent pending/failed jobs hide a user's completed results entirely.
+func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.UserID) ([]*domain.VideoJob, error) {
+	const query = `
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at
+		FROM video_jobs
+		WHERE user_id = $1 AND status = $2
+		ORDER BY created_at DESC, id ASC
+	`
+	rows, err := r.db.QueryContext(ctx, query, userID.String(), string(domain.JobStatusCompleted))
+	if err != nil {
+		return nil, fmt.Errorf("video: list completed video jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []*domain.VideoJob
+	for rows.Next() {
+		job, err := r.scanJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("video: list completed video jobs: %w", err)
+	}
+	return jobs, nil
+}
+
 // Update persists job's current status, frame count, error reason, and
 // storage key to its existing row, identified by its unchanging id. Unlike
 // Create, it writes no video_job_outbox row.

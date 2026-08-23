@@ -448,3 +448,151 @@ func TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds(t *testi
 		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
 	}
 }
+
+// completeTestJob drives a fresh job through its full transition sequence
+// and persists the result, so a test can seed genuinely completed rows
+// rather than hand-crafting invalid aggregate state.
+func completeTestJob(t *testing.T, repo *postgres.Repository, ids domain.VideoJobIDGenerator, userID, filename string, createdAt time.Time) *domain.VideoJob {
+	t.Helper()
+	ctx := context.Background()
+
+	job := newTestJob(t, ids, userID, filename, createdAt)
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.Complete(domain.ResultStorageKey(job.ID()), 3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return job
+}
+
+func TestRepository_FindCompletedByUserID_ReturnsOnlyCompletedJobsForThatUser(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	completed := completeTestJob(t, repo, ids, "user-1", "done.mp4", time.Now().UTC())
+	// A pending job for the same user, and a completed job for another one.
+	if err := repo.Create(ctx, newTestJob(t, ids, "user-1", "pending.mp4", time.Now().UTC())); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	completeTestJob(t, repo, ids, "user-2", "someone-else.mp4", time.Now().UTC())
+
+	userID, err := domain.NewUserID("user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	jobs, err := repo.FindCompletedByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("len(jobs) = %d, want 1", len(jobs))
+	}
+	if !jobs[0].ID().Equal(completed.ID()) {
+		t.Fatalf("jobs[0].ID() = %v, want %v", jobs[0].ID(), completed.ID())
+	}
+	if jobs[0].StorageKey().IsZero() {
+		t.Fatal("expected the completed job's StorageKey to be populated")
+	}
+}
+
+// TestRepository_FindCompletedByUserID_NonCompletedJobsDoNotHideCompletedOnes
+// is the case that motivates a dedicated query: filtering a page of
+// FindByUserID results would let a run of recent non-completed jobs push a
+// user's completed results out of the listing entirely.
+func TestRepository_FindCompletedByUserID_NonCompletedJobsDoNotHideCompletedOnes(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	base := time.Now().UTC()
+	completed := completeTestJob(t, repo, ids, "user-1", "done.mp4", base.Add(-time.Hour))
+	for i := range 5 {
+		newer := newTestJob(t, ids, "user-1", "pending.mp4", base.Add(time.Duration(i)*time.Minute))
+		if err := repo.Create(ctx, newer); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	userID, err := domain.NewUserID("user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	jobs, err := repo.FindCompletedByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jobs) != 1 || !jobs[0].ID().Equal(completed.ID()) {
+		t.Fatalf("expected the older completed job to be returned despite 5 newer non-completed jobs, got %d jobs", len(jobs))
+	}
+}
+
+// TestRepository_FindCompletedByUserID_HasNoImplicitLimit guards the
+// no-pagination decision: GET /api/status takes no pagination parameters, so
+// a bound here would silently make a heavy user's older results unreachable.
+func TestRepository_FindCompletedByUserID_HasNoImplicitLimit(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	// More than ListUserJobs' maximum page size of 100.
+	const total = 101
+	base := time.Now().UTC()
+	for i := range total {
+		completeTestJob(t, repo, ids, "user-1", "done.mp4", base.Add(time.Duration(i)*time.Second))
+	}
+
+	userID, err := domain.NewUserID("user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	jobs, err := repo.FindCompletedByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jobs) != total {
+		t.Fatalf("len(jobs) = %d, want %d — the query must apply no limit of its own", len(jobs), total)
+	}
+}
+
+func TestRepository_FindCompletedByUserID_OrdersNewestFirst(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	older := completeTestJob(t, repo, ids, "user-1", "older.mp4", time.Now().UTC().Add(-time.Hour))
+	newer := completeTestJob(t, repo, ids, "user-1", "newer.mp4", time.Now().UTC())
+
+	userID, err := domain.NewUserID("user-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	jobs, err := repo.FindCompletedByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("len(jobs) = %d, want 2", len(jobs))
+	}
+	if !jobs[0].ID().Equal(newer.ID()) || !jobs[1].ID().Equal(older.ID()) {
+		t.Fatalf("jobs = [%v, %v], want [newer, older]", jobs[0].ID(), jobs[1].ID())
+	}
+}
