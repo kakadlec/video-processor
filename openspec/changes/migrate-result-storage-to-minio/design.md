@@ -7,7 +7,7 @@ Today a completed job's zip lives at `outputs/frames_<jobID>.zip`, written by `i
 Two constraints shape everything below, and both were established empirically rather than assumed:
 
 - **`cmd/api/web/app.js` consumes the storage key verbatim.** Line 151 puts `result.zip_path` straight into the download button's `data-download-filename`, and line 83 fetches `'/download/' + encodeURIComponent(filename)`. Any `/` inside the key encodes to `%2F`, which Go decodes into `URL.Path`, which stops Gin's single-segment `:filename` parameter from matching.
-- **`app.js` renders `file.size` through `formatFileSize` and `file.created_at` as text** (lines 203-206). Dropping either field from `GET /api/status` renders "NaN undefined" in the UI.
+- **`app.js` renders `file.size` through `formatFileSize` and `file.created_at` as text** (line 204). Dropping either field from `GET /api/status` renders "NaN undefined" in the UI.
 
 ## Goals / Non-Goals
 
