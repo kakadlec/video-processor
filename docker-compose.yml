@@ -1,6 +1,6 @@
 # Local development/test infrastructure. Scoped to what the Identity and
-# Video contexts need today (PostgreSQL, Redis); later roadmap phases extend
-# this file with RabbitMQ and MinIO rather than replacing it.
+# Video contexts need today (PostgreSQL, Redis, MinIO); later roadmap phases
+# extend this file with RabbitMQ rather than replacing it.
 #
 # The credentials below are fixed, non-secret local-only defaults — this
 # service is never reachable from anywhere but the developer's own machine
@@ -38,6 +38,34 @@ services:
       - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Named volume, unlike the redis service directly above: once
+  # migrate-result-storage-to-minio lands, this bucket holds the only durable
+  # copy of every completed job's zip, so wiping it on `docker compose down`
+  # would leave completed video_jobs rows pointing at objects that no longer
+  # exist — the same dangling state postgres_data exists to prevent.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      # Fixed, non-secret local-only defaults — same rationale as the
+      # Postgres credentials above. These are the MinIO server's own
+      # variables, not internal/video/infrastructure/storage's VIDEO_MINIO_*
+      # configuration.
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # Loopback-only: same rationale as the redis and app services above.
+      # 9000 is the S3 API, 9001 the web console.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -122,11 +150,24 @@ services:
       # See the "app" service above — cmd/api's composition root now
       # requires this at startup, matching app's own value.
       REDIS_ADDR: redis:6379
+      # Exercises internal/video/infrastructure/storage's own test suite
+      # against a real instance. Deliberately only on app-test: cmd/api reads
+      # no VIDEO_MINIO_* variable yet, so adding them to "app" would imply a
+      # startup requirement that does not exist. The test bucket is separate
+      # from any runtime bucket for the same reason identity_test is separate
+      # from identity — these tests create and delete buckets.
+      VIDEO_MINIO_TEST_ENDPOINT: minio:9000
+      VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
+      VIDEO_MINIO_TEST_SECRET_KEY: minioadmin
+      VIDEO_MINIO_TEST_BUCKET: video-test
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
 
 volumes:
   postgres_data:
+  minio_data:
