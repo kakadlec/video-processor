@@ -3,10 +3,22 @@ package application
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"video-processor/internal/video/domain"
 )
+
+// statConcurrency bounds how many result objects are stated at once.
+//
+// The listing query is deliberately unpaginated (GET /api/status takes no
+// pagination parameters, and bounding it would silently hide a user's older
+// results), so a long-lived user's listing costs one network round trip per
+// completed job. Serially that latency grows linearly with their whole
+// history. A small fixed fan-out keeps the wall time roughly flat without
+// letting one request open an unbounded number of connections to the object
+// store — the failure mode an unlimited fan-out would trade it for.
+const statConcurrency = 8
 
 // ListUserResultsInput carries the caller-supplied listing fields. It has no
 // pagination: see domain.VideoJobRepository.FindCompletedByUserID.
@@ -50,19 +62,42 @@ func (uc *ListUserResults) Execute(ctx context.Context, input ListUserResultsInp
 		return nil, err
 	}
 
+	// Each job's result is stated into its own slot, so the repository's
+	// ordering survives the concurrent fan-out; found marks the slots that
+	// have a readable object.
+	stated := make([]ListUserResultsItem, len(jobs))
+	found := make([]bool, len(jobs))
+
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, statConcurrency)
+	for i, job := range jobs {
+		wg.Add(1)
+		go func(i int, job *domain.VideoJob) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+
+			key := job.StorageKey()
+			size, modifiedAt, err := uc.results.Stat(ctx, key)
+			if err != nil {
+				log.Printf("stat result %s for job %s: %v", key.String(), job.ID().String(), err)
+				return
+			}
+			stated[i] = ListUserResultsItem{
+				StorageKey: key.String(),
+				Size:       size,
+				ModifiedAt: modifiedAt,
+			}
+			found[i] = true
+		}(i, job)
+	}
+	wg.Wait()
+
 	items := make([]ListUserResultsItem, 0, len(jobs))
-	for _, job := range jobs {
-		key := job.StorageKey()
-		size, modifiedAt, err := uc.results.Stat(ctx, key)
-		if err != nil {
-			log.Printf("stat result %s for job %s: %v", key.String(), job.ID().String(), err)
-			continue
+	for i := range stated {
+		if found[i] {
+			items = append(items, stated[i])
 		}
-		items = append(items, ListUserResultsItem{
-			StorageKey: key.String(),
-			Size:       size,
-			ModifiedAt: modifiedAt,
-		})
 	}
 	return items, nil
 }

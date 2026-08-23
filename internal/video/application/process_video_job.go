@@ -48,11 +48,19 @@ type ProcessVideoJobResult struct {
 // output artifact ownership after this use case returned, and needed the
 // job left in "processing" so it could still FailJob if that recording
 // failed. Storing the result is this use case's own step now, so a
-// successful return already means the result is durable and the caller has
-// no fallible work left. The split survives only because collapsing it
-// would ripple through every caller and test of this use case, which is a
-// separate refactor. Do not reintroduce a post-processing failure branch in
-// a caller to justify it.
+// successful return already means the artifact is durable, and the caller
+// has no fallible step left *before* CompleteJob. The split survives only
+// because collapsing it would ripple through every caller and test of this
+// use case, which is a separate refactor. Do not reintroduce a
+// post-processing failure branch in a caller to justify it.
+//
+// CompleteJob itself can still fail, leaving a stored object whose job is
+// stuck "processing" and which no listing shows. That orphan class is not
+// new: the pre-MinIO pipeline produced exactly the same shape when the zip
+// was written and the subsequent ownership recording failed. Reconciling it
+// needs a recoverable workflow with a worker that can resume or compensate,
+// which is Phase 6's queue work, not something a synchronous in-request
+// pipeline can do correctly.
 type ProcessVideoJob struct {
 	enqueue   *EnqueueVideoJob
 	start     *StartProcessing

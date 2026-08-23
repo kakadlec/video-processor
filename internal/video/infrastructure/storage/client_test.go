@@ -79,12 +79,26 @@ func uniqueBucket(t *testing.T, prefix string) string {
 	return strings.Trim(full, "-")
 }
 
+// removeBucket drains bucket and deletes it. The drain matters for buckets
+// that actually hold objects (the ResultStorage tests): RemoveBucket refuses
+// a non-empty bucket, and these run against a shared MinIO instance whose
+// data lives in a named volume, so anything left behind accumulates across
+// every future suite run.
 func removeBucket(t *testing.T, client *minio.Client, bucket string) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	for object := range client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if object.Err != nil {
+			t.Logf("cleanup: list %q: %v", bucket, object.Err)
+			continue
+		}
+		if err := client.RemoveObject(ctx, bucket, object.Key, minio.RemoveObjectOptions{}); err != nil {
+			t.Logf("cleanup: remove %q/%q: %v", bucket, object.Key, err)
+		}
+	}
 	if err := client.RemoveBucket(ctx, bucket); err != nil {
 		t.Logf("cleanup: remove bucket %q: %v", bucket, err)
 	}

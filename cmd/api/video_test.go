@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
 
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	videoapplication "video-processor/internal/video/application"
@@ -306,6 +308,11 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 // instance cmd/api itself reads (VIDEO_MINIO_*). TestMain has already proven
 // the configuration loads, so a failure here is a genuine fault rather than
 // an unconfigured machine.
+//
+// Each test gets its own bucket, drained and removed afterwards. Sharing the
+// configured runtime bucket would leave a UUID-keyed object behind on every
+// upload test, and the local MinIO service keeps its data in a named volume,
+// so that would grow without bound across suite runs.
 func newTestResultStorage(t *testing.T) videodomain.ResultStorage {
 	t.Helper()
 	cfg, err := videostorage.LoadConfigFromEnv()
@@ -316,10 +323,48 @@ func newTestResultStorage(t *testing.T) videodomain.ResultStorage {
 	if err != nil {
 		t.Fatalf("open MinIO client: %v", err)
 	}
-	if err := videostorage.EnsureBucket(context.Background(), client, cfg.Bucket); err != nil {
-		t.Fatalf("ensure bucket %q: %v", cfg.Bucket, err)
+
+	bucket := uniqueTestBucket(t)
+	if err := videostorage.EnsureBucket(context.Background(), client, bucket); err != nil {
+		t.Fatalf("ensure bucket %q: %v", bucket, err)
 	}
-	return videostorage.NewResultStorage(client, cfg.Bucket)
+	t.Cleanup(func() { removeTestBucket(t, client, bucket) })
+
+	return videostorage.NewResultStorage(client, bucket)
+}
+
+// uniqueTestBucket derives an S3-valid (lowercase, no underscores, <= 63
+// chars) name unique to this test and run.
+func uniqueTestBucket(t *testing.T) string {
+	t.Helper()
+	name := strings.ToLower(t.Name())
+	name = strings.NewReplacer("/", "-", "_", "-", " ", "-").Replace(name)
+	full := fmt.Sprintf("api-%s-%d", name, time.Now().UnixNano()%1e6)
+	if len(full) > 63 {
+		full = full[:63]
+	}
+	return strings.Trim(full, "-")
+}
+
+// removeTestBucket drains bucket and deletes it; a bucket must be empty
+// before it can be removed. Failures are logged rather than fatal — cleanup
+// must not turn a passing test red, and it also runs after a failed one.
+func removeTestBucket(t *testing.T, client *minio.Client, bucket string) {
+	t.Helper()
+	ctx := context.Background()
+
+	for object := range client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if object.Err != nil {
+			t.Logf("cleanup: list %s: %v", bucket, object.Err)
+			continue
+		}
+		if err := client.RemoveObject(ctx, bucket, object.Key, minio.RemoveObjectOptions{}); err != nil {
+			t.Logf("cleanup: remove %s/%s: %v", bucket, object.Key, err)
+		}
+	}
+	if err := client.RemoveBucket(ctx, bucket); err != nil {
+		t.Logf("cleanup: remove bucket %s: %v", bucket, err)
+	}
 }
 
 // newTestVideoModuleWithStorage additionally hands back the ResultStorage

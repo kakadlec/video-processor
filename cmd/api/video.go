@@ -70,9 +70,10 @@ type videoModule struct {
 	// idempotency backs POST /upload's content-hash duplicate detection —
 	// see internal/video/domain.IdempotencyStore.
 	idempotency videodomain.IdempotencyStore
-	// jobs and results back GET /download/:filename and GET /api/status,
-	// which resolve a storage key to its owning VideoJob and then stream or
-	// stat the stored object.
+	// jobs backs GET /download/:filename's entitlement lookup. It is
+	// deliberately the authoritative repository, not the cached decorator —
+	// see setupVideo for why a stale cache entry must not be able to 404 a
+	// download the listing is already showing.
 	jobs    videodomain.VideoJobRepository
 	results videodomain.ResultStorage
 	idsFor  videodomain.VideoJobIDParser
@@ -160,12 +161,22 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	resultStorage := videostorage.NewResultStorage(minioClient, minioConfig.Bucket)
 
 	ids := videoidgen.New()
-	// Wrapping once here means every use case below — including
-	// CreateVideoJob — shares the same cache-aside/write-through
-	// decorator, per add-videojob-status-cache's design.md: Create is a
-	// pure pass-through on the decorator, so there's no reason to keep a
-	// separate uncached repo reference around just for it.
-	repo := videocache.NewCachedVideoJobRepository(videopostgres.NewRepository(db, ids), redisClient, ids)
+	// Every use case below shares the same cache-aside/write-through
+	// decorator, per add-videojob-status-cache's design.md; Create is a pure
+	// pass-through on it.
+	//
+	// authoritativeRepo is the undecorated PostgreSQL repository. It backs
+	// GET /download/:filename's entitlement lookup so that endpoint and
+	// GET /api/status read the same source: the listing queries PostgreSQL
+	// directly (the cache is keyed per job ID and cannot serve a listing),
+	// and if a completion's write-through SET and its fallback DEL both
+	// fail — Redis down at exactly that moment — a stale "processing" entry
+	// survives for the cache TTL. Reading through the cache here would then
+	// 404 a download for a result the listing is already showing. A
+	// PostgreSQL read is negligible next to streaming a zip, so nothing is
+	// lost by skipping the cache on this path.
+	authoritativeRepo := videopostgres.NewRepository(db, ids)
+	repo := videocache.NewCachedVideoJobRepository(authoritativeRepo, redisClient, ids)
 	clock := systemClock{}
 	extractor := videoffmpeg.New()
 	completeJob := videoapplication.NewCompleteJob(repo, ids)
@@ -187,7 +198,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 		completeJob,
 		failJob,
 		idempotencyStore,
-		repo,
+		authoritativeRepo,
 		resultStorage,
 		ids,
 	)

@@ -24,6 +24,12 @@ func newResultStorage(t *testing.T) *storage.ResultStorage {
 	if err := storage.EnsureBucket(context.Background(), client, bucket); err != nil {
 		t.Fatalf("ensure bucket: %v", err)
 	}
+	// Registered before the first Put: these run against a shared MinIO
+	// instance whose data directory is a named volume, so a bucket left
+	// behind here accumulates across every future suite run. Cleanup runs
+	// on failed tests too, which is why it is a t.Cleanup and not a defer
+	// after the assertions.
+	t.Cleanup(func() { removeBucket(t, client, bucket) })
 	return storage.NewResultStorage(client, bucket)
 }
 
