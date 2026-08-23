@@ -72,9 +72,11 @@ Browser / client
         │    │    ├─ Write temp/<jobID>.zip          (beside the frame dir, so
         │    │    │    the defer below can't delete it)
         │    │    └─ Remove temp/<jobID>/            (defer, always)
+        │    ├─ Remove temp/<jobID>.zip           (ProcessVideoJob's own
+        │    │    defer — registered before the store attempt, so a failed
+        │    │    upload can't leave the zip behind)
         │    ├─ ResultStorage.Put (infrastructure/storage):
-        │    │    ├─ FPutObject → bucket/frames_<jobID>.zip
-        │    │    └─ Remove temp/<jobID>.zip         (defer, always)
+        │    │    └─ FPutObject → bucket/frames_<jobID>.zip
         │    └─ FailJob if extraction OR storage failed (processing → failed)
         │         → also clears the idempotency reservation
         │         (on success, job stays "processing" — see below)

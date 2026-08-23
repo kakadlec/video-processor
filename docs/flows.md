@@ -55,19 +55,21 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
   │                        │    Enqueue → StartProcessing│                 │
   │                        │───────────────────────────►│                  │
   │                        │                            │  ffmpeg exec,    │
-  │                        │                            │  zip frames      │
+  │                        │                            │  zip → temp/     │
   │                        │                            │─────────────────►│
   │                        │                            │  (blocks)        │
   │                        │                            │◄─────────────────│
-  │                        │    Fail if extraction failed│                 │
+  │                        │    ResultStorage.Put →      │                 │
+  │                        │    bucket/frames_<jobID>.zip│                 │
+  │                        │    (local zip removed either way)             │
+  │                        │    Fail if extraction OR    │                 │
+  │                        │    storage failed           │                 │
   │                        │    (job stays "processing"  │                 │
-  │                        │     if extraction succeeded)│                 │
+  │                        │     if both succeeded)      │                 │
   │                        │───────────────────────────►│                  │
-  │                        │  Remove uploads/<file>,    │                 │
-  │                        │  record output artifact ownership│            │
-  │                        │───────────────────────────────────────────────►│
-  │                        │    Complete if ownership recorded,│           │
-  │                        │    else Fail                │                 │
+  │                        │  Remove uploads/<file>      │                 │
+  │                        │    CompleteJob — the result │                 │
+  │                        │    is already durable       │                 │
   │                        │───────────────────────────►│                  │
   │◄───────────────────────│                            │                  │
   │  200 { success, zip_path,│                           │                 │

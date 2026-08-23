@@ -4,7 +4,7 @@
 
 `internal/video/domain` SHALL define a `ResultStorage` port through which a `VideoJob`'s result artifact is stored and retrieved, with three operations: storing a local file under a `StorageKey`, opening a stored artifact for reading together with its size in bytes, and reporting a stored artifact's size and last-modified time without reading its contents. Its MinIO-backed implementation SHALL live in `internal/video/infrastructure/storage`, beside the connection plumbing `minio-infrastructure` defines. The domain and application layers SHALL depend only on the port.
 
-The port SHALL report a missing artifact through a single sentinel error owned by the domain, so callers can distinguish "not stored" from "storage failed" without matching on the MinIO client's own error codes outside the adapter.
+The port SHALL expose two sentinel errors owned by the domain, so callers can classify failures without matching on the MinIO client's own error codes outside the adapter: one for a missing artifact, and one that every failure to store an artifact wraps. The second exists because the storage client's error text names the endpoint and the bucket, and that text must never reach a user-facing message or a persisted failure reason — a caller that needs to describe a storage failure matches the sentinel and writes its own wording.
 
 #### Scenario: Domain and application layers do not import the adapter
 
@@ -23,6 +23,12 @@ The port SHALL report a missing artifact through a single sentinel error owned b
 - **GIVEN** the MinIO endpoint is unreachable
 - **WHEN** the artifact is opened or stated through the port
 - **THEN** the returned error does not match the not-found sentinel
+
+#### Scenario: Every store failure matches the store-failure sentinel
+
+- **GIVEN** storing an artifact fails for any reason
+- **WHEN** the caller inspects the returned error with `errors.Is`
+- **THEN** it matches the domain's store-failure sentinel, so the caller can recognize the failure without parsing the underlying client's message
 
 ### Requirement: Opening An Artifact Resolves Its Existence And Size Before Returning
 
@@ -64,6 +70,8 @@ The flat shape is a hard constraint, not a stylistic preference: the key is retu
 
 `ProcessVideoJob` SHALL, after `FrameExtractor.ExtractFrames` returns successfully, store the extracted zip through `ResultStorage` under the key derived from the job's ID, and SHALL remove the local zip file afterwards whether storing succeeded or failed. On a storage failure it SHALL call `FailJob` and report the failure to its caller, exactly as it already does for an extraction failure — a result that could not be stored is not a result.
 
+The failure reason it records for a storage failure SHALL be its own fixed wording, not the storage error's text. That reason is persisted on the job and echoed to the uploader through `POST /upload` and `GET /api/video-jobs/:id`, and the adapter's error names the endpoint and bucket. Extraction failures continue to echo `ffmpeg`'s own message, as they always have.
+
 The local zip SHALL be written under `temp/`, not `outputs/`; no directory named `outputs` is created, written to, or read by any part of the system after this change.
 
 #### Scenario: A successfully stored result leaves no local zip behind
@@ -76,7 +84,13 @@ The local zip SHALL be written under `temp/`, not `outputs/`; no directory named
 
 - **GIVEN** frame extraction succeeded but storing the zip fails
 - **WHEN** `ProcessVideoJob.Execute` returns
-- **THEN** the job's persisted status is `failed` with a non-empty `ErrorReason`, the result reports failure to the caller, and no zip file remains under `temp/`
+- **THEN** the job's persisted status is `failed` with a non-empty `ErrorReason`, the result reports failure to the caller, and the zip this request produced no longer exists under `temp/`
+
+#### Scenario: A storage failure leaks no infrastructure detail
+
+- **GIVEN** storing the zip fails with an error naming the object-storage endpoint and bucket
+- **WHEN** the job is failed and the upload response is written
+- **THEN** neither the persisted `ErrorReason` nor the message returned to the uploader contains the storage client's error text, endpoint, or bucket name — the underlying error is logged instead
 
 ### Requirement: MinIO Configuration Is Required At Application Startup
 

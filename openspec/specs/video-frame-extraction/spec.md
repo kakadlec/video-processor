@@ -37,7 +37,7 @@ The system SHALL package all extracted frames into a single downloadable `.zip` 
 #### Scenario: The zip is stored in the bucket, not on local disk
 
 - **WHEN** frame extraction succeeds for an upload
-- **THEN** the zip exists as an object in the configured bucket, and no zip file remains anywhere on the local filesystem after the request completes
+- **THEN** the zip exists as an object in the configured bucket, and the transient zip this request produced under `temp/` no longer exists after the request completes
 
 ### Requirement: Original Upload Cleanup After Successful Processing
 

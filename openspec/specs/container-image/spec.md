@@ -18,7 +18,11 @@ The repository's `Dockerfile` SHALL use a multi-stage build: a builder stage tha
 
 #### Scenario: A Go- and ffmpeg-capable stage exists for running tests
 - **WHEN** the Dockerfile is built targeting its test stage
-- **THEN** the resulting image contains both the Go toolchain and `ffmpeg`, sufficient to run `go test ./...` (including `main_test.go`'s integration tests), while the default/final image built without a target selection remains the Go-toolchain-free runtime stage
+- **THEN** the resulting image contains both the Go toolchain and `ffmpeg`, while the default/final image built without a target selection remains the Go-toolchain-free runtime stage
+
+#### Scenario: The test stage alone is not sufficient to run the suite
+- **WHEN** that image runs `go test ./...`
+- **THEN** it additionally requires the reachable backing services the suite depends on — PostgreSQL, Redis, and a MinIO instance configured through `VIDEO_MINIO_*` — which `docker-compose.yml`'s `app-test` service supplies; the image contents alone do not satisfy `cmd/api`'s integration tests
 
 ### Requirement: Non-Root Runtime User
 
@@ -44,6 +48,11 @@ The application requires environment configuration to start, and SHALL fail fast
 
 - **WHEN** `docker compose up --build` runs
 - **THEN** the `app` service builds successfully and serves the application on port 8080, with the environment the compose file supplies
+
+#### Scenario: Existing deployment commands keep working
+
+- **WHEN** a deployer runs the `docker build`/`docker run` commands documented in `docs/operations.md`, supplying every environment variable those docs list as required
+- **THEN** they succeed unmodified and the container behaves as documented: same port, same first-run directory creation, and the same fail-fast behavior for missing configuration
 
 #### Scenario: Missing configuration fails fast rather than degrading
 

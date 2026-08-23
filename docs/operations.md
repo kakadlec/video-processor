@@ -10,12 +10,17 @@ The application is a single Go binary (or `go run ./cmd/api`) behind a Docker co
 # Build
 docker build -t video-processor .
 
-# Run (identity, video, and Redis configuration are all required — see Environment Variables below)
+# Run (identity, video, Redis, and MinIO configuration are all required — see
+# Environment Variables below; the container exits at startup if any is missing)
 docker run -p 8080:8080 \
   -e IDENTITY_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e IDENTITY_JWT_SIGNING_KEY="change-me" \
   -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e REDIS_ADDR="host:6379" \
+  -e VIDEO_MINIO_ENDPOINT="host:9000" \
+  -e VIDEO_MINIO_ACCESS_KEY="minio-access-key" \
+  -e VIDEO_MINIO_SECRET_KEY="minio-secret-key" \
+  -e VIDEO_MINIO_BUCKET="video-results" \
   video-processor
 ```
 
@@ -45,11 +50,11 @@ The first four `VIDEO_MINIO_*` variables are **required**; `VIDEO_MINIO_USE_SSL`
 
 Their `VIDEO_` prefix marks them as the Video Processing context's own configuration, matching `VIDEO_POSTGRES_DSN` and distinguishing them from `internal/platform/`'s unprefixed `REDIS_ADDR`.
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and `REDIS_ADDR` are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`, unlike the four above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`).
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`).
 
 ## Runtime Directory Structure
 
-The application creates and uses three directories relative to its working directory:
+The application creates and uses two directories relative to its working directory:
 
 ```
 ./
