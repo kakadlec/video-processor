@@ -181,144 +181,183 @@ When a hard runtime prerequisite for the integration test suite is absent from t
 - **WHEN** `go test ./...` is run in an environment where `ffmpeg` is on `PATH`
 - **THEN** the suite runs and exits with the same outcome as before this change — this requirement adds no new test cases and changes no passing behavior
 
+### Requirement: OpenSpec Lifecycle Is Explicitly Opt-In
+
+OpenSpec lifecycle requirements in this specification SHALL apply only when a developer explicitly requests OpenSpec, invokes an `/opsx:*` command, or explicitly continues a named active OpenSpec change. A request to implement, fix, investigate, or answer a task SHALL NOT by itself activate OpenSpec, regardless of the request's size, type, or perceived complexity.
+
+#### Scenario: Direct implementation remains direct
+
+- **WHEN** a developer asks an agent to implement or fix a change without explicitly selecting OpenSpec
+- **THEN** the agent SHALL perform the work without proposing, requiring, or refusing work for an OpenSpec lifecycle
+
+#### Scenario: Explicit OpenSpec request activates the lifecycle
+
+- **WHEN** a developer asks to use OpenSpec, requests the OpenSpec lifecycle, invokes an `/opsx:*` command, or names an active OpenSpec change to continue
+- **THEN** the agent SHALL apply the OpenSpec lifecycle requirements in this specification
+
 ### Requirement: Roadmap Change Backlog Is Scoped To Product/Architecture Work
 
-`docs/roadmap.md`'s Change Backlog SHALL track only changes within the product/architecture scope of the 8-phase DDD roadmap. Changes whose own subject is this repository's development workflow or OpenSpec process itself (as opposed to product/architecture behavior) SHALL NOT receive a `docs/roadmap.md` Change Backlog row, at any stage — this is a categorical scope boundary, not a per-change exception requiring justification. For changes that are in scope, `docs/roadmap.md` SHALL be edited only at two points: when a row is added or re-scoped (a planning decision), and when a row is marked `archived` (a completion signal). No other status transition (including an intermediate "proposed" state) SHALL require a `docs/roadmap.md` edit; in-flight status for any change that has an `openspec/changes/<name>/` folder is available via `openspec list`.
+For a change that has explicitly opted into OpenSpec, `docs/roadmap.md`'s Change Backlog SHALL track only changes within the product/architecture scope of the 8-phase DDD roadmap. OpenSpec changes whose own subject is this repository's development workflow or OpenSpec process itself (as opposed to product/architecture behavior) SHALL NOT receive a `docs/roadmap.md` Change Backlog row, at any stage. For an opted-in change that is in scope, `docs/roadmap.md` SHALL be edited only when a row is added or re-scoped and when the row is marked `archived`. Direct work that has not opted into OpenSpec SHALL NOT be required to create, update, or consult a Change Backlog row.
 
-#### Scenario: A workflow/process-only change is proposed without a roadmap row
+#### Scenario: A direct change has no roadmap obligation
 
-- **WHEN** a change's own subject is this repository's development workflow, OpenSpec process, or agent tooling rather than product/architecture behavior
-- **THEN** it is proposed and implemented via the normal OpenSpec flow without ever gaining a `docs/roadmap.md` Change Backlog row
+- **WHEN** a developer implements a product or architecture change without opting into OpenSpec
+- **THEN** no `docs/roadmap.md` Change Backlog edit or lookup is required
 
-#### Scenario: A product/architecture change is added to the backlog as a planning decision
+#### Scenario: An opted-in workflow/process-only change has no roadmap row
 
-- **WHEN** new product/architecture-scope work is decided and scoped
-- **THEN** a row for it is added to `docs/roadmap.md`'s Change Backlog with status `not-started`, as the one required pre-proposal touch to the document
+- **WHEN** an explicitly opted-in change concerns the repository development workflow, OpenSpec process, or agent tooling rather than product/architecture behavior
+- **THEN** it proceeds through the selected OpenSpec lifecycle without a `docs/roadmap.md` Change Backlog row
+
+#### Scenario: An opted-in product/architecture change is added to the backlog
+
+- **WHEN** a developer opts into OpenSpec for new product/architecture-scope work and scopes that work
+- **THEN** a row for it is added to `docs/roadmap.md`'s Change Backlog with status `not-started`
 
 #### Scenario: No mid-flight status-flip PR is required
 
-- **WHEN** a product/architecture-scope change with an existing `docs/roadmap.md` row is proposed and its `openspec/changes/<name>/` folder is created
-- **THEN** no separate PR is required to flip that row's status in `docs/roadmap.md`; `openspec list --json` reflects the change's in-progress status from the folder's presence
+- **WHEN** an opted-in product/architecture-scope change with an existing `docs/roadmap.md` row is proposed and its `openspec/changes/<name>/` folder is created
+- **THEN** no separate PR is required to flip that row's status; `openspec list --json` reflects the in-progress status from the folder's presence
 
-#### Scenario: A row reaching archived is the completion signal
+#### Scenario: An opted-in row reaching archived is the completion signal
 
-- **WHEN** a product/architecture-scope change with an existing `docs/roadmap.md` row completes and is archived
-- **THEN** its row is flipped to `archived` with links to the archive folder and promoted spec(s), as the one required post-completion touch to the document
+- **WHEN** an opted-in product/architecture-scope change with an existing `docs/roadmap.md` row completes and is archived
+- **THEN** its row is flipped to `archived` with links to the archive folder and promoted spec(s)
 
 ### Requirement: One Change Equals One Coherent Spec Delta
 
-A single OpenSpec change SHALL correspond to exactly one coherent spec delta. If implementing a change reveals a second, distinct spec-level concern, or a design decision not already captured in that change's `design.md`, the change SHALL NOT be expanded in flight to absorb it — a new Change Backlog row (for product/architecture-scope work) or a new change proposal (for workflow-scope work) SHALL be created instead. `implement-identity-authentication-from-scratch` is the illustrative precedent this requirement generalizes from: the ownership/access-control concern (`video-processing-access` spec) was only discovered while archiving, and a design decision about unconfigured startup behavior shipped without ever being written into `design.md` up front — it should have been closer to five smaller changes.
+Within an explicitly opted-in OpenSpec change, a single change SHALL correspond to exactly one coherent spec delta. If implementing that OpenSpec change reveals a second distinct spec-level concern, or a design decision not captured in its `design.md`, the change SHALL NOT be expanded in flight to absorb it; a separate OpenSpec change SHALL be proposed for that concern. This requirement SHALL NOT impose an OpenSpec change on direct work that has not opted in.
 
-#### Scenario: A second spec concern is discovered mid-implementation
+#### Scenario: A second concern is discovered in an opted-in change
 
-- **WHEN** implementing a change surfaces a distinct spec-level concern not covered by that change's own delta spec
-- **THEN** the in-flight change is not expanded to cover it; a separate change is proposed for that concern instead
+- **WHEN** implementing an explicitly opted-in OpenSpec change surfaces a distinct spec-level concern not covered by that change's delta spec
+- **THEN** the in-flight change is not expanded to cover it and a separate OpenSpec change is proposed for that concern
 
-#### Scenario: An undocumented design decision is discovered mid-implementation
+#### Scenario: An undocumented design decision is discovered in an opted-in change
 
-- **WHEN** implementing a change requires a design decision that was never written into that change's `design.md`
-- **THEN** the in-flight change is not expanded to absorb it either; a new change is proposed to make and document that decision, exactly as the second-spec-concern scenario above requires
+- **WHEN** implementing an explicitly opted-in OpenSpec change requires a design decision that was not captured in that change's `design.md`
+- **THEN** the in-flight change is not expanded to absorb it and a separate OpenSpec change is proposed to make and document that decision
+
+#### Scenario: Direct work is not converted into an OpenSpec change
+
+- **WHEN** direct work reveals a distinct concern and the developer has not opted into OpenSpec
+- **THEN** this requirement does not require the agent to create an OpenSpec change
 
 ### Requirement: Explore Precedes Propose For Complex Or Ambiguous Changes
 
-Among changes that are not exempt from the OpenSpec flow under the existing trivial-edit criteria (typo fixes, comment tweaks, dependency bumps), those that are complex or ambiguous SHALL go through `/opsx:explore` before `/opsx:propose`. A change qualifies as complex or ambiguous under the same criteria this project already uses to decide whether a change needs a `design.md`: cross-cutting impact across multiple modules/services, a new architectural pattern or external dependency, security/performance/migration complexity, or open design decisions not already settled by the change's own scoping description — a `docs/roadmap.md` Change Backlog row's description for product/architecture-scope work, or the idea's own stated scope for a workflow/process-only change that has no such row. Changes that are simple and already unambiguously scoped by that description MAY go straight to `/opsx:propose` without an explore step. This is a judgment call made when picking up the work, not a mechanically checked gate — when genuinely unsure, `/opsx:explore` SHALL be run.
+Within an explicitly opted-in OpenSpec lifecycle, a complex or ambiguous change SHALL go through `/opsx:explore` before `/opsx:propose`. Complexity or ambiguity includes cross-cutting impact, a new architectural pattern or external dependency, security/performance/migration complexity, or open design decisions not settled by the stated scope. An explicitly opted-in change that is simple and already unambiguously scoped MAY proceed directly to `/opsx:propose`. This requirement SHALL NOT cause an agent to select OpenSpec for direct work.
 
-#### Scenario: A complex or ambiguous change is proposed
+#### Scenario: An opted-in complex change is explored
 
-- **WHEN** the next `not-started` row picked from `docs/roadmap.md`'s Change Backlog involves cross-cutting impact, a new architectural pattern or external dependency, security/performance/migration complexity, or design questions the row description doesn't already settle
-- **THEN** `/opsx:explore` is run on it before `/opsx:propose`
+- **WHEN** an explicitly opted-in OpenSpec change involves cross-cutting impact, a new architectural pattern or external dependency, security/performance/migration complexity, or unresolved design questions
+- **THEN** `/opsx:explore` is run before `/opsx:propose`
 
-#### Scenario: A simple, already-scoped change skips straight to propose
+#### Scenario: An opted-in simple change skips explore
 
-- **WHEN** the next `not-started` row picked from `docs/roadmap.md`'s Change Backlog is narrowly scoped to a single file or config change with no open design questions (e.g. fixing one stale documentation link, adding one already-fully-specified service to `docker-compose.yml`)
-- **THEN** `/opsx:propose` may be run directly, without an `/opsx:explore` step
+- **WHEN** an explicitly opted-in OpenSpec change is narrowly and unambiguously scoped
+- **THEN** `/opsx:propose` may run without `/opsx:explore`
 
-#### Scenario: A trivial edit remains exempt from the whole flow, explore included
+#### Scenario: A direct complex change does not imply OpenSpec
 
-- **WHEN** a change qualifies for the existing trivial-edit exemption from the full OpenSpec flow (typo fix, comment tweak, dependency bump)
-- **THEN** it never reaches `/opsx:propose` or `/opsx:explore` at all — this requirement only applies to changes that already go through OpenSpec
-
-#### Scenario: A workflow/process-only change with no backlog row is still evaluated for explore
-
-- **WHEN** a workflow/process-only change with no `docs/roadmap.md` Change Backlog row (per "Roadmap Change Backlog Is Scoped To Product/Architecture Work" above) is complex or ambiguous by the same criteria — cross-cutting impact, a new architectural pattern or external dependency, security/performance/migration complexity, or open design questions its own stated scope doesn't already settle
-- **THEN** `/opsx:explore` is run on it before `/opsx:propose`, exactly as it would be for a backlog row — the absence of a row does not exempt it from this requirement
+- **WHEN** a developer asks for a complex direct implementation without selecting OpenSpec
+- **THEN** the agent does not activate OpenSpec solely because of its complexity
 
 ### Requirement: Propose PR Contains Only Change Artifacts and Must Merge Before Implementation
 
-A propose PR for a change SHALL contain only the artifacts belonging to that change under `openspec/changes/<name>/` (`proposal.md`, `design.md`, `tasks.md`, and any delta specs under `openspec/changes/<name>/specs/`). It SHALL NOT contain application code, test files, CI configuration, `CLAUDE.md`, `AGENTS.md`, README files, or modifications to canonical specs under `openspec/specs/`. The propose PR SHALL be merged before implementation work on the change begins.
+For an explicitly opted-in OpenSpec change, its propose PR SHALL contain only the artifacts belonging to that change under `openspec/changes/<name>/` (`proposal.md`, `design.md`, `tasks.md`, and any delta specs under `openspec/changes/<name>/specs/`). It SHALL NOT contain application code, test files, CI configuration, `CLAUDE.md`, `AGENTS.md`, README files, or modifications to canonical specs under `openspec/specs/`. That propose PR SHALL be merged before implementation work on the opted-in change begins. This requirement does not apply to direct work that has not opted into OpenSpec.
 
-#### Scenario: Propose PR with change artifacts only is valid
+#### Scenario: An opted-in propose PR is isolated
 
-- **WHEN** a PR modifies only files under `openspec/changes/<name>/`
-- **THEN** it is a valid propose PR for that change
+- **WHEN** a PR for an explicitly opted-in OpenSpec proposal modifies only files under `openspec/changes/<name>/`
+- **THEN** it is a valid propose PR
 
-#### Scenario: Propose PR containing application code is invalid
+#### Scenario: An opted-in propose PR containing implementation is invalid
 
-- **WHEN** a PR contains both change artifacts and application code or test files
-- **THEN** it is NOT a valid propose PR and SHALL be split before implementation proceeds
+- **WHEN** a PR for an explicitly opted-in OpenSpec change contains both proposal artifacts and application code or tests
+- **THEN** it is not a valid propose PR and SHALL be split before implementation proceeds
 
-#### Scenario: Implementation does not start before the propose PR merges
+#### Scenario: Opted-in implementation waits for the propose PR merge
 
-- **WHEN** a propose PR for a change has been opened but not merged
-- **THEN** no implementation work for that change SHALL begin
+- **WHEN** the propose PR for an explicitly opted-in OpenSpec change is open but not merged
+- **THEN** no implementation work for that change begins
+
+#### Scenario: Direct work may begin without a propose PR
+
+- **WHEN** a developer implements work without opting into OpenSpec
+- **THEN** this requirement does not require a propose PR before implementation
 
 ### Requirement: Implementation PR Contains Only the Change's Declared Scope
 
-An implementation PR SHALL contain only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It SHALL NOT contain task checkoffs or other modifications to `tasks.md`, README or documentation files, `CLAUDE.md` or `AGENTS.md`, configuration or CI files unrelated to the change's declared scope, spec files, or any other file under `openspec/`.
+For an explicitly opted-in OpenSpec change, its implementation PR SHALL contain only the files that implement the change's declared proposal scope. It SHALL NOT contain task checkoffs, documentation, `CLAUDE.md`, `AGENTS.md`, or files under `openspec/`; those belong in the opted-in change's finalization PR. This requirement does not impose PR role separation on work that has not opted into OpenSpec.
 
-#### Scenario: Implementation PR with only source and test changes is valid
+#### Scenario: An opted-in implementation PR is scoped
 
-- **WHEN** a PR modifies only application source files and test files
+- **WHEN** an implementation PR belongs to an explicitly opted-in OpenSpec change
+- **THEN** it contains only the files in that change's declared implementation scope
+
+#### Scenario: An opted-in source-and-test implementation PR is valid
+
+- **WHEN** an opted-in feature or behavior change's implementation PR modifies only its declared application source and test files
 - **THEN** it is a valid implementation PR
 
-#### Scenario: Implementation PR scoped to configuration or infrastructure is valid
+#### Scenario: An opted-in configuration implementation PR is valid
 
-- **WHEN** a change's own declared subject is configuration, infrastructure, or CI, and its implementation PR modifies only the specific configuration/CI/infrastructure files named in that change's proposal
+- **WHEN** an opted-in configuration, infrastructure, or CI change's implementation PR modifies only the specific files declared by its proposal
 - **THEN** it is a valid implementation PR
 
-#### Scenario: Implementation PR containing task checkoffs is invalid
+#### Scenario: Task checkoffs are excluded from opted-in implementation
 
-- **WHEN** a PR contains application/configuration code and also modifies `tasks.md` to check off completed items
-- **THEN** it is NOT a valid implementation PR; task checkoffs SHALL be deferred to the finalization PR
+- **WHEN** an opted-in implementation PR also modifies `tasks.md` to check off completed work
+- **THEN** it is invalid and the checkoffs SHALL be deferred to finalization
 
-#### Scenario: Implementation PR containing project guidance is invalid
+#### Scenario: Permanent guidance is excluded from opted-in implementation
 
-- **WHEN** a PR contains application/configuration code and also modifies `CLAUDE.md`, `AGENTS.md`, README, or docs
-- **THEN** it is NOT a valid implementation PR; those changes SHALL be moved to the finalization PR
+- **WHEN** an opted-in implementation PR also modifies permanent documentation, `CLAUDE.md`, or `AGENTS.md`
+- **THEN** it is invalid and those updates SHALL be deferred to finalization
 
-#### Scenario: Implementation PR containing OpenSpec files is invalid
+#### Scenario: OpenSpec artifacts are excluded from opted-in implementation
 
-- **WHEN** a PR contains application/configuration code and also modifies any file under `openspec/`
-- **THEN** it is NOT a valid implementation PR
+- **WHEN** an opted-in implementation PR also modifies files under `openspec/`
+- **THEN** it is invalid and those updates SHALL be deferred to finalization
+
+#### Scenario: A direct PR is not assigned an OpenSpec role
+
+- **WHEN** a PR is created for work that did not opt into OpenSpec
+- **THEN** this requirement does not classify it as an OpenSpec implementation PR or require a finalization PR
 
 ### Requirement: Finalization PR Bundles Archive, Documentation, and Roadmap Status
 
-After the implementation PR for a change is merged, an agent SHALL use one finalization PR to: mark the change's completed tasks; promote its delta specs into canonical specs; move the complete change folder from `openspec/changes/<name>/` to `openspec/changes/archive/<date>-<name>/`; update any permanent documentation or agent instructions (`README.md`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that need to reflect the shipped change; and, if the change has a `docs/roadmap.md` Change Backlog row, flip that row to `archived` with links to the archive folder and promoted spec(s). These SHALL NOT be split across separate docs/archive/roadmap PRs. This finalization PR SHALL contain no application code or tests.
+After the implementation PR for an explicitly opted-in OpenSpec change is merged, an agent SHALL use one finalization PR to mark completed tasks, promote delta specs, archive the change folder, update permanent documentation or agent instructions that reflect the shipped change, and update the roadmap row when the opted-in change has one. This finalization PR SHALL contain no application code or tests. This requirement does not require finalization work for direct changes that did not opt into OpenSpec.
 
-#### Scenario: Finalization PR after implementation contains all closure operations together
+#### Scenario: An opted-in change is finalized together
 
-- **WHEN** the implementation PR is merged and a subsequent PR marks tasks complete, updates canonical specs from the delta, moves the change folder to archive, updates permanent documentation, and flips the roadmap backlog status (if the change has a row)
-- **THEN** it is a valid finalization PR
+- **WHEN** the implementation PR for an explicitly opted-in OpenSpec change is merged
+- **THEN** its archive, task checkoffs, required documentation, and applicable roadmap update are delivered together in one finalization PR
 
-#### Scenario: Finalization PR before implementation merges is premature
+#### Scenario: Opted-in finalization before implementation merges is premature
 
-- **WHEN** a PR checks off tasks or archives a change whose implementation PR has not merged
-- **THEN** that PR SHALL NOT be merged
+- **WHEN** a PR checks off tasks or archives an opted-in OpenSpec change whose implementation PR has not merged
+- **THEN** that finalization PR SHALL NOT be merged
 
-#### Scenario: Finalization PR containing application code is invalid
+#### Scenario: Opted-in finalization containing application code is invalid
 
-- **WHEN** a finalization PR modifies application source or test files
-- **THEN** it is NOT a valid finalization PR and the code changes SHALL be removed
+- **WHEN** an opted-in OpenSpec finalization PR modifies application source or tests
+- **THEN** it is invalid and those implementation changes SHALL be removed
 
-#### Scenario: Documentation is not silently bundled into implementation
+#### Scenario: Documentation is not bundled into opted-in implementation
 
-- **WHEN** permanent documentation, agent instructions, or configuration must change as a consequence of implementation
-- **THEN** those files SHALL be delivered in the finalization PR, never bundled with the application code (implementation) PR
+- **WHEN** permanent documentation or agent instructions must change as a consequence of an opted-in implementation
+- **THEN** those files SHALL be delivered in finalization, not in the implementation PR
 
-#### Scenario: A workflow/process-only change has no roadmap row to flip
+#### Scenario: An opted-in workflow change has no roadmap row to flip
 
-- **WHEN** the finalization PR is for a workflow/process-only change that never received a `docs/roadmap.md` Change Backlog row
-- **THEN** the finalization PR proceeds without a roadmap-status edit — its absence is expected, not an omission
+- **WHEN** finalizing an opted-in workflow/process-only change that has no Change Backlog row
+- **THEN** finalization proceeds without a roadmap edit
+
+#### Scenario: A direct PR has no OpenSpec finalization requirement
+
+- **WHEN** a PR delivers work that did not opt into OpenSpec
+- **THEN** no OpenSpec archive or finalization PR is required
 
 ### Requirement: Merge Requires Explicit User Authorization
 
@@ -340,28 +379,49 @@ An agent SHALL NOT merge any pull request, or take any action that causes a pull
 - **THEN** the agent SHALL wait for a separate explicit instruction before merging each subsequent PR
 
 ### Requirement: Claude Code Workflow Guidance Is Delivered Via An Auto-Triggered Skill
-Claude Code agents SHALL receive the compact, actionable version of this repo's PR-sequence, branch-protection, quality-gate, commit-convention, and merge-authorization rules through a dedicated skill under `.claude/skills/`, rather than through full prose duplicated in always-loaded project instructions (`CLAUDE.md`). The skill's trigger description SHALL cover, at minimum: opening or merging a pull request; marking any task, change, or OpenSpec change complete; writing a commit message; running or reporting quality gates (`go vet`, `go test`, `gosec`, `govulncheck`); and checking PR review comments before reporting a PR-related task done. The skill's trigger description SHALL also state explicit conditions under which it does not need to engage: read-only questions, pure exploration, and trivial single-file edits with no PR involved.
 
-#### Scenario: Skill trigger covers all required quality gates
-- **WHEN** an agent is asked to run or report the results of `go test`, `go vet`, `gosec`, or `govulncheck`
-- **THEN** the skill's trigger description matches the request for each of those four gates
+Claude Code agents SHALL receive pull-request quality guidance through a dedicated skill under `.claude/skills/`, rather than through full prose duplicated in always-loaded project instructions. The skill SHALL activate when a developer asks to open, update, hand off, or merge a pull request, and when the agent creates a pull request itself. It SHALL cover applicable local tests, required CI checks, review comments, branch freshness, commit conventions, and explicit merge authorization. It SHALL NOT activate OpenSpec or require an OpenSpec lifecycle.
 
-#### Scenario: Skill does not engage for a trivial, PR-less edit
-- **WHEN** a single-file typo or comment edit is requested with no pull request involved
-- **THEN** the skill's trigger description explicitly does not require engaging
+#### Scenario: Agent-created PR activates quality workflow
 
-#### Scenario: CLAUDE.md does not restate the full ruleset
+- **WHEN** an agent creates a pull request as part of completing work
+- **THEN** the pull-request quality skill is applied before the PR is handed off
+
+#### Scenario: PR request activates quality workflow
+
+- **WHEN** a developer asks to open, update, hand off, or merge a pull request
+- **THEN** the pull-request quality skill is applied
+
+#### Scenario: Direct implementation does not activate OpenSpec
+
+- **WHEN** a developer requests direct implementation without a PR action or explicit OpenSpec request
+- **THEN** the pull-request quality skill does not activate an OpenSpec lifecycle
+
+#### Scenario: Always-loaded guidance stays concise
+
 - **WHEN** `CLAUDE.md` is loaded into a conversation
-- **THEN** it contains project/app context and short pointers, not the full PR-sequence/quality-gate/commit-convention prose
+- **THEN** it contains project context, universal quality requirements, and pointers rather than the full PR workflow prose
 
 ### Requirement: Roadmap-Item Lifecycle Sequencing Is Encoded As A Skill
-The sequence for taking a `docs/roadmap.md` Change Backlog item (or any comparable non-trivial change) from idea to shipped — evaluate whether `/opsx:explore` is warranted, discuss, `/opsx:propose`, wait for the propose PR to merge before implementation begins, `/opsx:apply`, verify CI status and PR review comments before reporting any task or the change done, then `/opsx:archive`/finalize — SHALL be encoded in a dedicated skill, distinct from the per-step vendored OpenSpec skills, so an agent or user can invoke the end-to-end sequence directly rather than relying on prose scattered across multiple documents.
 
-#### Scenario: Lifecycle skill defers done-verification to the workflow skill
-- **WHEN** the lifecycle skill reaches a point where a task or PR must be verified done
-- **THEN** it invokes the same done-verification checklist used elsewhere, rather than restating it
+The full OpenSpec lifecycle SHALL be encoded in a dedicated skill distinct from the per-step vendored OpenSpec skills. That lifecycle skill SHALL activate only when a developer explicitly requests OpenSpec, invokes an `/opsx:*` command, or explicitly continues a named active OpenSpec change. Once activated, it SHALL sequence explore when warranted, propose, propose-PR merge, apply, and archive/finalization. It SHALL not activate from a generic task, backlog lookup, implementation request, or perceived change complexity.
 
-#### Scenario: Implementation does not start before the propose PR merges
-- **WHEN** the lifecycle skill is guiding a change whose propose PR is open but not yet merged
+#### Scenario: Explicit lifecycle request activates the skill
+
+- **WHEN** a developer explicitly asks to implement work through the full OpenSpec lifecycle
+- **THEN** the lifecycle skill guides the change through its OpenSpec steps
+
+#### Scenario: Generic task lookup does not activate the skill
+
+- **WHEN** a developer asks which task is next or asks to implement a task without selecting OpenSpec
+- **THEN** the lifecycle skill does not activate
+
+#### Scenario: Opted-in implementation waits for its propose PR
+
+- **WHEN** the lifecycle skill is guiding an explicitly opted-in change whose propose PR is open but not merged
 - **THEN** it does not proceed to `/opsx:apply`
 
+#### Scenario: Lifecycle PR actions use the PR quality skill
+
+- **WHEN** the opted-in lifecycle opens, updates, hands off, or merges a PR
+- **THEN** it invokes the same `repo-workflow` quality and merge requirements used by direct-work PRs

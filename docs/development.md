@@ -154,30 +154,28 @@ Use `!` after the type (e.g. `feat!:`) or a `BREAKING CHANGE:` footer for breaki
 
 Versioning is **not** manual — nobody runs `git tag` by hand. On every push to `main`, `release-please` (`.github/workflows/release-please.yml`) maintains a single up-to-date "Release PR" aggregating unreleased Conventional Commits, showing the computed next version and changelog. Merging that PR is what actually cuts a release: it creates the git tag, publishes a GitHub Release with generated notes, and updates `CHANGELOG.md`. Until it's merged, nothing is tagged or released. Config: `release-please-config.json` (`release-type: simple` — this app has no package-manager manifest to version-bump) and `.release-please-manifest.json` (tracks the current released version per path).
 
-### OpenSpec Workflow
+### Optional OpenSpec Workflow
 
-Non-trivial changes (new features, behavior changes, bug fixes with real design decisions, refactors, infra/workflow/CI changes) follow the spec-driven process:
+OpenSpec is an optional, explicitly selected methodology. A direct implementation request does not activate it, regardless of change size or complexity. The OpenSpec lifecycle begins only when a developer asks to use OpenSpec, invokes an `/opsx:*` command, or explicitly continues a named active OpenSpec change.
 
-1. **Explore (when warranted):** `/opsx:explore` → for changes that are complex or ambiguous (cross-cutting impact, a new architectural pattern/dependency, security/performance/migration complexity, or open design questions), before proposing. A simple, already-scoped change may skip straight to propose.
-2. **Propose:** `/opsx:propose` → creates `openspec/changes/<name>/proposal.md`, `design.md`, `tasks.md`
-3. **Implement:** `/opsx:apply` → work through `tasks.md`
-4. **Archive:** `/opsx:archive` → folds the change into `openspec/specs/`
+Once selected, the full lifecycle applies:
 
-Skip this flow only for trivial, obviously-scoped edits (typo fixes, comment tweaks, dependency bumps). This is a separate question from the test-run requirement above: a dependency bump can still skip OpenSpec/the 3-PR split, but if it's reported as a completed change it still needs a passing local test run first. When in doubt about whether something is trivial, don't skip the flow.
+1. **Explore (when warranted):** `/opsx:explore` for complex or ambiguous opted-in changes.
+2. **Propose:** `/opsx:propose` creates the change artifacts.
+3. **Implement:** after the proposal PR merges, `/opsx:apply` works through `tasks.md`.
+4. **Archive:** after implementation merges and strict validation passes, `/opsx:archive` promotes the specs and archives the change.
 
-For Claude Code specifically, the `change-lifecycle` skill (`.claude/skills/change-lifecycle/SKILL.md`) encodes this sequence and its gates (wait for the propose PR to merge before implementing, verify done-ness before reporting a task complete, do finalization work before running archive) so it can be invoked directly instead of re-deriving it each time; `repo-workflow` (`.claude/skills/repo-workflow/SKILL.md`) carries the compact version of everything else in this "Contribution Conventions" section.
+The `change-lifecycle` skill encodes this optional sequence. It does not activate for task lookup, backlog lookup, direct implementation, or perceived complexity. The `repo-workflow` skill is separate and applies to every requested or agent-created PR without selecting OpenSpec.
 
-### PR Separation Rule
+### OpenSpec PR Separation Rule
 
-Non-trivial changes use three PR roles, in this order:
+Only changes that explicitly opt into OpenSpec use three PR roles:
 
-1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; no application code, tests, docs, agent instructions, configuration, CI, or canonical specs. This PR must merge before implementation begins.
-2. **Implementation PR** — only the files that implement the change's declared proposal scope: application source and test files for a feature/behavior change, or the specific configuration/CI/infrastructure files named in the proposal for a change whose own subject is configuration, infrastructure, or CI. It must not modify `tasks.md`, `README`, `docs/`, `CLAUDE.md`, `AGENTS.md`, configuration or CI files unrelated to that scope, or any file under `openspec/`.
-3. **Finalization PR** — after implementation merges, one PR bundling *all* of: marking the completed tasks, promoting the delta into `openspec/specs/`, moving the change folder into `openspec/changes/archive/`, updating any permanent documentation (`README`, `docs/`, `CLAUDE.md`, `AGENTS.md`) that needs to reflect the shipped change, and, if the change has a `docs/roadmap.md` Change Backlog row (only product/architecture-scope changes do — see `docs/roadmap.md`), flipping it to `archived`. Do not split these into separate docs/archive/roadmap PRs. It must not contain application source or tests.
+1. **Propose PR** — only the new `openspec/changes/<name>/` artifacts; it must merge before implementation begins.
+2. **Implementation PR** — only files in the proposal's declared implementation scope; no task checkoffs, permanent documentation, agent instructions, or files under `openspec/`.
+3. **Finalization PR** — after implementation merges, bundles task checkoffs, promoted canonical specs, archive movement, required permanent documentation/agent instructions, and an applicable roadmap update. It contains no application source or tests.
 
-`tasks.md` checkoffs belong in the finalization PR, not in the implementation PR. Note that the vendored `openspec-apply-change` skill checks off tasks immediately as it completes them — when applying implementation-scoped tasks, keep those checkoff edits out of the implementation PR's commit and re-apply them during finalization instead.
-
-Green CI does not authorize a merge. An agent may merge only when the user explicitly authorizes that specific PR in the current session; authorization for one PR does not extend to later PRs.
+Direct work and its PRs are not assigned OpenSpec roles and do not require proposal or finalization PRs. Green CI never authorizes a merge; each PR still requires explicit authorization for that specific PR in the current session.
 
 ### Branch Protection
 
@@ -190,7 +188,7 @@ git push -u origin feat/short-description
 gh pr create --fill
 ```
 
-Branch from freshly-fetched `origin/main` rather than from whatever is currently checked out. Changes here land as PR sequences, so the working tree is frequently on an earlier branch of the same sequence or on an unrelated open PR; branching from there carries those commits into the new PR's diff and breaks its declared file scope.
+Branch from freshly-fetched `origin/main` rather than from whatever is currently checked out. Branching from stale or unrelated work can carry unrelated commits into the new PR's diff.
 
 ### PR Review Comments
 

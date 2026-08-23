@@ -54,6 +54,11 @@ Within an explicitly opted-in OpenSpec change, a single change SHALL correspond 
 - **WHEN** implementing an explicitly opted-in OpenSpec change surfaces a distinct spec-level concern not covered by that change's delta spec
 - **THEN** the in-flight change is not expanded to cover it and a separate OpenSpec change is proposed for that concern
 
+#### Scenario: An undocumented design decision is discovered in an opted-in change
+
+- **WHEN** implementing an explicitly opted-in OpenSpec change requires a design decision that was not captured in that change's `design.md`
+- **THEN** the in-flight change is not expanded to absorb it and a separate OpenSpec change is proposed to make and document that decision
+
 #### Scenario: Direct work is not converted into an OpenSpec change
 
 - **WHEN** direct work reveals a distinct concern and the developer has not opted into OpenSpec
@@ -87,6 +92,16 @@ For an explicitly opted-in OpenSpec change, its propose PR SHALL contain only th
 - **WHEN** a PR for an explicitly opted-in OpenSpec proposal modifies only files under `openspec/changes/<name>/`
 - **THEN** it is a valid propose PR
 
+#### Scenario: An opted-in propose PR containing implementation is invalid
+
+- **WHEN** a PR for an explicitly opted-in OpenSpec change contains both proposal artifacts and application code or tests
+- **THEN** it is not a valid propose PR and SHALL be split before implementation proceeds
+
+#### Scenario: Opted-in implementation waits for the propose PR merge
+
+- **WHEN** the propose PR for an explicitly opted-in OpenSpec change is open but not merged
+- **THEN** no implementation work for that change begins
+
 #### Scenario: Direct work may begin without a propose PR
 
 - **WHEN** a developer implements work without opting into OpenSpec
@@ -101,6 +116,31 @@ For an explicitly opted-in OpenSpec change, its implementation PR SHALL contain 
 - **WHEN** an implementation PR belongs to an explicitly opted-in OpenSpec change
 - **THEN** it contains only the files in that change's declared implementation scope
 
+#### Scenario: An opted-in source-and-test implementation PR is valid
+
+- **WHEN** an opted-in feature or behavior change's implementation PR modifies only its declared application source and test files
+- **THEN** it is a valid implementation PR
+
+#### Scenario: An opted-in configuration implementation PR is valid
+
+- **WHEN** an opted-in configuration, infrastructure, or CI change's implementation PR modifies only the specific files declared by its proposal
+- **THEN** it is a valid implementation PR
+
+#### Scenario: Task checkoffs are excluded from opted-in implementation
+
+- **WHEN** an opted-in implementation PR also modifies `tasks.md` to check off completed work
+- **THEN** it is invalid and the checkoffs SHALL be deferred to finalization
+
+#### Scenario: Permanent guidance is excluded from opted-in implementation
+
+- **WHEN** an opted-in implementation PR also modifies permanent documentation, `CLAUDE.md`, or `AGENTS.md`
+- **THEN** it is invalid and those updates SHALL be deferred to finalization
+
+#### Scenario: OpenSpec artifacts are excluded from opted-in implementation
+
+- **WHEN** an opted-in implementation PR also modifies files under `openspec/`
+- **THEN** it is invalid and those updates SHALL be deferred to finalization
+
 #### Scenario: A direct PR is not assigned an OpenSpec role
 
 - **WHEN** a PR is created for work that did not opt into OpenSpec
@@ -114,6 +154,26 @@ After the implementation PR for an explicitly opted-in OpenSpec change is merged
 
 - **WHEN** the implementation PR for an explicitly opted-in OpenSpec change is merged
 - **THEN** its archive, task checkoffs, required documentation, and applicable roadmap update are delivered together in one finalization PR
+
+#### Scenario: Opted-in finalization before implementation merges is premature
+
+- **WHEN** a PR checks off tasks or archives an opted-in OpenSpec change whose implementation PR has not merged
+- **THEN** that finalization PR SHALL NOT be merged
+
+#### Scenario: Opted-in finalization containing application code is invalid
+
+- **WHEN** an opted-in OpenSpec finalization PR modifies application source or tests
+- **THEN** it is invalid and those implementation changes SHALL be removed
+
+#### Scenario: Documentation is not bundled into opted-in implementation
+
+- **WHEN** permanent documentation or agent instructions must change as a consequence of an opted-in implementation
+- **THEN** those files SHALL be delivered in finalization, not in the implementation PR
+
+#### Scenario: An opted-in workflow change has no roadmap row to flip
+
+- **WHEN** finalizing an opted-in workflow/process-only change that has no Change Backlog row
+- **THEN** finalization proceeds without a roadmap edit
 
 #### Scenario: A direct PR has no OpenSpec finalization requirement
 
@@ -139,6 +199,11 @@ Claude Code agents SHALL receive pull-request quality guidance through a dedicat
 - **WHEN** a developer requests direct implementation without a PR action or explicit OpenSpec request
 - **THEN** the pull-request quality skill does not activate an OpenSpec lifecycle
 
+#### Scenario: Always-loaded guidance stays concise
+
+- **WHEN** `CLAUDE.md` is loaded into a conversation
+- **THEN** it contains project context, universal quality requirements, and pointers rather than the full PR workflow prose
+
 ### Requirement: Roadmap-Item Lifecycle Sequencing Is Encoded As A Skill
 
 The full OpenSpec lifecycle SHALL be encoded in a dedicated skill distinct from the per-step vendored OpenSpec skills. That lifecycle skill SHALL activate only when a developer explicitly requests OpenSpec, invokes an `/opsx:*` command, or explicitly continues a named active OpenSpec change. Once activated, it SHALL sequence explore when warranted, propose, propose-PR merge, apply, and archive/finalization. It SHALL not activate from a generic task, backlog lookup, implementation request, or perceived change complexity.
@@ -157,3 +222,8 @@ The full OpenSpec lifecycle SHALL be encoded in a dedicated skill distinct from 
 
 - **WHEN** the lifecycle skill is guiding an explicitly opted-in change whose propose PR is open but not merged
 - **THEN** it does not proceed to `/opsx:apply`
+
+#### Scenario: Lifecycle PR actions use the PR quality skill
+
+- **WHEN** the opted-in lifecycle opens, updates, hands off, or merges a PR
+- **THEN** it invokes the same `repo-workflow` quality and merge requirements used by direct-work PRs
