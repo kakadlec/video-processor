@@ -78,11 +78,17 @@ Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. 
 - **WHEN** `Open` is called with it
 - **THEN** it returns a non-nil client and no error — the unreachability only surfaces on a subsequent operation
 
-#### Scenario: Open reports a malformed endpoint
+#### Scenario: Open reports an endpoint the client constructor rejects
 
-- **GIVEN** a `Config` whose endpoint is not a valid `host:port` value
+- **GIVEN** a `Config` whose endpoint the underlying client constructor rejects — for example one carrying a path (`host:port/path`) or an invalid character in the host
 - **WHEN** `Open` is called with it
 - **THEN** it returns a non-nil error and no usable client
+
+#### Scenario: Endpoint validation is the client library's, not this adapter's
+
+- **GIVEN** a `Config` whose endpoint carries a URL scheme (`http://host:port`) rather than being a bare `host:port` value
+- **WHEN** `Open` is called with it
+- **THEN** it returns a client and no error, because the pinned client tolerates the scheme — this adapter SHALL NOT add endpoint validation of its own, so `Open` is not a guard against a mis-shaped endpoint the library accepts
 
 ### Requirement: Health Check Confirms Connectivity With A Real Round Trip
 
