@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"video-processor/internal/video/application"
@@ -162,7 +163,7 @@ func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T)
 	zipPath := writeTestZip(t)
 	extractor := fakeFrameExtractor{zipPath: zipPath, frameCount: 3, imageNames: []string{"frame_0001.png"}}
 	results := newFakeResultStorage()
-	results.putErr = errors.New("bucket unreachable")
+	results.putErr = errors.New("dial tcp 10.0.0.5:9000: connection refused, bucket \"video-results\"")
 
 	uc := newProcessVideoJobUseCase(repo, extractor, results)
 	result, err := uc.Execute(context.Background(), "job-1", "uploads/video.mp4")
@@ -175,8 +176,14 @@ func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T)
 	if result.StorageKey != "" {
 		t.Fatalf("result.StorageKey = %q, want empty for an unstored result", result.StorageKey)
 	}
-	if result.FailureReason != "bucket unreachable" {
-		t.Fatalf("result.FailureReason = %q, want %q", result.FailureReason, "bucket unreachable")
+	// The reason is persisted on the job and echoed to the uploader, so it
+	// must carry none of the adapter's own error text — that names the
+	// endpoint and bucket.
+	if result.FailureReason == "" {
+		t.Fatal("expected a non-empty FailureReason")
+	}
+	if strings.Contains(result.FailureReason, "9000") || strings.Contains(result.FailureReason, "video-results") {
+		t.Fatalf("result.FailureReason = %q, must not leak the storage endpoint or bucket", result.FailureReason)
 	}
 
 	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
@@ -185,6 +192,9 @@ func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T)
 	}
 	if job.Status() != domain.JobStatusFailed {
 		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusFailed)
+	}
+	if strings.Contains(job.ErrorReason(), "9000") || strings.Contains(job.ErrorReason(), "video-results") {
+		t.Fatalf("job.ErrorReason() = %q, must not leak the storage endpoint or bucket", job.ErrorReason())
 	}
 	if !job.StorageKey().IsZero() {
 		t.Fatalf("job.StorageKey() = %q, want unset", job.StorageKey().String())

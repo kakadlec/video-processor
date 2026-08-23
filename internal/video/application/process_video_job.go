@@ -12,6 +12,12 @@ import (
 // message is empty, since VideoJob.Fail rejects an empty reason.
 const fallbackFailureReason = "video processing failed"
 
+// storeFailureReason is recorded instead of the storage adapter's own error
+// text, which names the object-storage endpoint and bucket. The reason is
+// persisted on the job and echoed to the uploader, so it must carry no
+// infrastructure detail; the underlying error is logged instead.
+const storeFailureReason = "failed to store the extracted result"
+
 // ProcessVideoJobResult describes the outcome of running a VideoJob's
 // enqueue/start/extract sequence. On success the job is left in
 // "processing" status, not "completed" — see ProcessVideoJob's doc comment
@@ -78,7 +84,7 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 
 	zipPath, frameCount, imageNames, extractErr := uc.extractor.ExtractFrames(ctx, id, videoPath)
 	if extractErr != nil {
-		return uc.failWith(jobID, extractErr)
+		return uc.failWith(jobID, extractErr, extractErr.Error())
 	}
 	// Registered before the store attempt, not after it: the Put-error path
 	// below returns, so a defer set up afterwards would never run and the
@@ -91,7 +97,8 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 
 	storageKey := domain.ResultStorageKey(id)
 	if err := uc.results.Put(ctx, storageKey, zipPath); err != nil {
-		return uc.failWith(jobID, err)
+		log.Printf("store result %s for job %s: %v", storageKey.String(), jobID, err)
+		return uc.failWith(jobID, err, storeFailureReason)
 	}
 
 	return ProcessVideoJobResult{
@@ -103,12 +110,13 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 	}, nil
 }
 
-// failWith marks jobID failed for cause and reports it as an unsuccessful
+// failWith marks jobID failed with reason and reports it as an unsuccessful
 // result. It is shared by the extraction and storage failure paths: a
 // result that could not be stored is no more usable than one that could not
-// be extracted.
-func (uc *ProcessVideoJob) failWith(jobID string, cause error) (ProcessVideoJobResult, error) {
-	reason := cause.Error()
+// be extracted. reason is passed separately from cause because the two
+// paths differ in what may be persisted — extraction echoes ffmpeg's own
+// message, as it always has, while storage must not leak endpoint or bucket.
+func (uc *ProcessVideoJob) failWith(jobID string, cause error, reason string) (ProcessVideoJobResult, error) {
 	if reason == "" {
 		reason = fallbackFailureReason
 	}

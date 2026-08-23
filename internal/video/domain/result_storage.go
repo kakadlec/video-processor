@@ -13,6 +13,12 @@ import (
 // "not stored" apart from "storage failed" without importing infrastructure.
 var ErrResultNotFound = errors.New("video: result artifact not found")
 
+// ErrResultStoreFailed marks a failure to store a result artifact, so a
+// caller can classify it without inspecting the underlying client's error
+// text. That text names the endpoint and bucket, which must not reach a
+// user-facing message or a persisted failure reason.
+var ErrResultStoreFailed = errors.New("video: failed to store result artifact")
+
 // ResultStorage is the port through which a VideoJob's result artifact is
 // made durable and read back. The domain depends on this interface;
 // infrastructure supplies the concrete implementation (MinIO).

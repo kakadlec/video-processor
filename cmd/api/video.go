@@ -131,10 +131,12 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	redisClient := platformredis.Open(redisConfig)
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
 
+	// Returned unwrapped, like videostorage.Open's error below: this
+	// package's errors already carry the "video:" prefix.
 	minioConfig, err := videostorage.LoadConfigFromEnv()
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, err
 	}
 	minioClient, err := videostorage.Open(minioConfig)
 	if err != nil {

@@ -37,7 +37,7 @@ func (s *ResultStorage) Put(ctx context.Context, key domain.StorageKey, localPat
 	if _, err := s.client.FPutObject(ctx, s.bucket, key.String(), localPath, minio.PutObjectOptions{
 		ContentType: resultContentType,
 	}); err != nil {
-		return fmt.Errorf("video: store result %q: %w", key.String(), err)
+		return fmt.Errorf("%w: %s: %s", domain.ErrResultStoreFailed, key.String(), err.Error())
 	}
 	return nil
 }
