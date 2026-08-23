@@ -29,6 +29,7 @@ import (
 	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
+	videostorage "video-processor/internal/video/infrastructure/storage"
 )
 
 // Bounds for the wait-and-retry loop handleVideoUpload runs against
@@ -58,21 +59,39 @@ type videoModule struct {
 	getJobStatus    *videoapplication.GetJobStatus
 	listUserJobs    *videoapplication.ListUserJobs
 	processVideoJob *videoapplication.ProcessVideoJob
+	listUserResults *videoapplication.ListUserResults
 	// completeJob and failJob are called directly by handleVideoUpload,
 	// not just composed inside processVideoJob: ProcessVideoJob leaves a
-	// successfully-extracted job in "processing" specifically so the
-	// handler can call completeJob only once output artifact ownership is
-	// durably recorded, or failJob (a still-valid processing -> failed
-	// transition) if that recording fails.
+	// successfully-extracted job in "processing" so the handler owns the
+	// job's terminal state. See ProcessVideoJob's doc comment for why that
+	// split no longer has a failure branch behind it.
 	completeJob *videoapplication.CompleteJob
 	failJob     *videoapplication.FailJob
 	// idempotency backs POST /upload's content-hash duplicate detection —
 	// see internal/video/domain.IdempotencyStore.
 	idempotency videodomain.IdempotencyStore
+	// jobs and results back GET /download/:filename and GET /api/status,
+	// which resolve a storage key to its owning VideoJob and then stream or
+	// stat the stored object.
+	jobs    videodomain.VideoJobRepository
+	results videodomain.ResultStorage
+	idsFor  videodomain.VideoJobIDParser
 }
 
-func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore) *videoModule {
-	return &videoModule{createVideoJob: createVideoJob, getJobStatus: getJobStatus, listUserJobs: listUserJobs, processVideoJob: processVideoJob, completeJob: completeJob, failJob: failJob, idempotency: idempotency}
+func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, listUserResults *videoapplication.ListUserResults, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
+	return &videoModule{
+		createVideoJob:  createVideoJob,
+		getJobStatus:    getJobStatus,
+		listUserJobs:    listUserJobs,
+		processVideoJob: processVideoJob,
+		listUserResults: listUserResults,
+		completeJob:     completeJob,
+		failJob:         failJob,
+		idempotency:     idempotency,
+		jobs:            jobs,
+		results:         results,
+		idsFor:          idsFor,
+	}
 }
 
 // setupVideo builds the production Video Processing module from environment
@@ -112,6 +131,32 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	redisClient := platformredis.Open(redisConfig)
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
 
+	minioConfig, err := videostorage.LoadConfigFromEnv()
+	if err != nil {
+		closeDB(db)
+		return nil, nil, nil, fmt.Errorf("video: %w", err)
+	}
+	minioClient, err := videostorage.Open(minioConfig)
+	if err != nil {
+		closeDB(db)
+		return nil, nil, nil, err
+	}
+	// Fail-closed, deliberately unlike the Redis wiring above: rate
+	// limiting, idempotency, and the status cache all degrade to a slower
+	// but correct system when Redis is down, whereas a bucket that cannot
+	// be written leaves a completed job with nowhere to put its result.
+	// There is nothing to degrade to, so reachability and the bucket are
+	// confirmed here rather than discovered on the first upload.
+	if err := videostorage.Ping(ctx, minioClient, minioConfig.Bucket); err != nil {
+		closeDB(db)
+		return nil, nil, nil, err
+	}
+	if err := videostorage.EnsureBucket(ctx, minioClient, minioConfig.Bucket); err != nil {
+		closeDB(db)
+		return nil, nil, nil, err
+	}
+	resultStorage := videostorage.NewResultStorage(minioClient, minioConfig.Bucket)
+
 	ids := videoidgen.New()
 	// Wrapping once here means every use case below — including
 	// CreateVideoJob — shares the same cache-aside/write-through
@@ -133,17 +178,24 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
+			resultStorage,
 			ids,
 		),
+		videoapplication.NewListUserResults(repo, resultStorage),
 		completeJob,
 		failJob,
 		idempotencyStore,
+		repo,
+		resultStorage,
+		ids,
 	)
 	return module, db, redisClient, nil
 }
 
 func (m *videoModule) registerRoutes(videoRoutes *gin.RouterGroup) {
 	videoRoutes.POST("/upload", m.handleVideoUpload)
+	videoRoutes.GET("/download/:filename", m.handleDownload)
+	videoRoutes.GET("/api/status", m.handleStatus)
 
 	jobs := videoRoutes.Group("/api/video-jobs")
 	jobs.POST("", m.handleCreateVideoJob)
@@ -231,6 +283,117 @@ func videoFilePart(req *http.Request) (*multipart.Part, string, error) {
 // for it, and drives that job through ProcessVideoJob synchronously before
 // responding — the same external contract POST /upload always had, now
 // backed by the VideoJob application layer instead of an inline ffmpeg call.
+// artifactNotFoundMessage is the single body every rejected result read
+// returns. The not-found and not-entitled responses are deliberately
+// indistinguishable: a caller must not be able to tell "no such artifact"
+// apart from "someone else's artifact" by status, body, or headers, or the
+// endpoint becomes a probe for other users' results.
+const artifactNotFoundMessage = "File not found"
+
+func respondArtifactNotFound(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": artifactNotFoundMessage})
+}
+
+// handleDownload streams a completed job's stored result to its owner.
+//
+// Entitlement is decided entirely from the VideoJob row: the requested key
+// must parse to a job id, that job must exist, belong to the caller, be
+// completed, and carry this exact key as its own StorageKey. That last
+// check is what makes parsing the key safe — a forged key either names
+// someone else's job (rejected by the owner check) or no job's recorded
+// result (rejected here).
+func (m *videoModule) handleDownload(c *gin.Context) {
+	userID, ok := authenticatedUserID(c)
+	if !ok {
+		// requireBearerAuth gates this route, so reaching here means the
+		// router was misconfigured rather than that the caller is anonymous.
+		log.Print("download: no authenticated user on a bearer-gated route")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal error"})
+		return
+	}
+
+	key, err := videodomain.NewStorageKey(c.Param("filename"))
+	if err != nil {
+		respondArtifactNotFound(c)
+		return
+	}
+
+	jobID, err := videodomain.VideoJobIDFromStorageKey(key, m.idsFor)
+	if err != nil {
+		respondArtifactNotFound(c)
+		return
+	}
+
+	job, err := m.jobs.FindByID(c.Request.Context(), jobID)
+	if err != nil {
+		if !errors.Is(err, videodomain.ErrVideoJobNotFound) {
+			log.Printf("download: look up job %s: %v", jobID.String(), err)
+		}
+		respondArtifactNotFound(c)
+		return
+	}
+
+	if job.UserID().String() != userID.String() ||
+		job.Status() != videodomain.JobStatusCompleted ||
+		!job.StorageKey().Equal(key) {
+		respondArtifactNotFound(c)
+		return
+	}
+
+	reader, size, err := m.results.Open(c.Request.Context(), key)
+	if err != nil {
+		// Logged, never rendered: a storage error must not leak the
+		// endpoint, bucket name, or client error text into a response body.
+		log.Printf("download: open result %s: %v", key.String(), err)
+		respondArtifactNotFound(c)
+		return
+	}
+	defer reader.Close()
+
+	c.Header("Content-Description", "File Transfer")
+	c.Header("Content-Transfer-Encoding", "binary")
+	c.Header("Content-Disposition", "attachment; filename="+key.String())
+
+	c.DataFromReader(http.StatusOK, size, "application/zip", reader, nil)
+}
+
+// handleStatus lists the caller's completed results.
+func (m *videoModule) handleStatus(c *gin.Context) {
+	userID, ok := authenticatedUserID(c)
+	if !ok {
+		log.Print("status: no authenticated user on a bearer-gated route")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal error"})
+		return
+	}
+
+	items, err := m.listUserResults.Execute(c.Request.Context(), videoapplication.ListUserResultsInput{
+		UserID: userID.String(),
+	})
+	if err != nil {
+		log.Printf("status: list results for user: %v", err)
+		c.JSON(500, gin.H{"error": "Erro ao listar arquivos"})
+		return
+	}
+
+	// Left nil rather than pre-allocated when empty: an empty listing has
+	// always serialized as "files": null here, and the frontend reads it
+	// that way.
+	var results []map[string]interface{}
+	for _, item := range items {
+		results = append(results, map[string]interface{}{
+			"filename":     item.StorageKey,
+			"size":         item.Size,
+			"created_at":   item.ModifiedAt.Format("2006-01-02 15:04:05"),
+			"download_url": "/download/" + item.StorageKey,
+		})
+	}
+
+	c.JSON(200, gin.H{
+		"files": results,
+		"total": len(results),
+	})
+}
+
 func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// Streamed via MultipartReader rather than c.Request.FormFile: FormFile
 	// calls net/http's own ParseMultipartForm under the hood (this bypasses
@@ -458,42 +621,14 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	if err := removeArtifactOwner("uploads", filename); err != nil {
 		log.Printf("Failed to remove owner record for upload %s: %v", filename, err)
 	}
-	// If ownership can't be recorded, the zip would otherwise be reported
-	// as a success the owner can never actually retrieve (every
-	// ownership-checked read path fails closed on a missing sidecar).
-	// Treat it as a processing failure instead. The VideoJob is still
-	// "processing" at this point — ProcessVideoJob deliberately doesn't
-	// call CompleteJob — so failJob (processing -> failed) is a valid
-	// transition here, unlike trying to fail an already-completed job.
-	if err := recordArtifactOwner("outputs", result.ZipPath, userID.String()); err != nil {
-		log.Printf("Failed to record owner for output %s: %v", result.ZipPath, err)
-		if removeErr := os.Remove(filepath.Join("outputs", result.ZipPath)); removeErr != nil {
-			log.Printf("Failed to remove orphaned output %s: %v", result.ZipPath, removeErr)
-		}
-		// A detached context: c.Request.Context() may already be canceled
-		// (e.g. client disconnect), and this write must still succeed so
-		// the job reaches "failed" instead of being stuck "processing".
-		finalizeCtx, cancel := videoapplication.NewFinalizationContext()
-		defer cancel()
-		if _, failErr := m.failJob.Execute(finalizeCtx, videoapplication.FailJobInput{
-			JobID:  created.JobID,
-			Reason: "failed to record artifact ownership after processing",
-		}); failErr != nil {
-			log.Printf("Failed to mark video job %s failed after ownership error: %v", created.JobID, failErr)
-		} else if hasReservation {
-			if cleared, clearErr := m.idempotency.Clear(finalizeCtx, idemKey, token); clearErr != nil || !cleared {
-				log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
-			}
-		}
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Failed to record artifact ownership",
-		})
-		return
-	}
-
-	// Only now — once the result is durably reachable — is the job
-	// actually complete. Same detached-context reasoning as above.
+	// The result is already durable by this point: ProcessVideoJob stores
+	// the zip in the bucket as part of its own sequence, so a successful
+	// return means there is nothing left for this handler to make reachable
+	// before completing the job.
+	//
+	// A detached context: c.Request.Context() may already be canceled (e.g.
+	// client disconnect), and this write must still succeed so the job
+	// doesn't stay stuck in "processing".
 	finalizeCtx, cancel := videoapplication.NewFinalizationContext()
 	defer cancel()
 	if _, err := m.completeJob.Execute(finalizeCtx, videoapplication.CompleteJobInput{

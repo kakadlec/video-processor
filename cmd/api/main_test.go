@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,9 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+
+	videodomain "video-processor/internal/video/domain"
+	videostorage "video-processor/internal/video/infrastructure/storage"
 )
 
 // TestMain requires a real ffmpeg on PATH — the same hard dependency the app
@@ -24,10 +28,18 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE.md for the Docker fallback.")
 		os.Exit(1)
 	}
+	// MinIO is as hard a dependency of these tests as ffmpeg is: POST
+	// /upload stores its result in a bucket, and GET /download and GET
+	// /api/status read it back from one. Failing loudly here beats a suite
+	// that silently skips its own core coverage on an unconfigured machine.
+	if _, err := videostorage.LoadConfigFromEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v — integration tests require MinIO; see CLAUDE.md for the Docker fallback.\n", err)
+		os.Exit(1)
+	}
 	// go test sets the working directory to this package's own directory
-	// (cmd/api), but the app's uploads/outputs/temp paths are relative to
-	// the repo root — chdir so tests exercise the same directories the
-	// running app actually uses, not a shadow copy under cmd/api.
+	// (cmd/api), but the app's uploads/temp paths are relative to the repo
+	// root — chdir so tests exercise the same directories the running app
+	// actually uses, not a shadow copy under cmd/api.
 	if err := os.Chdir("../.."); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: failed to chdir to repo root: %v\n", err)
 		os.Exit(1)
@@ -158,26 +170,11 @@ func doUpload(t *testing.T, baseURL, token string, body *bytes.Buffer, contentTy
 	return resp, result
 }
 
-// cleanupOutputZip removes a zip (and its ownership sidecar, if any) created
-// under outputs/ during a test, so repeated `go test` runs don't accumulate
-// files.
-func cleanupOutputZip(t *testing.T, zipFilename string) {
-	t.Helper()
-	if zipFilename == "" {
-		return
-	}
-	t.Cleanup(func() {
-		os.Remove(filepath.Join("outputs", zipFilename))
-		os.Remove(filepath.Join("outputs", zipFilename+artifactOwnerSuffix))
-	})
-}
-
 func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
 	srv, token := startTestServer(t)
 	videoPath := generateTestVideo(t, 3)
 
 	resp, result := uploadVideo(t, srv.URL, token, videoPath, "test-video.mp4")
-	cleanupOutputZip(t, result.ZipPath)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
@@ -219,6 +216,118 @@ func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
 	if len(leftovers) != 0 {
 		t.Fatalf("expected uploaded file to be removed, found: %v", leftovers)
 	}
+
+	// The result is an object, not a file: no zip may be left behind.
+	strays, err := filepath.Glob(filepath.Join("temp", "*.zip"))
+	if err != nil {
+		t.Fatalf("failed to glob temp dir: %v", err)
+	}
+	if len(strays) != 0 {
+		t.Fatalf("expected no leftover zip under temp/, found: %v", strays)
+	}
+}
+
+// TestUpload_StoresResultInTheBucket asserts the artifact actually reached
+// object storage, against the same ResultStorage the handler was wired with
+// — not merely that the download endpoint served something.
+func TestUpload_StoresResultInTheBucket(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	video, _, results := newTestVideoModuleWithStorage(t)
+	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	t.Cleanup(srv.Close)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	videoPath := generateTestVideo(t, 1)
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "bucket-check.mp4")
+	if !result.Success {
+		t.Fatalf("setup upload failed: %s", result.Message)
+	}
+
+	key, err := videodomain.NewStorageKey(result.ZipPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	size, _, err := results.Stat(context.Background(), key)
+	if err != nil {
+		t.Fatalf("expected the result object to exist under %q: %v", key.String(), err)
+	}
+	if size == 0 {
+		t.Fatalf("stored object under %q is empty", key.String())
+	}
+}
+
+// TestDownload_EveryRejectionIsByteIdentical is the discriminating test for
+// the endpoint's information-leak property: a caller must not be able to
+// tell "no such artifact" from "someone else's artifact" from "not a key at
+// all". Comparing status codes alone would pass even if the bodies differed.
+func TestDownload_EveryRejectionIsByteIdentical(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	t.Cleanup(srv.Close)
+
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	videoPath := generateTestVideo(t, 1)
+	_, result := uploadVideo(t, srv.URL, tokenA, videoPath, "leak-check.mp4")
+	if !result.Success {
+		t.Fatalf("setup upload failed: %s", result.Message)
+	}
+
+	cases := []struct {
+		name  string
+		path  string
+		token string
+	}{
+		{"another user's artifact", "/download/" + result.ZipPath, tokenB},
+		{"a key belonging to no job", "/download/frames_3fa85f64-5717-4562-b3fc-2c963f66afff.zip", tokenA},
+		{"not a result key at all", "/download/whatever.txt", tokenA},
+		{"a key whose embedded id is malformed", "/download/frames_not-a-uuid.zip", tokenA},
+	}
+
+	var bodies []string
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := getWithAuthorization(t, srv.URL+tc.path, "Bearer "+tc.token)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			bodies = append(bodies, string(body))
+		})
+	}
+
+	for i := 1; i < len(bodies); i++ {
+		if bodies[i] != bodies[0] {
+			t.Fatalf("rejection bodies differ: %q vs %q — a caller could distinguish these cases", bodies[0], bodies[i])
+		}
+	}
+}
+
+// TestCreateDirs_DoesNotCreateOutputs pins the directory set the application
+// owns now that results live in a bucket.
+func TestCreateDirs_DoesNotCreateOutputs(t *testing.T) {
+	// os.Remove only succeeds on an empty directory, so a leftover outputs/
+	// from a pre-migration run of the binary is left alone and reported
+	// below rather than silently deleted.
+	_ = os.Remove("outputs")
+
+	createDirs()
+
+	for _, dir := range []string{"uploads", "temp"} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("expected %s/ to exist: %v", dir, err)
+		}
+	}
+	if _, err := os.Stat("outputs"); !os.IsNotExist(err) {
+		t.Fatalf("expected outputs/ not to be created, stat err = %v "+
+			"(if it exists and is non-empty, it is a leftover from a pre-migration run — remove it)", err)
+	}
 }
 
 func TestUpload_UnsupportedExtension_Rejected(t *testing.T) {
@@ -230,7 +339,6 @@ func TestUpload_UnsupportedExtension_Rejected(t *testing.T) {
 	}
 
 	resp, result := uploadVideo(t, srv.URL, token, tmpFile, "not-a-video.txt")
-	cleanupOutputZip(t, result.ZipPath)
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected HTTP 400, got %d", resp.StatusCode)
@@ -277,7 +385,6 @@ func TestUpload_VideoFieldNotFirst_StillFound(t *testing.T) {
 	}
 
 	resp, result := doUpload(t, srv.URL, token, body, writer.FormDataContentType())
-	cleanupOutputZip(t, result.ZipPath)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected HTTP 200, got %d (message: %s)", resp.StatusCode, result.Message)
@@ -384,7 +491,6 @@ func TestStatus_ListsProcessedZip(t *testing.T) {
 	videoPath := generateTestVideo(t, 1)
 
 	_, result := uploadVideo(t, srv.URL, token, videoPath, "status-check.mp4")
-	cleanupOutputZip(t, result.ZipPath)
 	if !result.Success {
 		t.Fatalf("setup upload failed: %s", result.Message)
 	}
@@ -466,7 +572,6 @@ func TestProcessing_Failure_CleansTempDir(t *testing.T) {
 	videoPath := generateUndecodableVideo(t, "corrupt-temp-check.mp4")
 
 	_, result := uploadVideo(t, srv.URL, token, videoPath, "corrupt-temp-check.mp4")
-	cleanupOutputZip(t, result.ZipPath)
 
 	if result.Success {
 		t.Fatalf("expected processing to fail for undecodable content, got success")
@@ -495,7 +600,6 @@ func TestProcessing_Success_CleansTempDir(t *testing.T) {
 	videoPath := generateTestVideo(t, 1)
 
 	_, result := uploadVideo(t, srv.URL, token, videoPath, "success-temp-check.mp4")
-	cleanupOutputZip(t, result.ZipPath)
 	if !result.Success {
 		t.Fatalf("setup upload failed: %s", result.Message)
 	}
@@ -531,20 +635,22 @@ func TestProcessing_Failure_LeavesUploadedFileBehind(t *testing.T) {
 	})
 }
 
-// TestStaticOutputs_NeverServesOwnerSidecarFiles guards against a sidecar
+// TestStaticUploads_NeverServesOwnerSidecarFiles guards against a sidecar
 // file leaking which UserID owns which artifact, even to the authenticated
 // user it names as owner: rejectOwnerSidecarRequests must reject the
-// .owner suffix outright rather than deferring to ownership matching.
-func TestStaticOutputs_NeverServesOwnerSidecarFiles(t *testing.T) {
+// .owner suffix outright rather than deferring to ownership matching. It
+// covers uploads/ now — outputs/ no longer exists, and result artifacts
+// have no sidecar at all.
+func TestStaticUploads_NeverServesOwnerSidecarFiles(t *testing.T) {
 	srv, token := startTestServer(t)
 
-	sidecarPath := filepath.Join("outputs", "fake-artifact.zip.owner")
+	sidecarPath := filepath.Join("uploads", "fake-artifact.mp4.owner")
 	if err := os.WriteFile(sidecarPath, []byte("3fa85f64-5717-4562-b3fc-2c963f66afa6"), 0600); err != nil {
 		t.Fatalf("failed to write fake sidecar: %v", err)
 	}
 	t.Cleanup(func() { os.Remove(sidecarPath) })
 
-	resp := getWithAuthorization(t, srv.URL+"/outputs/fake-artifact.zip.owner", "Bearer "+token)
+	resp := getWithAuthorization(t, srv.URL+"/uploads/fake-artifact.mp4.owner", "Bearer "+token)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNotFound {

@@ -17,10 +17,7 @@ import (
 	"video-processor/internal/video/domain"
 )
 
-const (
-	tempDirName    = "temp"
-	outputsDirName = "outputs"
-)
+const tempDirName = "temp"
 
 // ErrFfmpegExecFailed, ErrNoFramesExtracted, and ErrZipCreationFailed
 // classify ExtractFrames' failure modes so a caller can map each to its own
@@ -36,8 +33,10 @@ var (
 var _ domain.FrameExtractor = (*Extractor)(nil)
 
 // Extractor implements domain.FrameExtractor against a local ffmpeg
-// installation, extracting frames into tempDirName and packaging them into
-// outputsDirName — the same two directories cmd/api's legacy pipeline used.
+// installation, extracting frames and packaging them entirely within
+// tempDirName. It writes nothing outside temp/ — placing the resulting zip
+// in durable storage is domain.ResultStorage's job, driven by
+// application.ProcessVideoJob.
 type Extractor struct{}
 
 // New constructs an Extractor.
@@ -46,13 +45,14 @@ func New() *Extractor {
 }
 
 // ExtractFrames extracts one frame per second from the video at videoPath
-// into a per-job temporary directory, packages the frames into a zip under
-// outputsDirName, and always removes the temporary directory before
-// returning.
-func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, videoPath string) (domain.StorageKey, int, []string, error) {
+// into a per-job temporary directory, packages the frames into a zip beside
+// that directory, and always removes the directory before returning. The
+// returned zip path belongs to the caller, which is responsible for
+// removing it once it has been stored.
+func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, videoPath string) (string, int, []string, error) {
 	tempDir := filepath.Join(tempDirName, jobID.String())
 	if err := os.MkdirAll(tempDir, 0750); err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("video: create temp directory: %w", err)
+		return "", 0, nil, fmt.Errorf("video: create temp directory: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
 
@@ -67,22 +67,24 @@ func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, 
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("%w: %s\noutput: %s", ErrFfmpegExecFailed, err.Error(), string(output))
+		return "", 0, nil, fmt.Errorf("%w: %s\noutput: %s", ErrFfmpegExecFailed, err.Error(), string(output))
 	}
 
 	frames, err := filepath.Glob(filepath.Join(tempDir, "*.png"))
 	if err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("video: glob extracted frames: %w", err)
+		return "", 0, nil, fmt.Errorf("video: glob extracted frames: %w", err)
 	}
 	if len(frames) == 0 {
-		return domain.StorageKey{}, 0, nil, ErrNoFramesExtracted
+		return "", 0, nil, ErrNoFramesExtracted
 	}
 
-	zipFilename := fmt.Sprintf("frames_%s.zip", jobID.String())
-	zipPath := filepath.Join(outputsDirName, zipFilename)
+	// Beside the per-job frame directory, not inside it: the deferred
+	// RemoveAll above would otherwise delete the zip before the caller
+	// could store it.
+	zipPath := filepath.Join(tempDirName, jobID.String()+".zip")
 
 	if err := createZipFile(frames, zipPath); err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("%w: %s", ErrZipCreationFailed, err.Error())
+		return "", 0, nil, fmt.Errorf("%w: %s", ErrZipCreationFailed, err.Error())
 	}
 
 	imageNames := make([]string, len(frames))
@@ -90,12 +92,7 @@ func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, 
 		imageNames[i] = filepath.Base(frame)
 	}
 
-	storageKey, err := domain.NewStorageKey(zipFilename)
-	if err != nil {
-		return domain.StorageKey{}, 0, nil, fmt.Errorf("video: build storage key: %w", err)
-	}
-
-	return storageKey, len(frames), imageNames, nil
+	return zipPath, len(frames), imageNames, nil
 }
 
 // createZipFile writes files into a new zip archive at zipPath. zip.Writer's
@@ -105,7 +102,7 @@ func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, 
 // which would otherwise let a truncated/invalid zip be reported as success.
 func createZipFile(files []string, zipPath string) (err error) {
 	zipPath = filepath.Clean(zipPath)
-	if !strings.HasPrefix(zipPath, outputsDirName+string(os.PathSeparator)) {
+	if !strings.HasPrefix(zipPath, tempDirName+string(os.PathSeparator)) {
 		return fmt.Errorf("invalid zip path: %s", zipPath)
 	}
 

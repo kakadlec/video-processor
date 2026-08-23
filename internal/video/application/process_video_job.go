@@ -2,6 +2,8 @@ package application
 
 import (
 	"context"
+	"log"
+	"os"
 
 	"video-processor/internal/video/domain"
 )
@@ -22,35 +24,41 @@ type ProcessVideoJobResult struct {
 	ImageNames    []string
 	StorageKey    string
 	FailureReason string
-	// ExtractionError is the domain.FrameExtractor error that caused
-	// Success to be false, unwrapped so a caller can classify it (e.g. via
-	// errors.Is against a specific infrastructure adapter's sentinel
-	// errors) to choose its own user-facing message, instead of exposing
-	// FailureReason's raw text directly. Nil when Success is true.
+	// ExtractionError is the error that caused Success to be false —
+	// from domain.FrameExtractor or from storing the result — unwrapped so
+	// a caller can classify it (e.g. via errors.Is against a specific
+	// infrastructure adapter's sentinel errors) to choose its own
+	// user-facing message, instead of exposing FailureReason's raw text
+	// directly. Nil when Success is true.
 	ExtractionError error
 }
 
-// ProcessVideoJob runs a VideoJob's enqueue/start-processing/extract
-// sequence synchronously, in-process, failing the job if extraction errors.
-// It deliberately does NOT call CompleteJob itself on success: a caller
-// that has further work to do before the job can be considered truly done
-// (e.g. cmd/api/video.go recording output artifact ownership) needs the job
-// to still be in "processing" — the only status FailJob can validly move it
-// out of — so it can fail the job if that further work fails, instead of
-// being stuck with an already-"completed" job pointing at an artifact that
-// never became reachable. The caller calls CompleteJob itself once it's
-// sure the result is durably usable.
+// ProcessVideoJob runs a VideoJob's enqueue/start-processing/extract/store
+// sequence synchronously, in-process, failing the job if extraction or
+// storage errors.
+//
+// It does NOT call CompleteJob itself on success. That split no longer
+// exists for the reason it originally did — the caller used to record
+// output artifact ownership after this use case returned, and needed the
+// job left in "processing" so it could still FailJob if that recording
+// failed. Storing the result is this use case's own step now, so a
+// successful return already means the result is durable and the caller has
+// no fallible work left. The split survives only because collapsing it
+// would ripple through every caller and test of this use case, which is a
+// separate refactor. Do not reintroduce a post-processing failure branch in
+// a caller to justify it.
 type ProcessVideoJob struct {
 	enqueue   *EnqueueVideoJob
 	start     *StartProcessing
 	fail      *FailJob
 	extractor domain.FrameExtractor
+	results   domain.ResultStorage
 	idsFor    domain.VideoJobIDParser
 }
 
 // NewProcessVideoJob wires the ProcessVideoJob use case to its dependencies.
-func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
-	return &ProcessVideoJob{enqueue: enqueue, start: start, fail: fail, extractor: extractor, idsFor: idsFor}
+func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, results domain.ResultStorage, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
+	return &ProcessVideoJob{enqueue: enqueue, start: start, fail: fail, extractor: extractor, results: results, idsFor: idsFor}
 }
 
 // Execute runs jobID's enqueue/start-processing/extract sequence against
@@ -68,22 +76,22 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 		return ProcessVideoJobResult{}, err
 	}
 
-	storageKey, frameCount, imageNames, extractErr := uc.extractor.ExtractFrames(ctx, id, videoPath)
+	zipPath, frameCount, imageNames, extractErr := uc.extractor.ExtractFrames(ctx, id, videoPath)
 	if extractErr != nil {
-		reason := extractErr.Error()
-		if reason == "" {
-			reason = fallbackFailureReason
+		return uc.failWith(jobID, extractErr)
+	}
+	// Registered before the store attempt, not after it: the Put-error path
+	// below returns, so a defer set up afterwards would never run and the
+	// extracted zip would be left behind on every storage failure.
+	defer func() {
+		if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("remove extracted zip %s for job %s: %v", zipPath, jobID, err)
 		}
-		// A detached context, not ctx: extractErr may itself be the result
-		// of ctx being canceled (exec.CommandContext killing ffmpeg), and
-		// this write must still succeed so the job reaches "failed" rather
-		// than being stuck wherever it was.
-		finalizeCtx, cancel := NewFinalizationContext()
-		defer cancel()
-		if _, err := uc.fail.Execute(finalizeCtx, FailJobInput{JobID: jobID, Reason: reason}); err != nil {
-			return ProcessVideoJobResult{}, err
-		}
-		return ProcessVideoJobResult{JobID: jobID, Success: false, FailureReason: reason, ExtractionError: extractErr}, nil
+	}()
+
+	storageKey := domain.ResultStorageKey(id)
+	if err := uc.results.Put(ctx, storageKey, zipPath); err != nil {
+		return uc.failWith(jobID, err)
 	}
 
 	return ProcessVideoJobResult{
@@ -93,4 +101,25 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 		ImageNames: imageNames,
 		StorageKey: storageKey.String(),
 	}, nil
+}
+
+// failWith marks jobID failed for cause and reports it as an unsuccessful
+// result. It is shared by the extraction and storage failure paths: a
+// result that could not be stored is no more usable than one that could not
+// be extracted.
+func (uc *ProcessVideoJob) failWith(jobID string, cause error) (ProcessVideoJobResult, error) {
+	reason := cause.Error()
+	if reason == "" {
+		reason = fallbackFailureReason
+	}
+	// A detached context, not the request's: cause may itself be the result
+	// of that context being canceled (exec.CommandContext killing ffmpeg, or
+	// an aborted upload), and this write must still succeed so the job
+	// reaches "failed" rather than being stuck wherever it was.
+	finalizeCtx, cancel := NewFinalizationContext()
+	defer cancel()
+	if _, err := uc.fail.Execute(finalizeCtx, FailJobInput{JobID: jobID, Reason: reason}); err != nil {
+		return ProcessVideoJobResult{}, err
+	}
+	return ProcessVideoJobResult{JobID: jobID, Success: false, FailureReason: reason, ExtractionError: cause}, nil
 }

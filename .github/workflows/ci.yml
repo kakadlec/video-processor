@@ -172,6 +172,14 @@ jobs:
           VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
           VIDEO_MINIO_TEST_SECRET_KEY: minioadmin
           VIDEO_MINIO_TEST_BUCKET: video-test
+          # cmd/api's tests read the runtime variables, not the TEST_ ones:
+          # its TestMain requires MinIO the same way it requires ffmpeg.
+          # Same instance as above, a different bucket — the adapter tests
+          # create and delete buckets.
+          VIDEO_MINIO_ENDPOINT: 127.0.0.1:9000
+          VIDEO_MINIO_ACCESS_KEY: minioadmin
+          VIDEO_MINIO_SECRET_KEY: minioadmin
+          VIDEO_MINIO_BUCKET: video-results-test
         run: go test ./... -v
 
   sast:

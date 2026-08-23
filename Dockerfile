@@ -19,7 +19,7 @@ FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ffmpeg \
     && adduser -D -u 1000 appuser
 WORKDIR /app
-RUN mkdir -p uploads outputs temp && chown -R appuser:appuser /app
+RUN mkdir -p uploads temp && chown -R appuser:appuser /app
 COPY --from=builder /out/app /app/app
 USER appuser
 EXPOSE 8080

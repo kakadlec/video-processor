@@ -21,20 +21,16 @@ func requireFfmpeg(t *testing.T) {
 	}
 }
 
-// prepareOutputDirs creates the temp/ and outputs/ directories Extractor
-// expects relative to the test's working directory, and schedules their
-// removal.
-func prepareOutputDirs(t *testing.T) {
+// prepareTempDir creates the temp/ directory Extractor expects relative to
+// the test's working directory, and schedules its removal. There is no
+// outputs/ counterpart: the extractor writes everything, frames and zip
+// alike, under temp/.
+func prepareTempDir(t *testing.T) {
 	t.Helper()
-	for _, dir := range []string{"temp", "outputs"} {
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			t.Fatalf("unexpected error creating %s: %v", dir, err)
-		}
+	if err := os.MkdirAll("temp", 0750); err != nil {
+		t.Fatalf("unexpected error creating temp: %v", err)
 	}
-	t.Cleanup(func() {
-		os.RemoveAll("temp")
-		os.RemoveAll("outputs")
-	})
+	t.Cleanup(func() { os.RemoveAll("temp") })
 }
 
 func generateTestVideo(t *testing.T, durationSeconds int) string {
@@ -71,19 +67,18 @@ func testJobID(t *testing.T) domain.VideoJobID {
 
 func TestExtractor_ExtractFrames_Success(t *testing.T) {
 	requireFfmpeg(t)
-	prepareOutputDirs(t)
+	prepareTempDir(t)
 
 	videoPath := generateTestVideo(t, 3)
 	jobID := testJobID(t)
 
 	e := ffmpeg.New()
-	storageKey, frameCount, imageNames, err := e.ExtractFrames(context.Background(), jobID, videoPath)
+	zipPath, frameCount, imageNames, err := e.ExtractFrames(context.Background(), jobID, videoPath)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if storageKey.IsZero() {
-		t.Fatalf("expected a non-zero StorageKey")
-	}
+	t.Cleanup(func() { os.Remove(zipPath) })
+
 	if frameCount != 3 {
 		t.Fatalf("frameCount = %d, want 3", frameCount)
 	}
@@ -91,15 +86,22 @@ func TestExtractor_ExtractFrames_Success(t *testing.T) {
 		t.Fatalf("len(imageNames) = %d, want 3", len(imageNames))
 	}
 
-	zipPath := filepath.Join("outputs", storageKey.String())
 	if _, err := os.Stat(zipPath); err != nil {
 		t.Fatalf("expected zip file to exist at %s: %v", zipPath, err)
+	}
+	// The zip belongs to the caller and must outlive the per-job frame
+	// directory the extractor deletes on its way out.
+	if filepath.Dir(zipPath) != "temp" {
+		t.Fatalf("zipPath = %q, want a file directly under temp/", zipPath)
+	}
+	if _, err := os.Stat("outputs"); !os.IsNotExist(err) {
+		t.Fatalf("expected no outputs/ directory to be created, stat err = %v", err)
 	}
 }
 
 func TestExtractor_ExtractFrames_UndecodableVideo_ReturnsError(t *testing.T) {
 	requireFfmpeg(t)
-	prepareOutputDirs(t)
+	prepareTempDir(t)
 
 	videoPath := generateUndecodableVideo(t)
 	jobID := testJobID(t)
@@ -113,15 +115,17 @@ func TestExtractor_ExtractFrames_UndecodableVideo_ReturnsError(t *testing.T) {
 
 func TestExtractor_ExtractFrames_AlwaysRemovesTempDir(t *testing.T) {
 	requireFfmpeg(t)
-	prepareOutputDirs(t)
+	prepareTempDir(t)
 	jobID := testJobID(t)
 	e := ffmpeg.New()
 
 	t.Run("success", func(t *testing.T) {
 		videoPath := generateTestVideo(t, 1)
-		if _, _, _, err := e.ExtractFrames(context.Background(), jobID, videoPath); err != nil {
+		zipPath, _, _, err := e.ExtractFrames(context.Background(), jobID, videoPath)
+		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		t.Cleanup(func() { os.Remove(zipPath) })
 		assertNoLeftoverTempDir(t, jobID)
 	})
 
@@ -141,7 +145,7 @@ func TestExtractor_ExtractFrames_AlwaysRemovesTempDir(t *testing.T) {
 // consuming CPU/disk for the full video duration.
 func TestExtractor_ExtractFrames_ContextCancellation_StopsFfmpegAndCleansUp(t *testing.T) {
 	requireFfmpeg(t)
-	prepareOutputDirs(t)
+	prepareTempDir(t)
 
 	// A synthetic video (e.g. testsrc) decodes too fast to reliably still
 	// be running when a short-lived context is canceled, regardless of

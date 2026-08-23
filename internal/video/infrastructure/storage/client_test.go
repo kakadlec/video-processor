@@ -108,8 +108,8 @@ func TestOpen_SucceedsWithoutConnecting(t *testing.T) {
 func TestOpen_RejectsMalformedEndpoint(t *testing.T) {
 	// Verified against minio-go v7.3.0: a fully qualified path and an
 	// invalid host character are both rejected at construction. A bare
-	// "http://host:port" is NOT — that library tolerates the scheme — so
-	// it deliberately isn't asserted here.
+	// "http://host:port" is NOT — see
+	// TestOpen_ToleratesSchemePrefixedEndpoint below.
 	for _, endpoint := range []string{"localhost:9000/path", "local host:9000"} {
 		t.Run(endpoint, func(t *testing.T) {
 			client, err := storage.Open(storage.Config{
@@ -125,6 +125,27 @@ func TestOpen_RejectsMalformedEndpoint(t *testing.T) {
 				t.Fatalf("client = %v, want nil alongside the error", client)
 			}
 		})
+	}
+}
+
+// TestOpen_ToleratesSchemePrefixedEndpoint asserts what
+// minio-infrastructure's "Endpoint validation is the client library's, not
+// this adapter's" scenario specifies: a scheme-prefixed endpoint is accepted
+// by the pinned client, and Open adds no validation of its own. Recorded
+// only as a comment when that capability shipped; asserted here so a future
+// client upgrade that starts rejecting it cannot pass silently.
+func TestOpen_ToleratesSchemePrefixedEndpoint(t *testing.T) {
+	client, err := storage.Open(storage.Config{
+		Endpoint:  "http://localhost:9000",
+		AccessKey: "access",
+		SecretKey: "secret",
+		Bucket:    "bucket",
+	})
+	if err != nil {
+		t.Fatalf("expected the pinned client to tolerate a scheme-prefixed endpoint, got: %v", err)
+	}
+	if client == nil {
+		t.Fatal("client is nil")
 	}
 }
 

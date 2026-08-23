@@ -473,7 +473,6 @@ func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 		"/api/status",
 		"/download/whatever.zip",
 		"/uploads/whatever.mp4",
-		"/outputs/whatever.zip",
 	}
 	for _, path := range getCases {
 		resp := getWithAuthorization(t, srv.URL+path, "")
@@ -514,7 +513,6 @@ func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 	if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
 		t.Fatalf("unexpected error decoding upload response: %v", err)
 	}
-	cleanupOutputZip(t, result.ZipPath)
 
 	if uploadResp.StatusCode != http.StatusOK {
 		t.Fatalf("authenticated upload status = %d, want %d", uploadResp.StatusCode, http.StatusOK)
@@ -552,8 +550,9 @@ func issueTestToken(t *testing.T, tokens jwtauth.Adapter, uuid string) (domain.U
 }
 
 // uploadAsUser uploads a freshly generated 1s test video authenticated as
-// token, and returns the resulting output zip's filename. It registers
-// cleanup for both the zip and its ownership sidecar file.
+// token, and returns the resulting result artifact's storage key. Nothing
+// needs cleaning up: the artifact is an object in a dedicated test bucket,
+// keyed by the job's own UUID, not a file in the developer's working tree.
 func uploadAsUser(t *testing.T, baseURL, token string) string {
 	t.Helper()
 
@@ -569,10 +568,6 @@ func uploadAsUser(t *testing.T, baseURL, token string) string {
 		t.Fatalf("upload failed: status=%d success=%v message=%q", resp.StatusCode, result.Success, result.Message)
 	}
 
-	cleanupOutputZip(t, result.ZipPath)
-	t.Cleanup(func() {
-		os.Remove(filepath.Join("outputs", result.ZipPath+artifactOwnerSuffix))
-	})
 	return result.ZipPath
 }
 
@@ -649,26 +644,23 @@ func containsFilename(files []struct {
 	return false
 }
 
-func TestArtifactOwnership_StaticOutputsEnforcesOwnership(t *testing.T) {
+// TestArtifactOwnership_StaticOutputsRouteIsGone replaces the ownership test
+// that used to cover the /outputs static mount. That mount served the same
+// bytes as GET /download/:filename under a parallel ownership check, and it
+// is removed now that results live in object storage — so the property to
+// guard is that no route answers there at all, for the owner or anyone else.
+func TestArtifactOwnership_StaticOutputsRouteIsGone(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
-
 	zipFilename := uploadAsUser(t, srv.URL, tokenA)
 
-	ownResp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenA)
-	defer ownResp.Body.Close()
-	if ownResp.StatusCode != http.StatusOK {
-		t.Fatalf("owner static fetch status = %d, want %d", ownResp.StatusCode, http.StatusOK)
-	}
-
-	otherResp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenB)
-	defer otherResp.Body.Close()
-	if otherResp.StatusCode != http.StatusNotFound {
-		t.Fatalf("non-owner static fetch status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
+	resp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenA)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /outputs/<key> status = %d, want %d — the static outputs mount must no longer exist", resp.StatusCode, http.StatusNotFound)
 	}
 }
 
@@ -734,13 +726,13 @@ func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
 
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
-	sidecarPath := filepath.Join("outputs", "fake-artifact.zip.owner")
+	sidecarPath := filepath.Join("uploads", "fake-artifact.mp4.owner")
 	if err := os.WriteFile(sidecarPath, []byte(userID.String()), 0600); err != nil {
 		t.Fatalf("failed to write fake sidecar: %v", err)
 	}
 	t.Cleanup(func() { os.Remove(sidecarPath) })
 
-	resp := getWithAuthorization(t, srv.URL+"/outputs/fake-artifact.zip.owner", "Bearer "+token)
+	resp := getWithAuthorization(t, srv.URL+"/uploads/fake-artifact.mp4.owner", "Bearer "+token)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNotFound {

@@ -311,3 +311,10 @@ func (r *CachedVideoJobRepository) Create(ctx context.Context, job *domain.Video
 func (r *CachedVideoJobRepository) FindByUserID(ctx context.Context, userID domain.UserID, offset, limit int) ([]*domain.VideoJob, error) {
 	return r.inner.FindByUserID(ctx, userID, offset, limit)
 }
+
+// FindCompletedByUserID passes straight through, uncached, for the same
+// reason as FindByUserID: this cache is keyed by individual job ID and has
+// nothing to offer a multi-row listing.
+func (r *CachedVideoJobRepository) FindCompletedByUserID(ctx context.Context, userID domain.UserID) ([]*domain.VideoJob, error) {
+	return r.inner.FindCompletedByUserID(ctx, userID)
+}

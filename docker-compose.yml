@@ -110,14 +110,27 @@ services:
       # root now opens a Redis client for POST /upload's idempotency
       # mechanism, the first real (non-test-only) consumer of this service.
       REDIS_ADDR: redis:6379
+      # Required as of migrate-result-storage-to-minio: cmd/api opens a
+      # MinIO client at startup, pings it, and ensures the bucket, failing
+      # fatally if any step fails. Fail-closed, unlike the Redis-backed
+      # features above — a result that cannot be stored cannot be delivered,
+      # so there is nothing to degrade to. VIDEO_MINIO_USE_SSL stays
+      # optional and is omitted: this loopback service speaks plain HTTP.
+      VIDEO_MINIO_ENDPOINT: minio:9000
+      VIDEO_MINIO_ACCESS_KEY: minioadmin
+      VIDEO_MINIO_SECRET_KEY: minioadmin
+      VIDEO_MINIO_BUCKET: video-results
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     volumes:
+      # No ./outputs mount: result zips are objects in the MinIO bucket
+      # above, not files in the working directory.
       - ./uploads:/app/uploads
-      - ./outputs:/app/outputs
 
   # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
   # than "app"'s hardened "runtime" stage, which deliberately has neither.
@@ -151,15 +164,21 @@ services:
       # requires this at startup, matching app's own value.
       REDIS_ADDR: redis:6379
       # Exercises internal/video/infrastructure/storage's own test suite
-      # against a real instance. Deliberately only on app-test: cmd/api reads
-      # no VIDEO_MINIO_* variable yet, so adding them to "app" would imply a
-      # startup requirement that does not exist. The test bucket is separate
-      # from any runtime bucket for the same reason identity_test is separate
-      # from identity — these tests create and delete buckets.
+      # against a real instance. The test bucket is separate from the runtime
+      # bucket below for the same reason identity_test is separate from
+      # identity — these tests create and delete buckets.
       VIDEO_MINIO_TEST_ENDPOINT: minio:9000
       VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
       VIDEO_MINIO_TEST_SECRET_KEY: minioadmin
       VIDEO_MINIO_TEST_BUCKET: video-test
+      # See the "app" service above. cmd/api's own tests read these: its
+      # TestMain requires MinIO the same way it requires ffmpeg, since
+      # POST /upload stores its result in a bucket and GET /download and
+      # GET /api/status read it back from one.
+      VIDEO_MINIO_ENDPOINT: minio:9000
+      VIDEO_MINIO_ACCESS_KEY: minioadmin
+      VIDEO_MINIO_SECRET_KEY: minioadmin
+      VIDEO_MINIO_BUCKET: video-results-test
     depends_on:
       postgres:
         condition: service_healthy

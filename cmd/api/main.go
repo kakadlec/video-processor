@@ -88,24 +88,19 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	videoRoutes.Use(identity.requireBearerAuth())
 	videoRoutes.Use(rateLimitMiddleware(limiter))
 
-	// The /uploads and /outputs static mounts serve the exact same artifacts
-	// as handleDownload by filename, so they need the same per-owner check —
-	// otherwise they'd be a direct bypass of handleDownload's ownership
-	// enforcement below. rejectOwnerSidecarRequests runs unconditionally: the
-	// sidecar files themselves must never be servable, including any left
-	// over from before this route was protected.
+	// The /uploads static mount serves the exact same files as the upload
+	// pipeline saved, so it needs the same per-owner check.
+	// rejectOwnerSidecarRequests runs unconditionally: the sidecar files
+	// themselves must never be servable, including any left over from
+	// before this route was protected.
+	//
+	// There is no /outputs counterpart: result artifacts live in object
+	// storage and are reachable only through GET /download/:filename, whose
+	// entitlement comes from the VideoJob row rather than from a sidecar.
 	uploadsRoutes := videoRoutes.Group("/uploads")
 	uploadsRoutes.Use(rejectOwnerSidecarRequests())
 	uploadsRoutes.Use(requireArtifactOwnership("uploads"))
 	uploadsRoutes.Static("/", "./uploads")
-
-	outputsRoutes := videoRoutes.Group("/outputs")
-	outputsRoutes.Use(rejectOwnerSidecarRequests())
-	outputsRoutes.Use(requireArtifactOwnership("outputs"))
-	outputsRoutes.Static("/", "./outputs")
-
-	videoRoutes.GET("/download/:filename", handleDownload)
-	videoRoutes.GET("/api/status", handleStatus)
 
 	video.registerRoutes(videoRoutes)
 
@@ -115,10 +110,10 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 }
 
 // artifactOwnerSuffix names the sidecar file that records which
-// authenticated user owns a video-processing artifact (an upload or an
-// output zip), stored alongside it under the same directory. This is
-// explicit, checked ownership metadata — not an inference from the
-// artifact's filename or timestamp.
+// authenticated user owns an uploaded video, stored alongside it under
+// uploads/. Result artifacts no longer use this mechanism — their owner is
+// the VideoJob row — and it is retired entirely once uploads move to object
+// storage too.
 const artifactOwnerSuffix = ".owner"
 
 // recordArtifactOwner persists that userID owns the artifact at
@@ -196,77 +191,12 @@ func requireArtifactOwnership(dir string) gin.HandlerFunc {
 }
 
 func createDirs() {
-	dirs := []string{"uploads", "outputs", "temp"}
+	dirs := []string{"uploads", "temp"}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0750); err != nil {
 			log.Printf("Failed to create directory %s: %v", dir, err)
 		}
 	}
-}
-
-func handleDownload(c *gin.Context) {
-	filename := c.Param("filename")
-	filePath := filepath.Join("outputs", filename)
-
-	// The not-found and not-owned responses below are deliberately
-	// identical: a non-owner must not be able to tell "doesn't exist" apart
-	// from "exists but isn't yours" by response content.
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		c.JSON(404, gin.H{"error": "File not found"})
-		return
-	}
-
-	if userID, authenticated := authenticatedUserID(c); authenticated {
-		owner, hasOwner := artifactOwner("outputs", filename)
-		if !hasOwner || owner != userID.String() {
-			c.JSON(404, gin.H{"error": "File not found"})
-			return
-		}
-	}
-
-	c.Header("Content-Description", "File Transfer")
-	c.Header("Content-Transfer-Encoding", "binary")
-	c.Header("Content-Disposition", "attachment; filename="+filename)
-	c.Header("Content-Type", "application/zip")
-
-	c.File(filePath)
-}
-
-func handleStatus(c *gin.Context) {
-	files, err := filepath.Glob(filepath.Join("outputs", "*.zip"))
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Erro ao listar arquivos"})
-		return
-	}
-
-	userID, authenticated := authenticatedUserID(c)
-
-	var results []map[string]interface{}
-	for _, file := range files {
-		info, err := os.Stat(file)
-		if err != nil {
-			continue
-		}
-
-		if authenticated {
-			owner, hasOwner := artifactOwner("outputs", filepath.Base(file))
-			if !hasOwner || owner != userID.String() {
-				continue
-			}
-		}
-
-		results = append(results, map[string]interface{}{
-			"filename":     filepath.Base(file),
-			"size":         info.Size(),
-			"created_at":   info.ModTime().Format("2006-01-02 15:04:05"),
-			"download_url": "/download/" + filepath.Base(file),
-		})
-	}
-
-	c.JSON(200, gin.H{
-		"files": results,
-		"total": len(results),
-	})
 }
 
 func isValidVideoFile(filename string) bool {
