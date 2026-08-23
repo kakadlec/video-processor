@@ -31,7 +31,11 @@ This is the change that turns the Phase 5 adapter from dormant plumbing into the
 - `upload-idempotency`: one scenario describes the original request's untouched artifacts as living in `uploads/`/`outputs/`.
 - `minio-infrastructure`: its "MinIO Configuration Is Not Required At Application Startup" requirement is **removed** — it described a deliberately transitional state that ends here.
 
-`ddd-architecture` is deliberately **not** modified: object keys stay flat (`frames_<jobID>.zip`), so `StorageKey`'s "set only on completion, atomically with `FrameCount`" semantics are untouched.
+Three capabilities were checked and deliberately **not** modified:
+
+- `ddd-architecture` — object keys stay flat (`frames_<jobID>.zip`), so `StorageKey`'s "set only on completion, atomically with `FrameCount`" semantics are untouched.
+- `identity-authentication` — its "Authentication protects video-processing access" requirement specifies that ownership derives from the authenticated `UserID` rather than from caller-controlled fields, and says nothing about *where* that ownership is recorded. Replacing the sidecar with the job row satisfies it unchanged; its "Users cannot access another user's artifacts" scenario stays true.
+- `videojob-http-api` — `GET /api/video-jobs/:id`'s `storage_key` is specified as an opaque value with no stated relationship to a filesystem location.
 
 ## Impact
 
