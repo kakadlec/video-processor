@@ -18,6 +18,18 @@ The `/outputs` static mount is absent from that enumeration because it no longer
 - **WHEN** they make one more request to any route in `videoRoutes`
 - **THEN** the response is `429 Too Many Requests` with an English-language JSON error body and a `Retry-After` header giving a strictly positive number of whole seconds until the window resets, and no handler-specific logic runs
 
+#### Scenario: Different users are limited independently
+
+- **GIVEN** two different authenticated users, one of whom has exceeded their own limit
+- **WHEN** the other user (who has not exceeded their limit) makes a request
+- **THEN** that request succeeds — one user's rate-limit state never affects another user's
+
+#### Scenario: Limit resets after the window elapses
+
+- **GIVEN** an authenticated user who was rejected with `429` in the current window
+- **WHEN** the configured window duration elapses and they retry
+- **THEN** the request succeeds (the counter for the new window starts fresh)
+
 #### Scenario: Retry-After rounds a sub-second remainder up, never down to zero
 
 - **GIVEN** a denied request whose underlying window has less than one second of real time remaining before it expires

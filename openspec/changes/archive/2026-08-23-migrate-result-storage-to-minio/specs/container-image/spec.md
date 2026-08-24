@@ -1,10 +1,5 @@
-# container-image Specification
+## MODIFIED Requirements
 
-## Purpose
-
-Define the build and runtime requirements for the repository's `Dockerfile`: a multi-stage build with deterministic, fail-closed dependency resolution, a non-root runtime user, and a minimal runtime image with no Go toolchain — while preserving the container's external contract for both `docker-compose.yml`'s local-development `app` service and the deployment commands in `docs/operations.md`.
-
-## Requirements
 ### Requirement: Multi-Stage Image Build
 The repository's `Dockerfile` SHALL use a multi-stage build: a builder stage that compiles the application and a separate runtime stage that contains no Go toolchain or source tree. Dependency resolution in the builder SHALL run in a read-only mode (e.g. `go mod download` under `-mod=readonly`) that verifies against the committed `go.sum` and fails the build on any mismatch or missing entry, rather than a mode that can add to or rewrite `go.mod`/`go.sum` (e.g. `go mod tidy`, or bare `go mod download` without `-mod=readonly`).
 

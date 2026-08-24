@@ -58,16 +58,6 @@ The variables SHALL carry the owning context's prefix, matching `VIDEO_POSTGRES_
 - **WHEN** `LoadConfigFromEnv` is called
 - **THEN** it returns an error naming the variable and the offending value, and no `Config` — TLS is never silently disabled by an unrecognized value
 
-### Requirement: MinIO Configuration Is Not Required At Application Startup
-
-Loading MinIO configuration SHALL NOT be a precondition for starting `cmd/api`. No composition root SHALL call `LoadConfigFromEnv` or `Open` as part of this capability, so an environment with none of the `VIDEO_MINIO_*` variables set SHALL start and serve every existing route exactly as it did before this capability existed.
-
-#### Scenario: The server starts with no VIDEO_MINIO_* variables set
-
-- **GIVEN** none of the `VIDEO_MINIO_*` environment variables are set
-- **WHEN** `cmd/api` starts
-- **THEN** it starts successfully and every existing route behaves as it did before this capability was added
-
 ### Requirement: Open Constructs A Client Without Blocking On Connectivity
 
 `internal/video/infrastructure/storage.Open` SHALL construct and return a MinIO client from a `Config` without itself verifying connectivity — matching `internal/video/infrastructure/postgres.Open`'s and `internal/platform/redis.Open`'s lazy-connection behavior. Because the underlying client constructor parses the endpoint and builds the HTTP transport, either of which can fail, `Open` SHALL return an `error` alongside the client and SHALL propagate that failure rather than discarding it. `Open` SHALL NOT be specified to validate credentials: the static credential provider performs no key-shape validation, so invalid or absent credentials surface only on a later server operation. Callers are responsible for verifying reachability via the health check below before relying on the client.
@@ -168,7 +158,11 @@ It SHALL NOT extend that tolerance to a bucket owned by a different account. In 
 
 ### Requirement: The Adapter Is Tested Against A Real MinIO Instance
 
-This capability's tests SHALL exercise `Open`, `Ping`, and `EnsureBucket` against a real MinIO instance rather than a mock, configured through `VIDEO_MINIO_TEST_ENDPOINT`, `VIDEO_MINIO_TEST_ACCESS_KEY`, `VIDEO_MINIO_TEST_SECRET_KEY`, and `VIDEO_MINIO_TEST_BUCKET`. The test bucket SHALL be distinct from the runtime `VIDEO_MINIO_BUCKET`, so a test that creates or deletes buckets cannot disturb a locally running application's artifacts. When those variables are unset the tests SHALL skip with a clear message rather than fail, so `go test ./...` still passes on a machine with no MinIO available.
+This capability's tests SHALL exercise `Open`, `Ping`, and `EnsureBucket` against a real MinIO instance rather than a mock, configured through `VIDEO_MINIO_TEST_ENDPOINT`, `VIDEO_MINIO_TEST_ACCESS_KEY`, `VIDEO_MINIO_TEST_SECRET_KEY`, and `VIDEO_MINIO_TEST_BUCKET`. The test bucket SHALL be distinct from the runtime `VIDEO_MINIO_BUCKET`, so a test that creates or deletes buckets cannot disturb a locally running application's artifacts. When those variables are unset **this package's** tests SHALL skip with a clear message rather than fail.
+
+That skip is scoped to this package. It previously carried the further claim that `go test ./...` therefore still passes on a machine with no MinIO available, which is no longer true and is corrected here rather than left standing: `cmd/api`'s `TestMain` requires MinIO the same way it already requires `ffmpeg`, exiting non-zero with a clear message when the configuration is absent. That is deliberate — `POST /upload` stores its result in a bucket and `GET /download/:filename` and `GET /api/status` read it back from one, so a suite that skipped those silently would report green while covering none of its own core behavior.
+
+Any test that creates a bucket SHALL remove it, and its objects, when it finishes — including when it fails. The local MinIO service keeps its data in a named volume, so a bucket left behind accumulates across every later run.
 
 #### Scenario: Tests run against the configured instance
 
@@ -176,8 +170,20 @@ This capability's tests SHALL exercise `Open`, `Ping`, and `EnsureBucket` agains
 - **WHEN** the package's tests run
 - **THEN** they exercise `Open`, `Ping`, and `EnsureBucket` against that instance and pass
 
-#### Scenario: Tests skip when no test instance is configured
+#### Scenario: This package's tests skip when no test instance is configured
 
 - **GIVEN** the `VIDEO_MINIO_TEST_*` variables are unset
-- **WHEN** the package's tests run
-- **THEN** they skip with a message naming the missing configuration, and `go test ./...` still succeeds
+- **WHEN** this package's tests run
+- **THEN** they skip with a message naming the missing configuration
+
+#### Scenario: The application's own test suite requires MinIO rather than skipping
+
+- **GIVEN** the runtime `VIDEO_MINIO_*` variables are unset
+- **WHEN** `cmd/api`'s test suite starts
+- **THEN** it exits non-zero with a message naming what is missing and pointing at the Docker fallback, rather than skipping the tests that exercise result storage
+
+#### Scenario: A test that creates a bucket leaves nothing behind
+
+- **WHEN** a test provisions a bucket, whether it then passes or fails
+- **THEN** that bucket's objects and the bucket itself are removed before the suite ends
+

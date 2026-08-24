@@ -6,7 +6,8 @@
 |---|---|---|
 | Go | 1.25+ | Build and test the application |
 | ffmpeg | any recent | Frame extraction; must be on `PATH` |
-| Docker | any recent | Alternative if Go/ffmpeg are not installed locally |
+| MinIO | any recent | Result storage; `cmd/api` requires `VIDEO_MINIO_*` at startup, and its tests require it too |
+| Docker | any recent | Alternative if Go/ffmpeg/MinIO are not installed locally — `docker compose` provides all three |
 | git | any | Source control |
 
 ### Installing ffmpeg
@@ -47,22 +48,23 @@ go build -o app ./cmd/api
 ./app
 ```
 
-The server creates `uploads/`, `temp/`, and `outputs/` in the working directory on first run.
+The server creates `uploads/` and `temp/` in the working directory on first run. Processed ZIP results are not written to disk — they go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which the server requires at startup and creates if absent.
 
 To skip the manual wiring entirely, use `docker compose up --build`, which runs the whole application inside Docker with identity already configured — see "Docker Workflow" below.
 
 ## Running Tests
 
-Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands and write real files. `ffmpeg` must be on `PATH`.
+Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, and the `VIDEO_MINIO_*` variables must point at a reachable MinIO.
 
 ```bash
 go test ./... -v
 ```
 
-If `ffmpeg` is not available, the suite exits immediately with code 1:
+If either prerequisite is missing, the suite exits immediately with code 1 rather than skipping — a skipped result-storage suite would report green while covering none of `POST /upload`'s actual behavior:
 
 ```
 FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE.md for the Docker fallback.
+FATAL: video: VIDEO_MINIO_ENDPOINT environment variable is required — integration tests require MinIO; see CLAUDE.md for the Docker fallback.
 ```
 
 ### Running the full suite via Docker, including PostgreSQL-backed tests
@@ -71,7 +73,7 @@ FATAL: ffmpeg not found in PATH — integration tests require ffmpeg; see CLAUDE
 docker compose run --build --rm app-test go test ./... -v
 ```
 
-`app-test` builds from the `Dockerfile`'s `test` stage (Go toolchain + `ffmpeg`) and runs `go test` inside it — no local Go or ffmpeg install required. It's a separate service from `app` because `app`'s image (the hardened, deployed build) deliberately has no Go toolchain; see "Docker Workflow" below. `app-test` is gated behind Compose's `test` profile so it never starts as part of a plain `docker compose up`/`up --build` — `docker compose run` targets it explicitly regardless, so the command above needs no extra flag.
+`app-test` builds from the `Dockerfile`'s `test` stage (Go toolchain + `ffmpeg`) and runs `go test` inside it, against the compose-provided PostgreSQL, Redis, and MinIO — no local Go, ffmpeg, or MinIO install required. With result storage now in MinIO, this is the path of least resistance for anyone not already running one. It's a separate service from `app` because `app`'s image (the hardened, deployed build) deliberately has no Go toolchain; see "Docker Workflow" below. `app-test` is gated behind Compose's `test` profile so it never starts as part of a plain `docker compose up`/`up --build` — `docker compose run` targets it explicitly regardless, so the command above needs no extra flag.
 
 `internal/identity/infrastructure/postgres`'s adapter tests, which otherwise skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and `IDENTITY_POSTGRES_TEST_DSN` is already pointed at it — no manual export needed.
 
@@ -123,7 +125,7 @@ docker compose up --build
 
 > The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app` and deployment both use — ships only the compiled binary and `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000).
 >
-> **If the app fails to write to `./uploads`/`./outputs` on a fresh clone:** those directories are bind-mounted into the container, and the non-root user (UID 1000) needs write access to them. `chown -R 1000:1000 uploads outputs` once, or `chmod` them, fixes it — deleting and letting Docker recreate the directories does **not** help, since Docker creates a missing bind-mount source as root-owned regardless of which user runs `docker compose`.
+> **If the app fails to write to `./uploads` on a fresh clone:** that directory is bind-mounted into the container, and the non-root user (UID 1000) needs write access to it. `chown -R 1000:1000 uploads` once, or `chmod` it, fixes it — deleting and letting Docker recreate the directory does **not** help, since Docker creates a missing bind-mount source as root-owned regardless of which user runs `docker compose`. There is no `./outputs` counterpart any more: results live in MinIO.
 
 ## Dependency Management
 
