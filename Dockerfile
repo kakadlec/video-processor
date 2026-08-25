@@ -4,7 +4,7 @@
 # only the compiled binary and ffmpeg — no Go toolchain, no source tree — as
 # a non-root user.
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 ENV GOFLAGS=-mod=readonly
 WORKDIR /app
 COPY go.mod go.sum ./
