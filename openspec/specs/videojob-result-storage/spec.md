@@ -214,12 +214,12 @@ The route SHALL have no unauthenticated behavior, for the same reason as the dow
 
 The system SHALL NOT create, serve, or read an `outputs/` directory. The `/outputs` static route SHALL be removed from the router, and no `.owner` sidecar file SHALL be written, read, or deleted for a result artifact.
 
-The sidecar helpers themselves SHALL remain in the codebase for the `uploads/` directory, which still uses them; only the result-artifact call sites are removed by this change.
+The sidecar helpers no longer remain in the codebase for any directory. They survived this capability's change only because `uploads/` still used them; `migrate-upload-storage-to-minio` moves source videos into the bucket as well, deletes the `/uploads` static route, and removes every sidecar symbol. `videojob-source-storage` owns that retirement — this capability now only asserts that no result artifact has ever had one.
 
 #### Scenario: No outputs directory is created at startup
 
 - **WHEN** `cmd/api` starts
-- **THEN** it creates `uploads/` and `temp/`, and does not create `outputs/`
+- **THEN** it creates `temp/`, and does not create `outputs/`
 
 #### Scenario: The outputs route no longer exists
 
@@ -231,11 +231,10 @@ The sidecar helpers themselves SHALL remain in the codebase for the `uploads/` d
 - **WHEN** an upload is processed successfully
 - **THEN** no `.owner` file is written for the result artifact, and the job's `UserID` is the only record of who owns it
 
-#### Scenario: Upload ownership sidecars still work
+#### Scenario: No sidecar mechanism remains for any artifact class
 
-- **GIVEN** the `uploads/` directory still stores source videos
-- **WHEN** an upload is saved
-- **THEN** its `.owner` sidecar is written and enforced on the `/uploads` static route exactly as before this change
+- **WHEN** the codebase is inspected for the ownership-sidecar helpers, their suffix constant, and the middleware that enforced them
+- **THEN** none is present, and no route or handler depends on a sidecar for entitlement
 
 ### Requirement: The Result Storage Adapter Is Tested Against A Real MinIO Instance
 

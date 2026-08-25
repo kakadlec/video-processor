@@ -36,7 +36,7 @@ docker compose up --build
 The application is a synchronous monolith at this stage:
 
 - **No async processing** — `POST /upload` blocks until `ffmpeg` finishes. Large videos will hold the HTTP connection open for minutes.
-- **Uploads still on local disk** — uploaded videos and extracted frames live in `uploads/` and `temp/` on the server. Processed ZIPs no longer do: they are stored in MinIO (Phase 5), so a result survives its container and is reachable from any instance. Moving the uploads themselves is still pending.
+- **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so each request downloads its source into `temp/`, extracts frames there, and builds the zip there, removing all of it before responding. Nothing durable lives on local disk any more (Phase 5): uploaded source videos go to MinIO too, but only as **transient** objects each request deletes before it finishes — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
 - **No job queue** — concurrent uploads each run their own `ffmpeg` process with no concurrency limit.
 - **No notifications** — users must stay on the page or poll `GET /api/status` to find out when processing completes.
 - **In-flight work is lost on restart** — job records live in PostgreSQL and results in MinIO, both of which survive a restart, but a job being processed when the process dies is never resumed and stays stuck in `processing`.

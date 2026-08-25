@@ -1,4 +1,9 @@
-## ADDED Requirements
+# videojob-source-storage Specification
+
+## Purpose
+Define the `SourceStorage` domain port and its MinIO adapter: how an uploaded source video reaches the bucket without touching local disk, how its key is derived and why that key may carry a prefix when a result key may not, how `ProcessVideoJob` obtains the transient local copy `ffmpeg` needs, and the transient-lifetime contract that has every request attempt to delete its own source object. Result artifacts are `videojob-result-storage`'s concern; the two share one bucket and are separated only by key prefix.
+
+## Requirements
 
 ### Requirement: Uploaded Source Videos Are Stored As Objects, Never On Local Disk
 
@@ -98,13 +103,13 @@ This is an obligation to **attempt**, deliberately not a guarantee of absence. T
 
 #### Scenario: A failed upload deletes its source object
 
-- **GIVEN** a video whose content `ffmpeg` cannot decode
+- **GIVEN** a video whose content `ffmpeg` cannot decode, and storage reachable throughout
 - **WHEN** the request completes with `success: false`
 - **THEN** no object exists under that request's source key
 
 #### Scenario: A duplicate's source object is deleted without touching the original's
 
-- **GIVEN** a duplicate request that stored its own source object under its own `uploadID` before discovering the conflict
+- **GIVEN** a duplicate request that stored its own source object under its own `uploadID` before discovering the conflict, and storage reachable throughout
 - **WHEN** the handler cleans up
 - **THEN** that request's own source object is deleted and the original request's artifacts are untouched
 

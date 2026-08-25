@@ -33,17 +33,19 @@ Browser                        Go server (cmd/api/main.go / identity.go)     Pos
   │                                     │  ... continues below ...        │
 ```
 
-The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, `/api/status`, and `/uploads/*` carries a valid bearer token; there is no unauthenticated mode.
+The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/download/:filename`, and `/api/status` carries a valid bearer token; there is no unauthenticated mode.
 
 ```
-Browser              cmd/api/video.go       internal/video/application   Filesystem
+Browser              cmd/api/video.go       internal/video/application   MinIO bucket
   │                        │                          │                    │
   │  POST /upload           │                          │                   │
   │  (multipart)            │                          │                   │
   │───────────────────────►│                          │                    │
   │                        │  Validate extension       │                   │
-  │                        │  Save to uploads/, hashing│                   │
-  │                        │  the stream (SHA-256)      │                  │
+  │                        │  SourceStorage.Put →       │                   │
+  │                        │  uploads/<uploadID>_<name>,│                   │
+  │                        │  hashing the stream        │                   │
+  │                        │  (SHA-256) on the same pass│                   │
   │                        │──────────────────────────────────────────────►│
   │                        │  Reserve idempotency key (Redis: UserID+hash) │
   │                        │  reserved=false → poll for the winner's job   │
@@ -61,16 +63,19 @@ Browser              cmd/api/video.go       internal/video/application   Filesys
   │                        │                            │◄─────────────────│
   │                        │    ResultStorage.Put →      │                 │
   │                        │    bucket/frames_<jobID>.zip│                 │
-  │                        │    (local zip removed either way)             │
-  │                        │    Fail if extraction OR    │                 │
-  │                        │    storage failed           │                 │
+  │                        │    (local zip and downloaded source removed    │
+  │                        │     either way, by ProcessVideoJob's defers)   │
+  │                        │    Fail if fetch, extraction│                  │
+  │                        │    OR storage failed        │                 │
   │                        │    (job stays "processing"  │                 │
-  │                        │     if both succeeded)      │                 │
+  │                        │     if all three succeeded) │                 │
   │                        │───────────────────────────►│                  │
-  │                        │  Remove uploads/<file>      │                 │
   │                        │    CompleteJob — the result │                 │
   │                        │    is already durable       │                 │
   │                        │───────────────────────────►│                  │
+  │                        │  Delete uploads/<uploadID>_<name>              │
+  │                        │  (one defer, every exit path, best effort)     │
+  │                        │──────────────────────────────────────────────►│
   │◄───────────────────────│                            │                  │
   │  200 { success, zip_path,│                           │                 │
   │        frame_count, images}│                         │                 │
@@ -87,9 +92,9 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 - Content-hash idempotency: identical bytes uploaded twice by the same user reuse the first request's `VideoJob` rather than running `ffmpeg` again (Phase 4, `add-upload-idempotency-keys`) — see `docs/architecture.md`'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md` for the full reserve/finalize/clear protocol. `REDIS_ADDR` is required at startup for this.
 - Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous, in-process, no queue or worker (that's Phase 6).
 - No status polling, no notifications, at this HTTP surface — but the `VideoJob` created for the upload does progress through the real `pending → queued → processing → completed`/`failed` state machine internally (see `openspec/specs/videojob-lifecycle/spec.md`), and is queryable via `GET /api/video-jobs/:id` below.
-- On success, the original upload file is deleted; the ZIP object in the MinIO bucket is the only durable artifact (Phase 5, `migrate-result-storage-to-minio`).
-- On extraction or storage failure, the original upload is NOT deleted (known gap; see `TestProcessing_Failure_LeavesUploadedFileBehind`). This does not hold for a failure in the later `CompleteJob` step — the upload has already been removed by the time that runs.
-- Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields. For results it comes from the `VideoJob` row (`/download`, `/api/status`); for uploads still on disk it comes from the `.owner` sidecar the `/uploads` static mount checks.
+- Nothing the client uploads touches local disk on the way in. The source is streamed straight into the bucket, and the only local copy is the one `ProcessVideoJob` downloads for `ffmpeg`, which it removes on every path (Phase 5, `migrate-upload-storage-to-minio`).
+- The source object is deleted on success **and** on failure, through a single `defer` registered the moment the object exists — so the ZIP object is the only artifact meant to survive the request. That deletion is best effort: one call, no retry, logged with the key if it fails. See `docs/operations.md` for the recommended `uploads/`-prefix lifecycle rule that backstops it.
+- Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and always from the `VideoJob` row. The `.owner` sidecar mechanism is gone entirely — source objects are never served, so there is nothing to authorize for them.
 
 ---
 

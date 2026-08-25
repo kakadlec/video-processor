@@ -7,7 +7,9 @@ Define the Redis-backed idempotency-key mechanism for `POST /upload`: key deriva
 ## Requirements
 ### Requirement: Idempotency Key Is Derived From Per-User Content Hash
 
-`handleVideoUpload` SHALL derive an idempotency key by hashing the uploaded video's full content with SHA-256 while it is streamed to `uploads/`, and SHALL scope that hash per authenticated user (`idempotency:{userID}:{hash}`), not globally.
+`handleVideoUpload` SHALL derive an idempotency key by hashing the uploaded video's full content with SHA-256 while it is streamed to the configured MinIO bucket, and SHALL scope that hash per authenticated user (`idempotency:{userID}:{hash}`), not globally.
+
+The hash is available only once the whole part has been read, which is after the object has been written. A duplicate is therefore always detected *after* its own object exists, and the redundant object is deleted rather than never created. Avoiding that would require buffering the upload to hash before storing — which is the local file this migration removes — so the extra object write and delete on the duplicate path are accepted, not engineered around.
 
 #### Scenario: Same user, same content produces the same key
 
@@ -23,9 +25,9 @@ Define the Redis-backed idempotency-key mechanism for `POST /upload`: key deriva
 
 #### Scenario: Hashing adds no extra read of the upload
 
-- **GIVEN** a `POST /upload` request being saved to `uploads/`
+- **GIVEN** a `POST /upload` request being streamed to the bucket
 - **WHEN** the handler computes the idempotency hash
-- **THEN** it does so via the same read pass already used to write the file to disk, not a second read of the uploaded content
+- **THEN** it does so via the same read pass already used to upload the object, not a second read of the uploaded content
 
 ### Requirement: Concurrent Identical Requests Are Serialized Via Token-Owned Atomic Reservation
 
@@ -97,13 +99,15 @@ If `CreateVideoJob` fails for a request holding a reservation, `handleVideoUploa
 
 ### Requirement: A Finalized Duplicate Returns The Existing Job, Translated To The Upload Response Shape
 
-A `POST /upload` request whose idempotency key already holds a `VideoJobID` (not an in-flight reservation) SHALL NOT create a new `VideoJob` or invoke `ffmpeg`. It SHALL delete the redundant file this request itself just saved and return the existing job's current status translated into `ProcessingResult` — the same response shape a non-duplicate `POST /upload` returns — never `GetJobStatusResult`'s own field names.
+A `POST /upload` request whose idempotency key already holds a `VideoJobID` (not an in-flight reservation) SHALL NOT create a new `VideoJob` or invoke `ffmpeg`. It SHALL delete the redundant source object this request itself just stored and return the existing job's current status translated into `ProcessingResult` — the same response shape a non-duplicate `POST /upload` returns — never `GetJobStatusResult`'s own field names.
+
+The duplicate's cleanup SHALL be scoped to its own `uploadID`-derived key. The original request's *source* object is not asserted to survive — source objects are transient by contract (see `videojob-source-storage`), so an original that already completed has deleted its own. What a duplicate SHALL never do is delete a key it did not create.
 
 #### Scenario: Duplicate after the original completed
 
 - **GIVEN** a prior request's idempotency key now holds a `VideoJobID` for a job that has since reached `completed`
 - **WHEN** a new request with the same user and identical content arrives
-- **THEN** the handler does not invoke `ffmpeg` or create a new `VideoJob`, deletes the file it just saved for this request, and returns `ProcessingResult{Success: true, Message: <English>, ZipPath: <the job's StorageKey>, FrameCount: <the job's FrameCount>}`
+- **THEN** the handler does not invoke `ffmpeg` or create a new `VideoJob`, deletes the source object it just stored for this request, and returns `ProcessingResult{Success: true, Message: <English>, ZipPath: <the job's StorageKey>, FrameCount: <the job's FrameCount>}`
 
 #### Scenario: Duplicate after the original failed
 
@@ -115,13 +119,13 @@ A `POST /upload` request whose idempotency key already holds a `VideoJobID` (not
 
 - **GIVEN** a prior request's idempotency key now holds a `VideoJobID` for a job still in `processing` (reached via the bounded-retry-then-lookup path)
 - **WHEN** a new request with the same user and identical content arrives
-- **THEN** the handler does not invoke `ffmpeg` or create a new `VideoJob`, deletes the file it just saved for this request, and returns `ProcessingResult{Success: false, Message: <English: still being processed, try again shortly>}`
+- **THEN** the handler does not invoke `ffmpeg` or create a new `VideoJob`, deletes the source object it just stored for this request, and returns `ProcessingResult{Success: false, Message: <English: still being processed, try again shortly>}`
 
-#### Scenario: Duplicate's own file never affects the original request's artifacts
+#### Scenario: Duplicate's own object never affects the original request's artifacts
 
-- **GIVEN** a duplicate request has saved its own file under its own `uploadID`-prefixed path before discovering the duplicate
-- **WHEN** the handler deletes that redundant file
-- **THEN** the original request's uploaded file under `uploads/` (saved under a different `uploadID`) and its stored result object are both left untouched
+- **GIVEN** a duplicate request has stored its own source object under its own `uploadID`-prefixed key before discovering the duplicate
+- **WHEN** the handler deletes that redundant object
+- **THEN** the delete targets only this request's own source key, and the original request's stored result object remains readable — no key derived from another request's `uploadID` is ever deleted
 
 ### Requirement: A Failed Job Clears Its Idempotency Key Immediately
 
