@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -472,7 +471,6 @@ func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 	getCases := []string{
 		"/api/status",
 		"/download/whatever.zip",
-		"/uploads/whatever.mp4",
 	}
 	for _, path := range getCases {
 		resp := getWithAuthorization(t, srv.URL+path, "")
@@ -664,79 +662,24 @@ func TestArtifactOwnership_StaticOutputsRouteIsGone(t *testing.T) {
 	}
 }
 
-// TestArtifactOwnership_StaticUploadsEnforcesOwnership covers the /uploads
-// static mount specifically: on a successful run the upload is deleted, so
-// the only way to exercise this path is a failed run, whose upload file and
-// ownership sidecar are deliberately left behind (see
-// TestProcessing_Failure_LeavesUploadedFileBehind in main_test.go).
-func TestArtifactOwnership_StaticUploadsEnforcesOwnership(t *testing.T) {
+// TestStaticUploadsRouteIsGone replaces the two ownership tests that covered
+// the /uploads static mount and its sidecar files. Source videos are objects
+// now, deleted before their own request finishes, so there is nothing to
+// serve and no sidecar to leak — the property to guard is that no route
+// answers there at all.
+func TestStaticUploadsRouteIsGone(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
-	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
-	videoPath := generateUndecodableVideo(t, "uploads-ownership-check.mp4")
-	resp := uploadWithAuth(t, srv.URL, tokenA, videoPath, "uploads-ownership-check.mp4")
-	defer resp.Body.Close()
-
-	var result ProcessingResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("unexpected error decoding upload response: %v", err)
-	}
-	if result.Success {
-		t.Fatalf("expected processing to fail for undecodable content, got success")
-	}
-
-	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_uploads-ownership-check.mp4"))
-	if err != nil {
-		t.Fatalf("failed to glob uploads dir: %v", err)
-	}
-	if len(leftovers) != 1 {
-		t.Fatalf("expected exactly one leftover upload after a failed run, found: %v", leftovers)
-	}
-	uploadPath := leftovers[0]
-	uploadFilename := filepath.Base(uploadPath)
-	t.Cleanup(func() {
-		os.Remove(uploadPath)
-		os.Remove(uploadPath + artifactOwnerSuffix)
-	})
-
-	ownResp := getWithAuthorization(t, srv.URL+"/uploads/"+uploadFilename, "Bearer "+tokenA)
-	defer ownResp.Body.Close()
-	if ownResp.StatusCode != http.StatusOK {
-		t.Fatalf("owner static fetch status = %d, want %d", ownResp.StatusCode, http.StatusOK)
-	}
-
-	otherResp := getWithAuthorization(t, srv.URL+"/uploads/"+uploadFilename, "Bearer "+tokenB)
-	defer otherResp.Body.Close()
-	if otherResp.StatusCode != http.StatusNotFound {
-		t.Fatalf("non-owner static fetch status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
-	}
-}
-
-// TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles proves the
-// sidecar itself is never servable — not even to the user it names as
-// owner — since it's blocked before the ownership check even runs.
-func TestArtifactOwnership_StaticNeverServesOwnerSidecarFiles(t *testing.T) {
-	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-
-	sidecarPath := filepath.Join("uploads", "fake-artifact.mp4.owner")
-	if err := os.WriteFile(sidecarPath, []byte(userID.String()), 0600); err != nil {
-		t.Fatalf("failed to write fake sidecar: %v", err)
-	}
-	t.Cleanup(func() { os.Remove(sidecarPath) })
-
-	resp := getWithAuthorization(t, srv.URL+"/uploads/fake-artifact.mp4.owner", "Bearer "+token)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served, even to their recorded owner)", resp.StatusCode, http.StatusNotFound)
+	for _, path := range []string{"/uploads/whatever.mp4", "/uploads/fake-artifact.mp4.owner"} {
+		resp := getWithAuthorization(t, srv.URL+path, "Bearer "+token)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want %d — the static uploads mount must no longer exist", path, resp.StatusCode, http.StatusNotFound)
+		}
 	}
 }
 

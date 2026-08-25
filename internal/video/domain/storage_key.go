@@ -3,14 +3,21 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 )
 
 // ErrInvalidStorageKey is returned when a value fails StorageKey construction.
 var ErrInvalidStorageKey = errors.New("video: invalid storage key")
 
-// StorageKey identifies where a VideoJob's result artifact is stored. It is
-// only set once a job reaches completed; unset (zero value) otherwise.
+// StorageKey identifies an object in the configured bucket. Two key spaces
+// use it: ResultStorageKey names a job's result artifact, SourceStorageKey
+// names an uploaded source video.
+//
+// The "set only once a job reaches completed" rule belongs to the VideoJob's
+// own storageKey field — where RestoreVideoJob and Complete actually enforce
+// it via ErrStorageKeyRequiresCompletedStatus — not to this type. A source
+// key is minted before its VideoJob exists and never reaches the aggregate.
 type StorageKey struct {
 	value string
 }
@@ -78,4 +85,22 @@ func VideoJobIDFromStorageKey(key StorageKey, parser VideoJobIDParser) (VideoJob
 		return VideoJobID{}, fmt.Errorf("%w: %s", ErrInvalidStorageKey, err.Error())
 	}
 	return parsed, nil
+}
+
+// sourceKeyPrefix namespaces uploaded source videos inside the same bucket
+// that holds results.
+//
+// A prefix is safe here and not for results: a result key is handed back to
+// the browser and used verbatim as GET /download/:filename's single path
+// segment, so a "/" would percent-encode and break the route match. No route
+// exposes a source key — /uploads was removed when uploads moved into the
+// bucket. Anything that re-exposes source objects over HTTP has to drop this
+// prefix in the same change.
+const sourceKeyPrefix = "uploads/"
+
+// SourceStorageKey derives the storage key for an uploaded source video.
+// uploadID names the upload alone and is independent of the VideoJobID,
+// which is minted only after the object is safely stored.
+func SourceStorageKey(uploadID, originalFilename string) StorageKey {
+	return StorageKey{value: sourceKeyPrefix + uploadID + "_" + path.Base(originalFilename)}
 }

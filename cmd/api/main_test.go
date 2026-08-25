@@ -64,6 +64,24 @@ func generateTestVideo(t *testing.T, durationSeconds int) string {
 	return path
 }
 
+// generateTestVideoInContainer is generateTestVideo for a container other
+// than mp4, so a test can prove ffmpeg detects the format by probing rather
+// than from the filename — ProcessVideoJob downloads the source to an
+// extension-less local path.
+func generateTestVideoInContainer(t *testing.T, durationSeconds int, extension string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test."+extension)
+	cmd := exec.Command("ffmpeg",
+		"-f", "lavfi",
+		"-i", fmt.Sprintf("testsrc=duration=%d:size=320x240:rate=1", durationSeconds),
+		"-y", path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to generate %s test video: %v\n%s", extension, err, output)
+	}
+	return path
+}
+
 // generateUndecodableVideo writes a file with a valid video extension but
 // content ffmpeg cannot decode, to reliably trigger a processing failure
 // without relying on a specific ffmpeg error message.
@@ -208,13 +226,17 @@ func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
 		t.Fatalf("expected zip to contain %d frames, got %d", result.FrameCount, len(zr.File))
 	}
 
-	// The original upload must be cleaned up after a successful run.
-	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_test-video.mp4"))
+	// The source video never touches the local filesystem on the way in;
+	// the only local trace is the copy ProcessVideoJob downloads for ffmpeg,
+	// which it owns and removes. The bucket side — that the source object
+	// itself is gone — is asserted by
+	// TestUpload_Success_StoresResultAndDeletesSourceObject.
+	sourceCopies, err := filepath.Glob(filepath.Join("temp", "*_source"))
 	if err != nil {
-		t.Fatalf("failed to glob uploads dir: %v", err)
+		t.Fatalf("failed to glob temp dir: %v", err)
 	}
-	if len(leftovers) != 0 {
-		t.Fatalf("expected uploaded file to be removed, found: %v", leftovers)
+	if len(sourceCopies) != 0 {
+		t.Fatalf("expected the downloaded source copy to be removed, found: %v", sourceCopies)
 	}
 
 	// The result is an object, not a file: no zip may be left behind.
@@ -309,24 +331,27 @@ func TestDownload_EveryRejectionIsByteIdentical(t *testing.T) {
 	}
 }
 
-// TestCreateDirs_DoesNotCreateOutputs pins the directory set the application
-// owns now that results live in a bucket.
-func TestCreateDirs_DoesNotCreateOutputs(t *testing.T) {
-	// os.Remove only succeeds on an empty directory, so a leftover outputs/
+// TestCreateDirs_CreatesOnlyTemp pins the directory set the application owns
+// now that both source videos and results live in a bucket. temp/ is the
+// last one: per-request scratch for the downloaded source, the extracted
+// frames, and the zip built from them.
+func TestCreateDirs_CreatesOnlyTemp(t *testing.T) {
+	// os.Remove only succeeds on an empty directory, so a leftover directory
 	// from a pre-migration run of the binary is left alone and reported
 	// below rather than silently deleted.
 	_ = os.Remove("outputs")
+	_ = os.Remove("uploads")
 
 	createDirs()
 
-	for _, dir := range []string{"uploads", "temp"} {
-		if _, err := os.Stat(dir); err != nil {
-			t.Fatalf("expected %s/ to exist: %v", dir, err)
-		}
+	if _, err := os.Stat("temp"); err != nil {
+		t.Fatalf("expected temp/ to exist: %v", err)
 	}
-	if _, err := os.Stat("outputs"); !os.IsNotExist(err) {
-		t.Fatalf("expected outputs/ not to be created, stat err = %v "+
-			"(if it exists and is non-empty, it is a leftover from a pre-migration run — remove it)", err)
+	for _, dir := range []string{"uploads", "outputs"} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("expected %s/ not to be created, stat err = %v "+
+				"(if it exists and is non-empty, it is a leftover from a pre-migration run — remove it)", dir, err)
+		}
 	}
 }
 
@@ -577,21 +602,10 @@ func TestProcessing_Failure_CleansTempDir(t *testing.T) {
 		t.Fatalf("expected processing to fail for undecodable content, got success")
 	}
 
-	// Processing failure leaves the uploaded file (and, since this request is
-	// authenticated, its ownership sidecar) behind — see
-	// TestProcessing_Failure_LeavesUploadedFileBehind for why. Clean both up
-	// so this test doesn't accumulate files in the workspace on every run.
-	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_corrupt-temp-check.mp4"))
-	if err != nil {
-		t.Fatalf("failed to glob uploads dir: %v", err)
-	}
-	for _, leftover := range leftovers {
-		t.Cleanup(func() {
-			os.Remove(leftover)
-			os.Remove(leftover + artifactOwnerSuffix)
-		})
-	}
-
+	// Nothing to clean up in the workspace any more: the upload never
+	// touches the local filesystem, and the source object is deleted on the
+	// failure path too — see
+	// TestProcessing_Failure_DeletesStoredSourceObject.
 	assertTempDirClean(t)
 }
 
@@ -605,55 +619,4 @@ func TestProcessing_Success_CleansTempDir(t *testing.T) {
 	}
 
 	assertTempDirClean(t)
-}
-
-// TestProcessing_Failure_LeavesUploadedFileBehind documents current (not
-// fixed by this change) behavior: handleVideoUpload only removes the
-// uploaded file under uploads/ when processing succeeds, so a failed run
-// leaks the original upload indefinitely. See
-// openspec/specs/video-frame-extraction/spec.md, "Uploaded File Retained On
-// Processing Failure".
-func TestProcessing_Failure_LeavesUploadedFileBehind(t *testing.T) {
-	srv, token := startTestServer(t)
-	videoPath := generateUndecodableVideo(t, "leftover-check.mp4")
-
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "leftover-check.mp4")
-	if result.Success {
-		t.Fatalf("expected processing to fail for undecodable content, got success")
-	}
-
-	leftovers, err := filepath.Glob(filepath.Join("uploads", "*_leftover-check.mp4"))
-	if err != nil {
-		t.Fatalf("failed to glob uploads dir: %v", err)
-	}
-	if len(leftovers) != 1 {
-		t.Fatalf("expected exactly one leftover upload file (known cleanup gap on failure), found: %v", leftovers)
-	}
-	t.Cleanup(func() {
-		os.Remove(leftovers[0])
-		os.Remove(leftovers[0] + artifactOwnerSuffix)
-	})
-}
-
-// TestStaticUploads_NeverServesOwnerSidecarFiles guards against a sidecar
-// file leaking which UserID owns which artifact, even to the authenticated
-// user it names as owner: rejectOwnerSidecarRequests must reject the
-// .owner suffix outright rather than deferring to ownership matching. It
-// covers uploads/ now — outputs/ no longer exists, and result artifacts
-// have no sidecar at all.
-func TestStaticUploads_NeverServesOwnerSidecarFiles(t *testing.T) {
-	srv, token := startTestServer(t)
-
-	sidecarPath := filepath.Join("uploads", "fake-artifact.mp4.owner")
-	if err := os.WriteFile(sidecarPath, []byte("3fa85f64-5717-4562-b3fc-2c963f66afa6"), 0600); err != nil {
-		t.Fatalf("failed to write fake sidecar: %v", err)
-	}
-	t.Cleanup(func() { os.Remove(sidecarPath) })
-
-	resp := getWithAuthorization(t, srv.URL+"/uploads/fake-artifact.mp4.owner", "Bearer "+token)
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d (ownership sidecar files must never be served)", resp.StatusCode, http.StatusNotFound)
-	}
 }

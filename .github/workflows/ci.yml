@@ -166,8 +166,7 @@ jobs:
           # REDIS_TEST_ADDR above.
           REDIS_ADDR: localhost:6379
           # Exercises internal/video/infrastructure/storage's own tests
-          # against the MinIO container started above. No non-test
-          # VIDEO_MINIO_* variable is set: cmd/api reads none of them yet.
+          # against the MinIO container started above.
           VIDEO_MINIO_TEST_ENDPOINT: 127.0.0.1:9000
           VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
           VIDEO_MINIO_TEST_SECRET_KEY: minioadmin

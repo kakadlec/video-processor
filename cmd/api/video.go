@@ -11,10 +11,8 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -74,12 +72,17 @@ type videoModule struct {
 	// deliberately the authoritative repository, not the cached decorator —
 	// see setupVideo for why a stale cache entry must not be able to 404 a
 	// download the listing is already showing.
-	jobs    videodomain.VideoJobRepository
+	jobs videodomain.VideoJobRepository
+	// sources backs POST /upload's inbound stream and its own cleanup. The
+	// handler owns the source object's lifetime end to end: it is the only
+	// place that reaches every exit path, including the ones ProcessVideoJob
+	// never runs on.
+	sources videodomain.SourceStorage
 	results videodomain.ResultStorage
 	idsFor  videodomain.VideoJobIDParser
 }
 
-func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, listUserResults *videoapplication.ListUserResults, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
+func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, listUserResults *videoapplication.ListUserResults, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, sources videodomain.SourceStorage, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
 	return &videoModule{
 		createVideoJob:  createVideoJob,
 		getJobStatus:    getJobStatus,
@@ -90,6 +93,7 @@ func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatu
 		failJob:         failJob,
 		idempotency:     idempotency,
 		jobs:            jobs,
+		sources:         sources,
 		results:         results,
 		idsFor:          idsFor,
 	}
@@ -159,6 +163,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 		return nil, nil, nil, err
 	}
 	resultStorage := videostorage.NewResultStorage(minioClient, minioConfig.Bucket)
+	sourceStorage := videostorage.NewSourceStorage(minioClient, minioConfig.Bucket)
 
 	ids := videoidgen.New()
 	// Every use case below shares the same cache-aside/write-through
@@ -191,6 +196,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
+			sourceStorage,
 			resultStorage,
 			ids,
 		),
@@ -199,6 +205,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 		failJob,
 		idempotencyStore,
 		authoritativeRepo,
+		sourceStorage,
 		resultStorage,
 		ids,
 	)
@@ -450,41 +457,51 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		return
 	}
 
-	// uploadID names only the saved upload file, independent of the
-	// VideoJob's own ID (minted afterward, once the file is safely on
-	// disk) — so a save failure below never leaves a dangling VideoJob row.
+	// uploadID names only the stored source object, independent of the
+	// VideoJob's own ID (minted afterward, once the object is safely in the
+	// bucket) — so a storage failure below never leaves a dangling VideoJob
+	// row.
 	uploadID := uuid.NewString()
 	safeFilename := filepath.Base(originalFilename)
-	filename := fmt.Sprintf("%s_%s", uploadID, safeFilename)
-	videoPath := filepath.Clean(filepath.Join("uploads", filename))
-	if !strings.HasPrefix(videoPath, "uploads"+string(os.PathSeparator)) {
-		c.JSON(400, ProcessingResult{
-			Success: false,
-			Message: "Nome de arquivo inválido",
-		})
-		return
-	}
+	sourceKey := videodomain.SourceStorageKey(uploadID, safeFilename)
 
-	out, err := os.Create(videoPath)
-	if err != nil {
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Erro ao salvar arquivo: " + err.Error(),
-		})
-		return
-	}
-	defer out.Close()
-
-	// Hashing through the same io.Copy pass that saves the file costs no
-	// extra I/O — see add-upload-idempotency-keys' design.md Decision 1.
+	// Hashing through the same single read pass that uploads the object
+	// costs no extra I/O — see add-upload-idempotency-keys' design.md
+	// Decision 1. Nothing is written to the local filesystem on the way in.
 	hasher := sha256.New()
-	if _, err := io.Copy(out, io.TeeReader(file, hasher)); err != nil {
+	if err := m.sources.Put(c.Request.Context(), sourceKey, io.TeeReader(file, hasher)); err != nil {
+		// The adapter's error names the endpoint and bucket; log it, never
+		// render it.
+		log.Printf("store source %s: %v", sourceKey.String(), err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
-			Message: "Erro ao salvar arquivo: " + err.Error(),
+			Message: "Failed to store the uploaded file",
 		})
 		return
 	}
+	// One deferred cleanup, registered the moment the object exists, rather
+	// than a delete on each exit path below: this covers the idempotency
+	// conflict, a CreateVideoJob error, a ProcessVideoJob error, a
+	// processing failure, success, and a panic. Source objects are
+	// transient — nothing is meant to outlive its request.
+	//
+	// Best effort, deliberately: one call, no retry. If storage is
+	// unreachable at exactly this moment the object survives with nothing to
+	// reclaim it, which is why the log line carries the key (it is what
+	// makes the residual set enumerable) and why no spec here claims that no
+	// source object survives. The operator-side backstop is an expiration
+	// lifecycle rule on the uploads/ prefix; a real guarantee needs the
+	// reconciling worker Phase 6 introduces.
+	defer func() {
+		// A detached context: c.Request.Context() may already be canceled
+		// (client disconnect), which can itself be why processing failed,
+		// and the cleanup must still run.
+		cleanupCtx, cancel := videoapplication.NewFinalizationContext()
+		defer cancel()
+		if err := m.sources.Delete(cleanupCtx, sourceKey); err != nil {
+			log.Printf("delete source %s: %v", sourceKey.String(), err)
+		}
+	}()
 	contentHash := hex.EncodeToString(hasher.Sum(nil))
 
 	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), contentHash)
@@ -492,16 +509,12 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		// Unreachable in practice: userID.String() is already validated
 		// non-empty above, and contentHash is always a 64-char SHA-256
 		// digest. Handled defensively rather than assumed.
-		log.Printf("build idempotency key for upload %s: %v", filename, err)
+		log.Printf("build idempotency key for upload %s: %v", sourceKey.String(), err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Internal error building idempotency key",
 		})
 		return
-	}
-
-	if err := recordArtifactOwner("uploads", filename, userID.String()); err != nil {
-		log.Printf("Failed to record owner for upload %s: %v", filename, err)
 	}
 
 	// hasReservation tracks whether this request actually holds a valid
@@ -516,16 +529,15 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	var hasReservation bool
 	switch {
 	case err != nil:
-		log.Printf("idempotency reserve for upload %s: %v", filename, err)
+		log.Printf("idempotency reserve for upload %s: %v", sourceKey.String(), err)
 	case !reserved:
-		cleanupRedundantUpload(videoPath, filename)
 		if jobID, found := m.waitForFinalizedIdempotencyKey(c.Request.Context(), idemKey); found {
 			status, err := m.getJobStatus.Execute(c.Request.Context(), videoapplication.GetJobStatusInput{
 				RequestingUserID: userID.String(),
 				JobID:            jobID.String(),
 			})
 			if err != nil {
-				log.Printf("get job status for duplicate upload %s: %v", filename, err)
+				log.Printf("get job status for duplicate upload %s: %v", sourceKey.String(), err)
 				c.JSON(500, ProcessingResult{
 					Success: false,
 					Message: "Failed to retrieve existing job status",
@@ -559,11 +571,11 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		if hasReservation {
 			clearCtx, cancel := videoapplication.NewFinalizationContext()
 			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-				log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", filename, cleared, clearErr)
+				log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", sourceKey.String(), cleared, clearErr)
 			}
 			cancel()
 		}
-		log.Printf("create video job for upload %s: %v", filename, err)
+		log.Printf("create video job for upload %s: %v", sourceKey.String(), err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Erro ao registrar o processamento",
@@ -577,13 +589,13 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// finalize.
 	if hasReservation {
 		if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
-			log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", filename, err)
+			log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", sourceKey.String(), err)
 		} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
 			log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
 		}
 	}
 
-	processed, err := m.processVideoJob.Execute(c.Request.Context(), created.JobID, videoPath)
+	processed, err := m.processVideoJob.Execute(c.Request.Context(), created.JobID, sourceKey)
 	if err != nil {
 		// The job's state here isn't confirmed failed (ProcessVideoJob's
 		// own FailJob call may itself have errored) — leave the
@@ -628,12 +640,6 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		Images:     processed.ImageNames,
 	}
 
-	if err := os.Remove(videoPath); err != nil {
-		log.Printf("Failed to remove original upload %s: %v", videoPath, err)
-	}
-	if err := removeArtifactOwner("uploads", filename); err != nil {
-		log.Printf("Failed to remove owner record for upload %s: %v", filename, err)
-	}
 	// The result is already durable by this point: ProcessVideoJob stores
 	// the zip in the bucket as part of its own sequence, so a successful
 	// return means there is nothing left for this handler to make reachable
@@ -674,19 +680,6 @@ func extractionFailureMessage(extractionErr error, reason string) string {
 		return "Erro ao criar arquivo ZIP: " + reason
 	default:
 		return "Erro no processamento: " + reason
-	}
-}
-
-// cleanupRedundantUpload removes an upload that turned out to be a
-// duplicate — this request's own saved file and owner sidecar, never the
-// original request's artifacts (each request writes under its own
-// uploadID-prefixed path).
-func cleanupRedundantUpload(videoPath, filename string) {
-	if err := os.Remove(videoPath); err != nil {
-		log.Printf("Failed to remove redundant upload %s: %v", videoPath, err)
-	}
-	if err := removeArtifactOwner("uploads", filename); err != nil {
-		log.Printf("Failed to remove owner record for redundant upload %s: %v", filename, err)
 	}
 }
 

@@ -127,10 +127,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    volumes:
-      # No ./outputs mount: result zips are objects in the MinIO bucket
-      # above, not files in the working directory.
-      - ./uploads:/app/uploads
 
   # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
   # than "app"'s hardened "runtime" stage, which deliberately has neither.
