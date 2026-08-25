@@ -1,12 +1,12 @@
 *:Zone.Identifier
 
-/uploads/*
 /temp/*
-!/uploads/.gitkeep
 !/temp/.gitkeep
-# Retired by migrate-result-storage-to-minio; still ignored so a
+# Retired by migrate-result-storage-to-minio and
+# migrate-upload-storage-to-minio respectively; still ignored so a
 # pre-migration leftover can't be committed by accident.
 /outputs/
+/uploads/
 
 *.exe
 /app

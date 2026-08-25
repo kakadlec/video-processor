@@ -2,8 +2,11 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"video-processor/internal/video/domain"
 )
@@ -12,11 +15,24 @@ import (
 // message is empty, since VideoJob.Fail rejects an empty reason.
 const fallbackFailureReason = "video processing failed"
 
-// storeFailureReason is recorded instead of the storage adapter's own error
-// text, which names the object-storage endpoint and bucket. The reason is
-// persisted on the job and echoed to the uploader, so it must carry no
-// infrastructure detail; the underlying error is logged instead.
-const storeFailureReason = "failed to store the extracted result"
+// storeFailureReason and fetchFailureReason are recorded instead of the
+// storage adapter's own error text, which names the object-storage endpoint
+// and bucket. The reason is persisted on the job and echoed to the uploader,
+// so it must carry no infrastructure detail; the underlying error is logged
+// instead.
+const (
+	storeFailureReason = "failed to store the extracted result"
+	fetchFailureReason = "failed to retrieve the uploaded video"
+)
+
+// tempDirName is where the source video is downloaded for ffmpeg, matching
+// the directory the extractor writes its own frames and zip into.
+const tempDirName = "temp"
+
+// localSourceSuffix names the transient copy downloaded for ffmpeg. It sits
+// beside the extractor's per-job frame directory rather than inside it, so
+// that directory's own RemoveAll cannot delete a file it does not own.
+const localSourceSuffix = "_source"
 
 // ProcessVideoJobResult describes the outcome of running a VideoJob's
 // enqueue/start/extract sequence. On success the job is left in
@@ -31,17 +47,31 @@ type ProcessVideoJobResult struct {
 	StorageKey    string
 	FailureReason string
 	// ExtractionError is the error that caused Success to be false —
-	// from domain.FrameExtractor or from storing the result — unwrapped so
-	// a caller can classify it (e.g. via errors.Is against a specific
-	// infrastructure adapter's sentinel errors) to choose its own
-	// user-facing message, instead of exposing FailureReason's raw text
-	// directly. Nil when Success is true.
+	// from domain.FrameExtractor, from retrieving the source, or from
+	// storing the result — unwrapped so a caller can classify it (e.g. via
+	// errors.Is against a specific infrastructure adapter's sentinel
+	// errors) to choose its own user-facing message, instead of exposing
+	// FailureReason's raw text directly. Nil when Success is true.
 	ExtractionError error
 }
 
-// ProcessVideoJob runs a VideoJob's enqueue/start-processing/extract/store
-// sequence synchronously, in-process, failing the job if extraction or
-// storage errors.
+// ProcessVideoJob runs a VideoJob's enqueue/start-processing/fetch/extract/
+// store sequence synchronously, in-process, failing the job if any of those
+// steps errors.
+//
+// Execute takes a source StorageKey rather than a local file path, and that
+// is the point of the signature: a path written by the calling HTTP handler
+// is only meaningful to a process that shares that handler's filesystem, and
+// Phase 6 runs this sequence in cmd/worker, which does not. Do not
+// reintroduce a local-path parameter, and do not move the download into the
+// ffmpeg adapter — that adapter takes a local path and knows nothing about
+// object storage, the same split this project established for the result
+// zip.
+//
+// This use case owns the lifetime of the local copy it downloads. It does
+// NOT delete the source object: the caller stored it and reaches exit paths
+// this use case never runs on (a duplicate-content conflict, a
+// CreateVideoJob failure), so cleanup belongs there, in one place.
 //
 // It does NOT call CompleteJob itself on success. That split no longer
 // exists for the reason it originally did — the caller used to record
@@ -66,18 +96,19 @@ type ProcessVideoJob struct {
 	start     *StartProcessing
 	fail      *FailJob
 	extractor domain.FrameExtractor
+	sources   domain.SourceStorage
 	results   domain.ResultStorage
 	idsFor    domain.VideoJobIDParser
 }
 
 // NewProcessVideoJob wires the ProcessVideoJob use case to its dependencies.
-func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, results domain.ResultStorage, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
-	return &ProcessVideoJob{enqueue: enqueue, start: start, fail: fail, extractor: extractor, results: results, idsFor: idsFor}
+func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
+	return &ProcessVideoJob{enqueue: enqueue, start: start, fail: fail, extractor: extractor, sources: sources, results: results, idsFor: idsFor}
 }
 
-// Execute runs jobID's enqueue/start-processing/extract sequence against
-// the video file at videoPath.
-func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath string) (ProcessVideoJobResult, error) {
+// Execute runs jobID's enqueue/start-processing/fetch/extract/store sequence
+// against the source video stored under sourceKey.
+func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey domain.StorageKey) (ProcessVideoJobResult, error) {
 	id, err := uc.idsFor.ParseVideoJobID(jobID)
 	if err != nil {
 		return ProcessVideoJobResult{}, err
@@ -90,13 +121,30 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 		return ProcessVideoJobResult{}, err
 	}
 
+	videoPath, err := localSourcePath(id)
+	if err != nil {
+		log.Printf("build local source path for job %s: %v", jobID, err)
+		return uc.failWith(jobID, err, fetchFailureReason)
+	}
+	if err := uc.sources.Get(ctx, sourceKey, videoPath); err != nil {
+		log.Printf("fetch source %s for job %s: %v", sourceKey.String(), jobID, err)
+		return uc.failWith(jobID, err, fetchFailureReason)
+	}
+	// Registered before extraction, not after: the extraction-error path
+	// below returns, so a defer set up afterwards would never run and the
+	// downloaded video would be left behind on every failure.
+	defer func() {
+		if err := os.Remove(videoPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("remove local source %s for job %s: %v", videoPath, jobID, err)
+		}
+	}()
+
 	zipPath, frameCount, imageNames, extractErr := uc.extractor.ExtractFrames(ctx, id, videoPath)
 	if extractErr != nil {
 		return uc.failWith(jobID, extractErr, extractErr.Error())
 	}
-	// Registered before the store attempt, not after it: the Put-error path
-	// below returns, so a defer set up afterwards would never run and the
-	// extracted zip would be left behind on every storage failure.
+	// Same ordering rule as the source copy above, for the same reason: the
+	// Put-error path returns.
 	defer func() {
 		if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("remove extracted zip %s for job %s: %v", zipPath, jobID, err)
@@ -118,12 +166,31 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, videoPath 
 	}, nil
 }
 
+// localSourcePath names the transient copy downloaded for ffmpeg.
+//
+// The name is built entirely from the job's own identifier — no part of it
+// derives from the uploaded filename — and carries no extension. ffmpeg
+// detects input format by probing content, and every container this system
+// accepts has an unambiguous signature, so an extension buys nothing and
+// would cost a sanitization obligation. The confinement check mirrors the
+// extractor's own; it is unreachable for a parsed VideoJobID and exists so
+// the path handed to os.Remove and to ffmpeg is validated rather than
+// assumed.
+func localSourcePath(jobID domain.VideoJobID) (string, error) {
+	path := filepath.Clean(filepath.Join(tempDirName, jobID.String()+localSourceSuffix))
+	if !strings.HasPrefix(path, tempDirName+string(os.PathSeparator)) {
+		return "", fmt.Errorf("video: local source path %q escapes %s/", path, tempDirName)
+	}
+	return path, nil
+}
+
 // failWith marks jobID failed with reason and reports it as an unsuccessful
-// result. It is shared by the extraction and storage failure paths: a
-// result that could not be stored is no more usable than one that could not
-// be extracted. reason is passed separately from cause because the two
-// paths differ in what may be persisted — extraction echoes ffmpeg's own
-// message, as it always has, while storage must not leak endpoint or bucket.
+// result. It is shared by the fetch, extraction, and storage failure paths:
+// a result that could not be produced is no more usable than one that could
+// not be stored. reason is passed separately from cause because the paths
+// differ in what may be persisted — extraction echoes ffmpeg's own message,
+// as it always has, while the storage paths must not leak endpoint or
+// bucket.
 func (uc *ProcessVideoJob) failWith(jobID string, cause error, reason string) (ProcessVideoJobResult, error) {
 	if reason == "" {
 		reason = fallbackFailureReason

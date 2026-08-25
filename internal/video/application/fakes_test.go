@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -213,4 +214,66 @@ func (s *fakeResultStorage) has(key string) bool {
 	defer s.mu.Unlock()
 	_, ok := s.objects[key]
 	return ok
+}
+
+// fakeSourceStorage is an in-memory domain.SourceStorage for use-case tests,
+// so ProcessVideoJob's fetch step can be exercised without a MinIO instance.
+type fakeSourceStorage struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+
+	putErr    error
+	getErr    error
+	deleteErr error
+}
+
+func newFakeSourceStorage() *fakeSourceStorage {
+	return &fakeSourceStorage{objects: make(map[string][]byte)}
+}
+
+func (s *fakeSourceStorage) Put(_ context.Context, key domain.StorageKey, r io.Reader) error {
+	if s.putErr != nil {
+		return s.putErr
+	}
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key.String()] = content
+	return nil
+}
+
+func (s *fakeSourceStorage) Get(_ context.Context, key domain.StorageKey, localPath string) error {
+	if s.getErr != nil {
+		return s.getErr
+	}
+	s.mu.Lock()
+	content, ok := s.objects[key.String()]
+	s.mu.Unlock()
+	if !ok {
+		return domain.ErrSourceNotFound
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0750); err != nil {
+		return err
+	}
+	return os.WriteFile(localPath, content, 0600)
+}
+
+func (s *fakeSourceStorage) Delete(_ context.Context, key domain.StorageKey) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.objects, key.String())
+	return nil
+}
+
+// store seeds an object so a test can process a source it did not upload.
+func (s *fakeSourceStorage) store(key domain.StorageKey, content []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key.String()] = content
 }

@@ -313,7 +313,42 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 // configured runtime bucket would leave a UUID-keyed object behind on every
 // upload test, and the local MinIO service keeps its data in a named volume,
 // so that would grow without bound across suite runs.
-func newTestResultStorage(t *testing.T) videodomain.ResultStorage {
+// newTestStorages provisions one per-test bucket and returns both adapters
+// over it — the same arrangement production uses, where sources and results
+// share a bucket and are separated only by key prefix.
+func newTestStorages(t *testing.T) (videodomain.SourceStorage, videodomain.ResultStorage) {
+	t.Helper()
+	sources, results, _ := newTestStoragesWithInspector(t)
+	return sources, results
+}
+
+// bucketInspector lists a test bucket's objects, so a test can assert on
+// what a request left behind rather than only on what it can fetch by key —
+// which matters for source objects, whose uploadID-derived keys the test
+// never sees.
+type bucketInspector struct {
+	client *minio.Client
+	bucket string
+}
+
+func (b bucketInspector) keysWithPrefix(t *testing.T, prefix string) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var keys []string
+	for object := range b.client.ListObjects(ctx, b.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if object.Err != nil {
+			t.Fatalf("list %q under %q: %v", b.bucket, prefix, object.Err)
+		}
+		keys = append(keys, object.Key)
+	}
+	return keys
+}
+
+// newTestStoragesWithInspector is newTestStorages plus a handle on the
+// underlying bucket.
+func newTestStoragesWithInspector(t *testing.T) (videodomain.SourceStorage, videodomain.ResultStorage, bucketInspector) {
 	t.Helper()
 	cfg, err := videostorage.LoadConfigFromEnv()
 	if err != nil {
@@ -330,7 +365,9 @@ func newTestResultStorage(t *testing.T) videodomain.ResultStorage {
 	}
 	t.Cleanup(func() { removeTestBucket(t, client, bucket) })
 
-	return videostorage.NewResultStorage(client, bucket)
+	return videostorage.NewSourceStorage(client, bucket),
+		videostorage.NewResultStorage(client, bucket),
+		bucketInspector{client: client, bucket: bucket}
 }
 
 // uniqueTestBucket derives an S3-valid (lowercase, no underscores, <= 63
@@ -372,10 +409,16 @@ func removeTestBucket(t *testing.T, client *minio.Client, bucket string) {
 // bucket the upload path actually wrote to.
 func newTestVideoModuleWithStorage(t *testing.T) (*videoModule, *inMemoryVideoJobRepository, videodomain.ResultStorage) {
 	t.Helper()
+	module, repo, _, results := newTestVideoModuleWithBothStorages(t)
+	return module, repo, results
+}
+
+func newTestVideoModuleWithBothStorages(t *testing.T) (*videoModule, *inMemoryVideoJobRepository, videodomain.SourceStorage, videodomain.ResultStorage) {
+	t.Helper()
 	repo := newInMemoryVideoJobRepository()
 	ids := videoidgen.New()
 	extractor := videoffmpeg.New()
-	results := newTestResultStorage(t)
+	sources, results := newTestStorages(t)
 	completeJob := videoapplication.NewCompleteJob(repo, ids)
 	failJob := videoapplication.NewFailJob(repo, ids)
 	module := newVideoModule(
@@ -387,6 +430,7 @@ func newTestVideoModuleWithStorage(t *testing.T) (*videoModule, *inMemoryVideoJo
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
+			sources,
 			results,
 			ids,
 		),
@@ -395,10 +439,11 @@ func newTestVideoModuleWithStorage(t *testing.T) (*videoModule, *inMemoryVideoJo
 		failJob,
 		newFakeIdempotencyStore(),
 		repo,
+		sources,
 		results,
 		ids,
 	)
-	return module, repo, results
+	return module, repo, sources, results
 }
 
 // startTestVideoServer wires a real router with a fake identity module (so
@@ -824,6 +869,7 @@ func (f *blockingFrameExtractor) Invocations() int {
 // newTestVideoModuleWithRepo, which always uses a real ffmpeg extractor.
 func newIdempotencyTestVideoModule(extractor videodomain.FrameExtractor) (*videoModule, *fakeIdempotencyStore, *inMemoryVideoJobRepository) {
 	repo := newInMemoryVideoJobRepository()
+	sources := newFakeSourceStorage()
 	results := newFakeResultStorage()
 	ids := videoidgen.New()
 	completeJob := videoapplication.NewCompleteJob(repo, ids)
@@ -838,6 +884,7 @@ func newIdempotencyTestVideoModule(extractor videodomain.FrameExtractor) (*video
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
+			sources,
 			results,
 			ids,
 		),
@@ -846,6 +893,7 @@ func newIdempotencyTestVideoModule(extractor videodomain.FrameExtractor) (*video
 		failJob,
 		store,
 		repo,
+		sources,
 		results,
 		ids,
 	)
@@ -874,6 +922,7 @@ func newIdempotencyTestVideoModuleWithRepo(extractor videodomain.FrameExtractor,
 // ResultStorage, so a test can inject one whose Put fails — the storage
 // equivalent of createFailingRepository.
 func newIdempotencyTestVideoModuleWithRepoAndStorage(extractor videodomain.FrameExtractor, repo videodomain.VideoJobRepository, results videodomain.ResultStorage) (*videoModule, *fakeIdempotencyStore) {
+	sources := newFakeSourceStorage()
 	ids := videoidgen.New()
 	completeJob := videoapplication.NewCompleteJob(repo, ids)
 	failJob := videoapplication.NewFailJob(repo, ids)
@@ -887,6 +936,7 @@ func newIdempotencyTestVideoModuleWithRepoAndStorage(extractor videodomain.Frame
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
+			sources,
 			results,
 			ids,
 		),
@@ -895,6 +945,7 @@ func newIdempotencyTestVideoModuleWithRepoAndStorage(extractor videodomain.Frame
 		failJob,
 		store,
 		repo,
+		sources,
 		results,
 		ids,
 	)
@@ -1497,4 +1548,154 @@ func (s *fakeResultStorage) Stat(_ context.Context, key videodomain.StorageKey) 
 		return 0, time.Time{}, videodomain.ErrResultNotFound
 	}
 	return int64(len(data)), s.times[key.String()], nil
+}
+
+// fakeSourceStorage is an in-memory domain.SourceStorage for handler tests
+// that need deterministic control over timing or failure, where a real
+// bucket would only add latency.
+type fakeSourceStorage struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	putErr  error
+}
+
+func newFakeSourceStorage() *fakeSourceStorage {
+	return &fakeSourceStorage{objects: make(map[string][]byte)}
+}
+
+func (s *fakeSourceStorage) Put(_ context.Context, key videodomain.StorageKey, r io.Reader) error {
+	if s.putErr != nil {
+		return s.putErr
+	}
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key.String()] = content
+	return nil
+}
+
+func (s *fakeSourceStorage) Get(_ context.Context, key videodomain.StorageKey, localPath string) error {
+	s.mu.Lock()
+	content, ok := s.objects[key.String()]
+	s.mu.Unlock()
+	if !ok {
+		return videodomain.ErrSourceNotFound
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0750); err != nil {
+		return err
+	}
+	return os.WriteFile(localPath, content, 0600)
+}
+
+func (s *fakeSourceStorage) Delete(_ context.Context, key videodomain.StorageKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.objects, key.String())
+	return nil
+}
+
+func (s *fakeSourceStorage) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.objects)
+}
+
+// startSourceStorageTestServer runs the real router against a real bucket
+// and hands back an inspector for it, so a test can assert what a request
+// left behind under the uploads/ prefix.
+func startSourceStorageTestServer(t *testing.T) (*httptest.Server, string, bucketInspector) {
+	t.Helper()
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+
+	repo := newInMemoryVideoJobRepository()
+	ids := videoidgen.New()
+	sources, results, inspector := newTestStoragesWithInspector(t)
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
+	module := newVideoModule(
+		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewGetJobStatus(repo, ids),
+		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewProcessVideoJob(
+			videoapplication.NewEnqueueVideoJob(repo, ids),
+			videoapplication.NewStartProcessing(repo, ids),
+			failJob,
+			videoffmpeg.New(),
+			sources,
+			results,
+			ids,
+		),
+		videoapplication.NewListUserResults(repo, results),
+		completeJob,
+		failJob,
+		newFakeIdempotencyStore(),
+		repo,
+		sources,
+		results,
+		ids,
+	)
+
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	t.Cleanup(srv.Close)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	return srv, token, inspector
+}
+
+// TestUpload_Success_StoresResultAndDeletesSourceObject is the core
+// assertion of this change: the source lives in the bucket only for the
+// duration of the request, and the result is what survives.
+func TestUpload_Success_StoresResultAndDeletesSourceObject(t *testing.T) {
+	srv, token, inspector := startSourceStorageTestServer(t)
+	videoPath := generateTestVideo(t, 1)
+
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "source-lifecycle.mp4")
+	if !result.Success {
+		t.Fatalf("upload failed: %s", result.Message)
+	}
+
+	if leftover := inspector.keysWithPrefix(t, "uploads/"); len(leftover) != 0 {
+		t.Fatalf("source objects left in the bucket after a successful upload: %v", leftover)
+	}
+	if stored := inspector.keysWithPrefix(t, "frames_"); len(stored) != 1 {
+		t.Fatalf("result objects = %v, want exactly one", stored)
+	}
+}
+
+// TestProcessing_Failure_DeletesStoredSourceObject inverts the behavior the
+// removed "Uploaded File Retained On Processing Failure" requirement
+// documented. It replaces TestProcessing_Failure_LeavesUploadedFileBehind:
+// the same setup, the opposite assertion.
+func TestProcessing_Failure_DeletesStoredSourceObject(t *testing.T) {
+	srv, token, inspector := startSourceStorageTestServer(t)
+	videoPath := generateUndecodableVideo(t, "failed-source-cleanup.mp4")
+
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "failed-source-cleanup.mp4")
+	if result.Success {
+		t.Fatalf("expected processing to fail for undecodable content, got success")
+	}
+
+	if leftover := inspector.keysWithPrefix(t, "uploads/"); len(leftover) != 0 {
+		t.Fatalf("source objects left in the bucket after a failed upload: %v — a failure must not retain the source", leftover)
+	}
+}
+
+// TestUpload_NonMp4Container_ExtractsFromExtensionlessLocalCopy is the
+// empirical check the extension-less naming owes. ProcessVideoJob downloads
+// to temp/<jobID>_source with no extension, so extraction has to rely on
+// ffmpeg probing the content — this proves it does for a container other
+// than the one every other test uses.
+func TestUpload_NonMp4Container_ExtractsFromExtensionlessLocalCopy(t *testing.T) {
+	srv, token, _ := startSourceStorageTestServer(t)
+	videoPath := generateTestVideoInContainer(t, 1, "mkv")
+
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "probe-check.mkv")
+	if !result.Success {
+		t.Fatalf("mkv upload failed: %s — ffmpeg must detect the container from content, not from a filename extension", result.Message)
+	}
+	if result.FrameCount < 1 {
+		t.Fatalf("result.FrameCount = %d, want at least 1", result.FrameCount)
+	}
 }

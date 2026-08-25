@@ -122,3 +122,47 @@ func mustVideoJobID(t *testing.T, value string) domain.VideoJobID {
 	}
 	return id
 }
+
+func TestSourceStorageKey_CarriesTheUploadsPrefixAndUploadID(t *testing.T) {
+	key := domain.SourceStorageKey("upload-1", "movie.mp4")
+
+	if got, want := key.String(), "uploads/upload-1_movie.mp4"; got != want {
+		t.Fatalf("SourceStorageKey = %q, want %q", got, want)
+	}
+}
+
+// TestSourceStorageKey_TakesOnlyTheBaseName guards the one place a
+// user-supplied filename reaches a derived key. A source key is an opaque
+// object name rather than a filesystem path, so traversal is not the risk —
+// escaping the uploads/ prefix is, since that prefix is what separates
+// source objects from result objects sharing the same bucket.
+func TestSourceStorageKey_TakesOnlyTheBaseName(t *testing.T) {
+	for _, filename := range []string{"../../etc/passwd", "/etc/passwd", "nested/dir/movie.mp4"} {
+		key := domain.SourceStorageKey("upload-1", filename).String()
+		if !strings.HasPrefix(key, "uploads/upload-1_") {
+			t.Fatalf("SourceStorageKey(%q) = %q, want the uploads/upload-1_ prefix", filename, key)
+		}
+		if strings.Count(key, "/") != 1 {
+			t.Fatalf("SourceStorageKey(%q) = %q, want exactly one separator (the prefix's own)", filename, key)
+		}
+	}
+}
+
+// TestSourceAndResultKeysNeverCollide pins the separation the shared bucket
+// depends on: results must stay flat because app.js uses a result key as a
+// single URL path segment, while sources take a prefix precisely because no
+// route exposes them.
+func TestSourceAndResultKeysNeverCollide(t *testing.T) {
+	source := domain.SourceStorageKey("upload-1", "movie.mp4").String()
+	result := domain.ResultStorageKey(mustVideoJobID(t, "3fa85f64-5717-4562-b3fc-2c963f66afa6")).String()
+
+	if source == result {
+		t.Fatalf("source and result keys collided on %q", source)
+	}
+	if strings.Contains(result, "/") {
+		t.Fatalf("result key %q must contain no separator — app.js uses it verbatim as a path segment", result)
+	}
+	if !strings.HasPrefix(source, "uploads/") {
+		t.Fatalf("source key %q must carry the uploads/ prefix", source)
+	}
+}

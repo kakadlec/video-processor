@@ -88,20 +88,11 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	videoRoutes.Use(identity.requireBearerAuth())
 	videoRoutes.Use(rateLimitMiddleware(limiter))
 
-	// The /uploads static mount serves the exact same files as the upload
-	// pipeline saved, so it needs the same per-owner check.
-	// rejectOwnerSidecarRequests runs unconditionally: the sidecar files
-	// themselves must never be servable, including any left over from
-	// before this route was protected.
-	//
-	// There is no /outputs counterpart: result artifacts live in object
-	// storage and are reachable only through GET /download/:filename, whose
-	// entitlement comes from the VideoJob row rather than from a sidecar.
-	uploadsRoutes := videoRoutes.Group("/uploads")
-	uploadsRoutes.Use(rejectOwnerSidecarRequests())
-	uploadsRoutes.Use(requireArtifactOwnership("uploads"))
-	uploadsRoutes.Static("/", "./uploads")
-
+	// No static mount remains. Source videos and result artifacts are both
+	// objects in the bucket, reachable only through handlers that derive
+	// entitlement from the VideoJob row — GET /download/:filename for
+	// results, and nothing at all for sources, which never outlive the
+	// request that stored them.
 	video.registerRoutes(videoRoutes)
 
 	identity.registerRoutes(r)
@@ -109,89 +100,12 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	return r
 }
 
-// artifactOwnerSuffix names the sidecar file that records which
-// authenticated user owns an uploaded video, stored alongside it under
-// uploads/. Result artifacts no longer use this mechanism — their owner is
-// the VideoJob row — and it is retired entirely once uploads move to object
-// storage too.
-const artifactOwnerSuffix = ".owner"
-
-// recordArtifactOwner persists that userID owns the artifact at
-// filepath.Join(dir, artifactFilename). dir is confined to like videoPath
-// and zipPath are confined elsewhere in this file.
-func recordArtifactOwner(dir, artifactFilename, userID string) error {
-	path := filepath.Clean(filepath.Join(dir, artifactFilename+artifactOwnerSuffix))
-	if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
-		return fmt.Errorf("invalid artifact filename: %s", artifactFilename)
-	}
-	return os.WriteFile(path, []byte(userID), 0600)
-}
-
-// artifactOwner returns the userID recorded by recordArtifactOwner for the
-// artifact at filepath.Join(dir, artifactFilename), if any.
-func artifactOwner(dir, artifactFilename string) (string, bool) {
-	path := filepath.Clean(filepath.Join(dir, artifactFilename+artifactOwnerSuffix))
-	if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
-		return "", false
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
-	}
-	return string(data), true
-}
-
-// removeArtifactOwner deletes the ownership sidecar for the artifact at
-// filepath.Join(dir, artifactFilename), confined the same way as above.
-func removeArtifactOwner(dir, artifactFilename string) error {
-	path := filepath.Clean(filepath.Join(dir, artifactFilename+artifactOwnerSuffix))
-	if !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
-		return fmt.Errorf("invalid artifact filename: %s", artifactFilename)
-	}
-	return os.Remove(path)
-}
-
-// rejectOwnerSidecarRequests blocks direct HTTP access to ownership sidecar
-// files under a static file group. It's registered unconditionally,
-// regardless of whether identity is configured, since a sidecar written
-// during an earlier, identity-enabled run of the server must stay
-// unreadable even after identity is turned off.
-func rejectOwnerSidecarRequests() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		filename := filepath.Base(c.Param("filepath"))
-		if strings.HasSuffix(filename, artifactOwnerSuffix) {
-			c.AbortWithStatusJSON(404, gin.H{"error": "File not found"})
-			return
-		}
-		c.Next()
-	}
-}
-
-// requireArtifactOwnership gates a static file group (uploads/ or outputs/)
-// so an authenticated user can only fetch artifacts recorded as their own.
-// It's only registered behind requireBearerAuth, so an authenticated UserID
-// is always present in context by the time it runs.
-func requireArtifactOwnership(dir string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userID, ok := authenticatedUserID(c)
-		if !ok {
-			c.AbortWithStatusJSON(404, gin.H{"error": "File not found"})
-			return
-		}
-
-		filename := filepath.Base(c.Param("filepath"))
-		owner, hasOwner := artifactOwner(dir, filename)
-		if !hasOwner || owner != userID.String() {
-			c.AbortWithStatusJSON(404, gin.H{"error": "File not found"})
-			return
-		}
-
-		c.Next()
-	}
-}
-
+// createDirs creates the one directory the application still writes to.
+// Both uploads/ and outputs/ are gone: source videos and result artifacts
+// are objects in the bucket, and temp/ holds only per-request scratch —
+// the downloaded source, the extracted frames, and the zip built from them.
 func createDirs() {
-	dirs := []string{"uploads", "temp"}
+	dirs := []string{"temp"}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0750); err != nil {
 			log.Printf("Failed to create directory %s: %v", dir, err)
