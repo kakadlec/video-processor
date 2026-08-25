@@ -15,7 +15,9 @@ The source no longer lives on the local filesystem: it is an object under the `u
 
 ### Requirement: Source Object Removed On Processing Failure
 
-When frame extraction or result storage fails, the system SHALL delete the stored source object rather than retaining it. A failed request SHALL leave behind neither a source object in the bucket nor a local copy under `temp/`.
+When frame extraction or result storage fails, the system SHALL delete the stored source object rather than retaining it. With storage reachable, a failed request leaves behind neither a source object in the bucket nor a local copy under `temp/`.
+
+The deletion is an obligation to attempt, not a guarantee of absence — `videojob-source-storage`'s "Every Request Deletes Its Own Source Object" owns the full semantics, including what happens when the attempt itself fails. The point of this requirement is the reversal of intent: failure is no longer a reason to keep the source.
 
 This inverts the behavior the removed "Uploaded File Retained On Processing Failure" requirement documented. Retention was a known leak, tolerable only because a local file is reclaimed when its container is replaced; the same leak in object storage would be durable and unbounded, with nothing in this system to reap it.
 

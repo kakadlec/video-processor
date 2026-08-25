@@ -74,6 +74,18 @@ The delete runs on a detached context (`NewFinalizationContext`), for the reason
 
 A delete of an already-absent key is not treated as an error, so the deferred delete is safe even on paths where an earlier step already removed the object.
 
+### 6a. That deletion is best effort, and the specs say so
+
+One `RemoveObject` call, no retry, no persisted cleanup record. If MinIO is unreachable at exactly that moment — or the detached context's own bound expires — the delete fails, and there is nothing in this system that will come back for the object later. Unlike the local file it replaces, nothing reclaims it when a container is replaced.
+
+So the contract is written as an obligation to *attempt*, not as a guarantee of absence: the handler SHALL attempt deletion on every exit path, SHALL log a failure with the key, and SHALL NOT fail the request because cleanup failed — the response is about the job, not about housekeeping. No requirement in this change asserts that no source object survives its request, because no mechanism here can enforce that.
+
+This is the same defect class as PR #179's "No zip file remains anywhere on the local filesystem", which was globally unenforceable and had to be scoped in review. Catching it in the proposal is the cheaper place.
+
+Two things bound the residual leak. First, its shape: it needs a storage failure at the exact moment of cleanup, and every such failure is logged with the key that leaked, so the set is enumerable from logs rather than invisible. Second, its backstop: an expiration lifecycle rule on the `uploads/` key prefix reclaims anything the application misses. That rule is operator policy rather than application behavior — nothing in the code depends on it — and it is *cheap only because* decision 3 gave source objects a prefix of their own. Result objects, which must never expire, share the bucket but not the prefix. `docs/operations.md` recommends it in the finalization tasks.
+
+*Alternative considered:* retry the delete, or record pending cleanups somewhere durable. Both are the beginning of a reconciler, and a reconciler needs a process that outlives the request — which is Phase 6's worker. Building half of one here would add moving parts without closing the gap.
+
 ### 7. Deleting the source on failure removes the documented retention gap
 
 `video-frame-extraction`'s "Uploaded File Retained On Processing Failure" requirement, and the test that pins it, describe behavior this design ends. The requirement is removed rather than rewritten: it exists to document a leak, and the leak is gone.
@@ -97,6 +109,8 @@ The idempotency key is derived from the content hash, which is only known after 
 **[Operators lose the ability to inspect a failed upload on the host filesystem.]** → By design; there is nothing to inspect once failures stop retaining the source. The job's persisted `ErrorReason` and the server logs remain, and `ProcessVideoJob` already logs storage failures with the underlying error.
 
 **[A failed job can no longer be retried without re-uploading the bytes.]** → An accepted consequence of the transient-source decision. If Phase 6's worker is later given replay-on-retry, it will need the source key persisted on the aggregate and a retention policy to match; deciding that now, with no worker to use it, would add a column that nothing reads.
+
+**[A failed cleanup leaks a source object durably, with nothing to reclaim it.]** → Not fully mitigated, and deliberately not specified away. The deletion is one best-effort call (decision 6a); a storage failure at that instant leaves the object. Every such failure is logged with its key, so the leak is enumerable rather than silent, and an expiration lifecycle rule on the `uploads/` prefix reclaims what the application misses. Closing the gap properly requires a reconciling worker, which is Phase 6.
 
 **[An interrupted `PutObject` can leave an incomplete multipart upload server-side.]** → `minio-go` aborts the multipart upload when its own write fails, so the common case self-heals. A client that disconnects mid-body is covered by the same path, since the copy returns an error. Bucket-level abort-incomplete-multipart lifecycle configuration is not added here — it is operator policy, not application behavior, and no code path depends on it.
 

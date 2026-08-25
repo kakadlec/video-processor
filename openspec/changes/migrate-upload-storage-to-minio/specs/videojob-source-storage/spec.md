@@ -6,10 +6,13 @@
 
 The port SHALL expose `Put`, `Get`, and `Delete`. `Put` SHALL accept an `io.Reader` rather than a local path — the source has no local existence at upload time, and requiring one would reintroduce the file this capability exists to remove. `Get` SHALL write the object to a caller-supplied local path, since its only consumer needs a file for `ffmpeg`.
 
+This requirement constrains the **inbound** path only, observed while the request is in flight. What survives the request is specified separately by "Every Request Deletes Its Own Source Object"; the two are not in tension, because the object's existence mid-request is exactly what makes the deletion afterwards meaningful.
+
 #### Scenario: A successful upload writes no local copy of the source
 
-- **WHEN** a valid video is uploaded to `POST /upload`
-- **THEN** the object exists in the configured bucket under the request's source key, and no file containing the uploaded video's bytes was created outside `temp/` at any point during the request
+- **GIVEN** a valid video uploaded to `POST /upload`, observed **while the request is still in flight** — after the object is stored and before the handler's cleanup runs
+- **WHEN** the local filesystem is inspected
+- **THEN** the object is readable from the configured bucket under the request's source key, and no file containing the uploaded video's bytes exists outside `temp/`
 
 #### Scenario: A storage failure rejects the upload
 
@@ -80,18 +83,20 @@ The `FrameExtractor` port SHALL continue to receive a local file path and SHALL 
 - **WHEN** a video in a non-mp4 supported container is uploaded and extracted from the extension-less local copy
 - **THEN** extraction succeeds and reports a frame count, confirming format detection does not depend on the filename
 
-### Requirement: No Source Object Outlives Its Request
+### Requirement: Every Request Deletes Its Own Source Object
 
-Every `POST /upload` request that stores a source object SHALL delete that object before the request completes, on every exit path: successful processing, processing failure, a duplicate-content conflict, a `CreateVideoJob` error, and any other early return after the object was written.
+Every `POST /upload` request that stores a source object SHALL attempt to delete that object before the request completes, on every exit path: successful processing, processing failure, a duplicate-content conflict, a `CreateVideoJob` error, and any other early return after the object was written. The attempt SHALL be made from a single deferred call registered as soon as the object is stored, not from per-path cleanup calls, so no future exit path can be added without it.
 
-The deletion SHALL be performed on a context detached from the request's own, because a canceled request context may itself be the reason processing failed, and the cleanup must still succeed. Deleting a key that is already absent SHALL NOT be treated as an error.
+The deletion SHALL be performed on a context detached from the request's own, because a canceled request context may itself be the reason processing failed. Deleting a key that is already absent SHALL NOT be treated as an error.
 
-#### Scenario: A successful upload leaves no source object
+This is an obligation to **attempt**, deliberately not a guarantee of absence. The attempt is one call with no retry and no persisted cleanup record, so a storage failure at that instant leaves the object behind with nothing in this system to reclaim it. A failure SHALL be logged with the leaked key — so the residual set is enumerable from logs rather than invisible — and SHALL NOT fail the request, which is about the job's outcome rather than about housekeeping. No requirement in this capability asserts that no source object survives its request, because nothing here can enforce that; an expiration lifecycle rule on the `uploads/` key prefix is the recommended operator-side backstop, and a guarantee proper would need the reconciling worker Phase 6 introduces.
 
-- **WHEN** a video is uploaded and processed successfully
-- **THEN** no object exists under that request's source key after the response is returned, and the result object is the only durable artifact
+#### Scenario: A successful upload deletes its source object
 
-#### Scenario: A failed upload leaves no source object
+- **WHEN** a video is uploaded and processed successfully, with storage reachable throughout
+- **THEN** no object exists under that request's source key after the response is returned, and the result object is the only remaining artifact
+
+#### Scenario: A failed upload deletes its source object
 
 - **GIVEN** a video whose content `ffmpeg` cannot decode
 - **WHEN** the request completes with `success: false`
@@ -103,11 +108,17 @@ The deletion SHALL be performed on a context detached from the request's own, be
 - **WHEN** the handler cleans up
 - **THEN** that request's own source object is deleted and the original request's artifacts are untouched
 
-#### Scenario: A client disconnect still cleans up
+#### Scenario: A client disconnect still triggers cleanup
 
 - **GIVEN** a request whose context is canceled after its source object was stored
 - **WHEN** the handler unwinds
-- **THEN** the source object is still deleted, because the cleanup does not run on the canceled request context
+- **THEN** the deletion is still attempted, because the cleanup does not run on the canceled request context
+
+#### Scenario: A cleanup failure is logged, not fatal, and not specified away
+
+- **GIVEN** a request whose source object was stored but whose deletion fails
+- **WHEN** the handler unwinds
+- **THEN** the response is whatever the job's own outcome dictates — unchanged by the cleanup failure — and the failure is logged with the source key, leaving an object the application will not retry
 
 ### Requirement: The uploads Directory And The Ownership Sidecar Mechanism Are Retired
 
