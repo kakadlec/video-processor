@@ -48,7 +48,7 @@ go build -o app ./cmd/api
 ./app
 ```
 
-The server creates `uploads/` and `temp/` in the working directory on first run. Processed ZIP results are not written to disk — they go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which the server requires at startup and creates if absent.
+The server creates `temp/` in the working directory on first run — the only directory it owns now. Neither uploaded source videos nor processed ZIP results are written to disk: both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which the server requires at startup and creates if absent. `temp/` holds per-request scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the request finishes.
 
 To skip the manual wiring entirely, use `docker compose up --build`, which runs the whole application inside Docker with identity already configured — see "Docker Workflow" below.
 
@@ -125,7 +125,7 @@ docker compose up --build
 
 > The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app` and deployment both use — ships only the compiled binary and `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000).
 >
-> **If the app fails to write to `./uploads` on a fresh clone:** that directory is bind-mounted into the container, and the non-root user (UID 1000) needs write access to it. `chown -R 1000:1000 uploads` once, or `chmod` it, fixes it — deleting and letting Docker recreate the directory does **not** help, since Docker creates a missing bind-mount source as root-owned regardless of which user runs `docker compose`. There is no `./outputs` counterpart any more: results live in MinIO.
+> **Bind-mount permissions:** there is no longer a bind-mounted working directory to get wrong. `./uploads` and `./outputs` were both removed once their artifacts moved into MinIO, so the non-root user (UID 1000) writes only to `temp/` inside the container, which the image creates and owns. If you still have a root-owned `uploads/` or `outputs/` in your clone from an older checkout, it is inert — delete it.
 
 ## Dependency Management
 

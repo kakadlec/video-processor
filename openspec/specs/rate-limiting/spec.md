@@ -7,9 +7,9 @@ Define the Redis-backed, per-authenticated-user request rate limiter applied to 
 ## Requirements
 ### Requirement: Authenticated Video Routes Are Rate Limited Per User
 
-`cmd/api` SHALL apply a Redis-backed, per-authenticated-user request rate limit to every route in the `videoRoutes` group (everything gated by `identity.requireBearerAuth()`: `POST /upload`, `POST /api/video-jobs`, `GET /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /download/:filename`, `GET /api/status`, and the `/uploads` static mount). A request that exceeds the configured limit within the current window SHALL be rejected with `429 Too Many Requests` before any handler-specific logic (including `ffmpeg` invocation) runs. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, `/`, static assets) are out of scope.
+`cmd/api` SHALL apply a Redis-backed, per-authenticated-user request rate limit to every route in the `videoRoutes` group (everything gated by `identity.requireBearerAuth()`: `POST /upload`, `POST /api/video-jobs`, `GET /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /download/:filename`, and `GET /api/status`). A request that exceeds the configured limit within the current window SHALL be rejected with `429 Too Many Requests` before any handler-specific logic (including `ffmpeg` invocation) runs. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, `/`, static assets) are out of scope.
 
-The `/outputs` static mount is absent from that enumeration because it no longer exists: result artifacts moved to object storage and are reachable only through `GET /download/:filename`, which is itself in the group and therefore still limited.
+Neither static mount appears in that enumeration any more, because neither exists. `/outputs` went when results moved to object storage; `/uploads` goes with this change, when source videos move there too. The group now contains only JSON and streaming handlers, every one of which is still limited.
 
 #### Scenario: Request within the limit succeeds
 
@@ -46,6 +46,12 @@ The `/outputs` static mount is absent from that enumeration because it no longer
 - **GIVEN** an authenticated user who has exhausted their window
 - **WHEN** they request `GET /download/:filename`
 - **THEN** the response is `429 Too Many Requests`, with no object retrieved from storage
+
+#### Scenario: The upload route remains rate limited after its static mount is removed
+
+- **GIVEN** an authenticated user who has exhausted their window
+- **WHEN** they `POST /upload`
+- **THEN** the response is `429 Too Many Requests`, with nothing stored in the bucket and `ffmpeg` never invoked
 
 ### Requirement: Rate Limit Thresholds Are Configurable With Safe Defaults
 

@@ -54,25 +54,27 @@ Their `VIDEO_` prefix marks them as the Video Processing context's own configura
 
 ## Runtime Directory Structure
 
-The application creates and uses two directories relative to its working directory:
+The application creates and uses **one** directory relative to its working directory:
 
 ```
 ./
-  uploads/    Transient input: uploaded video files
-  temp/       Per-request scratch: extracted PNG frames and the ZIP built from them
+  temp/       Per-request scratch: the downloaded source video, the extracted
+              PNG frames, and the ZIP built from them
 ```
 
-Processed ZIP results are **not** on local disk — they are objects in the MinIO bucket named by `VIDEO_MINIO_BUCKET`.
+Neither uploaded source videos nor processed ZIP results are on local disk any more — both are objects in the MinIO bucket named by `VIDEO_MINIO_BUCKET`, separated by key prefix.
 
-| Directory | Created by | Contents | Cleaned by |
+| Location | Created by | Contents | Cleaned by |
 |---|---|---|---|
-| `uploads/` | `createDirs()` at startup | Uploaded video (named `<timestamp>_<original>`) | Deleted on successful processing |
-| `temp/` | Per request in `processVideo` | PNG frames from `ffmpeg` | Always deleted by `defer os.RemoveAll` |
-| MinIO bucket | `EnsureBucket` at startup | `frames_<jobID>.zip` objects | Never (manual cleanup required) |
+| `temp/` | `createDirs()` at startup, plus per-request subpaths | Downloaded source copy, PNG frames, the built ZIP | Always, by `defer` on every path |
+| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | The same request, on success and failure alike — best effort, see below |
+| Bucket, flat keys | `ProcessVideoJob` on success | `frames_<jobID>.zip` results | Never (manual cleanup required) |
 
-> **Known gap:** If processing fails, the file in `uploads/` is NOT deleted. This is documented behavior in `main_test.go` (`TestProcessing_Failure_LeavesUploadedFileBehind`).
+**Source cleanup is best effort.** Each upload request deletes its own source object through a single deferred call — one `RemoveObject`, no retry. If MinIO is unreachable at exactly that moment the object survives, and nothing in the application will come back for it. The failure is logged with the leaked key, so the residual set is recoverable from logs rather than invisible.
 
-The bucket accumulates ZIPs indefinitely. There is no expiry, no lifecycle rule, no cleanup job, and no size limit — its growth must be monitored manually in the current deployment. Moving the results off local disk removes the container-disk pressure, not the retention gap.
+The recommended backstop is a bucket **expiration lifecycle rule scoped to the `uploads/` prefix** — for example, expire objects under `uploads/` after one day. It must be scoped to that prefix: result objects live in the same bucket under flat `frames_*.zip` keys and must never expire. This is operator policy, not an application dependency; no code path assumes the rule exists.
+
+Results accumulate indefinitely. There is no expiry, no lifecycle rule, no cleanup job, and no size limit for them — growth must be monitored manually in the current deployment. Moving artifacts off local disk removed the container-disk pressure, not the retention gap.
 
 ## CI / CD
 
@@ -105,15 +107,16 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 2. **Rate limiting** — **Implemented.** `internal/platform/ratelimit.Limiter` enforces a per-user, fixed-window request cap (`RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`, both optional with defaults) on every authenticated route, mounted via `cmd/api/ratelimit.go`'s `rateLimitMiddleware`. Denied requests get `429` + `Retry-After`; a limiter failure (or an internal bounded timeout) fails open. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/rate-limiting/spec.md`.
 3. **Status cache** — **Implemented.** `internal/video/infrastructure/cache.CachedVideoJobRepository` decorates the PostgreSQL `VideoJobRepository` with a cache-aside/write-through cache for `FindByID` lookups (backing `GetJobStatus`'s repeated polling reads via `GET /api/video-jobs/:id`), wired into `setupVideo` ahead of every use case. No new environment variable — the cache TTL is a fixed constant, not configurable. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/videojob-status-cache/spec.md`.
 
-### MinIO — Result storage implemented (Phase 5)
+### MinIO — Source and result storage implemented (Phase 5)
 
-S3-compatible object storage. As of `migrate-result-storage-to-minio` it holds every processed ZIP result, so multiple API instances share one storage backend and a result survives its container. Uploaded source videos still live in `uploads/` (that is `migrate-upload-storage-to-minio`), and downloads are still proxied through the API rather than presigned (`add-presigned-download-urls`).
+S3-compatible object storage. As of `migrate-result-storage-to-minio` it holds every processed ZIP result, and as of `migrate-upload-storage-to-minio` every uploaded source video too — so multiple API instances share one storage backend, a result survives its container, and no artifact class depends on local disk. Downloads are still proxied through the API rather than presigned (`add-presigned-download-urls`), the last of Phase 5's changes.
 
-`internal/video/infrastructure/storage` holds both the connection plumbing (`Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `EnsureBucket`) and `ResultStorage`, the adapter implementing the domain port. Properties worth knowing:
+`internal/video/infrastructure/storage` holds the connection plumbing (`Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `EnsureBucket`) and both adapters — `ResultStorage` and `SourceStorage` — implementing their domain ports over the same client and bucket. Properties worth knowing:
 
 - **Startup is fail-closed.** `setupVideo` loads, opens, pings, and ensures the bucket; any failure stops the process. See the environment table above, including the deployment-ordering note.
+- **Source objects are transient.** `POST /upload` streams the video straight into the bucket without touching local disk, and deletes its own object before the request finishes — on success and on failure alike. See the Runtime Directory Structure section above for the best-effort caveat and the recommended lifecycle-rule backstop.
 - **`GET /download/:filename` is authorized from the `VideoJob` row**, not from anything stored beside the artifact, and every rejection returns a byte-identical `404` so the endpoint cannot be used to probe for other users' results. `GET /api/status` lists a caller's `completed` jobs and reads each object's size and timestamp directly.
-- **Object keys are flat** (`frames_<jobID>.zip`) and must stay that way: the key is handed to the browser and used verbatim as that route's single path segment, so a `/` would percent-encode and break the match. Bucket prefixes require a frontend change.
+- **Result keys are flat** (`frames_<jobID>.zip`) and must stay that way: the key is handed to the browser and used verbatim as `GET /download/:filename`'s single path segment, so a `/` would percent-encode and break the match. Giving *results* a bucket prefix requires a frontend change. **Source keys do carry a prefix** (`uploads/<uploadID>_<filename>`) for exactly the complementary reason: no route exposes them, so no key of theirs ever becomes a URL path segment. Anything that re-exposes source objects over HTTP has to drop that prefix in the same change.
 - **There is no teardown call**, unlike the Redis and PostgreSQL adapters above. `minio-go`'s client exposes none and keeps its transport unexported, so the package deliberately offers no `Close` rather than one that reports success while releasing nothing. Callers have no teardown obligation.
 - **`Open` does not validate credentials or reachability.** Its error covers endpoint parsing and transport construction; wrong credentials and an unreachable server both surface on the first operation. Use `Ping` (a real round trip) to check connectivity.
 
