@@ -91,8 +91,8 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	// No static mount remains. Source videos and result artifacts are both
 	// objects in the bucket, reachable only through handlers that derive
 	// entitlement from the VideoJob row — GET /download/:filename for
-	// results, and nothing at all for sources, which never outlive the
-	// request that stored them.
+	// results, and nothing at all for sources, whose deletion each upload
+	// request attempts before it finishes.
 	video.registerRoutes(videoRoutes)
 
 	identity.registerRoutes(r)

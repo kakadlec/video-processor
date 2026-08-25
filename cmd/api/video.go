@@ -475,7 +475,7 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		log.Printf("store source %s: %v", sourceKey.String(), err)
 		c.JSON(500, ProcessingResult{
 			Success: false,
-			Message: "Erro ao salvar arquivo",
+			Message: "Failed to store the uploaded file",
 		})
 		return
 	}

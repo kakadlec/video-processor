@@ -304,18 +304,17 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 	return module, repo
 }
 
-// newTestResultStorage builds a ResultStorage against the same real MinIO
+// newTestStorages builds both storage adapters against the same real MinIO
 // instance cmd/api itself reads (VIDEO_MINIO_*). TestMain has already proven
 // the configuration loads, so a failure here is a genuine fault rather than
 // an unconfigured machine.
 //
-// Each test gets its own bucket, drained and removed afterwards. Sharing the
-// configured runtime bucket would leave a UUID-keyed object behind on every
-// upload test, and the local MinIO service keeps its data in a named volume,
-// so that would grow without bound across suite runs.
-// newTestStorages provisions one per-test bucket and returns both adapters
-// over it — the same arrangement production uses, where sources and results
-// share a bucket and are separated only by key prefix.
+// One bucket serves both, as in production, where sources and results are
+// separated only by key prefix. Each test gets its own, drained and removed
+// afterwards: sharing the configured runtime bucket would leave a
+// UUID-keyed object behind on every upload test, and the local MinIO
+// service keeps its data in a named volume, so that would grow without
+// bound across suite runs.
 func newTestStorages(t *testing.T) (videodomain.SourceStorage, videodomain.ResultStorage) {
 	t.Helper()
 	sources, results, _ := newTestStoragesWithInspector(t)
