@@ -88,6 +88,16 @@ Presign failure, `Stat` failure, and storage unreachability join the existing re
 
 It is never logged, never echoed into an error, never included in a failure message. The existing handlers log the *key* on failure; the new paths do the same. This is a code-review property more than a testable one, which is why it is stated here and reflected in a spec requirement rather than left implicit.
 
+### 9a. The issuance response is `Cache-Control: no-store`
+
+An authenticated `200` carrying JSON is ordinarily cacheable, and the JSON here is a credential. A private or user-agent cache retaining it would preserve working access past the request that asked for it, which is precisely what the five-minute lifetime exists to prevent. The header goes on every response the endpoint produces, not only the successful one — the rejection responses are required to be byte-identical down to headers, and a directive present on one path and absent on another would break that.
+
+### 9b. The reported expiry is read off the signature, not off the clock
+
+`expires_at` is derived by parsing the issued URL's `X-Amz-Date` and adding its `X-Amz-Expires` seconds. Computing `time.Now().Add(ttl)` alongside the signing call looks equivalent and is not: the library stamps the signature's start instant at whole-second precision and truncates the requested lifetime to whole seconds. Measured against the pinned stack, the naive value overstated the real admission window by 561 ms in a single issuance, and a requested `5m0.5s` signed as exactly `300` seconds.
+
+The direction of the error is what makes it worth a decision rather than a rounding note. An `expires_at` that *overstates* the window tells a client the credential is still good when the service has already stopped accepting it; a client that schedules a retry against that instant retries into a `403`. Reading the value off the credential itself cannot drift from what the credential actually says.
+
 ### 10. `app.js` navigates; it does not fetch the artifact
 
 `downloadFile()` fetches the issuance endpoint with the bearer token, reads `url`, and drives an anchor at it. The `download` attribute is not relied on — it is ignored cross-origin — so the attachment behavior comes entirely from the signed `response-content-disposition`. User-facing copy stays pt-BR per the language policy; the Go side stays English.
@@ -99,6 +109,7 @@ It is never logged, never echoed into an error, never included in a failure mess
 - **Result bytes stop being rate limited.** Issuance is limited; the transfer is between browser and MinIO → accepted. `rate-limiting`'s spec is amended so "every authenticated route is rate limited" is not read as "every byte served is rate limited". Bounding transfer bandwidth is an object-storage-side concern, not an API middleware's.
 - **The bucket must be reachable from the browser's network.** Previously only the API needed reach; now the client does too → an operational fact, not a defect, but one that changes the deployment topology and belongs in the docs rather than in a surprise.
 - **A test that only inspects the URL string proves nothing.** Query-parameter assertions pass happily against a URL that `403`s → at least one test fetches the issued URL against the real test MinIO, with no `Authorization` header, and compares bytes. Structural assertions are supplementary to that, never a substitute.
+- **An issuance response could be cached.** It is an authenticated `200` whose body is a credential → `Cache-Control: no-store` on every response from the endpoint (Decision 9a), asserted in tests on both the success and the rejection path.
 - **Breaking change for non-browser clients.** Anything scripting `GET /download/...` for the zip now receives JSON → the frontend is updated in the same change; there is no other known consumer, and the roadmap has scoped this behavior since Phase 5 was planned.
 
 ## Migration Plan

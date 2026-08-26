@@ -8,6 +8,8 @@ The port SHALL NOT expose an operation that returns a reader over a stored artif
 
 The port SHALL expose three sentinel errors owned by the domain, so callers can classify failures without matching on the MinIO client's own error codes outside the adapter: one for a missing artifact, one that every failure to store an artifact wraps, and one that every failure to issue a presigned URL wraps. The latter two exist because the storage client's error text names the endpoint and the bucket, and that text must never reach a user-facing message or a persisted failure reason — a caller that needs to describe a storage failure matches the sentinel and writes its own wording.
 
+The wrapped error itself MAY carry the client's own text, and does: that is what makes it worth logging. The obligation is on the **caller's rendering**, not on the error value — a handler matches the sentinel, logs the wrapped error, and writes its own response. This is the contract the store-failure sentinel has always had, and the presign-failure sentinel inherits it unchanged rather than inventing a stricter one the adapter would have to strip detail to satisfy.
+
 #### Scenario: Domain and application layers do not import the adapter
 
 - **GIVEN** the `ResultStorage` adapter exists under `internal/video/infrastructure/storage`
@@ -36,7 +38,13 @@ The port SHALL expose three sentinel errors owned by the domain, so callers can 
 
 - **GIVEN** issuing a presigned URL fails for any reason
 - **WHEN** the caller inspects the returned error with `errors.Is`
-- **THEN** it matches the domain's presign-failure sentinel, and the error surfaced to the caller carries no endpoint, bucket name, or credential
+- **THEN** it matches the domain's presign-failure sentinel, so the caller can recognize the failure without parsing the underlying client's message
+
+#### Scenario: The wrapped error keeps its detail for the log, not for the response
+
+- **GIVEN** an issuance failure whose underlying error names the endpoint and bucket
+- **WHEN** the handler renders a response for it
+- **THEN** the response body contains none of that text, and the underlying error is logged intact — the detail is stripped at the rendering boundary, not at the adapter
 
 #### Scenario: No reader-returning operation remains on the port
 
@@ -136,6 +144,8 @@ Every test that provisions a bucket SHALL remove that bucket and its objects whe
 
 An issued URL SHALL grant read access to exactly one object — the `StorageKey` it was issued for — and SHALL carry a fixed expiry chosen by the system rather than by the caller. The expiry SHALL be a compile-time constant of five minutes; no environment variable SHALL configure it, matching the fixed TTL `videojob-status-cache` already uses.
 
+The expiry reported to the caller SHALL be **derived from the issued URL's own signed fields**, not computed from the issuing process's clock. The signing library stamps the signature's start instant at whole-second precision and truncates the requested lifetime to whole seconds, so an independently computed `now + TTL` overstates the real admission window by up to a second — measured at 561 ms in one issuance against the pinned stack, and a requested lifetime of five minutes and 500 milliseconds signed as exactly 300 seconds. An expiry that overstates the credential's actual admission window is worse than no expiry field: a client that trusts it retries at an instant the storage service has already stopped accepting.
+
 The guarantee the storage service enforces is that **a request arriving after the expiry instant is refused**. It is NOT that access ceases at that instant: a transfer already in progress when the expiry passes runs to completion, and clock skew between the issuing process and the storage service shifts the effective instant in both directions. Specifications, documentation, and code comments SHALL describe this bound as request admission, never as "the URL stops working" or "no download continues past expiry".
 
 An issued URL SHALL NOT be revocable. Deleting the `VideoJob`, changing its owner, or changing its status does not invalidate a URL already handed out; the expiry is the entire mechanism by which access ends. This is a property of presigned access, and it is the reason the expiry is short.
@@ -163,6 +173,12 @@ An issued URL SHALL NOT be revocable. Deleting the `VideoJob`, changing its owne
 - **WHEN** the configuration surface is inspected
 - **THEN** no environment variable sets, extends, or shortens the presigned URL's lifetime
 
+#### Scenario: The reported expiry equals the signed admission instant
+
+- **GIVEN** a URL issued for a stored artifact
+- **WHEN** the expiry reported to the caller is compared against the instant encoded in the URL's own signature
+- **THEN** the two are equal, rather than the reported value being computed independently from the issuing process's clock
+
 ### Requirement: The Attachment Filename Travels Inside The Signature
 
 The issued URL SHALL instruct the storage service to return `Content-Disposition: attachment` naming the result's key, carried as a signed request parameter rather than applied by the API. Altering that parameter after issuance SHALL invalidate the URL.
@@ -185,6 +201,8 @@ This is not cosmetic. The browser reaches the storage service at a different ori
 
 An issued URL SHALL NOT be written to a log, included in an error message, echoed in a failure response, or recorded on the `VideoJob`. Where the existing handlers log a `StorageKey` on failure, the issuance path SHALL do the same — the key is not a credential and the URL is.
 
+The issuance response SHALL carry `Cache-Control: no-store`. Without it the response is an ordinary authenticated `200` that a private or user-agent cache may retain, which would preserve a working credential past the request that requested it and defeat the short lifetime this design relies on. The header SHALL be set on **every** response the endpoint produces, not only the successful one, so that the rejection responses this capability requires to be byte-identical remain byte-identical to one another.
+
 #### Scenario: A failure on the issuance path logs the key, not a URL
 
 - **GIVEN** issuance fails after the entitlement check passes
@@ -195,6 +213,16 @@ An issued URL SHALL NOT be written to a log, included in an error message, echoe
 
 - **WHEN** a URL is issued for a job's result
 - **THEN** nothing is written to the job's row, and the URL exists only in the response to the request that asked for it
+
+#### Scenario: The issuance response forbids caching
+
+- **WHEN** a URL is issued for a job's result
+- **THEN** the response carries `Cache-Control: no-store`
+
+#### Scenario: A rejection carries the same caching directive
+
+- **WHEN** the endpoint rejects a request for any reason
+- **THEN** that response carries `Cache-Control: no-store` too, leaving every rejection byte-identical to every other
 
 ### Requirement: Presigned Issuance Is Verified By Following The Issued URL
 
