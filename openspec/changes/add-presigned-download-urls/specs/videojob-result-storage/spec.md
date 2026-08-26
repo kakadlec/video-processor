@@ -101,6 +101,35 @@ Because signing is performed locally and succeeds for a key that holds no object
 - **WHEN** they request `GET /download/:filename` with that job's storage key
 - **THEN** the response is `HTTP 404` byte-identical to every other rejection, and no URL is issued
 
+### Requirement: The Result Storage Adapter Is Tested Against A Real MinIO Instance
+
+This capability's adapter tests SHALL exercise storing, stating, and presigning artifacts against a real MinIO instance rather than a mock, using the same `VIDEO_MINIO_TEST_*` variables `minio-infrastructure` established, and SHALL skip with a clear message when those variables are unset. Opening is no longer among them: the port no longer offers that operation.
+
+Presigning SHALL be verified by **following the issued URL against that instance and comparing bytes**, never by inspecting the URL alone. A signed URL is structurally well-formed whether or not the storage service will honor it, so assertions on its host, path, or parameters cannot establish that it works.
+
+`cmd/api`'s own tests, which exercise `POST /upload` end to end, SHALL run against a real bucket and SHALL NOT skip when it is unconfigured: that suite requires MinIO the way it already requires `ffmpeg`, failing loudly instead, since a silently-skipped suite would report green while covering none of the behavior this capability adds. `docker-compose.yml`'s `app-test` service and CI's test step SHALL supply the configuration those tests need.
+
+Every test that provisions a bucket SHALL remove that bucket and its objects when it finishes, including on failure — the local MinIO service stores its data in a named volume, so anything left behind accumulates across later runs.
+
+#### Scenario: Adapter tests skip without a configured instance
+
+- **GIVEN** the `VIDEO_MINIO_TEST_*` variables are unset
+- **WHEN** the storage package's tests run
+- **THEN** they skip with a message naming the missing configuration
+
+#### Scenario: The application's test suite fails rather than skipping without MinIO
+
+- **GIVEN** the runtime `VIDEO_MINIO_*` variables are unset
+- **WHEN** `cmd/api`'s test suite starts
+- **THEN** it exits non-zero with a message naming what is missing, rather than skipping its result-storage coverage
+
+#### Scenario: The end-to-end upload path is exercised against a real bucket
+
+- **GIVEN** a configured MinIO instance
+- **WHEN** `cmd/api`'s upload tests run
+- **THEN** they upload a real video, and assert the result is retrievable by following the URL `GET /download/:filename` issues for it, and that it is listed by `GET /api/status`
+
+
 ## ADDED Requirements
 
 ### Requirement: A Presigned Result URL Grants Bounded, Single-Object, Non-Revocable Access
