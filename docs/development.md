@@ -4,7 +4,7 @@
 
 | Tool | Version | Purpose |
 |---|---|---|
-| Go | 1.25+ | Build and test the application |
+| Go | 1.27+ | Build and test the application |
 | ffmpeg | any recent | Frame extraction; must be on `PATH` |
 | MinIO | any recent | Result storage; `cmd/api` requires `VIDEO_MINIO_*` at startup, and its tests require it too |
 | Docker | any recent | Alternative if Go/ffmpeg/MinIO are not installed locally — `docker compose` provides all three |

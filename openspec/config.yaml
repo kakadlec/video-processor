@@ -5,7 +5,7 @@ schema: spec-driven
 # Add your tech stack, conventions, style guides, domain knowledge, etc.
 context: |
   FIAP X - Processador de Vídeos: a POSTECH/FIAP hackathon deliverable.
-  Tech stack: Go 1.25, Gin web framework, ffmpeg (shelled out via os/exec).
+  Tech stack: Go 1.27, Gin web framework, ffmpeg (shelled out via os/exec).
   Single-package app (main.go) with no internal module structure yet.
   User-facing strings (errors, HTML UI) are in Portuguese (pt-BR) - keep new
   ones consistent with that.
