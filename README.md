@@ -6,7 +6,7 @@ A Go web service that accepts a video upload, extracts frames at 1 fps via `ffmp
 
 | Dependency | Version | Notes |
 |---|---|---|
-| Go | 1.25+ | Required; see `go.mod` |
+| Go | 1.27+ | Required; see `go.mod` |
 | ffmpeg | any recent | Must be on `PATH`; the app shells out to it |
 | Docker | any recent | Optional for local dev; required if Go/ffmpeg are not installed |
 
@@ -69,7 +69,7 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 
 ## Tech Stack
 
-- **Language:** Go 1.25
+- **Language:** Go 1.27
 - **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12
 - **Frame extraction:** `ffmpeg` (via `exec.Command`)
 - **Identity persistence:** PostgreSQL (via `pgx`)

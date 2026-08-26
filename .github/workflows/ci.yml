@@ -41,37 +41,28 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Go
-        # matches the "go" directive in go.mod, currently 1.25 (raised by the
-        # gin v1.12.x upgrade, which itself requires go1.25.0).
+        # Matches the "go" directive in go.mod and the Docker builder's
+        # minor version so CI validates the production build toolchain.
         uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           # setup-go's built-in cache only restores on an exact match of
           # resolved Go patch version + go.sum hash (also scoped by runner
           # OS/arch/image, unchanged here since this always runs on
-          # ubuntu-latest) — confirmed against this repo's own cache
-          # entries, which fragment across 1.25.12/1.25.13/1.26.x as the
-          # runner image's toolchain updates. That, plus this repo's high
-          # branch/dependency churn on go.sum, misses often. Cache it
-          # explicitly below instead, with a restore-keys fallback so a
-          # near match still warm-starts.
+          # ubuntu-latest). This repo's high branch/dependency churn on
+          # go.sum also causes frequent misses. Cache it explicitly below,
+          # with a restore-keys fallback so a near match still warm-starts.
           cache: false
 
       - name: Get resolved Go version
-        # go.mod's "go 1.25" only pins the minor version, so the actual
-        # toolchain patch (1.25.12 vs 1.25.13 etc.) drifts as the runner
-        # image updates — same thing the comment above says invalidates
-        # setup-go's own cache. The build cache below needs this in its key
-        # too: GOCACHE entries are internally keyed by the compiler's own
-        # build ID, so restoring a cache built under a different patch
-        # version is a silent no-op — the directory restores fine and
-        # actions/cache reports a hit, but `go vet`/`go test` reject every
-        # cached object as stale and recompile from scratch anyway. Caught
-        # this by comparing two real runs: a hit restored 117MB yet `go
-        # vet` still took ~46s (confirmed as a full cold compile locally:
-        # ~20s at 6-7 cores, which scales to CI's more limited cores) —
-        # the run that saved the cache had resolved Go 1.25.12, the run
-        # that "hit" it had 1.25.13.
+        # The go.mod directive establishes the minimum toolchain while
+        # setup-go resolves the latest available 1.27 patch release. The
+        # build cache below needs that resolved version in its key: GOCACHE
+        # entries are internally keyed by the compiler's own build ID, so
+        # restoring a cache built under a different patch version is a
+        # silent no-op — the directory restores fine and actions/cache
+        # reports a hit, but `go vet`/`go test` reject every cached object
+        # as stale and recompile from scratch.
         id: go-version
         run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
 
@@ -192,7 +183,7 @@ jobs:
 
       - name: Set up Go
         # gosec's own minimum Go requirement moves independently of this
-        # project's go.mod (go 1.25) — use the latest stable toolchain to
+        # project's go.mod (go 1.27) — use the latest stable toolchain to
         # install/run it, since it's a dev tool, not the app itself.
         uses: actions/setup-go@v7
         with:

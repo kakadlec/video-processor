@@ -24,7 +24,7 @@ docker run -p 8080:8080 \
   video-processor
 ```
 
-The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.26-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships only that binary and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
+The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.27-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships only that binary and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
 
 ### Environment Variables
 
