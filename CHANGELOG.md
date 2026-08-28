@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.0](https://github.com/kakadlec/video-processor/compare/v0.10.0...v1.0.0) (2026-08-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* GET /download/:filename returns {"url", "expires_at"} JSON instead of the zip archive. Clients that read the archive from this endpoint must follow the returned URL instead.
+* the /uploads static mount is removed. An authenticated owner can no longer retrieve their own source video over HTTP; the route returns 404 because it no longer exists. cmd/api/web/app.js never referenced it, so the bundled frontend is unaffected.
+* MinIO configuration is now required at startup. setupVideo loads the config, opens the client, pings it, and ensures the bucket, failing fatally on any of the four — fail-closed, deliberately unlike every Redis backed feature, since a result that cannot be stored cannot be delivered. A deployment that does not set VIDEO_MINIO_ENDPOINT, VIDEO_MINIO_ACCESS_KEY, VIDEO_MINIO_SECRET_KEY, and VIDEO_MINIO_BUCKET will refuse to start. VIDEO_MINIO_USE_SSL remains optional.
+
+### Features
+
+* add MinIO connection adapter for the video context ([#174](https://github.com/kakadlec/video-processor/issues/174)) ([a56d29e](https://github.com/kakadlec/video-processor/commit/a56d29ee612eb1a8843771d64db6fd009aa7a836))
+* issue presigned download URLs instead of proxying result bytes ([#186](https://github.com/kakadlec/video-processor/issues/186)) ([2e1e241](https://github.com/kakadlec/video-processor/commit/2e1e241dc9cd6dcdea8b95e1d3302f24ce70e085))
+* store uploaded source videos in MinIO instead of the uploads directory ([#181](https://github.com/kakadlec/video-processor/issues/181)) ([00ccd75](https://github.com/kakadlec/video-processor/commit/00ccd75f24dc1486209bb78d8c7c1a16d8662a25))
+* store video results in MinIO instead of the outputs directory ([#178](https://github.com/kakadlec/video-processor/issues/178)) ([e3157f9](https://github.com/kakadlec/video-processor/commit/e3157f9753f886fcae140443d1a790800f2b765b))
+
 ## [0.10.0](https://github.com/kakadlec/video-processor/compare/v0.9.0...v0.10.0) (2026-08-22)
 
 
