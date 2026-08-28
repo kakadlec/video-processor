@@ -1,6 +1,6 @@
 # FIAP X — Video Frame Processor
 
-A Go web service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and serves the result for download. Built as the code deliverable for a POSTECH/FIAP hackathon.
+A Go web service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Built as the code deliverable for a POSTECH/FIAP hackathon.
 
 ## Prerequisites
 
@@ -25,8 +25,9 @@ docker compose up --build
 # already wired in — /api/auth/register and /api/auth/login are live
 
 # 3. Open http://127.0.0.1:8080 in your browser
-# Register/log in, then upload a video file; the page returns a download
-# link when processing completes.
+# Register/log in, then upload a video file. When processing completes the
+# page shows a Download button: clicking it asks the API for a 5-minute
+# URL and the browser fetches the ZIP from MinIO directly.
 ```
 
 `docker-compose.yml` is the only supported way to run the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. (Container deployment is a different concern; see [docs/operations.md](docs/operations.md).) See [docs/development.md](docs/development.md) for running the test suite the same way.
@@ -64,7 +65,7 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 | `POST` | `/api/auth/register` | Create a user account |
 | `POST` | `/api/auth/login` | Authenticate and receive a bearer access token |
 | `POST` | `/upload` | Upload a video file (multipart `video` field); returns JSON with `zip_path` on success; requires `Authorization: Bearer <token>` |
-| `GET` | `/download/:filename` | Download a processed ZIP by filename; owner-only |
+| `GET` | `/download/:filename` | Issue a 5-minute presigned URL for a processed ZIP: `200 {"url", "expires_at"}`, not the archive itself. Owner-only; follow the returned URL (no `Authorization` header) to fetch the bytes from MinIO |
 | `GET` | `/api/status` | List processed ZIPs with metadata; scoped to the caller's own uploads |
 
 ## Tech Stack

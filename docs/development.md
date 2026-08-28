@@ -25,20 +25,31 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity, Video Processing, and Redis configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, and `REDIS_ADDR` are all set (see [docs/operations.md](operations.md) for all four variables). Start PostgreSQL and Redis (`docker compose up -d postgres redis`) and export all four before `go run ./cmd/api`:
+Identity, Video Processing, Redis, and MinIO configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are set (see [docs/operations.md](operations.md) for every variable, required and optional). Start PostgreSQL, Redis, and MinIO (`docker compose up -d postgres redis minio`) and export them before `go run ./cmd/api`:
 
 ```bash
 # Download dependencies
 go mod download
 
-# Start PostgreSQL and Redis for the identity, video, and idempotency-key modules
-docker compose up -d postgres redis
+# Start PostgreSQL, Redis, and MinIO for the identity, video, idempotency-key,
+# and storage modules
+docker compose up -d postgres redis minio
 
-# Set required identity, video, and Redis configuration
+# Set required identity, video, Redis, and MinIO configuration
 export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
 export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export REDIS_ADDR="localhost:6379"
+export VIDEO_MINIO_ENDPOINT="localhost:9000"
+export VIDEO_MINIO_ACCESS_KEY="minioadmin"
+export VIDEO_MINIO_SECRET_KEY="minioadmin"
+export VIDEO_MINIO_BUCKET="video-results"
+# VIDEO_MINIO_USE_SSL, VIDEO_MINIO_PUBLIC_ENDPOINT, and
+# VIDEO_MINIO_PUBLIC_USE_SSL are optional and correct unset for this setup:
+# the browser reaches MinIO at the same localhost:9000 the server does, so the
+# presigned URLs GET /download/:filename issues are already followable. That
+# is not true inside Docker Compose, where the server uses minio:9000 and the
+# compose file sets VIDEO_MINIO_PUBLIC_ENDPOINT to the published port instead.
 
 # Start the server (listens on :8080)
 go run ./cmd/api
