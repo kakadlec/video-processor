@@ -162,7 +162,24 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 		closeDB(db)
 		return nil, nil, nil, err
 	}
-	resultStorage := videostorage.NewResultStorage(minioClient, minioConfig.Bucket)
+	// The region is discovered here, on the reachable client, and handed to
+	// the presigning client rather than configured: the server can simply
+	// ask for a value an operator would otherwise have to keep correct, and
+	// a wrong one stays invisible until the deployment moves off MinIO.
+	// Fatal like Ping and EnsureBucket above — without it the presigning
+	// client would try to discover the region itself, against a host it
+	// generally cannot reach.
+	region, err := videostorage.BucketRegion(ctx, minioClient, minioConfig.Bucket)
+	if err != nil {
+		closeDB(db)
+		return nil, nil, nil, err
+	}
+	presignClient, err := videostorage.OpenPresigner(minioConfig, region)
+	if err != nil {
+		closeDB(db)
+		return nil, nil, nil, err
+	}
+	resultStorage := videostorage.NewResultStorage(minioClient, presignClient, minioConfig.Bucket)
 	sourceStorage := videostorage.NewSourceStorage(minioClient, minioConfig.Bucket)
 
 	ids := videoidgen.New()
@@ -314,7 +331,26 @@ func respondArtifactNotFound(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": artifactNotFoundMessage})
 }
 
-// handleDownload streams a completed job's stored result to its owner.
+// downloadURLTTL bounds how long the storage service keeps admitting
+// requests on an issued grant. A constant rather than configuration, like
+// the status cache's TTL: the interval that actually has to be survived is
+// the gap between this endpoint's JSON response and the browser's
+// navigation, which is sub-second, because a URL is issued when the user
+// clicks and not when the listing renders.
+const downloadURLTTL = 5 * time.Minute
+
+// downloadResponse is what GET /download/:filename returns now that it hands
+// out a grant instead of the artifact. ExpiresAt is the instant the storage
+// service stops admitting requests on URL, as read back off the grant itself.
+type downloadResponse struct {
+	URL       string `json:"url"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// handleDownload authorizes a completed job's stored result for its owner
+// and issues a time-bounded URL the caller redeems against object storage
+// directly. It does not serve bytes; nothing in this process is on the
+// transfer path any more.
 //
 // Entitlement is decided entirely from the VideoJob row: the requested key
 // must parse to a job id, that job must exist, belong to the caller, be
@@ -322,7 +358,18 @@ func respondArtifactNotFound(c *gin.Context) {
 // check is what makes parsing the key safe — a forged key either names
 // someone else's job (rejected by the owner check) or no job's recorded
 // result (rejected here).
+//
+// Issuance is the complete authorization decision. The issued URL carries no
+// identity, so nothing re-checks ownership when it is redeemed, and nothing
+// can withdraw it before the storage service stops admitting it.
 func (m *videoModule) handleDownload(c *gin.Context) {
+	// Set before the first branch so it holds on every response this
+	// handler can produce. On the 200 it keeps a private or user-agent
+	// cache from retaining a working credential past the request that asked
+	// for it; on the rejections it is what keeps them byte-identical to one
+	// another down to their headers.
+	c.Header("Cache-Control", "no-store")
+
 	userID, ok := authenticatedUserID(c)
 	if !ok {
 		// requireBearerAuth gates this route, so reaching here means the
@@ -360,21 +407,33 @@ func (m *videoModule) handleDownload(c *gin.Context) {
 		return
 	}
 
-	reader, size, err := m.results.Open(c.Request.Context(), key)
-	if err != nil {
-		// Logged, never rendered: a storage error must not leak the
-		// endpoint, bucket name, or client error text into a response body.
-		log.Printf("download: open result %s: %v", key.String(), err)
+	// Not a leftover from the streaming implementation. Signing is offline
+	// and succeeds for a key holding no object, so without this a missing
+	// object would surface as MinIO's own 404 — different origin, XML body —
+	// instead of the rejection this endpoint promises to make
+	// indistinguishable from every other. Both its not-found and its error
+	// cases take the same path for that reason.
+	if _, _, err := m.results.Stat(c.Request.Context(), key); err != nil {
+		if !errors.Is(err, videodomain.ErrResultNotFound) {
+			log.Printf("download: stat result %s: %v", key.String(), err)
+		}
 		respondArtifactNotFound(c)
 		return
 	}
-	defer reader.Close()
 
-	c.Header("Content-Description", "File Transfer")
-	c.Header("Content-Transfer-Encoding", "binary")
-	c.Header("Content-Disposition", "attachment; filename="+key.String())
+	signedURL, expiresAt, err := m.results.PresignGet(c.Request.Context(), key, downloadURLTTL, key.String())
+	if err != nil {
+		// The key, never the URL: the URL is the credential this call just
+		// minted, and the wrapped error names the endpoint and bucket.
+		log.Printf("download: presign result %s: %v", key.String(), err)
+		respondArtifactNotFound(c)
+		return
+	}
 
-	c.DataFromReader(http.StatusOK, size, "application/zip", reader, nil)
+	c.JSON(http.StatusOK, downloadResponse{
+		URL:       signedURL,
+		ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+	})
 }
 
 // handleStatus lists the caller's completed results.

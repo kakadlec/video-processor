@@ -17,6 +17,8 @@ func setAllRequired(t *testing.T) {
 	t.Setenv("VIDEO_MINIO_SECRET_KEY", "secret")
 	t.Setenv("VIDEO_MINIO_BUCKET", "bucket")
 	t.Setenv("VIDEO_MINIO_USE_SSL", "")
+	t.Setenv("VIDEO_MINIO_PUBLIC_ENDPOINT", "")
+	t.Setenv("VIDEO_MINIO_PUBLIC_USE_SSL", "")
 }
 
 func TestLoadConfigFromEnv_RequiresEachVariable(t *testing.T) {
@@ -50,6 +52,8 @@ func TestLoadConfigFromEnv_ReadsAllValues(t *testing.T) {
 	t.Setenv("VIDEO_MINIO_SECRET_KEY", "the-secret-key")
 	t.Setenv("VIDEO_MINIO_BUCKET", "the-bucket")
 	t.Setenv("VIDEO_MINIO_USE_SSL", "")
+	t.Setenv("VIDEO_MINIO_PUBLIC_ENDPOINT", "storage.example:9000")
+	t.Setenv("VIDEO_MINIO_PUBLIC_USE_SSL", "true")
 
 	cfg, err := storage.LoadConfigFromEnv()
 	if err != nil {
@@ -57,11 +61,13 @@ func TestLoadConfigFromEnv_ReadsAllValues(t *testing.T) {
 	}
 
 	want := storage.Config{
-		Endpoint:  "minio:9000",
-		AccessKey: "the-access-key",
-		SecretKey: "the-secret-key",
-		Bucket:    "the-bucket",
-		UseSSL:    false,
+		Endpoint:       "minio:9000",
+		AccessKey:      "the-access-key",
+		SecretKey:      "the-secret-key",
+		Bucket:         "the-bucket",
+		UseSSL:         false,
+		PublicEndpoint: "storage.example:9000",
+		PublicUseSSL:   true,
 	}
 	if cfg != want {
 		t.Fatalf("cfg = %+v, want %+v", cfg, want)
@@ -137,5 +143,89 @@ func TestLoadConfigFromEnv_UseSSLRejectsMalformedValue(t *testing.T) {
 				t.Fatalf("cfg = %+v, want the zero Config alongside the error", cfg)
 			}
 		})
+	}
+}
+
+// TestLoadConfigFromEnv_PublicEndpointDefaultsToInternal covers the shape
+// most deployments have: one address reachable from both the server and its
+// clients, declared once.
+func TestLoadConfigFromEnv_PublicEndpointDefaultsToInternal(t *testing.T) {
+	setAllRequired(t)
+
+	cfg, err := storage.LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PublicEndpoint != cfg.Endpoint {
+		t.Fatalf("PublicEndpoint = %q, want it to default to Endpoint %q", cfg.PublicEndpoint, cfg.Endpoint)
+	}
+}
+
+func TestLoadConfigFromEnv_PublicEndpointHonored(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("VIDEO_MINIO_PUBLIC_ENDPOINT", "downloads.example.com")
+
+	cfg, err := storage.LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PublicEndpoint != "downloads.example.com" {
+		t.Fatalf("PublicEndpoint = %q, want %q", cfg.PublicEndpoint, "downloads.example.com")
+	}
+	if cfg.Endpoint != "localhost:9000" {
+		t.Fatalf("Endpoint = %q, want the public value not to have overwritten it", cfg.Endpoint)
+	}
+}
+
+// The default the naive implementation gets wrong: PublicUseSSL follows the
+// *resolved* UseSSL, not false. Defaulting to false would silently sign
+// http:// URLs for a deployment that declared TLS once and reasonably
+// expected it to apply to both audiences.
+func TestLoadConfigFromEnv_PublicUseSSLDefaultsToInternalUseSSL(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("VIDEO_MINIO_USE_SSL", "true")
+
+	cfg, err := storage.LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.PublicUseSSL {
+		t.Fatal("PublicUseSSL = false, want it to follow UseSSL when VIDEO_MINIO_PUBLIC_USE_SSL is unset")
+	}
+}
+
+// The two are independent when both are declared: TLS terminates in front of
+// the browser-facing address while the server talks plaintext inside its own
+// network. Asserting the direction that is not merely "both true".
+func TestLoadConfigFromEnv_PublicUseSSLIndependentOfInternal(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("VIDEO_MINIO_USE_SSL", "false")
+	t.Setenv("VIDEO_MINIO_PUBLIC_USE_SSL", "true")
+
+	cfg, err := storage.LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.UseSSL {
+		t.Fatal("UseSSL = true, want false")
+	}
+	if !cfg.PublicUseSSL {
+		t.Fatal("PublicUseSSL = false, want true")
+	}
+}
+
+func TestLoadConfigFromEnv_PublicUseSSLRejectsMalformedValue(t *testing.T) {
+	setAllRequired(t)
+	t.Setenv("VIDEO_MINIO_PUBLIC_USE_SSL", "ture")
+
+	cfg, err := storage.LoadConfigFromEnv()
+	if err == nil {
+		t.Fatalf("expected an error, got cfg = %+v", cfg)
+	}
+	if !strings.Contains(err.Error(), "VIDEO_MINIO_PUBLIC_USE_SSL") {
+		t.Fatalf("error %q does not name the variable", err)
+	}
+	if cfg != (storage.Config{}) {
+		t.Fatalf("cfg = %+v, want the zero Config alongside the error", cfg)
 	}
 }

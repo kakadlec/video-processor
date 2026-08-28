@@ -65,3 +65,43 @@ func EnsureBucket(ctx context.Context, client *minio.Client, bucket string) erro
 	}
 	return nil
 }
+
+// BucketRegion asks the server which region bucket lives in, so
+// OpenPresigner can be handed a concrete value instead of leaving the
+// presigning client to discover it over the network — see that function for
+// why discovering it there is not an option.
+func BucketRegion(ctx context.Context, client *minio.Client, bucket string) (string, error) {
+	region, err := client.GetBucketLocation(ctx, bucket)
+	if err != nil {
+		return "", fmt.Errorf("video: bucket region %q: %w", bucket, err)
+	}
+	return region, nil
+}
+
+// OpenPresigner constructs a client used for one thing only: signing URLs
+// that a browser will follow. It is built from cfg.PublicEndpoint and
+// cfg.PublicUseSSL, because SigV4 covers the Host header and a signed URL's
+// host therefore cannot be corrected after issuance.
+//
+// The client is deliberately never pinged and never used for a bucket or
+// object operation: in the general deployment it points at a host the
+// server cannot reach at all. Open's contract already promises no
+// connectivity check, so nothing here talks to the network.
+//
+// region is required rather than optional. Probed against minio-go v7.3.0:
+// on a client with no configured region, PresignedGetObject issues a
+// GetBucketLocation round trip against its own endpoint before it can sign,
+// which fails outright ("dial tcp: lookup ... no such host") when that
+// endpoint is unreachable from the server. With the region set, signing is
+// local arithmetic.
+func OpenPresigner(cfg Config, region string) (*minio.Client, error) {
+	client, err := minio.New(cfg.PublicEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure: cfg.PublicUseSSL,
+		Region: region,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("video: open minio presigning client: %w", err)
+	}
+	return client, nil
+}
