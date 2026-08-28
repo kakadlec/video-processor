@@ -92,15 +92,21 @@ async function downloadFile(filename) {
             showResult('Erro ao baixar o arquivo.', 'error');
             return;
         }
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
+        const data = await response.json();
+        if (!data.url) {
+            showResult('Erro ao baixar o arquivo.', 'error');
+            return;
+        }
         const link = document.createElement('a');
-        link.href = url;
+        link.href = data.url;
+        // Kept for same-origin setups only: the download attribute is
+        // ignored for cross-origin URLs, and the attachment behavior comes
+        // from the Content-Disposition the storage service returns, which
+        // travels inside the URL's signature.
         link.download = filename;
         document.body.appendChild(link);
         link.click();
         link.remove();
-        URL.revokeObjectURL(url);
     } catch (error) {
         showResult('Erro de conexão: ' + error.message, 'error');
     }

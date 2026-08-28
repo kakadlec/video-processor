@@ -120,6 +120,13 @@ services:
       VIDEO_MINIO_ACCESS_KEY: minioadmin
       VIDEO_MINIO_SECRET_KEY: minioadmin
       VIDEO_MINIO_BUCKET: video-results
+      # Deliberately not minio:9000. GET /download/:filename hands the
+      # browser a presigned URL, and SigV4 signs Host, so the host has to be
+      # right at signing time — it cannot be rewritten afterwards. minio:9000
+      # only resolves inside this compose network; 127.0.0.1:9000 is the
+      # published port the developer's browser actually reaches. The server
+      # never dials this address.
+      VIDEO_MINIO_PUBLIC_ENDPOINT: 127.0.0.1:9000
     depends_on:
       postgres:
         condition: service_healthy

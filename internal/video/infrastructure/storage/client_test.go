@@ -30,11 +30,16 @@ func testConfig(t *testing.T) storage.Config {
 		t.Skip("VIDEO_MINIO_TEST_ENDPOINT/ACCESS_KEY/SECRET_KEY/BUCKET not all set; skipping MinIO integration test")
 	}
 
+	// PublicEndpoint is set explicitly rather than left zero: these tests
+	// build a Config literal instead of going through LoadConfigFromEnv, so
+	// they do not get its defaulting, and minio.New rejects an empty
+	// endpoint.
 	return storage.Config{
-		Endpoint:  endpoint,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		Bucket:    bucket,
+		Endpoint:       endpoint,
+		AccessKey:      accessKey,
+		SecretKey:      secretKey,
+		Bucket:         bucket,
+		PublicEndpoint: endpoint,
 	}
 }
 
@@ -53,10 +58,11 @@ func unreachableClient(t *testing.T) *minio.Client {
 	t.Helper()
 
 	client, err := storage.Open(storage.Config{
-		Endpoint:  unreachableEndpoint,
-		AccessKey: "access",
-		SecretKey: "secret",
-		Bucket:    "bucket",
+		Endpoint:       unreachableEndpoint,
+		AccessKey:      "access",
+		SecretKey:      "secret",
+		Bucket:         "bucket",
+		PublicEndpoint: unreachableEndpoint,
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -106,10 +112,11 @@ func removeBucket(t *testing.T, client *minio.Client, bucket string) {
 
 func TestOpen_SucceedsWithoutConnecting(t *testing.T) {
 	client, err := storage.Open(storage.Config{
-		Endpoint:  unreachableEndpoint,
-		AccessKey: "access",
-		SecretKey: "secret",
-		Bucket:    "bucket",
+		Endpoint:       unreachableEndpoint,
+		AccessKey:      "access",
+		SecretKey:      "secret",
+		Bucket:         "bucket",
+		PublicEndpoint: unreachableEndpoint,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -268,5 +275,66 @@ func TestEnsureBucket_FailsAgainstUnreachableMinIO(t *testing.T) {
 
 	if err := storage.EnsureBucket(ctx, client, "bucket"); err == nil {
 		t.Fatal("expected an error against an unreachable instance")
+	}
+}
+
+func TestBucketRegion_ReportsTheServersRegion(t *testing.T) {
+	client, _ := testClient(t)
+	bucket := uniqueBucket(t, "region")
+	if err := storage.EnsureBucket(context.Background(), client, bucket); err != nil {
+		t.Fatalf("ensure bucket: %v", err)
+	}
+	t.Cleanup(func() { removeBucket(t, client, bucket) })
+
+	region, err := storage.BucketRegion(context.Background(), client, bucket)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Not compared against a literal: the value is whatever the server
+	// reports, and hardcoding MinIO's answer here would be the same mistake
+	// as hardcoding it in the configuration.
+	if region == "" {
+		t.Fatal("region is empty; the presigning client would fall back to discovering it over the network")
+	}
+}
+
+// The presign-only client is built against a host the server is not expected
+// to reach, so construction must not dial — the same contract Open already
+// has, asserted separately because this is the client that depends on it.
+func TestOpenPresigner_SucceedsWithoutConnecting(t *testing.T) {
+	client, err := storage.OpenPresigner(storage.Config{
+		Endpoint:       "minio:9000",
+		AccessKey:      "access",
+		SecretKey:      "secret",
+		Bucket:         "bucket",
+		PublicEndpoint: "downloads.invalid:9000",
+	}, "us-east-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if client == nil {
+		t.Fatal("client is nil")
+	}
+}
+
+func TestOpenPresigner_UsesThePublicEndpointNotTheInternalOne(t *testing.T) {
+	client, err := storage.OpenPresigner(storage.Config{
+		Endpoint:       "minio:9000",
+		AccessKey:      "access",
+		SecretKey:      "secret",
+		Bucket:         "bucket",
+		PublicEndpoint: "downloads.example.com:9000",
+		PublicUseSSL:   true,
+	}, "us-east-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	endpoint := client.EndpointURL()
+	if endpoint.Host != "downloads.example.com:9000" {
+		t.Fatalf("host = %q, want the public endpoint", endpoint.Host)
+	}
+	if endpoint.Scheme != "https" {
+		t.Fatalf("scheme = %q, want https from PublicUseSSL", endpoint.Scheme)
 	}
 }

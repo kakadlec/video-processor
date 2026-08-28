@@ -345,6 +345,19 @@ func (b bucketInspector) keysWithPrefix(t *testing.T, prefix string) []string {
 	return keys
 }
 
+// removeObject deletes one object from the test bucket, so a test can
+// exercise the case where a result the VideoJob row still points at is no
+// longer in storage.
+func (b bucketInspector) removeObject(t *testing.T, key string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := b.client.RemoveObject(ctx, b.bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		t.Fatalf("remove %q from %q: %v", key, b.bucket, err)
+	}
+}
+
 // newTestStoragesWithInspector is newTestStorages plus a handle on the
 // underlying bucket.
 func newTestStoragesWithInspector(t *testing.T) (videodomain.SourceStorage, videodomain.ResultStorage, bucketInspector) {
@@ -364,8 +377,22 @@ func newTestStoragesWithInspector(t *testing.T) (videodomain.SourceStorage, vide
 	}
 	t.Cleanup(func() { removeTestBucket(t, client, bucket) })
 
+	// Built the way setupVideo builds it: region discovered on the
+	// reachable client, then handed to a presign-only client. cfg's
+	// PublicEndpoint defaults to Endpoint here, so the URLs these tests
+	// issue point at the same MinIO the test process can reach — which is
+	// what lets a test follow one.
+	region, err := videostorage.BucketRegion(context.Background(), client, bucket)
+	if err != nil {
+		t.Fatalf("bucket region %q: %v", bucket, err)
+	}
+	presigner, err := videostorage.OpenPresigner(cfg, region)
+	if err != nil {
+		t.Fatalf("open presigning client: %v", err)
+	}
+
 	return videostorage.NewSourceStorage(client, bucket),
-		videostorage.NewResultStorage(client, bucket),
+		videostorage.NewResultStorage(client, presigner, bucket),
 		bucketInspector{client: client, bucket: bucket}
 }
 
@@ -1504,10 +1531,11 @@ func TestHandleVideoUpload_GenuineConflict_StillReturns409(t *testing.T) {
 // aren't about object storage itself (the idempotency suite), and for the
 // one that needs a Put failure it can trigger on demand.
 type fakeResultStorage struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	times   map[string]time.Time
-	putErr  error
+	mu         sync.Mutex
+	objects    map[string][]byte
+	times      map[string]time.Time
+	putErr     error
+	presignErr error
 }
 
 func newFakeResultStorage() *fakeResultStorage {
@@ -1529,14 +1557,17 @@ func (s *fakeResultStorage) Put(_ context.Context, key videodomain.StorageKey, l
 	return nil
 }
 
-func (s *fakeResultStorage) Open(_ context.Context, key videodomain.StorageKey) (io.ReadCloser, int64, error) {
+// PresignGet mimics the real adapter's offline signing: it never consults
+// the stored objects, so an absent key yields a URL here exactly as it would
+// against MinIO. presignErr drives the handler's presign-failure branch,
+// which is otherwise unreachable.
+func (s *fakeResultStorage) PresignGet(_ context.Context, key videodomain.StorageKey, ttl time.Duration, _ string) (string, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, ok := s.objects[key.String()]
-	if !ok {
-		return nil, 0, videodomain.ErrResultNotFound
+	if s.presignErr != nil {
+		return "", time.Time{}, s.presignErr
 	}
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	return "https://storage.test/" + key.String() + "?signature=fake", time.Now().Add(ttl), nil
 }
 
 func (s *fakeResultStorage) Stat(_ context.Context, key videodomain.StorageKey) (int64, time.Time, error) {

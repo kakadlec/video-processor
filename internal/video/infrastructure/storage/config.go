@@ -26,6 +26,9 @@ const (
 	secretKeyEnv = envPrefix + "SECRET_KEY"
 	bucketEnv    = envPrefix + "BUCKET"
 	useSSLEnv    = envPrefix + "USE_SSL"
+
+	publicEndpointEnv = envPrefix + "PUBLIC_ENDPOINT"
+	publicUseSSLEnv   = envPrefix + "PUBLIC_USE_SSL"
 )
 
 // ErrEndpointRequired, ErrAccessKeyRequired, ErrSecretKeyRequired, and
@@ -39,16 +42,31 @@ var (
 )
 
 // Config holds the MinIO connection settings.
+//
+// PublicEndpoint/PublicUseSSL exist because SigV4 signs the Host header: a
+// presigned URL's host is fixed at signing time and cannot be rewritten
+// afterwards without invalidating the signature. Endpoint is routinely a
+// name only the server resolves (docker-compose.yml sets minio:9000), so
+// URLs handed to a browser have to be signed against the browser-facing
+// host from the start. PublicEndpoint is only ever used to construct URLs;
+// the server never dials it.
 type Config struct {
 	Endpoint  string
 	AccessKey string
 	SecretKey string
 	Bucket    string
 	UseSSL    bool
+
+	PublicEndpoint string
+	PublicUseSSL   bool
 }
 
 // LoadConfigFromEnv reads the VIDEO_MINIO_* variables. The first four are
-// required; VIDEO_MINIO_USE_SSL is optional and defaults to false when unset.
+// required; VIDEO_MINIO_USE_SSL is optional and defaults to false when
+// unset. VIDEO_MINIO_PUBLIC_ENDPOINT and VIDEO_MINIO_PUBLIC_USE_SSL are
+// optional too, each defaulting to its internal counterpart — the resolved
+// UseSSL, not false — so a deployment whose storage is reachable at one
+// address from both the server and its clients needs neither variable.
 func LoadConfigFromEnv() (Config, error) {
 	endpoint := os.Getenv(endpointEnv)
 	if endpoint == "" {
@@ -75,12 +93,24 @@ func LoadConfigFromEnv() (Config, error) {
 		return Config{}, err
 	}
 
+	publicEndpoint := os.Getenv(publicEndpointEnv)
+	if publicEndpoint == "" {
+		publicEndpoint = endpoint
+	}
+
+	publicUseSSL, err := boolFromEnv(publicUseSSLEnv, useSSL)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
-		Endpoint:  endpoint,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		Bucket:    bucket,
-		UseSSL:    useSSL,
+		Endpoint:       endpoint,
+		AccessKey:      accessKey,
+		SecretKey:      secretKey,
+		Bucket:         bucket,
+		UseSSL:         useSSL,
+		PublicEndpoint: publicEndpoint,
+		PublicUseSSL:   publicUseSSL,
 	}, nil
 }
 

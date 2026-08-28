@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -13,8 +14,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 
 	videodomain "video-processor/internal/video/domain"
 	videostorage "video-processor/internal/video/infrastructure/storage"
@@ -208,16 +213,9 @@ func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
 	}
 
 	// The zip must be downloadable and contain exactly the reported frames.
-	downloadResp := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
-	defer downloadResp.Body.Close()
-	if downloadResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200 downloading zip, got %d", downloadResp.StatusCode)
-	}
-
-	zipBytes, err := io.ReadAll(downloadResp.Body)
-	if err != nil {
-		t.Fatalf("failed to read zip body: %v", err)
-	}
+	// The API hands out a grant; the bytes come from storage directly.
+	issued := issueDownload(t, srv.URL, token, result.ZipPath)
+	zipBytes := followIssuedURL(t, issued.URL)
 	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
 	if err != nil {
 		t.Fatalf("downloaded file is not a valid zip: %v", err)
@@ -308,26 +306,212 @@ func TestDownload_EveryRejectionIsByteIdentical(t *testing.T) {
 		{"a key whose embedded id is malformed", "/download/frames_not-a-uuid.zip", tokenA},
 	}
 
-	var bodies []string
+	var fingerprints []rejectionFingerprint
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := getWithAuthorization(t, srv.URL+tc.path, "Bearer "+tc.token)
 			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusNotFound {
-				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
-			}
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatalf("read body: %v", err)
-			}
-			bodies = append(bodies, string(body))
+			fingerprints = append(fingerprints, fingerprintRejection(t, resp))
 		})
 	}
 
-	for i := 1; i < len(bodies); i++ {
-		if bodies[i] != bodies[0] {
-			t.Fatalf("rejection bodies differ: %q vs %q — a caller could distinguish these cases", bodies[0], bodies[i])
+	for i := 1; i < len(fingerprints); i++ {
+		if fingerprints[i] != fingerprints[0] {
+			t.Fatalf("rejections differ: %+v vs %+v — a caller could distinguish these cases", fingerprints[0], fingerprints[i])
 		}
+	}
+}
+
+// rejectionFingerprint is everything a caller could read off a rejected
+// download to tell one cause from another. Named fields rather than the whole
+// header map: Date and Content-Length legitimately vary, and comparing them
+// would fail for reasons that have nothing to do with the leak this guards.
+type rejectionFingerprint struct {
+	status       int
+	body         string
+	contentType  string
+	cacheControl string
+}
+
+func fingerprintRejection(t *testing.T, resp *http.Response) rejectionFingerprint {
+	t.Helper()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (body %q)", resp.StatusCode, http.StatusNotFound, body)
+	}
+	// A rejection must not carry a usable grant by any route, not merely
+	// omit the field the success path uses.
+	if strings.Contains(string(body), "http") {
+		t.Fatalf("rejection body %q looks like it carries a URL", body)
+	}
+	return rejectionFingerprint{
+		status:       resp.StatusCode,
+		body:         string(body),
+		contentType:  resp.Header.Get("Content-Type"),
+		cacheControl: resp.Header.Get("Cache-Control"),
+	}
+}
+
+// downloadIssuance is what GET /download/:filename returns now that it grants
+// access instead of serving it.
+type downloadIssuance struct {
+	URL       string `json:"url"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func issueDownload(t *testing.T, baseURL, token, filename string) downloadIssuance {
+	t.Helper()
+
+	resp := getWithAuthorization(t, baseURL+"/download/"+filename, "Bearer "+token)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("issuance status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("Cache-Control = %q, want %q — the body is a credential", cc, "no-store")
+	}
+
+	var issued downloadIssuance
+	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
+		t.Fatalf("decode issuance: %v", err)
+	}
+	if issued.URL == "" {
+		t.Fatal("issuance carries no url")
+	}
+	if _, err := time.Parse(time.RFC3339, issued.ExpiresAt); err != nil {
+		t.Fatalf("expires_at %q is not RFC3339: %v", issued.ExpiresAt, err)
+	}
+	return issued
+}
+
+// followIssuedURL redeems a grant the way a browser does: no Authorization
+// header, straight to storage.
+func followIssuedURL(t *testing.T, signedURL string) []byte {
+	t.Helper()
+
+	resp, err := http.Get(signedURL)
+	if err != nil {
+		t.Fatalf("follow issued url: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("following the issued url: status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read issued url body: %v", err)
+	}
+	return body
+}
+
+// TestDownload_MissingObjectIsRejectedLikeEveryOtherCase covers what the
+// pre-issuance Stat exists for. Signing is offline, so without that Stat this
+// request would succeed and the failure would surface as MinIO's own 404 —
+// a different origin, an XML body — instead of this endpoint's rejection.
+func TestDownload_MissingObjectIsRejectedLikeEveryOtherCase(t *testing.T) {
+	srv, token, inspector := startSourceStorageTestServer(t)
+
+	videoPath := generateTestVideo(t, 1)
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "deleted-object.mp4")
+	if !result.Success {
+		t.Fatalf("setup upload failed: %s", result.Message)
+	}
+
+	// Entitlement still passes: the VideoJob row is untouched and still
+	// records this key. Only the object is gone.
+	inspector.removeObject(t, result.ZipPath)
+
+	missing := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+	defer missing.Body.Close()
+
+	baseline := getWithAuthorization(t, srv.URL+"/download/whatever.txt", "Bearer "+token)
+	defer baseline.Body.Close()
+
+	if got, want := fingerprintRejection(t, missing), fingerprintRejection(t, baseline); got != want {
+		t.Fatalf("deleted-object rejection %+v differs from %+v", got, want)
+	}
+}
+
+// TestDownload_PresignFailureIsRejectedLikeEveryOtherCase drives the branch
+// that is unreachable in production — the TTL is a constant inside the
+// library's accepted range and the key is validated before it — but which
+// must not be the one path that leaks an endpoint name into a body.
+func TestDownload_PresignFailureIsRejectedLikeEveryOtherCase(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	repo := newInMemoryVideoJobRepository()
+	results := newFakeResultStorage()
+	module, _ := newIdempotencyTestVideoModuleWithRepoAndStorage(videoffmpeg.New(), repo, results)
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	t.Cleanup(srv.Close)
+
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	videoPath := generateTestVideo(t, 1)
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "presign-failure.mp4")
+	if !result.Success {
+		t.Fatalf("setup upload failed: %s", result.Message)
+	}
+
+	baseline := getWithAuthorization(t, srv.URL+"/download/whatever.txt", "Bearer "+token)
+	defer baseline.Body.Close()
+	want := fingerprintRejection(t, baseline)
+
+	results.mu.Lock()
+	results.presignErr = errors.New("presign failed against https://minio.internal:9000/some-bucket")
+	results.mu.Unlock()
+
+	failed := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+	defer failed.Body.Close()
+
+	if got := fingerprintRejection(t, failed); got != want {
+		t.Fatalf("presign-failure rejection %+v differs from %+v", got, want)
+	}
+}
+
+// TestDownload_NonOwnerReceivesNoGrant is the complement to the fingerprint
+// comparison: it is not enough that a rejection looks like the others, it
+// must also not have minted anything the caller could use.
+func TestDownload_NonOwnerReceivesNoGrant(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	t.Cleanup(srv.Close)
+
+	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	videoPath := generateTestVideo(t, 1)
+	_, result := uploadVideo(t, srv.URL, tokenA, videoPath, "no-grant.mp4")
+	if !result.Success {
+		t.Fatalf("setup upload failed: %s", result.Message)
+	}
+
+	resp := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+tokenB)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	var issued downloadIssuance
+	if err := json.Unmarshal(body, &issued); err == nil && issued.URL != "" {
+		t.Fatalf("a rejected request produced a usable url: %q", issued.URL)
+	}
+	if strings.Contains(string(body), "X-Amz-Signature") {
+		t.Fatalf("rejection body %q carries signature material", body)
+	}
+
+	// And the owner still gets one, so the assertion above is not passing
+	// because issuance is broken for everyone.
+	owner := issueDownload(t, srv.URL, tokenA, result.ZipPath)
+	if owner.URL == "" {
+		t.Fatal("owner issuance carries no url")
 	}
 }
 

@@ -1,7 +1,6 @@
 package application_test
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"os"
@@ -159,9 +158,9 @@ type fakeResultStorage struct {
 	objects map[string][]byte
 	times   map[string]time.Time
 
-	putErr  error
-	statErr error
-	openErr error
+	putErr     error
+	statErr    error
+	presignErr error
 }
 
 func newFakeResultStorage() *fakeResultStorage {
@@ -183,17 +182,15 @@ func (s *fakeResultStorage) Put(_ context.Context, key domain.StorageKey, localP
 	return nil
 }
 
-func (s *fakeResultStorage) Open(_ context.Context, key domain.StorageKey) (io.ReadCloser, int64, error) {
+// PresignGet mimics the real adapter's offline signing: no object lookup, so
+// an absent key yields a URL just as it does against MinIO.
+func (s *fakeResultStorage) PresignGet(_ context.Context, key domain.StorageKey, ttl time.Duration, _ string) (string, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.openErr != nil {
-		return nil, 0, s.openErr
+	if s.presignErr != nil {
+		return "", time.Time{}, s.presignErr
 	}
-	data, ok := s.objects[key.String()]
-	if !ok {
-		return nil, 0, domain.ErrResultNotFound
-	}
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	return "https://storage.test/" + key.String() + "?signature=fake", time.Now().Add(ttl), nil
 }
 
 func (s *fakeResultStorage) Stat(_ context.Context, key domain.StorageKey) (int64, time.Time, error) {
