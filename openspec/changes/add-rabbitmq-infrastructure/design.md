@@ -17,7 +17,7 @@ Each difference is forced by its client library rather than chosen. RabbitMQ div
 **Goals:**
 
 - Connection plumbing — configure, open, health-check, close — for an AMQP broker, usable by both bounded contexts.
-- An idempotent topology declaration driven by an exported descriptor, so the relay (Phase 6.2), the worker (6.3), and the Notification subscriber (Phase 7) bind to one definition rather than to literals repeated at each call site.
+- An idempotent topology declaration driven by an exported descriptor, so the job-dispatch exchange and routing key have one definition that the relay (Phase 6.2) and the worker (6.3) both read. The worker's successor queue is that descriptor with a new job-queue name, not a fresh set of literals. Phase 7's notification events are a separate topology on their own exchange; what they reuse from this change is the connection adapter, not `DefaultTopology`.
 - A topology whose storage footprint is finite even with no consumer running for an extended period.
 - Local and CI brokers to test against, wired the same way Redis and MinIO already are.
 
@@ -115,7 +115,7 @@ The idempotency and conflict scenarios are the exception in spirit: they assert 
 ## Risks / Trade-offs
 
 - **A future consistency pass "fixes" `Open` to be lazy like the other three adapters** → The spec forbids it in normative text with the reason attached, and this document records the alternative that was considered and why it was rejected.
-- **The TTL/max-length values are guesses at this workload's scale, and AMQP makes them expensive to change** (a redeclaration with different arguments fails, so changing one means deleting the queue) → They are exported constants with the policy intent written down, and the `.v1` naming already establishes that a queue with new arguments ships as a new queue. The friction is real and deliberate rather than an oversight.
+- **The TTL/max-length values are guesses at this workload's scale, and AMQP makes them expensive to change** (a redeclaration with different arguments fails, so changing one means deleting the queue) → They are pinned defaults on `DefaultTopology()` with the policy intent written down, and the `.v1` naming already establishes that a queue with new arguments ships as a new queue. The friction is real and deliberate rather than an oversight.
 - **A dead-letter exchange named in `x-dead-letter-exchange` that does not exist causes silent message loss, and RabbitMQ will not warn** → Declaration order puts the sink first, and the topology is declared in one function so no caller can create half of it.
 - **`Ping` opening a channel is heavier than a cached predicate, and a health endpoint calling it under load adds broker work** → Nothing calls `Ping` in this change; the composition roots that will are free to rate-limit or cache their own health responses. The alternative fails the check it exists to perform.
 - **This package's tests skip when no broker is configured, so a local `go test ./...` can pass having exercised none of it** → The skip matches both sibling adapters and is the right local behavior; the risk it carries is silently missing integration coverage, not a failing suite. Mitigated by CI, which always provides the broker, and by task 5.3, which requires confirming the section 3 tests reported `PASS` rather than `SKIP` in the verification run. `docker compose run --build --rm app-test go test ./... -v` supplies all four services locally.

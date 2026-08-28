@@ -78,7 +78,9 @@ The underlying client exposes a cheap `IsClosed()` predicate, and that is not su
 
 ### Requirement: The Declared Topology Is Pinned By This Package
 
-`internal/platform/rabbitmq` SHALL export a `Topology` descriptor and a `DefaultTopology` function returning the one topology this system uses, so that the relay, the worker, and the Phase 7 subscriber bind to a single definition rather than to string literals repeated at each call site. AMQP rejects a redeclaration whose arguments differ from the existing queue's, so a drifted literal is a startup failure at a distance; the descriptor exists so that failure cannot be reached by copying.
+`internal/platform/rabbitmq` SHALL export a `Topology` descriptor and a `DefaultTopology` function returning the job-dispatch topology this change introduces, so that every party to **that** topology reads one definition rather than string literals repeated at each call site. AMQP rejects a redeclaration whose arguments differ from the existing queue's, so a drifted literal is a startup failure at a distance; the descriptor exists so that failure cannot be reached by copying.
+
+What that covers, precisely, because two later changes deliberately do not use `DefaultTopology` unchanged. The **exchange and routing key** are shared: every job-dispatch publisher and consumer uses them. The **job queue name is not permanently shared** — the cutover consumes a successor queue, which it obtains as a `Topology` value derived from this one with a new job-queue name, not as a fresh set of literals, and it must not consume `.v1`, whose contents by then are the residue the relay accumulated with nothing draining it. Phase 7's **Notification events do not belong to this topology at all**: they get their own exchange with their own fanout semantics, and putting them on the job exchange would route integration events to a queue that expects job dispatches. The descriptor is reused for the job-dispatch topology and its successor; it is not a registry of every exchange this system will ever declare.
 
 `DefaultTopology` SHALL return exactly:
 
@@ -130,6 +132,8 @@ Declaration order SHALL be: dead-letter exchange, dead-letter queue, and their b
 ### Requirement: Both Queues Are Bounded By The Topology
 
 The job queue SHALL be declared with a message TTL and a maximum length, and SHALL dead-letter into the dead-letter exchange rather than discarding silently. The dead-letter queue SHALL carry a message TTL and a maximum length of its own, and SHALL discard on expiry and overflow rather than forwarding anywhere.
+
+Both queues and both exchanges SHALL be declared `durable: true`, `autoDelete: false`, `exclusive: false`, and `noWait: false`. Those four flags are independent of one another, and "durable" alone constrains none of the other three: an exclusive queue is visible only to the connection that declared it and vanishes when that connection closes, an auto-delete queue vanishes when its last consumer goes away, and `noWait: true` returns before the broker has answered, so a rejected declaration would surface later as a channel-level exception rather than as this function's error. Any of the three would defeat the guarantee the durable flag is here for — a queue that outlives the process that declared it, holding jobs for a consumer that has not started yet.
 
 A bound on the job queue alone would relocate unbounded growth instead of capping it: a TTL that dead-letters into an unbounded destination lets the destination grow without limit, and during the window opened by the next Phase 6 change the destination is where every message ends up, because nothing consumes the job queue until the cutover. Both bounds together are what make the broker's storage footprint finite regardless of how long a consumer is absent.
 
