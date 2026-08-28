@@ -17,7 +17,7 @@ Each difference is forced by its client library rather than chosen. RabbitMQ div
 **Goals:**
 
 - Connection plumbing — configure, open, health-check, close — for an AMQP broker, usable by both bounded contexts.
-- An idempotent topology declaration whose names and arguments are exported constants, so the relay (Phase 6.2), the worker (6.3), and the Notification subscriber (Phase 7) bind to identifiers rather than to repeated literals.
+- An idempotent topology declaration driven by an exported descriptor, so the relay (Phase 6.2), the worker (6.3), and the Notification subscriber (Phase 7) bind to one definition rather than to literals repeated at each call site.
 - A topology whose storage footprint is finite even with no consumer running for an extended period.
 - Local and CI brokers to test against, wired the same way Redis and MinIO already are.
 
@@ -26,7 +26,7 @@ Each difference is forced by its client library rather than chosen. RabbitMQ div
 - Publishing, consuming, acknowledgement, or retry policy. Those belong to the changes that actually move messages.
 - The outbox relay. It is `add-videojob-source-key-and-outbox-relay`'s, along with the `video_job.queued` event it publishes.
 - Any `cmd/api` or `cmd/worker` wiring. Nothing in the running application opens an AMQP connection after this change, and no startup configuration becomes required.
-- Publisher confirms, consumer prefetch, and connection recovery. All are per-consumer policy; the packages that publish and consume configure them on their own channels.
+- Publisher-confirm *policy*, consumer prefetch, and connection recovery. Those are per-caller choices, configured on the caller's own channel. The spec does record that confirm mode is required to observe an overflow rejection at all — a bare `basic.publish` is asynchronous and returns nothing — because a relay that treated a nil return as acceptance would stamp `published_at` for a message the broker refused.
 - The cutover's second job queue. This change declares the topology 6.2 publishes into; 6.3 declares its own queue beside it and retires this one.
 
 ## Decisions
@@ -80,9 +80,13 @@ Two bounds, not one. Bounding only the job queue relocates growth rather than ca
 
 One hour on the job queue is a policy statement, not a tuning parameter: a job nobody has picked up in an hour is a failure to surface, not work to keep waiting. Twenty-four hours on the dead-letter queue is long enough to look at the morning after an incident. Both are exported constants; changing either requires deleting and redeclaring the queue, since AMQP will reject a redeclaration with different arguments — which is the intended friction, not an obstacle to work around.
 
-### Decision 6: `DeclareTopology` owns its own channel
+### Decision 6: `DeclareTopology` takes a descriptor and owns its own channel
 
-It opens a channel, declares everything, binds, and closes the channel. Callers pass a connection, not a channel, so the function cannot leave a caller's long-lived publishing or consuming channel in a closed state — a failed declaration closes the channel it happened on, and AMQP gives no way to reopen the same one.
+The signature is `DeclareTopology(conn *amqp091.Connection, topo Topology) error`, with `DefaultTopology()` returning the production values. A `DeclareTopology(conn)` that read package constants internally was the first shape considered and is untestable in the way that matters: the only way to exercise it would be to declare the production names on a shared broker, which leaves a queue behind under a production name — with test-sized arguments, in the overflow test's case — for a later run to collide with as `PRECONDITION_FAILED`. Isolating tests in per-test vhosts was the alternative; it needs the management HTTP API to create them, which means the `-management` image variant and a second protocol in the test suite, to buy isolation the descriptor gives for free.
+
+The two overflow policies and the dead-letter queue's lack of its own dead-letter exchange are deliberately **not** descriptor fields. They are what make the topology bounded, and a caller able to vary them could declare an unbounded chain through this same function. Names and the four TTL/length values are fields; the invariants are not.
+
+It opens its own channel, declares everything, binds, and closes it. Callers pass a connection, not a channel, so the function cannot leave a caller's long-lived publishing or consuming channel in a closed state — a failed declaration closes the channel it happened on, and AMQP gives no way to reopen the same one.
 
 Declaration order matters and is fixed: dead-letter exchange, dead-letter queue, and its binding first, then the job exchange and the job queue that references the dead-letter exchange by name. RabbitMQ does not validate that a queue's `x-dead-letter-exchange` exists at declare time — it silently drops dead-lettered messages if it does not — so declaring the sink first makes a partial failure leave a topology that is incomplete rather than one that is complete-looking and lossy.
 
@@ -92,9 +96,13 @@ Declaration order matters and is fixed: dead-letter exchange, dead-letter queue,
 
 Image pinned to `rabbitmq:4-alpine`, matching the major-version pinning convention `postgres:16-alpine` and `redis:7-alpine` already use, and the same tag in `docker-compose.yml` so "works in CI" and "works locally" mean the same broker.
 
-### Decision 8: No named volume in `docker-compose.yml`
+### Decision 8: A named volume in `docker-compose.yml`, following `postgres` and `minio` rather than `redis`
 
-Following `redis` rather than `postgres` and `minio`. The broker holds in-flight job messages whose authoritative state is the `video_jobs` row and the `video_job_outbox` row that produced them; PostgreSQL is the source of truth, and a message lost to a `docker compose down` is recoverable from an outbox row whose `published_at` was never stamped. A named volume would preserve exactly the stale residue the cutover is designed to make unreachable.
+The tempting argument is that PostgreSQL is authoritative and a lost message is replayable from an outbox row whose `published_at` was never stamped. That argument is wrong, and the failure it misses is the whole point of the outbox pattern: once the relay has a broker acknowledgement and stamps `published_at`, the row is done and the *message* is the only record that the job is waiting to be processed. Wiping an unpersisted broker at that moment loses the job with PostgreSQL showing nothing left to replay — the same dangling state `minio_data` exists to prevent, where a `completed` row points at an object that no longer exists.
+
+So the broker gets `rabbitmq_data`. `redis` is the correct counter-example rather than the model: its contents are explicitly non-authoritative (idempotency keys, rate-limit counters, a status cache), and losing them is a correctness non-event by design. A queued job is not.
+
+This does mean a `docker compose down -v` is now the way to clear the residue the relay change accumulates, rather than an ordinary `down`. That is the right trade: the residue is bounded by the queue's own TTL and the cutover reaches it through a differently named queue anyway, so persistence costs a little stale storage and buys not losing real work.
 
 ### Decision 9: Tests scope their topology per test
 
@@ -108,7 +116,7 @@ The idempotency and conflict scenarios are the exception in spirit: they assert 
 - **The TTL/max-length values are guesses at this workload's scale, and AMQP makes them expensive to change** (a redeclaration with different arguments fails, so changing one means deleting the queue) → They are exported constants with the policy intent written down, and the `.v1` naming already establishes that a queue with new arguments ships as a new queue. The friction is real and deliberate rather than an oversight.
 - **A dead-letter exchange named in `x-dead-letter-exchange` that does not exist causes silent message loss, and RabbitMQ will not warn** → Declaration order puts the sink first, and the topology is declared in one function so no caller can create half of it.
 - **`Ping` opening a channel is heavier than a cached predicate, and a health endpoint calling it under load adds broker work** → Nothing calls `Ping` in this change; the composition roots that will are free to rate-limit or cache their own health responses. The alternative fails the check it exists to perform.
-- **The test suite gains a fourth infrastructure prerequisite, and a developer without a broker running now sees failures across a package they were not touching** → Consistent with how PostgreSQL, Redis, and MinIO already behave, and `docker compose run --build --rm app-test go test ./... -v` supplies all four. Failing loudly is the deliberate choice this repository has made three times already; a skip would report green while covering nothing.
+- **This package's tests skip when no broker is configured, so a local `go test ./...` can pass having exercised none of it** → The skip matches both sibling adapters and is the right local behavior; the risk it carries is silently missing integration coverage, not a failing suite. Mitigated by CI, which always provides the broker, and by task 5.3, which requires confirming the section 3 tests reported `PASS` rather than `SKIP` in the verification run. `docker compose run --build --rm app-test go test ./... -v` supplies all four services locally.
 
 ## Migration Plan
 
