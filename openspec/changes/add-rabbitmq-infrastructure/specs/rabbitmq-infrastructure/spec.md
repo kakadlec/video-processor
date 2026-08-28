@@ -149,6 +149,26 @@ A publish outside confirm mode returns nothing to the publisher: AMQP's `basic.p
 - **WHEN** the dead-letter queue's arguments are inspected
 - **THEN** it carries a message TTL and a maximum length, and no dead-letter exchange of its own
 
+### Requirement: Messages Published To This Topology Are Persistent
+
+Any publisher of a job message to this topology SHALL mark it persistent (AMQP delivery mode 2). A queue declared durable survives a broker restart; the messages in it do not unless each was published persistently, and a transient message in a durable queue is discarded on restart with no error to anyone.
+
+This is stated here, in the capability that owns the topology, rather than left to each publisher, because the durability argument the topology rests on is otherwise incomplete in a way that is invisible until it costs a job: the relay receives a broker acknowledgement, stamps `published_at`, and the row is done — so the message is the only remaining record that the job is waiting. Durable queue, persistent message, and persisted broker storage are three conditions, and the guarantee needs all three.
+
+This change adds no publisher, so it does not verify the two scenarios below — they describe broker behavior that becomes reachable only once something publishes. `add-videojob-source-key-and-outbox-relay` owns demonstrating them end to end (publish, confirm, restart the broker, observe the message still queued), and this requirement is what obliges it to. Recording the obligation here rather than there is deliberate: it is a property of the topology's durability story, and a relay written without it would look correct against every test this change can run.
+
+#### Scenario: A transient message does not survive a broker restart
+
+- **GIVEN** a durable queue declared by `DeclareTopology` holding a message published with the default (transient) delivery mode
+- **WHEN** the broker is restarted
+- **THEN** the message is gone, demonstrating that queue durability alone does not carry it
+
+#### Scenario: A persistent message survives a broker restart
+
+- **GIVEN** the same durable queue holding a message published with delivery mode 2
+- **WHEN** the broker is restarted
+- **THEN** the message is still queued
+
 ### Requirement: The Adapter Is Tested Against A Real RabbitMQ Instance
 
 `internal/platform/rabbitmq`'s tests SHALL exercise `Open`, `Ping`, `Close`, and `DeclareTopology` against a running broker rather than a fake, reached through a `RABBITMQ_TEST_URL` environment variable. When that variable is unset, **this package's** tests SHALL skip with a clear message rather than fail, matching `internal/platform/redis` and `internal/video/infrastructure/storage` exactly.
