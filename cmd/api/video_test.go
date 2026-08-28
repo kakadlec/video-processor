@@ -1535,6 +1535,7 @@ type fakeResultStorage struct {
 	objects    map[string][]byte
 	times      map[string]time.Time
 	putErr     error
+	statErr    error
 	presignErr error
 }
 
@@ -1573,6 +1574,9 @@ func (s *fakeResultStorage) PresignGet(_ context.Context, key videodomain.Storag
 func (s *fakeResultStorage) Stat(_ context.Context, key videodomain.StorageKey) (int64, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.statErr != nil {
+		return 0, time.Time{}, s.statErr
+	}
 	data, ok := s.objects[key.String()]
 	if !ok {
 		return 0, time.Time{}, videodomain.ErrResultNotFound

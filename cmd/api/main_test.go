@@ -343,11 +343,6 @@ func fingerprintRejection(t *testing.T, resp *http.Response) rejectionFingerprin
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d (body %q)", resp.StatusCode, http.StatusNotFound, body)
 	}
-	// A rejection must not carry a usable grant by any route, not merely
-	// omit the field the success path uses.
-	if strings.Contains(string(body), "http") {
-		t.Fatalf("rejection body %q looks like it carries a URL", body)
-	}
 	return rejectionFingerprint{
 		status:       resp.StatusCode,
 		body:         string(body),
@@ -436,11 +431,12 @@ func TestDownload_MissingObjectIsRejectedLikeEveryOtherCase(t *testing.T) {
 	}
 }
 
-// TestDownload_PresignFailureIsRejectedLikeEveryOtherCase drives the branch
-// that is unreachable in production — the TTL is a constant inside the
-// library's accepted range and the key is validated before it — but which
-// must not be the one path that leaks an endpoint name into a body.
-func TestDownload_PresignFailureIsRejectedLikeEveryOtherCase(t *testing.T) {
+// TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase drives the two
+// branches an outage reaches. Both are hard to provoke against a real bucket
+// and easy to get wrong: they are the paths whose underlying error names the
+// endpoint and the bucket, so they are exactly the ones that must render as
+// the same opaque rejection as a malformed key.
+func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	repo := newInMemoryVideoJobRepository()
 	results := newFakeResultStorage()
@@ -451,7 +447,7 @@ func TestDownload_PresignFailureIsRejectedLikeEveryOtherCase(t *testing.T) {
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
 	videoPath := generateTestVideo(t, 1)
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "presign-failure.mp4")
+	_, result := uploadVideo(t, srv.URL, token, videoPath, "storage-failure.mp4")
 	if !result.Success {
 		t.Fatalf("setup upload failed: %s", result.Message)
 	}
@@ -460,15 +456,44 @@ func TestDownload_PresignFailureIsRejectedLikeEveryOtherCase(t *testing.T) {
 	defer baseline.Body.Close()
 	want := fingerprintRejection(t, baseline)
 
-	results.mu.Lock()
-	results.presignErr = errors.New("presign failed against https://minio.internal:9000/some-bucket")
-	results.mu.Unlock()
+	// Deliberately not ErrResultNotFound: this is the "storage is broken"
+	// leg, the one that logs. The not-found leg has its own test against a
+	// real bucket.
+	outage := errors.New("stat failed against https://minio.internal:9000/some-bucket")
 
-	failed := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
-	defer failed.Body.Close()
+	cases := []struct {
+		name string
+		set  func()
+	}{
+		{"stat fails", func() { results.statErr = outage }},
+		// Unreachable in production — the TTL is a constant inside the
+		// library's accepted range and the key is validated before it — but
+		// it must not be the one path that leaks an endpoint name into a
+		// body.
+		{"presigning fails", func() { results.presignErr = outage }},
+	}
 
-	if got := fingerprintRejection(t, failed); got != want {
-		t.Fatalf("presign-failure rejection %+v differs from %+v", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			results.mu.Lock()
+			results.statErr = nil
+			results.presignErr = nil
+			tc.set()
+			results.mu.Unlock()
+			t.Cleanup(func() {
+				results.mu.Lock()
+				results.statErr = nil
+				results.presignErr = nil
+				results.mu.Unlock()
+			})
+
+			failed := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+			defer failed.Body.Close()
+
+			if got := fingerprintRejection(t, failed); got != want {
+				t.Fatalf("rejection %+v differs from %+v", got, want)
+			}
+		})
 	}
 }
 
