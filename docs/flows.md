@@ -154,8 +154,13 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
   │                        │                    │               │                  │
   │  GET <download_url>     │                    │               │                  │
   │───────────────────────►│                    │               │                  │
-  │◄───────────────────────│   Presigned MinIO  │               │                  │
-  │  ZIP file               │   URL redirect     │               │                  │
+  │◄───────────────────────│                    │               │                  │
+  │  200 { url, expires_at }│                    │               │                  │
+  │                        │                    │               │                  │
+  │  GET <url>             │                    │               │                  │
+  │──────────────────────────────────────────────────────────────────────────────►│
+  │◄──────────────────────────────────────────────────────────────────────────────│
+  │  ZIP file — as it already works today (Phase 5)                                │
 ```
 
 **Key characteristics (target):**
@@ -164,6 +169,7 @@ Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    
 - Job state is persisted in PostgreSQL (authoritative); Redis caches status reads.
 - Files are stored in MinIO (S3-compatible) instead of the local filesystem.
 - On completion, the Notification context is triggered via a domain event over RabbitMQ (Phase 7).
+- The download itself is unchanged from today: `download_url` points at `GET /download/:filename`, which authorizes and returns a signed URL the client redeems against MinIO. It is not a redirect — an earlier sketch of this diagram showed one, and `add-presigned-download-urls` rejected that shape because a `fetch` following a cross-origin redirect makes the feature depend on MinIO's CORS configuration.
 
 ---
 
