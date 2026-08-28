@@ -5,11 +5,14 @@
 Define the Redis-backed, per-authenticated-user request rate limiter applied to every route in `cmd/api`'s `videoRoutes` group: threshold/window configuration, the fixed-window counting algorithm's observable behavior, the `429`/`Retry-After` rejection contract, and the fail-open behavior when the Redis-backed check itself is unavailable. This is the second Phase 4 feature (of idempotency keys, rate limiting, status cache) to consume `internal/platform/redis` (`redis-infrastructure`), implementing the "Rate limiting rejects excess requests" behavior `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement already documents at the target-state level.
 
 ## Requirements
+
 ### Requirement: Authenticated Video Routes Are Rate Limited Per User
 
 `cmd/api` SHALL apply a Redis-backed, per-authenticated-user request rate limit to every route in the `videoRoutes` group (everything gated by `identity.requireBearerAuth()`: `POST /upload`, `POST /api/video-jobs`, `GET /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /download/:filename`, and `GET /api/status`). A request that exceeds the configured limit within the current window SHALL be rejected with `429 Too Many Requests` before any handler-specific logic (including `ffmpeg` invocation) runs. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, `/`, static assets) are out of scope.
 
-Neither static mount appears in that enumeration any more, because neither exists. `/outputs` went when results moved to object storage; `/uploads` goes with this change, when source videos move there too. The group now contains only JSON and streaming handlers, every one of which is still limited.
+Neither static mount appears in that enumeration any more, because neither exists: `/outputs` went when results moved to object storage, `/uploads` when source videos followed. Every handler in the group returns JSON; none streams an artifact.
+
+The limit governs **requests to this API**, and after result downloads became presigned URLs that is narrower than it may read. `GET /download/:filename` issues a URL and is limited; the transfer that URL authorizes happens between the client and the storage service, which this middleware does not sit in front of. A caller held to `RATE_LIMIT_MAX_REQUESTS` issuances per window can still begin that many transfers, and each transfer's bandwidth is unbounded by anything specified here. Bounding artifact egress is an object-storage concern, and no requirement in this capability SHALL be read as constraining it.
 
 #### Scenario: Request within the limit succeeds
 
@@ -45,13 +48,19 @@ Neither static mount appears in that enumeration any more, because neither exist
 
 - **GIVEN** an authenticated user who has exhausted their window
 - **WHEN** they request `GET /download/:filename`
-- **THEN** the response is `429 Too Many Requests`, with no object retrieved from storage
+- **THEN** the response is `429 Too Many Requests`, with no object stated in storage and no URL issued
 
 #### Scenario: The upload route remains rate limited after its static mount is removed
 
 - **GIVEN** an authenticated user who has exhausted their window
 - **WHEN** they `POST /upload`
 - **THEN** the response is `429 Too Many Requests`, with nothing stored in the bucket and `ffmpeg` never invoked
+
+#### Scenario: A transfer authorized by an issued URL is outside the limiter's reach
+
+- **GIVEN** an authenticated user who has exhausted their window and holds a presigned URL issued earlier in that window
+- **WHEN** they request that URL
+- **THEN** the transfer proceeds, because the request goes to the storage service rather than to a route this middleware is mounted on
 
 ### Requirement: Rate Limit Thresholds Are Configurable With Safe Defaults
 

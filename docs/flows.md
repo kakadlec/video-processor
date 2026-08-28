@@ -82,8 +82,16 @@ Browser              cmd/api/video.go       internal/video/application   MinIO b
   │                        │                            │                  │
   │  GET /download/<zip_path>│                           │                 │
   │───────────────────────►│                            │                  │
-  │◄───────────────────────│  Stream bucket/<zip>       │                  │
-  │  ZIP file               │                           │                  │
+  │                        │  Stat bucket/<zip>          │                 │
+  │                        │──────────────────────────────────────────────►│
+  │                        │  Presign (local; no network call)             │
+  │◄───────────────────────│                            │                  │
+  │  200 { url, expires_at }│  Cache-Control: no-store   │                 │
+  │                        │                            │                  │
+  │  GET <url>  (no Authorization header)                                  │
+  │──────────────────────────────────────────────────────────────────────►│
+  │◄──────────────────────────────────────────────────────────────────────│
+  │  ZIP file — straight from MinIO; the API is not in this path            │
 ```
 
 The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/infrastructure/ffmpeg`'s `Extractor`, called through the `FrameExtractor` port `ProcessVideoJob` depends on — see `openspec/specs/videojob-execution/spec.md`.
@@ -95,6 +103,7 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 - Nothing the client uploads touches local disk on the way in. The source is streamed straight into the bucket, and the only local copy is the one `ProcessVideoJob` downloads for `ffmpeg`, which it removes on every path (Phase 5, `migrate-upload-storage-to-minio`).
 - The source object is deleted on success **and** on failure, through a single `defer` registered the moment the object exists — so the ZIP object is the only artifact meant to survive the request. That deletion is best effort: one call, no retry, logged with the key if it fails. See `docs/operations.md` for the recommended `uploads/`-prefix lifecycle rule that backstops it.
 - Authentication (Phase 2) is required; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and always from the `VideoJob` row. The `.owner` sidecar mechanism is gone entirely — source objects are never served, so there is nothing to authorize for them.
+- The download is a two-step exchange, not a proxied stream (Phase 5, `add-presigned-download-urls`). `GET /download/:filename` authorizes and issues; the client redeems the issued URL against MinIO with no `Authorization` header. Entitlement is evaluated **only** at issuance, since the URL carries no identity — nothing re-checks ownership when it is redeemed, and nothing can withdraw it before its five minutes are up. The `Stat` before signing is not optional: signing is offline and succeeds for a key holding no object, so without it a missing object would surface as MinIO's own `404` instead of this endpoint's byte-identical one.
 
 ---
 
@@ -205,9 +214,12 @@ User submits upload form
   └─► POST /upload  (with Authorization header if a token is present)
         → blocks until processing completes
         on success:
-          └─► show a "Download ZIP" button (fetches the file with the
-              Authorization header and saves it via a Blob, since a
-              plain link can't carry a custom header)
+          └─► show a "Download ZIP" button
+                └─► GET /download/<zip_path> with the Authorization
+                    header → { url, expires_at }
+                └─► navigate an anchor at that url; MinIO serves the ZIP
+                    (the download attribute is ignored cross-origin — the
+                    attachment comes from the signed disposition)
           └─► GET /api/status    → refresh file list
         on error:
           └─► show error message
@@ -227,7 +239,8 @@ User submits form
   └─► POST /upload       → returns immediately with { job_id, status_url }
         └─► poll GET /jobs/{job_id}/status every N seconds
               on "completed":
-                └─► show download link (presigned MinIO URL)
+                └─► show download link (issued by GET /download/:filename,
+                    as it already is today)
                 └─► stop polling
               on "failed":
                 └─► show error message
@@ -246,7 +259,7 @@ User submits form
 | `POST /api/auth/login` | Issues a bearer JWT (Phase 2) | Unchanged | No |
 | `POST /upload` | Blocks; returns ZIP download link; requires a bearer token | Returns immediately; returns job ID + status URL | No — kept for compatibility |
 | `GET /api/status` | Lists the caller's `completed` jobs' results, with size and timestamp read from MinIO | Unchanged (compat) | No — kept for compatibility |
-| `GET /download/:filename` | Streams the ZIP from MinIO; owner-only (a non-owner gets the same 404 as a missing key) | Presigned URL instead of a proxied stream (`add-presigned-download-urls`) | No |
+| `GET /download/:filename` | Issues a 5-minute presigned MinIO URL (`{ url, expires_at }`); owner-only (a non-owner gets the same 404 as a missing key), and the API never carries the bytes | Unchanged | No |
 | `GET /jobs/{id}/status` | Does not exist | Per-job polling endpoint | N/A — new in Phase 6 |
 | `POST /jobs` | Does not exist | Canonical async upload endpoint | N/A — new in Phase 6 |
 | `POST /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /api/video-jobs` | Preview job-lifecycle API (Phase 3); JSON metadata only, no processing trigger | Unrelated to this migration — not the same endpoints as `/jobs` above | Not applicable — separate, unreplaced capability |
