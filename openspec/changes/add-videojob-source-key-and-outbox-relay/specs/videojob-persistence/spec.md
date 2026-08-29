@@ -6,6 +6,8 @@
 
 The outbox row's `event_type` SHALL be `video_job.queued`, following the `video_job.created` constant already in this package, and that string SHALL be a single shared constant rather than a literal repeated at the insert and at the relay's claim. A drifted literal produces a relay that matches nothing and reports no error.
 
+The payload SHALL carry `type` (`"video_job.queued"`), `job_id`, `user_id`, `source_key`, and `occurred_at`, matching the `VideoJobQueued` event `docs/domain-model.md` already defines and mirroring the shape `video_job.created` already persists. The discriminator and the timestamp are not optional extras: the relay forwards the stored payload verbatim, so whatever is written here *is* the wire contract a consumer parses, and an event without a `type` cannot be dispatched on by a subscriber that will eventually see more than one kind.
+
 This is a dedicated method rather than a status-dependent behavior added to `Update`. `Update` is also `CompleteJob`'s and `FailJob`'s path, so making it outbox-aware would turn event emission into a side effect of a general-purpose method and would decide, as a by-product, the shape Phase 7 inherits for `VideoJobCompleted`/`VideoJobFailed`.
 
 `internal/video/infrastructure/cache.CachedVideoJobRepository` SHALL implement `Enqueue` write-through, like `Update`: PostgreSQL first, then an unconditional cache write. It SHALL NOT pass the call through uncached — a job left `pending` in the cache while `queued` in PostgreSQL would make `GET /api/video-jobs/:id` contradict the row the relay is about to publish.
@@ -14,7 +16,7 @@ This is a dedicated method rather than a status-dependent behavior added to `Upd
 
 - **GIVEN** a persisted `VideoJob` in `pending` status with a non-empty source key
 - **WHEN** `Repository.Enqueue` is called with it after its `Enqueue` transition has been applied
-- **THEN** its row's status is `queued`, and a `video_job_outbox` row exists whose `event_type` is `video_job.queued`, whose payload carries that job's `job_id`, `user_id`, and source key, and whose `published_at` is `NULL`
+- **THEN** its row's status is `queued`, and a `video_job_outbox` row exists whose `event_type` is `video_job.queued`, whose payload carries `type: "video_job.queued"` plus that job's `job_id`, `user_id`, `source_key`, and `occurred_at`, and whose `published_at` is `NULL`
 
 #### Scenario: A failed outbox insert leaves the job unqueued
 

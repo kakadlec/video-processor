@@ -85,6 +85,12 @@ MinIO is fail-closed because a result that cannot be stored cannot be delivered 
 
 Redis's fail-open is also the wrong analogy: those features degrade a request by skipping an optimization. Here there is no request to degrade; there is a background loop that either runs now or runs shortly.
 
+### Decision 7a: Unpublished rows are not isolated by a separate queue
+
+The cutover consumes a different generation, which isolates every message this relay **published**. It does not isolate rows this relay never managed to publish — nacked against a full queue, or written while the broker was down. Those stay claimable, so a relay later pointed at the new generation would deliver them there: dispatches for jobs already `completed`, with their sources deleted.
+
+This change cannot close that, because switching generations is the cutover's act, and defining the cutoff is therefore the cutover's decision. What this change owes is the honest statement plus the affordance: `video_job_outbox.occurred_at` is recorded on every row, so a cutoff is expressible without a schema change. The claim to avoid making — and which an earlier draft of this proposal did make — is that a separately named queue means no residue can reach the worker.
+
 ### Decision 7: Relay lifecycle and pacing
 
 The relay declares the topology on every successful dial, before opening its publishing channel. Nothing else ever declares it — `add-rabbitmq-infrastructure` shipped the descriptor and the declaring function without a caller — so against a fresh broker the exchange simply does not exist, and a publish to a missing exchange closes the channel rather than failing routably. Declaring on connect rather than once at startup is what makes a reconnect correct too: if the broker was recreated while the relay was disconnected, the redeclaration restores the topology instead of publishing into nothing.
@@ -101,7 +107,7 @@ The relay's own behavior against a real broker is covered by `internal/video/inf
 
 ## Risks / Trade-offs
 
-- **The `Enqueue`-only invariant means a `queued` row with an empty source key is representable** → It can only arise from data that predates this change, never from code: `Enqueue` is the sole path into `queued` and rejects it. The relay publishes the source key from the row, so such a row would produce a message the worker rejects — which the worker must handle anyway, since a message can name a job in any state.
+- **The `Enqueue`-only invariant means a `queued` row with an empty source key is representable** → It can only arise from data that predates this change, never from code: `Enqueue` is the sole path into `queued` and rejects it. Such a row stays loadable and is simply never dispatched — it has no `video_job.queued` outbox row (it predates the event) and the relay ignores its `video_job.created` row by design, so no message is produced for it at all. It is stranded rather than mis-dispatched, and recovering one is an operator action (fail it, or re-upload), not something this change automates.
 - **Row locks are held across a broker round trip** → Bounded batch, bounded confirm wait, and `SKIP LOCKED` so concurrent replicas step over rather than queue behind. The alternative loses rows permanently, which is worse than a brief lock.
 - **A stalled relay is quiet**: publishes nacked, outbox rows accumulating, no user-visible symptom while `/upload` still completes in-request → Accepted for this window and logged with the row id and the queue's state. The cutover, which makes dispatch load-bearing, is where this becomes worth alerting on.
 - **Two replicas both polling adds contention** → `SKIP LOCKED` is what makes it correct; the cost is wasted polls, not duplicates.

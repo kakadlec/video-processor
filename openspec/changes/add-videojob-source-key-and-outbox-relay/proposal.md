@@ -27,7 +27,9 @@ Three things therefore have to land together, because none of them is useful or 
 
 ### What this deliberately does not do
 
-Nothing consumes the queue. Every message this relay publishes names a job that the same request has already driven to `completed` or `failed`, with its source object deleted — `POST /upload` still processes in-request. That residue is inert by construction: the cutover consumes a different queue, so nothing can ever read these messages. It also does not drain on its own, because the job queue carries no message TTL; it sits until the cutover deletes that queue, and if it reaches the queue's maximum length first, `reject-publish` stalls this relay with its outbox rows unstamped — nothing lost, uploads unaffected, resuming on retirement.
+Nothing consumes the queue. Every message this relay publishes names a job that the same request has already driven to `completed` or `failed`, with its source object deleted — `POST /upload` still processes in-request. **Published** residue is inert by construction: the cutover consumes a different queue, so nothing can ever read those messages. It does not drain on its own either, because the job queue carries no message TTL; it sits until the cutover deletes that queue, and if it reaches the queue's maximum length first, `reject-publish` stalls this relay with rows unstamped — nothing lost, uploads unaffected, resuming on retirement.
+
+**Unpublished** rows are a different matter, and a separate queue does not isolate them. A row that was never successfully published — nacked against a full queue, or written while the broker was unreachable — is still claimable, so a relay later switched to the cutover's generation would deliver it there: a dispatch for a job already `completed` with its source deleted. This change cannot fix that on its own, because the cutover is what switches generations; what it can do is not pretend otherwise. The requirement is recorded for that change: it must define a cutoff for pre-existing unpublished rows before it starts publishing into the new generation, and `video_job_outbox.occurred_at` is what makes a cutoff expressible.
 
 ## Capabilities
 
