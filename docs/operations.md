@@ -44,6 +44,7 @@ The Dockerfile is a multi-stage build. The default (final) stage — used by the
 | `VIDEO_MINIO_BUCKET` | unset | Bucket holding processed ZIP results, keyed `frames_<jobID>.zip`. Required at startup; created automatically if absent. |
 | `VIDEO_MINIO_USE_SSL` | `false` | Whether to connect over TLS. Optional, but a value that is *set* and not parseable as a boolean is a configuration error, never a silent `false` — a typo must not quietly downgrade an intended TLS connection to plaintext. |
 | `VIDEO_MINIO_PUBLIC_ENDPOINT` | `VIDEO_MINIO_ENDPOINT` | Address (`host:port`) clients reach MinIO at, used **only** to construct presigned download URLs. Optional as of Phase 5's `add-presigned-download-urls`; defaults to the internal endpoint, so a deployment where one address serves both the server and its clients needs nothing here. The server never dials this address. |
+| `RABBITMQ_URL` | unset | Full AMQP URI for the shared broker (e.g. `amqp://video:video@rabbitmq:5672/`) — a URI, not a `host:port` pair like `REDIS_ADDR`, because it carries the TLS scheme, the credentials, and the virtual host. **Not required at startup** as of Phase 6's `add-rabbitmq-infrastructure`: no composition root opens a connection, so the server starts and serves every endpoint with no broker reachable. It becomes required when `add-videojob-source-key-and-outbox-relay` wires the outbox relay into `cmd/api`. |
 | `VIDEO_MINIO_PUBLIC_USE_SSL` | `VIDEO_MINIO_USE_SSL` | Scheme for the URLs issued against `VIDEO_MINIO_PUBLIC_ENDPOINT`. Optional; defaults to the *resolved* `VIDEO_MINIO_USE_SSL`, not to `false` — declaring TLS once must not silently produce `http://` links. Set it explicitly when TLS terminates in front of the public address but the server talks plaintext internally. A set-but-unparseable value is a configuration error, same as above. |
 
 The first four `VIDEO_MINIO_*` variables are **required**; `VIDEO_MINIO_USE_SSL`, `VIDEO_MINIO_PUBLIC_ENDPOINT`, and `VIDEO_MINIO_PUBLIC_USE_SSL` are optional. `setupVideo` loads the configuration, opens the client, pings it, ensures the bucket exists, and discovers the bucket's region for the presign-only client, and **any of those steps failing stops startup**. This is deliberately fail-closed, unlike the Redis-backed features above, which degrade to a slower but correct system when Redis is down: a result that cannot be stored cannot be delivered, so there is nothing to degrade to.
@@ -71,7 +72,7 @@ An issued URL also **cannot be revoked**: deleting the job, changing its owner, 
 
 Their `VIDEO_` prefix marks them as the Video Processing context's own configuration, matching `VIDEO_POSTGRES_DSN` and distinguishing them from `internal/platform/`'s unprefixed `REDIS_ADDR`.
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`).
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`). `RABBITMQ_URL` is in a category of its own: it is read by no startup path at all today, so setting it has no effect and leaving it unset costs nothing (see the RabbitMQ section below).
 
 ## Runtime Directory Structure
 
@@ -149,15 +150,42 @@ Unlike Redis's, MinIO's contents are authoritative once results move there: `doc
 
 ---
 
+### RabbitMQ — Connection adapter and topology implemented, nothing wired (Phase 6)
+
+`internal/platform/rabbitmq` opens, health-checks, and closes an AMQP connection and declares a topology; `internal/video/infrastructure/messaging` defines the one this context uses. Both shipped with `add-rabbitmq-infrastructure`.
+
+**Nothing in the deployed application uses either yet.** No composition root opens a connection, nothing publishes, nothing consumes, and `RABBITMQ_URL` is **not required at startup** — the server starts and serves every endpoint with no broker reachable. That changes when `add-videojob-source-key-and-outbox-relay` wires the relay into `cmd/api`; until then a broker is needed only to run `internal/platform/rabbitmq`'s own tests, through `RABBITMQ_TEST_URL`.
+
+- **`RABBITMQ_URL`** holds a full AMQP URI (`amqp://user:pass@host:5672/vhost`), not a `host:port` pair like `REDIS_ADDR`: the URI carries the scheme that selects TLS, the credentials, and the virtual host. It is read by `LoadConfigFromEnv` and by nothing else today.
+- **`Open` connects**, unlike the Redis and MinIO adapters, which construct a client without touching the network. AMQP has no lazy client, so an unreachable broker or wrong credentials surface immediately rather than on first use.
+- **The health check is a real round trip** — it opens a channel and closes it. The client's own `IsClosed()` predicate reports only what the process has already observed, which is stale for a broker that stopped answering without the connection being torn down.
+
+The declared topology, and the two operational policies in it that are decisions rather than defaults:
+
+| Entity | Name | Arguments |
+|---|---|---|
+| Job exchange | `video.jobs.v1` | `direct`, durable |
+| Routing key | `video_job.queued` | equal to the outbox `event_type` string |
+| Job queue | `video.jobs.queued.v1` | `x-max-length` 10 000, `x-overflow` `reject-publish`, dead-letters to `video.jobs.dlx` |
+| Dead-letter exchange | `video.jobs.dlx` | `fanout`, durable |
+| Dead-letter queue | `video.jobs.dead` | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, forwards nowhere |
+
+- **A full job queue refuses new publishes; it does not drop old ones.** `reject-publish` means the broker nacks the publisher rather than evicting the oldest queued job, so a full queue becomes back-pressure: the publisher leaves its outbox row unstamped, retries, and the system resumes when the queue drains. Nothing is lost. Expect a stalled relay and a growing count of unpublished outbox rows as the symptom, not missing jobs.
+- **Job messages never expire.** The job queue deliberately carries no message TTL. An expired message would be dead-lettered without any update to its `video_jobs` row, and the state machine has no transition out of `queued` except to `processing` — so the job would report `queued` to its owner forever. A backlog therefore persists until it is consumed rather than aging out, which is the intended trade.
+- **The generation suffix is on the exchange**, and the queue name follows it. A `direct` exchange delivers each publish to every queue bound with the matching routing key, so a future generation gets a new exchange rather than only a new queue.
+
+Like PostgreSQL's and MinIO's, this broker's contents are authoritative once the relay ships: an acknowledged, `published_at`-stamped message is the only record that a job is waiting. `docker-compose.yml` gives the local service a named `rabbitmq_data` volume and a pinned `hostname` for that reason — RabbitMQ keys its Mnesia directory by hostname, so the volume does nothing without it, and clearing queued messages locally needs `docker compose down -v` rather than a plain `down`.
+
+- **Local/CI service:** `docker-compose.yml` and CI both start `rabbitmq:4-alpine`. CI uses a service container, unlike MinIO, whose image needs command arguments a service container cannot supply.
+- **Local/CI credentials** (`video`/`video`) are fixed, non-secret defaults. They are a dedicated account rather than the built-in `guest` because RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection here arrives over a Docker network.
+
+A fourth Redis-backed responsibility — a **distributed lease** preventing a redelivered message from being processed alongside the job a live worker still holds — is planned for later in Phase 6, once `cmd/worker` exists to contend over job pickup.
+
+---
+
 ## Planned Infrastructure (Not Yet Implemented)
 
 > The components below are planned for future phases and do not exist in the current deployment. Each is labeled with the phase that introduces it.
-
-### RabbitMQ — Planned (Phase 6)
-
-Durable async message broker for dispatching `VideoJob` processing tasks to the worker. Key properties: per-message acknowledgement, dead-letter queues, durable queues that survive broker restarts. The API publishes a job message after `CreateVideoJob`; the worker (`cmd/worker`) dequeues, runs `ffmpeg`, and calls `CompleteJob` or `FailJob`. The transactional outbox table in PostgreSQL ensures no messages are lost if the API crashes between the DB write and the broker publish.
-
-A fourth Redis-backed responsibility — a **distributed lock**, belt-and-suspenders alongside RabbitMQ acknowledgement to prevent concurrent worker pickup of the same job — is also planned here rather than in Phase 4: there is no `cmd/worker` to contend over job pickup until this phase.
 
 ### Email / Webhook delivery — Planned (Phase 7)
 

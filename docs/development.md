@@ -7,7 +7,8 @@
 | Go | 1.27+ | Build and test the application |
 | ffmpeg | any recent | Frame extraction; must be on `PATH` |
 | MinIO | any recent | Result storage; `cmd/api` requires `VIDEO_MINIO_*` at startup, and its tests require it too |
-| Docker | any recent | Alternative if Go/ffmpeg/MinIO are not installed locally — `docker compose` provides all three |
+| RabbitMQ | any recent | Not needed to build or run the app — `cmd/api` never opens a connection. `internal/platform/rabbitmq`'s own tests use it via `RABBITMQ_TEST_URL` and skip cleanly when it is unset |
+| Docker | any recent | Alternative if Go/ffmpeg/MinIO/RabbitMQ are not installed locally — `docker compose` provides all of them |
 | git | any | Source control |
 
 ### Installing ffmpeg
@@ -66,6 +67,8 @@ To skip the manual wiring entirely, use `docker compose up --build`, which runs 
 ## Running Tests
 
 Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, and the `VIDEO_MINIO_*` variables must point at a reachable MinIO.
+
+RabbitMQ is a prerequisite for **full coverage**, not for a passing run: `internal/platform/rabbitmq`'s tests skip with a clear message when `RABBITMQ_TEST_URL` is unset, the same way the Redis and MinIO adapter suites do. A local run without a broker passes while exercising none of that package, so exercise it through the Docker command below (or CI, which always provides one) before trusting a green result for a change that touches it.
 
 ```bash
 go test ./... -v

@@ -204,6 +204,7 @@ video-processor/
     platform/
       redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close, wired into cmd/api by add-upload-idempotency-keys
       ratelimit/      # Redis-backed fixed-window rate Limiter (implemented, Phase 4 — add-rate-limiting-middleware), wired into cmd/api's rateLimitMiddleware on every authenticated route
+      rabbitmq/       # Shared AMQP connection adapter (implemented, Phase 6 — add-rabbitmq-infrastructure) — Config/Open/Ping/Close plus a generic Topology descriptor and DeclareTopology; names no exchange or queue of its own, and is not wired into any cmd yet
     identity/                        # Implemented (Phase 2), wired into cmd/api
       domain/         # User aggregate, value objects, repository/password/token ports
       application/    # Use cases: RegisterUser, AuthenticateUser
@@ -215,7 +216,7 @@ video-processor/
         idempotency/  # Redis-backed IdempotencyStore adapter (implemented, Phase 4 — add-upload-idempotency-keys), wired into cmd/api's POST /upload handler
         cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4 — add-videojob-status-cache), wired into cmd/api's setupVideo ahead of every use case
         storage/      # MinIO adapter (implemented, Phase 5) — Config/Open/Ping/EnsureBucket connection plumbing (add-minio-infrastructure) plus ResultStorage, the domain port carrying result artifacts into and out of the bucket (migrate-result-storage-to-minio)
-        # RabbitMQ publisher planned (Phase 6)
+        messaging/    # This context's job-dispatch topology (implemented, Phase 6 — add-rabbitmq-infrastructure): JobDispatchTopology() returns the descriptor internal/platform/rabbitmq declares. Names only; the publisher itself is planned (Phase 6, add-videojob-source-key-and-outbox-relay)
     notification/
       domain/         # NotificationPreference, DeliveryAttempt
       application/    # Use cases: SendJobCompletionNotification, …
@@ -231,7 +232,7 @@ video-processor/
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
 | Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), rate limiting (`add-rate-limiting-middleware`), and the `VideoJob` status cache (`add-videojob-status-cache`) — all three **implemented** (Phase 4 complete) |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Fully implemented: ZIP results through `internal/video/domain.ResultStorage` (`migrate-result-storage-to-minio`) and uploaded source videos through `SourceStorage` (`migrate-upload-storage-to-minio`), sharing one bucket, separated by key prefix, with configuration required at startup. Results are handed to clients as presigned URLs rather than proxied (`add-presigned-download-urls`), so the API is absent from the transfer path |
-| RabbitMQ | Durable async task queue for job dispatch | Planned (Phase 6) |
+| RabbitMQ | Durable async task queue for job dispatch | Connection adapter **implemented** (Phase 6, `add-rabbitmq-infrastructure`): `internal/platform/rabbitmq` opens, health-checks, and declares a topology, and `internal/video/infrastructure/messaging` defines this context's exchange, queue, and dead-letter sink. Nothing publishes or consumes yet, no composition root opens a connection, and `RABBITMQ_URL` is required by nothing at startup — the relay and the worker are separate Phase 6 changes |
 
 A fourth Redis-backed responsibility — a distributed lock preventing concurrent `cmd/worker` instances from picking up the same job — is planned for Phase 6 (not Phase 4): there is no worker to contend over job pickup until then.
 
