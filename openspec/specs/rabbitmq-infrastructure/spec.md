@@ -26,9 +26,11 @@ This is an allow-list rather than a prohibition naming `identity` and `video`, b
 
 #### Scenario: The package names no context's entities
 
-- **GIVEN** any Go file under `internal/platform/rabbitmq/`
+- **GIVEN** any non-test Go file under `internal/platform/rabbitmq/`
 - **WHEN** its string literals are inspected
 - **THEN** none is an exchange, queue, or routing-key name specific to a bounded context
+
+Test files are excluded because the test that enforces this rule necessarily contains the literals it forbids.
 
 ### Requirement: AMQP Connection Is Configured From The Environment
 

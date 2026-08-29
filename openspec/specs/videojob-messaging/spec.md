@@ -17,8 +17,10 @@ The definition lives in the context rather than in `internal/platform/rabbitmq` 
 #### Scenario: The names live in the video context
 
 - **GIVEN** the strings `video.jobs`, `video_job.queued`, and the job queue's name
-- **WHEN** the repository is searched for them outside test files
+- **WHEN** the repository's non-test Go source is searched for them
 - **THEN** they appear under `internal/video/`, and not under `internal/platform/`
+
+The scope is non-test Go source deliberately. Documentation and OpenSpec artifacts name the topology throughout — that is what they are for — and the guard in `internal/platform/rabbitmq` skips `_test.go` files, since the test that enforces this rule necessarily contains the very literals it forbids.
 
 ### Requirement: The Job-Dispatch Topology Is Pinned
 
