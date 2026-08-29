@@ -1,6 +1,6 @@
 # Local development/test infrastructure. Scoped to what the Identity and
-# Video contexts need today (PostgreSQL, Redis, MinIO); later roadmap phases
-# extend this file with RabbitMQ rather than replacing it.
+# Video contexts need today (PostgreSQL, Redis, MinIO, RabbitMQ); later
+# roadmap phases extend this file rather than replacing it.
 #
 # The credentials below are fixed, non-secret local-only defaults — this
 # service is never reachable from anywhere but the developer's own machine
@@ -69,6 +69,45 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  # Named volume and a pinned hostname, unlike the redis service above.
+  # Redis holds explicitly non-authoritative data, so losing it on restart is
+  # a correctness non-event; a queued job is not. Once the outbox relay has a
+  # broker acknowledgement and stamps published_at, the message is the only
+  # remaining record that the job is waiting to be processed — wiping it
+  # loses real work with nothing left in PostgreSQL to replay, the same
+  # dangling state minio_data exists to prevent.
+  #
+  # The hostname is what makes the volume work, not decoration: RabbitMQ
+  # stores its Mnesia database under mnesia/rabbit@<hostname>, and Compose
+  # gives a recreated container a freshly generated hostname — so a persisted
+  # volume would be reopened by a node with a different name, starting empty
+  # beside the old directory rather than resuming it.
+  #
+  # Consequence worth knowing: clearing queued messages needs
+  # `docker compose down -v`, not a plain `down`.
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    hostname: rabbitmq
+    environment:
+      # A dedicated account rather than the built-in "guest", which RabbitMQ
+      # confines to loopback as the broker itself sees it — every connection
+      # here arrives over this compose network from another address, so a
+      # guest URI fails with ACCESS_REFUSED. Do not simplify this back to
+      # guest. Fixed, non-secret, local-only, same posture as the Postgres
+      # and MinIO credentials above.
+      RABBITMQ_DEFAULT_USER: video
+      RABBITMQ_DEFAULT_PASS: video
+    ports:
+      # Loopback-only: same rationale as the redis, minio, and app services.
+      - "127.0.0.1:5672:5672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
 
   # Runs the same Dockerfile used for deployment, built to its default
   # "runtime" target (hardened, non-root, no Go toolchain — see the
@@ -182,6 +221,11 @@ services:
       VIDEO_MINIO_ACCESS_KEY: minioadmin
       VIDEO_MINIO_SECRET_KEY: minioadmin
       VIDEO_MINIO_BUCKET: video-results-test
+      # Exercises internal/platform/rabbitmq's own test suite against a real
+      # broker. No non-test RABBITMQ_URL on the "app" service: nothing in
+      # cmd/api reads one, and adding it would imply a startup requirement
+      # add-rabbitmq-infrastructure deliberately does not create.
+      RABBITMQ_TEST_URL: amqp://video:video@rabbitmq:5672/
     depends_on:
       postgres:
         condition: service_healthy
@@ -189,7 +233,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   postgres_data:
   minio_data:
+  rabbitmq_data:

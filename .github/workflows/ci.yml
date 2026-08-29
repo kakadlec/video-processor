@@ -36,6 +36,26 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
+      rabbitmq:
+        # A service container, unlike MinIO below. The warning on that step
+        # is specific to an image whose CMD lacks its own server arguments;
+        # this image's default command is rabbitmq-server, which is exactly
+        # what is wanted. Matches the tag pinned in docker-compose.yml.
+        image: rabbitmq:4-alpine
+        env:
+          # A dedicated account, not the built-in "guest": RabbitMQ confines
+          # guest to loopback as the broker itself sees it, and a connection
+          # through the published port below reaches it from the Docker
+          # bridge, so guest is refused here too.
+          RABBITMQ_DEFAULT_USER: video
+          RABBITMQ_DEFAULT_PASS: video
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -170,6 +190,11 @@ jobs:
           VIDEO_MINIO_ACCESS_KEY: minioadmin
           VIDEO_MINIO_SECRET_KEY: minioadmin
           VIDEO_MINIO_BUCKET: video-results-test
+          # Exercises internal/platform/rabbitmq's own tests against the
+          # service container above. localhost:5672 is the runner's published
+          # port; the broker still sees the connection arriving from the
+          # bridge, which is why this is the "video" account and not guest.
+          RABBITMQ_TEST_URL: amqp://video:video@localhost:5672/
         run: go test ./... -v
 
   sast:
