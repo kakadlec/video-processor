@@ -169,6 +169,13 @@ services:
       # published port the developer's browser actually reaches. The server
       # never dials this address.
       VIDEO_MINIO_PUBLIC_ENDPOINT: 127.0.0.1:9000
+      # Required as of add-videojob-source-key-and-outbox-relay: cmd/api
+      # loads this at startup and exits without it. Deliberately absent from
+      # depends_on below — a service_healthy condition would make broker
+      # reachability a startup gate, which is exactly the coupling the relay
+      # exists to avoid. The API serves normally with the broker down; the
+      # relay retries in the background.
+      RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
     depends_on:
       postgres:
         condition: service_healthy
@@ -224,11 +231,14 @@ services:
       VIDEO_MINIO_ACCESS_KEY: minioadmin
       VIDEO_MINIO_SECRET_KEY: minioadmin
       VIDEO_MINIO_BUCKET: video-results-test
-      # Exercises internal/platform/rabbitmq's own test suite against a real
-      # broker. No non-test RABBITMQ_URL on the "app" service: nothing in
-      # cmd/api reads one, and adding it would imply a startup requirement
-      # add-rabbitmq-infrastructure deliberately does not create.
+      # Exercises internal/platform/rabbitmq's and
+      # internal/video/infrastructure/messaging's own test suites against a
+      # real broker.
       RABBITMQ_TEST_URL: amqp://video:video@rabbitmq:5672/
+      # See the "app" service above. cmd/api's TestMain requires this to be
+      # set, matching the startup requirement — not to be reachable, which
+      # cmd/api itself does not require either.
+      RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
     depends_on:
       postgres:
         condition: service_healthy

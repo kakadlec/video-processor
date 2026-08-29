@@ -106,3 +106,54 @@ func TestCreateVideoJob_RepositoryFailure_IsPropagated(t *testing.T) {
 		t.Fatalf("error = %v, want %v", err, repoErr)
 	}
 }
+
+// TestCreateVideoJob_RoundTripsSourceKey covers the field POST /upload
+// supplies and the worker cannot reconstruct.
+func TestCreateVideoJob_RoundTripsSourceKey(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: newTestVideoJobID(t, "job-1")}, fakeClock{now: time.Now()})
+
+	sourceKey := domain.SourceStorageKey("upload-1", "movie.mp4")
+	if _, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
+		UserID:           "user-1",
+		OriginalFilename: "movie.mp4",
+		SourceKey:        sourceKey.String(),
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !job.SourceKey().Equal(sourceKey) {
+		t.Fatalf("job.SourceKey() = %v, want %v", job.SourceKey(), sourceKey)
+	}
+	// The result key stays unset: it is a different field, set only on
+	// completion, and the two are adjacent in every constructor.
+	if !job.StorageKey().IsZero() {
+		t.Fatalf("job.StorageKey() = %v, want unset", job.StorageKey())
+	}
+}
+
+// TestCreateVideoJob_EmptySourceKeyIsValid covers POST /api/video-jobs,
+// which creates a job from a filename with no stored object at all.
+func TestCreateVideoJob_EmptySourceKeyIsValid(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: newTestVideoJobID(t, "job-1")}, fakeClock{now: time.Now()})
+
+	if _, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
+		UserID:           "user-1",
+		OriginalFilename: "movie.mp4",
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !job.SourceKey().IsZero() {
+		t.Fatalf("job.SourceKey() = %v, want unset", job.SourceKey())
+	}
+}

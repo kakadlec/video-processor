@@ -195,6 +195,9 @@ jobs:
           # port; the broker still sees the connection arriving from the
           # bridge, which is why this is the "video" account and not guest.
           RABBITMQ_TEST_URL: amqp://video:video@localhost:5672/
+          # cmd/api's TestMain requires this to be set, matching the startup
+          # requirement it now has. Reachability is not required.
+          RABBITMQ_URL: amqp://video:video@localhost:5672/
         run: go test ./... -v
 
   sast:

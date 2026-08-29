@@ -49,6 +49,11 @@ var ErrInvalidStatusTransition = errors.New("video: invalid status transition")
 // ErrFailureReasonRequired is returned by Fail when called with an empty reason.
 var ErrFailureReasonRequired = errors.New("video: failure reason is required")
 
+// ErrSourceKeyRequiredToEnqueue is returned by Enqueue when the job has no
+// source key. A job with no stored source cannot be processed, so queueing it
+// would produce a dispatch no worker can act on.
+var ErrSourceKeyRequiredToEnqueue = errors.New("video: source key is required to enqueue")
+
 // VideoJob is the Video Processing bounded context's aggregate root.
 // FrameCount and ErrorReason are aggregate-validated primitive fields rather
 // than standalone value objects: their invariants are cross-field (they
@@ -63,25 +68,39 @@ type VideoJob struct {
 	id               VideoJobID
 	userID           UserID
 	originalFilename OriginalFilename
-	storageKey       StorageKey
-	frameCount       int
-	errorReason      string
-	status           JobStatus
-	createdAt        time.Time
+	// sourceKey names the uploaded video in object storage. It is NOT
+	// storageKey, which names the result zip and is set only on completion —
+	// overloading one for the other is the confusion this field exists to
+	// prevent. It may be empty: POST /api/video-jobs creates a job from a
+	// filename with no stored object at all. What such a job cannot do is be
+	// enqueued; see Enqueue.
+	sourceKey   StorageKey
+	storageKey  StorageKey
+	frameCount  int
+	errorReason string
+	status      JobStatus
+	createdAt   time.Time
 }
 
 // NewVideoJob creates a brand-new VideoJob, minting its VideoJobID through
 // the supplied generator. It always produces status pending, FrameCount 0,
 // an empty ErrorReason, and an unset StorageKey.
-func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, createdAt time.Time) (*VideoJob, error) {
+func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, sourceKey StorageKey, createdAt time.Time) (*VideoJob, error) {
 	if generator == nil {
 		return nil, ErrVideoJobIDGeneratorRequired
 	}
-	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, StorageKey{}, 0, "", JobStatusPending, createdAt)
+	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, StorageKey{}, 0, "", JobStatusPending, createdAt)
 }
 
 // RestoreVideoJob reconstructs a VideoJob from already-known, already-validated values, e.g. from storage.
-func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, storageKey StorageKey, frameCount int, errorReason string, status JobStatus, createdAt time.Time) (*VideoJob, error) {
+// sourceKey is deliberately NOT paired with status here, unlike storageKey
+// and errorReason. The source_key column ships with an empty default, and a
+// row can legitimately already be sitting in queued or processing — POST
+// /upload drives the whole sequence inside one request, so a crash or a
+// client disconnect strands one. Pairing the field at reconstitution would
+// make those rows unloadable, turning FindByID into a domain error at deploy
+// time with no obvious cause. The invariant lives on Enqueue instead.
+func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, sourceKey StorageKey, storageKey StorageKey, frameCount int, errorReason string, status JobStatus, createdAt time.Time) (*VideoJob, error) {
 	if id.IsZero() {
 		return nil, ErrVideoJobIDRequired
 	}
@@ -111,6 +130,7 @@ func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, st
 		id:               id,
 		userID:           userID,
 		originalFilename: filename,
+		sourceKey:        sourceKey,
 		storageKey:       storageKey,
 		frameCount:       frameCount,
 		errorReason:      errorReason,
@@ -132,6 +152,12 @@ func (j *VideoJob) UserID() UserID {
 // OriginalFilename returns the validated source filename.
 func (j *VideoJob) OriginalFilename() OriginalFilename {
 	return j.originalFilename
+}
+
+// SourceKey returns the storage key of the uploaded video this job processes,
+// unset for a job created without one.
+func (j *VideoJob) SourceKey() StorageKey {
+	return j.sourceKey
 }
 
 // StorageKey returns the job's result storage key, unset unless completed.
@@ -159,8 +185,13 @@ func (j *VideoJob) CreatedAt() time.Time {
 	return j.createdAt
 }
 
-// Enqueue transitions the job from pending to queued.
+// Enqueue transitions the job from pending to queued. A job with no source
+// key is rejected: there is nothing for a worker to fetch, so queueing it
+// would produce a dispatch that can only fail.
 func (j *VideoJob) Enqueue() error {
+	if j.sourceKey.IsZero() {
+		return ErrSourceKeyRequiredToEnqueue
+	}
 	return j.transitionTo(JobStatusQueued)
 }
 

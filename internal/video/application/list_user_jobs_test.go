@@ -15,7 +15,7 @@ func createTestJob(t *testing.T, repo *fakeVideoJobRepository, jobID, userID str
 	id := newTestVideoJobID(t, jobID)
 	owner := newTestVideoUserID(t, userID)
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
-	job, err := domain.RestoreVideoJob(id, owner, filename, domain.StorageKey{}, 0, "", domain.JobStatusPending, createdAt)
+	job, err := domain.RestoreVideoJob(id, owner, filename, domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, createdAt)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

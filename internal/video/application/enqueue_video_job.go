@@ -15,7 +15,9 @@ type TransitionResult struct {
 }
 
 // EnqueueVideoJob loads a VideoJob by ID, transitions it from pending to
-// queued, and persists the result.
+// queued, and persists the result through the repository's Enqueue method —
+// which writes the video_job.queued outbox row in the same transaction, so
+// the dispatch is recorded atomically with the status it announces.
 type EnqueueVideoJob struct {
 	jobs   domain.VideoJobRepository
 	idsFor domain.VideoJobIDParser
@@ -38,11 +40,13 @@ func (uc *EnqueueVideoJob) Execute(ctx context.Context, jobID string) (Transitio
 		return TransitionResult{}, err
 	}
 
+	// The aggregate rejects a job with no source key here; this use case
+	// propagates that rather than re-checking, so the rule has one home.
 	if err := job.Enqueue(); err != nil {
 		return TransitionResult{}, err
 	}
 
-	if err := uc.jobs.Update(ctx, job); err != nil {
+	if err := uc.jobs.Enqueue(ctx, job); err != nil {
 		return TransitionResult{}, err
 	}
 

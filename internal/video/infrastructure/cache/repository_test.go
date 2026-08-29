@@ -58,8 +58,10 @@ type fakeRepository struct {
 	createCalls                int
 	updateCalls                int
 
+	enqueueCalls             int
 	findByIDErr              error
 	updateErr                error
+	enqueueErr               error
 	findByUserIDErr          error
 	findCompletedByUserIDErr error
 }
@@ -77,7 +79,7 @@ func newFakeRepository() *fakeRepository {
 // test like TestCachedVideoJobRepository_MissRepopulation_* pass whether or
 // not the production code actually handles the race correctly.
 func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
-	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
 	if err != nil {
 		panic("fakeRepository: failed to clone video job: " + err.Error())
 	}
@@ -137,6 +139,17 @@ func (r *fakeRepository) Update(_ context.Context, job *domain.VideoJob) error {
 	return nil
 }
 
+func (r *fakeRepository) Enqueue(_ context.Context, job *domain.VideoJob) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enqueueCalls++
+	if r.enqueueErr != nil {
+		return r.enqueueErr
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return nil
+}
+
 var jobIDCounter int
 
 func newTestJob(t *testing.T) *domain.VideoJob {
@@ -155,7 +168,15 @@ func newTestJob(t *testing.T) *domain.VideoJob {
 	if err != nil {
 		t.Fatalf("NewOriginalFilename: %v", err)
 	}
-	job, err := domain.RestoreVideoJob(id, userID, filename, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	// A source key is set because Enqueue rejects a job without one, and
+	// its value is chosen to be unmistakable next to a result key so a
+	// transposition between the two adjacent StorageKey fields shows up as a
+	// wrong value rather than as a passing test.
+	sourceKey, err := domain.NewStorageKey("uploads/source-video.mp4")
+	if err != nil {
+		t.Fatalf("NewStorageKey: %v", err)
+	}
+	job, err := domain.RestoreVideoJob(id, userID, filename, sourceKey, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("RestoreVideoJob: %v", err)
 	}
@@ -323,6 +344,10 @@ func (b *blockingFindByID) FindCompletedByUserID(ctx context.Context, userID dom
 
 func (b *blockingFindByID) Update(ctx context.Context, job *domain.VideoJob) error {
 	return b.fake.Update(ctx, job)
+}
+
+func (b *blockingFindByID) Enqueue(ctx context.Context, job *domain.VideoJob) error {
+	return b.fake.Enqueue(ctx, job)
 }
 
 func (b *blockingFindByID) FindByID(ctx context.Context, id domain.VideoJobID) (*domain.VideoJob, error) {
@@ -639,5 +664,74 @@ func TestCachedVideoJobRepository_Create_PassesThroughUncachedAndDoesNotPopulate
 
 	if _, err := repo.FindByID(ctx, job.ID()); err == nil {
 		t.Fatal("FindByID succeeded from cache after Create, want a miss falling through to the (erroring) inner repository")
+	}
+}
+
+// TestCachedVideoJobRepository_Enqueue_WritesThrough covers the decorator's
+// second write path. Passing Enqueue through uncached, the way Create is
+// passed through, would leave the cache reporting pending for a job
+// PostgreSQL already has as queued — contradicting the very row the relay is
+// about to publish a dispatch for.
+func TestCachedVideoJobRepository_Enqueue_WritesThrough(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	if err := fake.Create(context.Background(), job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	ctx := context.Background()
+
+	// Populate the cache with the pending state first, so the assertion
+	// below can only pass if Enqueue actually overwrote it.
+	if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	if err := repo.Enqueue(ctx, job); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if fake.enqueueCalls != 1 {
+		t.Fatalf("fake.enqueueCalls = %d, want 1", fake.enqueueCalls)
+	}
+
+	before := fake.findByIDCalls
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+	if fake.findByIDCalls != before {
+		t.Fatalf("fake.findByIDCalls = %d, want %d — the read should have been served from the cache", fake.findByIDCalls, before)
+	}
+	if found.Status() != domain.JobStatusQueued {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
+	}
+	// The source key must survive the round trip through Redis, or the
+	// relay publishes a dispatch naming no object.
+	if !found.SourceKey().Equal(job.SourceKey()) {
+		t.Fatalf("SourceKey = %v, want %v", found.SourceKey(), job.SourceKey())
+	}
+}
+
+// TestCachedVideoJobRepository_Enqueue_InnerFailureIsNotCached keeps the
+// authority where it belongs: PostgreSQL must accept the write before the
+// cache reflects it.
+func TestCachedVideoJobRepository_Enqueue_InnerFailureIsNotCached(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	fake.enqueueErr = errors.New("postgres unavailable")
+	job := newTestJob(t)
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	if err := repo.Enqueue(context.Background(), job); err == nil {
+		t.Fatal("expected the inner repository's error to propagate")
+	}
+	if _, err := client.Get(context.Background(), "videojob:status:"+job.ID().String()).Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("expected no cache entry, got err = %v", err)
 	}
 }

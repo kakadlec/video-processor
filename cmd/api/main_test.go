@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 
 	videodomain "video-processor/internal/video/domain"
@@ -39,6 +40,15 @@ func TestMain(m *testing.M) {
 	// that silently skips its own core coverage on an unconfigured machine.
 	if _, err := videostorage.LoadConfigFromEnv(); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v — integration tests require MinIO; see CLAUDE.md for the Docker fallback.\n", err)
+		os.Exit(1)
+	}
+	// RABBITMQ_URL is required to be set, and deliberately not required to
+	// be reachable: setupVideo loads the config but never dials, so a suite
+	// that demanded a live broker would assert a stronger contract than
+	// cmd/api actually has. The relay's behavior against a real broker is
+	// covered by internal/video/infrastructure/messaging's own tests.
+	if _, err := platformrabbitmq.LoadConfigFromEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: %v — integration tests require it to be set; see CLAUDE.md for the Docker fallback.\n", err)
 		os.Exit(1)
 	}
 	// go test sets the working directory to this package's own directory

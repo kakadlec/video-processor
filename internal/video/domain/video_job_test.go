@@ -35,8 +35,12 @@ func TestNewVideoJob(t *testing.T) {
 	userID := validVideoJobUserID(t)
 	filename := validVideoJobFilename(t)
 	now := time.Now()
+	sourceKey, err := domain.NewStorageKey("uploads/upload-1_input.mp4")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-	job, err := domain.NewVideoJob(gen, userID, filename, now)
+	job, err := domain.NewVideoJob(gen, userID, filename, sourceKey, now)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -61,20 +65,26 @@ func TestNewVideoJob(t *testing.T) {
 	if !job.StorageKey().IsZero() {
 		t.Fatalf("job.StorageKey() = %v, want unset", job.StorageKey())
 	}
+	// Asserted against a value that could not be confused with the result
+	// key above: the two fields are the same type and adjacent in both
+	// constructors, so a transposition compiles silently.
+	if !job.SourceKey().Equal(sourceKey) {
+		t.Fatalf("job.SourceKey() = %v, want %v", job.SourceKey(), sourceKey)
+	}
 	if !job.CreatedAt().Equal(now) {
 		t.Fatalf("job.CreatedAt() = %v, want %v", job.CreatedAt(), now)
 	}
 }
 
 func TestNewVideoJob_NilGenerator(t *testing.T) {
-	_, err := domain.NewVideoJob(nil, validVideoJobUserID(t), validVideoJobFilename(t), time.Now())
+	_, err := domain.NewVideoJob(nil, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, time.Now())
 	if !errors.Is(err, domain.ErrVideoJobIDGeneratorRequired) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobIDGeneratorRequired)
 	}
 }
 
 func TestRestoreVideoJob_RequiresID(t *testing.T) {
-	_, err := domain.RestoreVideoJob(domain.VideoJobID{}, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(domain.VideoJobID{}, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrVideoJobIDRequired) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobIDRequired)
 	}
@@ -82,7 +92,7 @@ func TestRestoreVideoJob_RequiresID(t *testing.T) {
 
 func TestRestoreVideoJob_RequiresUserID(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, domain.UserID{}, validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(id, domain.UserID{}, validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrVideoJobUserIDRequired) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobUserIDRequired)
 	}
@@ -90,7 +100,7 @@ func TestRestoreVideoJob_RequiresUserID(t *testing.T) {
 
 func TestRestoreVideoJob_RequiresOriginalFilename(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), domain.OriginalFilename{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), domain.OriginalFilename{}, domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrOriginalFilenameRequired) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrOriginalFilenameRequired)
 	}
@@ -98,7 +108,7 @@ func TestRestoreVideoJob_RequiresOriginalFilename(t *testing.T) {
 
 func TestRestoreVideoJob_InvalidStatusRejected(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatus("bogus"), time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatus("bogus"), time.Now())
 	if !errors.Is(err, domain.ErrInvalidJobStatus) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrInvalidJobStatus)
 	}
@@ -107,7 +117,7 @@ func TestRestoreVideoJob_InvalidStatusRejected(t *testing.T) {
 func TestRestoreVideoJob_StorageKeySetWithoutCompletedStatusRejected(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	storageKey, _ := domain.NewStorageKey("outputs/frames_123.zip")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), storageKey, 0, "", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, storageKey, 0, "", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrStorageKeyRequiresCompletedStatus) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrStorageKeyRequiresCompletedStatus)
 	}
@@ -115,7 +125,7 @@ func TestRestoreVideoJob_StorageKeySetWithoutCompletedStatusRejected(t *testing.
 
 func TestRestoreVideoJob_CompletedStatusWithoutStorageKeyRejected(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusCompleted, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusCompleted, time.Now())
 	if !errors.Is(err, domain.ErrStorageKeyRequiresCompletedStatus) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrStorageKeyRequiresCompletedStatus)
 	}
@@ -123,7 +133,7 @@ func TestRestoreVideoJob_CompletedStatusWithoutStorageKeyRejected(t *testing.T) 
 
 func TestRestoreVideoJob_FailedStatusWithoutErrorReasonRejected(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusFailed, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusFailed, time.Now())
 	if !errors.Is(err, domain.ErrErrorReasonRequiresFailedStatus) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrErrorReasonRequiresFailedStatus)
 	}
@@ -131,7 +141,7 @@ func TestRestoreVideoJob_FailedStatusWithoutErrorReasonRejected(t *testing.T) {
 
 func TestRestoreVideoJob_NegativeFrameCountRejected(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, -1, "", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, -1, "", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrFrameCountNegative) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrFrameCountNegative)
 	}
@@ -139,7 +149,7 @@ func TestRestoreVideoJob_NegativeFrameCountRejected(t *testing.T) {
 
 func TestRestoreVideoJob_NonZeroFrameCountRequiresCompletedStatus(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 10, "", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 10, "", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrFrameCountRequiresCompletedStatus) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrFrameCountRequiresCompletedStatus)
 	}
@@ -147,7 +157,7 @@ func TestRestoreVideoJob_NonZeroFrameCountRequiresCompletedStatus(t *testing.T) 
 
 func TestRestoreVideoJob_ErrorReasonRequiresFailedStatus(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "ffmpeg exploded", domain.JobStatusPending, time.Now())
+	_, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "ffmpeg exploded", domain.JobStatusPending, time.Now())
 	if !errors.Is(err, domain.ErrErrorReasonRequiresFailedStatus) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrErrorReasonRequiresFailedStatus)
 	}
@@ -157,7 +167,7 @@ func TestRestoreVideoJob_CompletedJobWithStorageKeyAndFrameCount(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	storageKey, _ := domain.NewStorageKey("outputs/frames_123.zip")
 
-	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), storageKey, 42, "", domain.JobStatusCompleted, time.Now())
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, storageKey, 42, "", domain.JobStatusCompleted, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -172,7 +182,7 @@ func TestRestoreVideoJob_CompletedJobWithStorageKeyAndFrameCount(t *testing.T) {
 func TestRestoreVideoJob_FailedJobWithErrorReason(t *testing.T) {
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
-	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "ffmpeg exploded", domain.JobStatusFailed, time.Now())
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "ffmpeg exploded", domain.JobStatusFailed, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -181,10 +191,16 @@ func TestRestoreVideoJob_FailedJobWithErrorReason(t *testing.T) {
 	}
 }
 
+// newPendingVideoJob builds a pending job that carries a source key, which
+// is what every transition below needs: Enqueue rejects a job without one.
 func newPendingVideoJob(t *testing.T) *domain.VideoJob {
 	t.Helper()
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	sourceKey, err := domain.NewStorageKey("uploads/upload-1_input.mp4")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), sourceKey, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error building pending job: %v", err)
 	}
@@ -198,6 +214,72 @@ func TestVideoJob_Enqueue_PendingToQueued(t *testing.T) {
 	}
 	if job.Status() != domain.JobStatusQueued {
 		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusQueued)
+	}
+}
+
+func TestVideoJob_Enqueue_RejectsAJobWithNoSourceKey(t *testing.T) {
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := job.Enqueue(); !errors.Is(err, domain.ErrSourceKeyRequiredToEnqueue) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrSourceKeyRequiredToEnqueue)
+	}
+	if job.Status() != domain.JobStatusPending {
+		t.Fatalf("job.Status() = %v, want the job left in %v", job.Status(), domain.JobStatusPending)
+	}
+}
+
+// TestRestoreVideoJob_QueuedWithNoSourceKeyIsLoadable pins a deliberate
+// *absence* of validation, which is why it exists as its own test: without
+// this note it reads like an oversight next to the StorageKey<->completed and
+// ErrorReason<->failed pairings a few tests above.
+//
+// The source_key column ships with an empty default and cannot be backfilled
+// — the key embeds a generated uploadID that exists nowhere else — and a row
+// can legitimately already be sitting in queued or processing, because POST
+// /upload drives the whole sequence inside one request and a crash or client
+// disconnect strands one. Pairing the field here would turn every such row
+// into a FindByID error at deploy time. The invariant lives on Enqueue
+// instead, where the caller that has to satisfy it can be checked.
+func TestRestoreVideoJob_QueuedWithNoSourceKeyIsLoadable(t *testing.T) {
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusQueued, time.Now())
+	if err != nil {
+		t.Fatalf("unexpected error restoring a pre-migration queued row: %v", err)
+	}
+	if !job.SourceKey().IsZero() {
+		t.Fatalf("job.SourceKey() = %v, want unset", job.SourceKey())
+	}
+	if job.Status() != domain.JobStatusQueued {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusQueued)
+	}
+}
+
+// TestRestoreVideoJob_RoundTripsBothKeys guards the transposition the two
+// adjacent StorageKey parameters invite: swapping them compiles, and for a
+// completed job it also passes RestoreVideoJob's own validation, surfacing
+// only as GET /download/:filename rejecting every result.
+func TestRestoreVideoJob_RoundTripsBothKeys(t *testing.T) {
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	sourceKey, err := domain.NewStorageKey("uploads/upload-1_input.mp4")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resultKey := domain.ResultStorageKey(id)
+
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), sourceKey, resultKey, 7, "", domain.JobStatusCompleted, time.Now())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !job.SourceKey().Equal(sourceKey) {
+		t.Fatalf("job.SourceKey() = %v, want %v", job.SourceKey(), sourceKey)
+	}
+	if !job.StorageKey().Equal(resultKey) {
+		t.Fatalf("job.StorageKey() = %v, want %v", job.StorageKey(), resultKey)
 	}
 }
 

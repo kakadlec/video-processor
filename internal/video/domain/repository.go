@@ -26,7 +26,19 @@ type VideoJobRepository interface {
 	// returns are exactly the rows that endpoint renders.
 	FindCompletedByUserID(ctx context.Context, userID UserID) ([]*VideoJob, error)
 	// Update persists an already-loaded VideoJob's current status,
-	// frame count, error reason, and storage key. Unlike Create, it does
-	// not write a transactional-outbox row.
+	// frame count, error reason, and storage key. Unlike Create and
+	// Enqueue, it does not write a transactional-outbox row.
 	Update(ctx context.Context, job *VideoJob) error
+	// Enqueue persists a job that has just transitioned to queued and, in
+	// the same transaction, the outbox event describing that dispatch —
+	// the row and the event it announces are never observably
+	// inconsistent. That event is the only thing Enqueue writes which
+	// Update does not; the status column update itself is identical.
+	//
+	// It exists as its own method rather than as a status-dependent branch
+	// inside Update on purpose. Update is also CompleteJob's and FailJob's
+	// path, so making it outbox-aware would turn event publication into a
+	// side effect of a general-purpose write and would decide, in advance
+	// and by accident, what the completion and failure events look like.
+	Enqueue(ctx context.Context, job *VideoJob) error
 }
