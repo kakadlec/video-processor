@@ -11,11 +11,17 @@ import (
 // contentTypeJSON labels the payload the outbox stores, which is JSON.
 const contentTypeJSON = "application/json"
 
+// ErrBatchTooLarge is returned by Publish for a batch exceeding
+// maxPublishBatch. See Publish for why the cap is a correctness bound rather
+// than a tuning knob.
+
 // maxPublishBatch bounds one Publish call, and with it the number of rows
 // the relay claims per poll. It is also the returns channel's buffer: the
 // confirmation wait must not be able to deadlock against a return the
 // client cannot hand over, so the buffer has to cover a whole batch.
 const maxPublishBatch = 100
+
+var ErrBatchTooLarge = fmt.Errorf("video: publisher: batch exceeds the maximum of %d messages", maxPublishBatch)
 
 // Message is one unit of work handed to a Publisher: an id used both to
 // correlate the broker's answer and to stamp the row it came from, and the
@@ -107,9 +113,21 @@ func (p *Publisher) Close() error {
 // basic.return before the basic.ack for the same unroutable publish, so by
 // the time the last confirmation has arrived, every return for this batch is
 // already buffered.
+//
+// That sequence is also why maxPublishBatch is enforced here rather than
+// left to the caller. Returns are buffered, not read, until every
+// confirmation has arrived; a batch larger than the buffer whose messages
+// are unroutable would fill it and block the client's own dispatch
+// goroutine, which is the goroutine that still owes us those confirmations.
+// The wait would then never finish. Today's only caller claims at most this
+// many rows, so the bound is unreachable through it — which is exactly why
+// it is checked rather than assumed.
 func (p *Publisher) Publish(ctx context.Context, messages []Message) ([]string, error) {
 	if len(messages) == 0 {
 		return nil, nil
+	}
+	if len(messages) > maxPublishBatch {
+		return nil, ErrBatchTooLarge
 	}
 
 	confirmations := make([]*amqp.DeferredConfirmation, 0, len(messages))

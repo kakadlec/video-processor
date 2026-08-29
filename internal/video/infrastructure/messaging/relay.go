@@ -98,34 +98,54 @@ func (r *Relay) Run(ctx context.Context) error {
 			continue
 		}
 		log.Print("video: outbox relay: connected")
-		backoff = dialBackoffInitial
 
-		if err := r.serve(ctx, conn); err != nil {
+		served, err := r.serve(ctx, conn)
+		if err != nil {
 			log.Printf("video: outbox relay: connection lost: %v", err)
 		}
 		_ = rabbitmq.Close(conn)
 		if ctx.Err() != nil {
 			return nil
 		}
+
+		// The backoff is reset by a connection that actually worked, not by
+		// one that merely dialed. A failure after a successful dial — a
+		// topology that conflicts with an existing declaration, a
+		// permissions error, a channel that closes on every publish — would
+		// otherwise redial in a tight loop, hammering the broker and
+		// flooding the log with exactly the failure nobody is watching for.
+		if served {
+			backoff = dialBackoffInitial
+			continue
+		}
+		log.Printf("video: outbox relay: connection was unusable; retrying in %s", backoff)
+		if !sleepCtx(ctx, backoff) {
+			return nil
+		}
+		backoff = nextBackoff(backoff)
 	}
 }
 
 // serve declares the topology, opens a publisher, and polls until the
 // connection or the channel fails, or ctx is cancelled. Its error describes
 // why the connection was given up, and is nil when ctx ended the loop.
-func (r *Relay) serve(ctx context.Context, conn *amqp.Connection) error {
+//
+// The bool reports whether this connection ever completed a polling cycle —
+// that is, whether it proved usable rather than merely dialable. Run uses it
+// to decide between redialing at once and backing off.
+func (r *Relay) serve(ctx context.Context, conn *amqp.Connection) (bool, error) {
 	// Declared on every dial, not once at startup. Nothing else declares
 	// this topology, so against a fresh broker the exchange does not exist
 	// and a publish to a missing exchange closes the channel instead of
 	// failing routably; and a broker recreated while the relay was
 	// disconnected gets its topology back on reconnect for the same reason.
 	if err := rabbitmq.DeclareTopology(conn, r.topology); err != nil {
-		return err
+		return false, err
 	}
 
 	publisher, err := NewPublisher(conn, r.topology.Exchange, r.topology.RoutingKey)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = publisher.Close() }()
 
@@ -133,17 +153,19 @@ func (r *Relay) serve(ctx context.Context, conn *amqp.Connection) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	var served bool
 	// A cycle runs before the first tick, not after it: a reconnect
 	// following an outage has a backlog waiting, and there is no reason to
 	// add a poll interval to its age.
 	for {
 		if err := r.cycle(ctx, publisher); err != nil {
-			return err
+			return served, err
 		}
+		served = true
 
 		select {
 		case <-ctx.Done():
-			return nil
+			return served, nil
 		case amqpErr, ok := <-connClosed:
 			// The client closes its notification channels rather than
 			// sending on them when the close carries no error, so a receive
@@ -151,14 +173,14 @@ func (r *Relay) serve(ctx context.Context, conn *amqp.Connection) error {
 			// arms say so explicitly instead of relying on this loop
 			// returning either way.
 			if !ok {
-				return errors.New("video: outbox relay: broker connection closed")
+				return served, errors.New("video: outbox relay: broker connection closed")
 			}
-			return amqpErr
+			return served, amqpErr
 		case amqpErr, ok := <-publisher.Closed():
 			if !ok {
-				return errors.New("video: outbox relay: publishing channel closed")
+				return served, errors.New("video: outbox relay: publishing channel closed")
 			}
-			return amqpErr
+			return served, amqpErr
 		case <-ticker.C:
 		}
 	}

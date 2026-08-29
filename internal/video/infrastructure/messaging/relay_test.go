@@ -1,13 +1,17 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
+	"log"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -508,4 +512,102 @@ func waitForStamp(t *testing.T, db *sql.DB, id string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("row %s was never marked published", id)
+}
+
+// TestPublisher_RejectsAnOversizedBatch guards the deadlock the
+// confirmation-first sequence would otherwise allow: returns are buffered
+// and not read until every confirmation has arrived, so a batch larger than
+// that buffer whose messages are unroutable would block the client's own
+// dispatch goroutine — the one that still owes the confirmations being
+// waited on. The current caller cannot reach this bound, which is why it is
+// checked rather than assumed.
+func TestPublisher_RejectsAnOversizedBatch(t *testing.T) {
+	conn := openTestConn(t)
+	topo := testTopology(t, conn, 10)
+	publisher := declaredPublisher(t, conn, topo)
+
+	messages := make([]Message, maxPublishBatch+1)
+	for i := range messages {
+		messages[i] = Message{ID: uuid.NewString(), Body: []byte(`{}`)}
+	}
+
+	published, err := publisher.Publish(context.Background(), messages)
+	if !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("error = %v, want %v", err, ErrBatchTooLarge)
+	}
+	if published != nil {
+		t.Fatalf("published = %v, want none", published)
+	}
+	if depth := queueDepth(t, conn, topo.WorkQueue); depth != 0 {
+		t.Fatalf("queue depth = %d, want 0 — a rejected batch must publish nothing", depth)
+	}
+}
+
+// TestRelay_Run_BacksOffWhenAConnectionIsUnusable covers the failure mode a
+// dial-only backoff misses. A topology that conflicts with an existing
+// declaration fails *after* a successful dial, so resetting the backoff on
+// connect alone would redial in a tight loop — hammering the broker and
+// flooding the log with the one failure nobody is watching for. The relay
+// must instead treat a connection that never completed a cycle as a failed
+// attempt.
+func TestRelay_Run_BacksOffWhenAConnectionIsUnusable(t *testing.T) {
+	db := testDB(t)
+	conn := openTestConn(t)
+	topo := testTopology(t, conn, 10)
+
+	// Declared with a different max-length, so the relay's own declaration
+	// is refused with PRECONDITION_FAILED on every attempt.
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+	if _, err := ch.QueueDeclare(topo.WorkQueue, true, false, false, false, amqp.Table{"x-max-length": int64(topo.WorkMaxLength + 1)}); err != nil {
+		t.Fatalf("declare conflicting queue: %v", err)
+	}
+	_ = ch.Close()
+
+	// log output is captured rather than instrumented: the dial rate is only
+	// observable through the relay's own lifecycle logging, which is also
+	// the thing an operator would see flooding.
+	var logs safeBuffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	relay := newTestRelay(t, db, topo)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- relay.Run(ctx) }()
+
+	// Long enough for an unbacked-off loop to produce dozens of attempts and
+	// for a backed-off one to produce at most a handful (1s + 2s).
+	time.Sleep(3500 * time.Millisecond)
+	cancel()
+	<-done
+
+	attempts := strings.Count(logs.String(), "video: outbox relay: connected")
+	if attempts == 0 {
+		t.Fatal("the relay never connected; the test never reached the path it is checking")
+	}
+	if attempts > 4 {
+		t.Fatalf("the relay dialed %d times in 3.5s; a connection that fails after dialing must be backed off, not retried in a tight loop", attempts)
+	}
+}
+
+// safeBuffer is a bytes.Buffer usable from the relay's goroutine and the
+// test's at once — log writes are concurrent with the assertion's read.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
