@@ -49,9 +49,11 @@ The dead-letter exchange and dead-letter queue SHALL NOT carry a generation suff
 - **WHEN** it derives its descriptor from this one
 - **THEN** it changes the exchange and queue names and leaves the routing key equal to the outbox `event_type`, so publishers of different generations do not share a delivery path
 
-### Requirement: Job Messages Are Published Persistently
+### Requirement: Job Messages Are Published Persistently And Without Expiry
 
-Any publisher of a job message to this topology SHALL mark it persistent (AMQP delivery mode 2).
+Any publisher of a job message to this topology SHALL mark it persistent (AMQP delivery mode 2) and SHALL leave the per-message `expiration` property unset.
+
+The two obligations are separate and both are load-bearing. RabbitMQ honours a message's own `expiration` independently of the queue's arguments, so a publisher that set one would expire the message into the dead-letter queue even though the job queue deliberately carries no `x-message-ttl` — reproducing exactly the failure that omission exists to prevent: a message dead-lettered with no update to its `video_jobs` row, against a state machine with no transition out of `queued` except to `processing`, leaving the job reporting `queued` to its owner forever.
 
 A queue declared durable survives a broker restart; the messages in it do not unless each was published persistently, and a transient message in a durable queue is discarded on restart with no error to anyone. Durable queue, persistent message, and persisted broker storage are three conditions, and the guarantee needs all three — which matters here because the relay that publishes these messages stamps its outbox row as published once the broker acknowledges, after which the message is the only remaining record that the job is waiting.
 
@@ -68,3 +70,9 @@ No publisher exists yet, so the scenarios below are not currently verified by an
 - **GIVEN** the same durable job queue holding a message published with delivery mode 2
 - **WHEN** the broker is restarted
 - **THEN** the message is still queued
+
+#### Scenario: A published job message carries no expiration
+
+- **GIVEN** a job message published to this topology
+- **WHEN** its properties are inspected
+- **THEN** its `expiration` property is unset, so the queue's absent `x-message-ttl` is the only expiry policy in effect and there is none

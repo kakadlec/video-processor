@@ -171,7 +171,7 @@ The declared topology, and the two operational policies in it that are decisions
 | Dead-letter queue | `video.jobs.dead` | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, forwards nowhere |
 
 - **A full job queue refuses new publishes; it does not drop old ones.** `reject-publish` means the broker nacks the publisher rather than evicting the oldest queued job, so a full queue becomes back-pressure: the publisher leaves its outbox row unstamped, retries, and the system resumes when the queue drains. Nothing is lost. Expect a stalled relay and a growing count of unpublished outbox rows as the symptom, not missing jobs.
-- **Job messages never expire.** The job queue deliberately carries no message TTL. An expired message would be dead-lettered without any update to its `video_jobs` row, and the state machine has no transition out of `queued` except to `processing` — so the job would report `queued` to its owner forever. A backlog therefore persists until it is consumed rather than aging out, which is the intended trade.
+- **Job messages never expire**, and that takes two things, not one. The job queue deliberately carries no `x-message-ttl`; publishers must also leave the per-message `expiration` property unset, since RabbitMQ honours it independently of any queue setting. Either one would dead-letter a message without any update to its `video_jobs` row, and the state machine has no transition out of `queued` except to `processing` — so the job would report `queued` to its owner forever. A backlog therefore persists until it is consumed rather than aging out, which is the intended trade.
 - **The generation suffix is on the exchange**, and the queue name follows it. A `direct` exchange delivers each publish to every queue bound with the matching routing key, so a future generation gets a new exchange rather than only a new queue.
 
 Like PostgreSQL's and MinIO's, this broker's contents are authoritative once the relay ships: an acknowledged, `published_at`-stamped message is the only record that a job is waiting. `docker-compose.yml` gives the local service a named `rabbitmq_data` volume and a pinned `hostname` for that reason — RabbitMQ keys its Mnesia directory by hostname, so the volume does nothing without it.
@@ -181,9 +181,12 @@ Because the volume persists, a plain `docker compose down` no longer clears queu
 ```bash
 docker compose stop rabbitmq
 docker compose rm -f rabbitmq
-docker volume rm hackathon_rabbitmq_data   # <project>_rabbitmq_data; the project defaults to the directory name
+docker volume ls --filter name=_rabbitmq_data     # find this project's volume
+docker volume rm <name-from-the-line-above>
 docker compose up -d rabbitmq
 ```
+
+The volume is named `<project>_rabbitmq_data`, and Compose derives `<project>` from the directory the file lives in — so it is `video-processor_rabbitmq_data` in a default clone and something else in a differently-named checkout. Look it up rather than guessing: a wrong name makes `docker volume rm` fail and leaves the messages exactly where they were.
 
 - **Local/CI service:** `docker-compose.yml` and CI both start `rabbitmq:4-alpine`. CI uses a service container, unlike MinIO, whose image needs command arguments a service container cannot supply.
 - **Local/CI credentials** (`video`/`video`) are fixed, non-secret defaults. They are a dedicated account rather than the built-in `guest` because RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection here arrives over a Docker network.
