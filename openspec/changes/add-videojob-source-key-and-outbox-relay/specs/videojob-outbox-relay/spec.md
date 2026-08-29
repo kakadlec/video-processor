@@ -64,9 +64,11 @@ The failure this ordering does allow is the recoverable one: a crash after the b
 - **WHEN** the process is lost and a later poll runs
 - **THEN** the row is still unpublished and is published again, rather than being marked published without having been delivered
 
-### Requirement: Only Acknowledged Messages Are Marked Published
+### Requirement: Only Acknowledged, Routed Messages Are Marked Published
 
-The publishing channel SHALL run in publisher-confirm mode, and the relay SHALL mark `published_at` only for messages the broker acknowledged.
+The publishing channel SHALL run in publisher-confirm mode, and the relay SHALL publish **mandatory**, correlate any `basic.return` with its confirmation, and mark `published_at` only for messages that were both acknowledged **and** not returned.
+
+A confirmation alone is not proof of delivery, and the difference is the whole point of an outbox. A publisher confirm says the *exchange* accepted the publish; a non-mandatory publish to an exchange with no queue bound for the routing key is acknowledged and then discarded. Stamping on the confirmation alone would therefore mark a row published for a message that reached no queue — a dispatch lost permanently, which is precisely the failure mode this capability exists to make impossible. Publishing mandatory turns that silent discard into a `basic.return` the relay can see, and a returned message leaves its row unstamped for the next poll.
 
 A negative acknowledgement SHALL NOT be treated as a failure of the relay. The job queue's `reject-publish` overflow policy nacks a publish when the queue is at its maximum length, which is designed back-pressure: the row stays unpublished, the next poll retries it, and nothing is lost. A relay that treated a nack as fatal would turn back-pressure into a crash loop, and one that marked rows regardless would turn it into silent loss.
 
@@ -77,6 +79,12 @@ The consequence is worth stating rather than discovering: while nothing consumes
 - **GIVEN** the job queue is at its maximum length
 - **WHEN** the relay attempts to publish a claimed row
 - **THEN** the broker nacks it, the row's `published_at` stays `NULL`, the relay does not error out, and a later poll attempts it again
+
+#### Scenario: An unroutable message leaves its row unstamped
+
+- **GIVEN** a topology whose job queue is not bound for the routing key being published
+- **WHEN** the relay publishes a claimed row mandatory and the broker acknowledges but returns it
+- **THEN** the row's `published_at` stays `NULL`, so the dispatch is retried rather than recorded as delivered
 
 #### Scenario: Publishing without confirms is not sufficient
 
@@ -101,6 +109,24 @@ Both halves matter and the second is invisible when omitted: RabbitMQ honours a 
 - **GIVEN** a message the relay published
 - **WHEN** its properties are inspected
 - **THEN** its `expiration` property is unset
+
+### Requirement: The Relay Declares the Topology on Every Connection
+
+After each successful dial — the first and every re-dial — the relay SHALL call `rabbitmq.DeclareTopology` with `JobDispatchTopology()` before opening its publishing channel.
+
+Nothing else declares it. `internal/video/infrastructure/messaging` defines the descriptor and `internal/platform/rabbitmq` can declare one, but no code path had ever called the two together — so against a fresh broker the exchange does not exist, and a publish to a missing exchange closes the channel rather than returning a routable error. Declaring on connect is also what makes the declaration idempotent guarantee useful: a reconnect after the broker was recreated finds the topology gone and restores it, instead of publishing into nothing.
+
+#### Scenario: A fresh broker gets its topology before the first publish
+
+- **GIVEN** a broker with none of the job-dispatch topology declared and an unpublished `video_job.queued` row
+- **WHEN** the relay connects and runs
+- **THEN** the exchange, job queue, and dead-letter sink exist, and the row is published and marked
+
+#### Scenario: A reconnect redeclares
+
+- **GIVEN** a relay that has lost its connection to a broker whose topology has since been removed
+- **WHEN** it re-dials
+- **THEN** it declares the topology again before publishing, rather than publishing into a missing exchange
 
 ### Requirement: The Broker Connection Is the Relay's, Not a Startup Gate
 

@@ -66,9 +66,9 @@ The alternative — commit the claim first, publish afterwards — releases the 
 
 The failure this ordering does allow is the safe one: a crash after the broker acknowledged but before the commit leaves the row unstamped, so a later poll republishes it. That is at-least-once delivery, which the consumer has to tolerate regardless — a redelivery after a nack or a worker crash produces the same duplicate.
 
-### Decision 5: Only acknowledged messages are stamped, and a nack is not an error
+### Decision 5: Stamping requires an acknowledgement *and* a routing guarantee, and a nack is not an error
 
-The publishing channel runs in confirm mode. A message the broker nacks — which is what `reject-publish` returns when the job queue is at its maximum length — leaves its row unstamped, so the next poll retries it. Nothing is lost and nothing is logged as a failure beyond a warning; a full queue is back-pressure, and back-pressure is the designed behavior, not an incident.
+The publishing channel runs in confirm mode, and publishes are **mandatory**. Confirms alone are not enough, and the gap is easy to miss: a confirmation says the *exchange* accepted the publish, not that any queue received it, so a non-mandatory publish to an exchange with no matching binding is acknowledged and discarded. Stamping on that confirmation would record a dispatch that reached no queue — permanently, silently, and in the one component whose entire purpose is that this cannot happen. Mandatory publishing turns the silent discard into a `basic.return`, which the relay correlates with its confirmation and treats as not-published. A message the broker nacks — which is what `reject-publish` returns when the job queue is at its maximum length — leaves its row unstamped, so the next poll retries it. Nothing is lost and nothing is logged as a failure beyond a warning; a full queue is back-pressure, and back-pressure is the designed behavior, not an incident.
 
 The consequence worth stating because it will look alarming: if the job queue fills while nothing consumes it, this relay stalls and unpublished outbox rows accumulate indefinitely. Uploads are unaffected — they still complete in-request — and the backlog drains when the cutover retires that queue. A relay that treated a nack as fatal, or that stamped regardless, would turn that benign state into either a crash loop or silent data loss.
 
@@ -86,6 +86,8 @@ MinIO is fail-closed because a result that cannot be stored cannot be delivered 
 Redis's fail-open is also the wrong analogy: those features degrade a request by skipping an optimization. Here there is no request to degrade; there is a background loop that either runs now or runs shortly.
 
 ### Decision 7: Relay lifecycle and pacing
+
+The relay declares the topology on every successful dial, before opening its publishing channel. Nothing else ever declares it — `add-rabbitmq-infrastructure` shipped the descriptor and the declaring function without a caller — so against a fresh broker the exchange simply does not exist, and a publish to a missing exchange closes the channel rather than failing routably. Declaring on connect rather than once at startup is what makes a reconnect correct too: if the broker was recreated while the relay was disconnected, the redeclaration restores the topology instead of publishing into nothing.
 
 One goroutine per `cmd/api` process, started after the module is wired and stopped on shutdown via context cancellation, draining its in-flight transaction first. It polls on a fixed interval with a bounded batch size, both compile-time constants — no new environment variables, matching the status cache's fixed TTL.
 
