@@ -1,16 +1,26 @@
 ## ADDED Requirements
 
-### Requirement: The RabbitMQ Adapter Lives In internal/platform
+### Requirement: The AMQP Adapter Holds Only Connection And Lifecycle Plumbing
 
-The AMQP connection adapter SHALL live at `internal/platform/rabbitmq`, alongside `internal/platform/redis` and `internal/platform/ratelimit`, and SHALL NOT be placed under any bounded context's own `infrastructure` package.
+The AMQP connection adapter SHALL live at `internal/platform/rabbitmq`, alongside `internal/platform/redis` and `internal/platform/ratelimit`, and SHALL contain no exchange name, routing key, or queue name belonging to a specific bounded context's use case.
 
-This is the opposite placement from MinIO, deliberately. `internal/video/infrastructure/storage` sits inside the Video Processing context because every one of its consumers belongs to that context. The broker's consumers do not: the Video Processing context publishes job messages and the Notification context (Phase 7) subscribes to integration events on the same connection, which is exactly the cross-cutting infrastructure `ddd-architecture`'s "Monorepo Package Topology" requirement reserves `internal/platform/` for. This is infrastructure sharing only and SHALL NOT be read as permitting shared `domain` or `application` code between contexts.
+`ddd-architecture`'s "Shared infrastructure with no owning context lives under internal/platform" scenario permits this package "only connection/lifecycle plumbing — never domain or application logic for a specific context's use case", and that boundary decides the split precisely. Opening, health-checking, and closing a connection, and declaring an arbitrary exchange/queue/dead-letter topology, are plumbing: Phase 7's Notification context will declare its own topology through the same functions. The concrete names `video.jobs` and `video_job.queued` are Video Processing's and live in that context (see the `videojob-messaging` capability) — which is why this change needs no delta against that canonical scenario rather than quietly straining it.
+
+This placement is the opposite of MinIO's, deliberately: `internal/video/infrastructure/storage` sits inside the Video Processing context because every one of its consumers belongs to that context, and the broker's do not.
 
 #### Scenario: The package imports no bounded context
 
 - **GIVEN** any Go file under `internal/platform/rabbitmq/`
 - **WHEN** its imports are inspected
-- **THEN** it imports no package under `internal/identity/` or `internal/video/`
+- **THEN** every `video-processor/internal/...` import it declares is itself under `video-processor/internal/platform/`
+
+This is an allow-list rather than a prohibition naming `identity` and `video`, because `ddd-architecture` already names a Notification context for Phase 7: a rule listing today's two contexts would silently permit importing the third the day it appears.
+
+#### Scenario: The package names no context's entities
+
+- **GIVEN** any Go file under `internal/platform/rabbitmq/`
+- **WHEN** its string literals are inspected
+- **THEN** none is an exchange, queue, or routing-key name specific to a bounded context
 
 ### Requirement: AMQP Connection Is Configured From The Environment
 
@@ -46,7 +56,7 @@ This diverges from `internal/platform/redis.Open` and `internal/video/infrastruc
 
 - **GIVEN** a `Config` whose `URL` addresses no running broker
 - **WHEN** `Open` is called with it
-- **THEN** it returns a nil connection and a non-nil error, and the error names neither the URI's credentials nor its password component
+- **THEN** it returns a nil connection and a non-nil error, and the error contains neither the URI's username nor its password
 
 ### Requirement: Health Check Confirms Connectivity With A Real Round Trip
 
@@ -76,52 +86,29 @@ The underlying client exposes a cheap `IsClosed()` predicate, and that is not su
 - **WHEN** `Close` is called on it
 - **THEN** it returns no error, and a subsequent `Ping` on that connection fails rather than appearing healthy
 
-### Requirement: The Declared Topology Is Pinned By This Package
-
-`internal/platform/rabbitmq` SHALL export a `Topology` descriptor and a `DefaultTopology` function returning the job-dispatch topology this change introduces, so that every party to **that** topology reads one definition rather than string literals repeated at each call site. AMQP rejects a redeclaration whose arguments differ from the existing queue's, so a drifted literal is a startup failure at a distance; the descriptor exists so that failure cannot be reached by copying.
-
-What that covers, precisely, because two later changes deliberately do not use `DefaultTopology` unchanged. The **exchange and routing key** are shared: every job-dispatch publisher and consumer uses them. The **job queue name is not permanently shared** — the cutover consumes a successor queue, which it obtains as a `Topology` value derived from this one with a new job-queue name, not as a fresh set of literals, and it must not consume `.v1`, whose contents by then are the residue the relay accumulated with nothing draining it. Phase 7's **Notification events do not belong to this topology at all**: they get their own exchange with their own fanout semantics, and putting them on the job exchange would route integration events to a queue that expects job dispatches. The descriptor is reused for the job-dispatch topology and its successor; it is not a registry of every exchange this system will ever declare.
-
-`DefaultTopology` SHALL return exactly:
-
-| Entity | Name | Type | Arguments |
-|---|---|---|---|
-| Job exchange | `video.jobs` | `direct`, durable | — |
-| Routing key | `video_job.queued` | — | — |
-| Job queue | `video.jobs.queued.v1` | durable | `x-message-ttl` 1 h, `x-max-length` 10 000, `x-overflow` `reject-publish-dlx`, `x-dead-letter-exchange` `video.jobs.dlx` |
-| Dead-letter exchange | `video.jobs.dlx` | `fanout`, durable | — |
-| Dead-letter queue | `video.jobs.dead` | durable | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, **no** `x-dead-letter-exchange` |
-
-The routing key SHALL equal the persisted outbox `event_type` string for the same event, so the database and the broker name it identically. The job queue's name SHALL carry a version suffix: the change that cuts over to a worker consumes from a separately named queue rather than purging this one, and a suffix makes that successor a convention rather than an ad-hoc rename.
-
-The two overflow policies and the dead-letter queue's absence of a dead-letter exchange SHALL NOT be fields of `Topology`. They are the invariants that make the topology bounded, and a caller able to vary them could declare an unbounded chain through the same API.
-
-#### Scenario: DefaultTopology returns the pinned names
-
-- **WHEN** `DefaultTopology` is called
-- **THEN** its exchange, routing key, job queue, dead-letter exchange, and dead-letter queue names are exactly the values tabulated above, and its four TTL/length values are 1 h, 10 000, 24 h, and 10 000
-
 ### Requirement: Topology Declaration Is Idempotent And Takes A Descriptor
 
-`internal/platform/rabbitmq.DeclareTopology` SHALL take a connection and a `Topology`, declare the exchange, the job queue, the dead-letter exchange, and the dead-letter queue with the bindings between them, and succeed when called repeatedly with the same descriptor against a broker where that topology already exists.
+`internal/platform/rabbitmq` SHALL expose a `Topology` descriptor and a `DeclareTopology(conn, topo)` function that declares the exchange, the work queue, the dead-letter exchange, and the dead-letter queue the descriptor names, together with the bindings between them, and that succeeds when called repeatedly with the same descriptor against a broker where that topology already exists.
 
-The descriptor is a parameter rather than a package-level constant read internally, and that is what makes this function testable: a `DeclareTopology(conn)` fixed to the production names could only be exercised by declaring those exact names on a shared broker, which would leave test-sized arguments behind under production names for a later run to collide with. Passing a descriptor lets the tests drive the same exported code path under names scoped to each test.
+The descriptor carries names and bound values only, and this package SHALL NOT define a default value for it. A caller supplies the topology it owns. That is what keeps this package context-free while one implementation serves the Video Processing context today and the Notification context later.
 
-Declaration order SHALL be: dead-letter exchange, dead-letter queue, and their binding first; then the job exchange, the job queue, and its binding. RabbitMQ does not validate at declare time that a queue's `x-dead-letter-exchange` names an existing exchange, and silently drops dead-lettered messages when it does not — so declaring the sink first makes a partial failure leave a topology that is visibly incomplete rather than complete-looking and lossy.
+Declaration order SHALL be: dead-letter exchange, dead-letter queue, and their binding first; then the work exchange, the work queue, and its binding. RabbitMQ does not validate at declare time that a queue's `x-dead-letter-exchange` names an existing exchange, and silently drops dead-lettered messages when it does not — so declaring the sink first makes a partial failure leave a topology that is visibly incomplete rather than complete-looking and lossy.
 
 `DeclareTopology` SHALL open its own channel and close it before returning, so a failed declaration cannot leave a caller's long-lived publishing or consuming channel closed. AMQP provides no way to reopen a closed channel.
+
+Every exchange and queue SHALL be declared `durable: true`, `autoDelete: false`, `exclusive: false`, and `noWait: false`. Those four flags are independent, and "durable" constrains none of the other three: an exclusive queue is visible only to the connection that declared it and vanishes when that connection closes, an auto-delete queue vanishes when its last consumer goes away, and `noWait: true` returns before the broker has answered, so a rejected declaration would surface later as a channel-level exception rather than as this function's error. Any of the three defeats what durability is here for — a queue that outlives the process that declared it, holding work for a consumer that has not started yet.
 
 #### Scenario: Declaring twice succeeds
 
 - **GIVEN** a live connection to a broker with none of a given descriptor's topology declared
 - **WHEN** `DeclareTopology` is called twice with that same descriptor
-- **THEN** both calls return no error, and the exchange, job queue, dead-letter exchange, and dead-letter queue all exist
+- **THEN** both calls return no error, and the exchange, work queue, dead-letter exchange, and dead-letter queue all exist
 
 #### Scenario: A conflicting redeclaration is rejected by the broker
 
-- **GIVEN** a broker where a descriptor's job queue already exists as `DeclareTopology` declared it
-- **WHEN** `DeclareTopology` is called with a descriptor carrying the same names but a different message TTL
-- **THEN** the broker rejects it with a precondition failure, confirming the arguments this package declares are the ones it pins
+- **GIVEN** a broker where a descriptor's work queue already exists as `DeclareTopology` declared it
+- **WHEN** `DeclareTopology` is called with a descriptor carrying the same names but a different bound value
+- **THEN** the broker rejects it with a precondition failure, confirming the arguments this function declares are the ones it pins
 
 #### Scenario: Declaration fails against a closed connection
 
@@ -129,59 +116,49 @@ Declaration order SHALL be: dead-letter exchange, dead-letter queue, and their b
 - **WHEN** `DeclareTopology` is called with it
 - **THEN** it returns a non-nil error and declares nothing
 
-### Requirement: Both Queues Are Bounded By The Topology
+### Requirement: Declared Queues Are Bounded, And Overflow Refuses Rather Than Discards
 
-The job queue SHALL be declared with a message TTL and a maximum length, and SHALL dead-letter into the dead-letter exchange rather than discarding silently. The dead-letter queue SHALL carry a message TTL and a maximum length of its own, and SHALL discard on expiry and overflow rather than forwarding anywhere.
+`DeclareTopology` SHALL declare the work queue with a maximum length and an overflow policy of `reject-publish`, and SHALL declare the dead-letter queue with a maximum length, a message TTL, an overflow policy of `drop-head`, and no dead-letter exchange of its own.
 
-Both queues and both exchanges SHALL be declared `durable: true`, `autoDelete: false`, `exclusive: false`, and `noWait: false`. Those four flags are independent of one another, and "durable" alone constrains none of the other three: an exclusive queue is visible only to the connection that declared it and vanishes when that connection closes, an auto-delete queue vanishes when its last consumer goes away, and `noWait: true` returns before the broker has answered, so a rejected declaration would surface later as a channel-level exception rather than as this function's error. Any of the three would defeat the guarantee the durable flag is here for — a queue that outlives the process that declared it, holding jobs for a consumer that has not started yet.
+Two bounds, not one. Bounding only the work queue would relocate growth rather than cap it, since what a dead-lettering queue sheds lands in the dead-letter queue; the dead-letter queue forwards nowhere and drops its own head, so the chain terminates.
 
-A bound on the job queue alone would relocate unbounded growth instead of capping it: a TTL that dead-letters into an unbounded destination lets the destination grow without limit, and during the window opened by the next Phase 6 change the destination is where every message ends up, because nothing consumes the job queue until the cutover. Both bounds together are what make the broker's storage footprint finite regardless of how long a consumer is absent.
+`reject-publish` rather than the default `drop-head` on the work queue: a full queue must refuse the incoming publish rather than silently evicting the oldest queued item. A publisher told its message was refused can leave its own durable record of that work unpublished and retry, which turns a full queue into back-pressure — nothing is lost, and the system resumes the moment the queue drains. A dropped head is work that vanishes with no record anywhere that it existed.
 
-The job queue's overflow policy SHALL reject the incoming publish rather than dropping the oldest queued message. A publisher that is told its message was refused can leave the corresponding outbox row unpublished and retry; a silently dropped head is a job lost with no record anywhere that it existed.
+`reject-publish` rather than `reject-publish-dlx`: a publisher that retries a refused message would deposit one dead-lettered copy per attempt, filling the dead-letter queue with duplicates of work that was never lost. The negative acknowledgement the publisher already receives is the authoritative record, and it is the one that can name the row the message came from.
 
-#### Scenario: The declared job queue enforces a length bound by rejecting publishes
+The work queue SHALL NOT carry a message TTL. That omission is deliberate and load-bearing: expiring a live work message moves it to the dead-letter queue without touching the database row describing the same work, and this system's `VideoJob` state machine has no edge out of `queued` except to `processing` — so an expired message would leave a job reporting `queued` forever, an inconsistency nothing in this phase repairs. An honest TTL here would require both a reconciler and a new state-machine edge; a maximum length with `reject-publish` bounds the queue without creating the inconsistency at all.
 
-- **GIVEN** a job queue declared with a maximum length, filled to that length, and a publishing channel in confirm mode
+#### Scenario: A full work queue refuses the publish rather than evicting
+
+- **GIVEN** a work queue declared with a maximum length, filled to that length, and a publishing channel in confirm mode
 - **WHEN** a further message is published to it
-- **THEN** the broker returns a negative acknowledgement rather than silently evicting the oldest message, and the refused message is dead-lettered
+- **THEN** the broker returns a negative acknowledgement, and the messages already queued are unchanged
 
-A publish outside confirm mode returns nothing to the publisher: AMQP's `basic.publish` is asynchronous and unacknowledged by default, so an overflow rejection is reported as a `basic.nack` only on a channel that has requested confirms. A publisher that needs to know whether the broker took responsibility for a message — which is exactly what lets the relay decide whether to stamp `published_at` — SHALL enable confirms and await the acknowledgement rather than treating a nil return as acceptance.
+A publish outside confirm mode returns nothing to the publisher: AMQP's `basic.publish` is asynchronous and unacknowledged by default, so an overflow rejection is reported as a `basic.nack` only on a channel that has requested confirms. A publisher that needs to know whether the broker took responsibility for a message SHALL enable confirms and await the acknowledgement rather than treating a nil return as acceptance.
 
 #### Scenario: The dead-letter queue forwards nowhere
 
-- **GIVEN** the topology as declared by `DeclareTopology`
+- **GIVEN** a topology declared by `DeclareTopology`
 - **WHEN** the dead-letter queue's arguments are inspected
 - **THEN** it carries a message TTL and a maximum length, and no dead-letter exchange of its own
 
-### Requirement: Messages Published To This Topology Are Persistent
+#### Scenario: The work queue carries no message TTL
 
-Any publisher of a job message to this topology SHALL mark it persistent (AMQP delivery mode 2). A queue declared durable survives a broker restart; the messages in it do not unless each was published persistently, and a transient message in a durable queue is discarded on restart with no error to anyone.
-
-This is stated here, in the capability that owns the topology, rather than left to each publisher, because the durability argument the topology rests on is otherwise incomplete in a way that is invisible until it costs a job: the relay receives a broker acknowledgement, stamps `published_at`, and the row is done — so the message is the only remaining record that the job is waiting. Durable queue, persistent message, and persisted broker storage are three conditions, and the guarantee needs all three.
-
-This change adds no publisher, so it does not verify the two scenarios below — they describe broker behavior that becomes reachable only once something publishes. `add-videojob-source-key-and-outbox-relay` owns demonstrating them end to end (publish, confirm, restart the broker, observe the message still queued), and this requirement is what obliges it to. Recording the obligation here rather than there is deliberate: it is a property of the topology's durability story, and a relay written without it would look correct against every test this change can run.
-
-#### Scenario: A transient message does not survive a broker restart
-
-- **GIVEN** a durable queue declared by `DeclareTopology` holding a message published with the default (transient) delivery mode
-- **WHEN** the broker is restarted
-- **THEN** the message is gone, demonstrating that queue durability alone does not carry it
-
-#### Scenario: A persistent message survives a broker restart
-
-- **GIVEN** the same durable queue holding a message published with delivery mode 2
-- **WHEN** the broker is restarted
-- **THEN** the message is still queued
+- **GIVEN** a topology declared by `DeclareTopology`
+- **WHEN** the work queue's arguments are inspected
+- **THEN** they include a maximum length and an overflow policy, and no `x-message-ttl`
 
 ### Requirement: The Adapter Is Tested Against A Real RabbitMQ Instance
 
 `internal/platform/rabbitmq`'s tests SHALL exercise `Open`, `Ping`, `Close`, and `DeclareTopology` against a running broker rather than a fake, reached through a `RABBITMQ_TEST_URL` environment variable. When that variable is unset, **this package's** tests SHALL skip with a clear message rather than fail, matching `internal/platform/redis` and `internal/video/infrastructure/storage` exactly.
 
-A fake proves nothing about the two behaviors this package exists to get right: that a handshake against a real broker succeeds or fails as reported, and that a redeclaration with the arguments this package pins is accepted while a conflicting one is not. Both are broker-enforced, and a test double would assert only that the package calls the functions the test double was written to expect.
+A fake proves nothing about the two behaviors this package exists to get right: that a handshake against a real broker succeeds or fails as reported, and that a redeclaration with the arguments it declares is accepted while a conflicting one is not. Both are broker-enforced, and a test double would assert only that the package calls the functions the test double was written to expect.
 
-The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. Nothing in the running application opens an AMQP connection after this change, so there is no such coverage to lose here; when a later Phase 6 change makes the broker load-bearing for a composition root, that change owns tightening its own entrypoint's `TestMain`.
+The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. Nothing in the running application opens an AMQP connection after this change, so there is no such coverage to lose here; when a later change makes the broker load-bearing for a composition root, that change owns tightening its own entrypoint's `TestMain`.
 
-Tests SHALL exercise the exported `DeclareTopology` itself, passing a descriptor whose names are scoped to the individual test rather than `DefaultTopology`'s. `DefaultTopology`'s values are asserted directly instead, which is what keeps the two obligations — exercise the real code path, leave no production-named queue behind — from contradicting each other. Every test SHALL delete the exchanges and queues it declared when it finishes, including on failure.
+The broker SHALL be reached through a dedicated account rather than the built-in `guest`. RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection in this project's local and CI environments arrives over a Docker network from another address — so a `guest` URI fails with `ACCESS_REFUSED` in both, presenting as every test in the package failing at `Open` and reading like an absent broker.
+
+Tests SHALL exercise the exported `DeclareTopology` itself, passing descriptors whose names are scoped to the individual test, and SHALL delete the exchanges and queues they declared when they finish, including on failure.
 
 #### Scenario: Tests skip with a clear message when no broker is configured
 
@@ -193,7 +170,7 @@ Tests SHALL exercise the exported `DeclareTopology` itself, passing a descriptor
 
 - **GIVEN** a test that calls `DeclareTopology` with a test-scoped descriptor
 - **WHEN** it finishes, whether it passed or failed
-- **THEN** none of the entities it declared remains on the broker, and no entity named by `DefaultTopology` was ever declared by it
+- **THEN** none of the entities it declared remains on the broker
 
 #### Scenario: This change wires no composition root
 
