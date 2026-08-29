@@ -115,6 +115,26 @@ func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatu
 // rate-limiter wiring) can reuse the same connection instead of opening a
 // second one, and so is the outbox relay, which main owns the lifetime of.
 func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, error) {
+	// Loaded first, and loaded only — this reads an environment variable and
+	// touches no network. Every other subsystem below interleaves its config
+	// load with opening and pinging the thing it configures, so leaving this
+	// where the relay is actually built would make a missing RABBITMQ_URL
+	// surface only after a database connection, a migration, and three
+	// service round trips had already succeeded. A variable that is simply
+	// absent should not cost that.
+	//
+	// Loaded, not dialed. An unset RABBITMQ_URL is misconfiguration and stops
+	// startup like every other required variable, but broker reachability is
+	// the relay's own concern: it is in no request path, it needs a redial
+	// loop regardless because an AMQP connection can drop at any time, and
+	// making the first dial fatal would couple this API's availability to the
+	// broker's for a subsystem no request touches. See design.md decision 6 —
+	// deliberately neither MinIO's fail-closed nor Redis's fail-open.
+	rabbitConfig, err := platformrabbitmq.LoadConfigFromEnv()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
+	}
+
 	pgConfig, err := videopostgres.LoadConfigFromEnv()
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
@@ -143,20 +163,6 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	// add-upload-idempotency-keys' design.md.
 	redisClient := platformredis.Open(redisConfig)
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
-
-	// Loaded, not dialed. An unset RABBITMQ_URL is misconfiguration and
-	// stops startup like every other required variable, but broker
-	// reachability is the relay's own concern: it is in no request path, it
-	// needs a redial loop regardless because an AMQP connection can drop at
-	// any time, and making the first dial fatal would couple this API's
-	// availability to the broker's for a subsystem no request touches. See
-	// design.md decision 6 — deliberately neither MinIO's fail-closed nor
-	// Redis's fail-open.
-	rabbitConfig, err := platformrabbitmq.LoadConfigFromEnv()
-	if err != nil {
-		closeDB(db)
-		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
-	}
 
 	// Returned unwrapped, like videostorage.Open's error below: this
 	// package's errors already carry the "video:" prefix.

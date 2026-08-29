@@ -854,6 +854,12 @@ func TestSetupVideo_UnreachablePostgres_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestSetupVideo_RabbitMQURLMissing_ReturnsError asserts the startup gate
+// itself, which is why it does not configure anything else: setupVideo checks
+// this variable before it opens a database, so the test reaches the gate
+// whatever the rest of the environment holds. An earlier version of this test
+// assumed VIDEO_POSTGRES_DSN was set, which is true in Docker and false in
+// CI — where it failed on the wrong error entirely.
 func TestSetupVideo_RabbitMQURLMissing_ReturnsError(t *testing.T) {
 	// t.Setenv registers the restore; Unsetenv is what actually produces the
 	// unset case a bare t.Setenv("", ...) would not.
