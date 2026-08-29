@@ -1,0 +1,80 @@
+# Tasks
+
+Sections 1–8 are implementation-scoped and ship in the implementation PR. Section 9 is finalization-only and ships in its own PR, per `repo-workflow`'s PR-separation rule — no `openspec/` edits, doc updates, or task checkoffs travel with the code.
+
+## 1. Domain: the source key
+
+- [ ] 1.1 `internal/video/domain/video_job.go`: add a `sourceKey StorageKey` field with a `SourceKey()` accessor. `NewVideoJob` and `RestoreVideoJob` both take it. Note in a comment that this is the **source** key, distinct from `storageKey`, which is the result key set at completion — the two are easy to confuse and overloading one for the other is the mistake the field exists to prevent.
+- [ ] 1.2 `RestoreVideoJob`: accept and set the field, and add **no** cross-field validation pairing it with status. That break from the `StorageKey`↔`completed` and `ErrorReason`↔`failed` pattern is deliberate and needs the reason in a comment: the column ships with an empty default, and a row can legitimately be sitting in `queued` or `processing` already (a crash or a client disconnect mid-`/upload` strands one), so pairing it here would make those rows unloadable — `FindByID` returning a domain error instead of a job, at deploy time, with no obvious cause.
+- [ ] 1.3 `Enqueue()`: reject a job whose `sourceKey` is zero, with a new exported sentinel error. This is where the invariant lives — a job with no stored source cannot be processed, so queueing it would produce a dispatch no worker can act on.
+
+## 2. Persistence
+
+- [ ] 2.1 `internal/video/infrastructure/postgres/schema.sql`: `ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS source_key TEXT NOT NULL DEFAULT ''`. Additive only — no backfill is possible, since the key embeds a generated `uploadID` that exists in no other column. Follow the file's existing idempotent-DDL style so `Migrate` stays re-runnable.
+- [ ] 2.2 `schema.sql`: a partial index for the relay's claim — `CREATE INDEX IF NOT EXISTS video_job_outbox_unpublished_idx ON video_job_outbox (occurred_at) WHERE published_at IS NULL`, or the equivalent covering `event_type` as well. Justify the chosen shape in a comment against the claim query in task 2.5.
+- [ ] 2.3 `repository.go`: round-trip `source_key` through `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID`. A pre-migration row must load with an empty source key, not error.
+- [ ] 2.4 `repository.go`: `Enqueue(ctx, job)` — update the row to `queued` and insert a `video_job.queued` outbox row in one transaction, mirroring `Create`'s shape. Add `videoJobQueuedEventType = "video_job.queued"` beside the existing `videoJobCreatedEventType`, and use that same constant in task 2.5's claim so the writer and the reader cannot drift. Payload carries at least `job_id`, `user_id`, `source_key`, and `occurred_at` — the worker needs `(jobID, sourceKey)`.
+- [ ] 2.5 `outbox.go` (new, same package): `OutboxRepository` with a claim-publish-mark cycle the caller drives — `SELECT id, payload FROM video_job_outbox WHERE event_type = $1 AND published_at IS NULL ORDER BY occurred_at LIMIT $2 FOR UPDATE SKIP LOCKED`, and a mark that sets `published_at` for a given set of ids, both inside a transaction the caller opens and commits. The event-type filter is load-bearing, not tuning: the table holds an unpublished `video_job.created` row for every job created since Phase 3, and an unfiltered claim would re-read that backlog every poll and, with a bounded batch, starve the rows the relay exists to deliver.
+- [ ] 2.6 `domain/repository.go`: add `Enqueue` to the `VideoJobRepository` port, with a doc comment stating what it writes that `Update` does not, and why `Update` is deliberately not a third outbox writer.
+- [ ] 2.7 `internal/video/infrastructure/cache/repository.go`: implement `Enqueue` write-through, like `Update` — PostgreSQL first, then an unconditional `SET`. Do **not** pass it through uncached: a job left `pending` in the cache while `queued` in PostgreSQL makes `GET /api/video-jobs/:id` contradict the row the relay is about to publish.
+
+## 3. Application layer
+
+- [ ] 3.1 `create_video_job.go`: `CreateVideoJobInput` gains `SourceKey`; `Execute` parses it into a `domain.StorageKey` and passes it to `NewVideoJob`. An empty value stays valid — `POST /api/video-jobs` has no source object.
+- [ ] 3.2 `enqueue_video_job.go`: persist via `jobs.Enqueue` instead of `jobs.Update`. The aggregate's `Enqueue()` already rejects an empty source key (task 1.3), so this use case propagates that error rather than checking again.
+- [ ] 3.3 `process_video_job.go`: remove the `uc.enqueue.Execute` call and the `enqueue` dependency from the struct and constructor. The sequence becomes `StartProcessing` → fetch → extract → store. Update the doc comment, which currently describes an "enqueue/start-processing/fetch/extract/store" sequence.
+
+## 4. Messaging: publisher and relay
+
+- [ ] 4.1 `internal/video/infrastructure/messaging/publisher.go`: a `Publisher` over an `*amqp091.Connection` that opens a channel in **confirm mode** (`Channel.Confirm(false)`), publishes to `JobDispatchTopology()`'s exchange and routing key with `DeliveryMode: amqp091.Persistent` and **no** `Expiration`, and reports per-message whether the broker acknowledged. Both publishing properties are required by `videojob-messaging`; the `Expiration` one is invisible when omitted, since RabbitMQ honours it independently of the queue's arguments and would expire a job message into the dead-letter queue.
+- [ ] 4.2 `internal/video/infrastructure/messaging/relay.go`: a `Relay` composing the `OutboxRepository` with the `Publisher`. One cycle: open a transaction, claim a bounded batch, publish each and await its confirmation, mark only the acknowledged ones, commit. Fixed poll interval and batch size as compile-time constants — no new environment variable, matching the status cache's fixed TTL.
+- [ ] 4.3 `relay.go`: a nack is **not** an error. Leave the row unstamped, log it with the row id, and let the next poll retry — a full job queue nacking under `reject-publish` is designed back-pressure. A relay that errored out would turn back-pressure into a crash loop; one that stamped regardless would turn it into silent loss.
+- [ ] 4.4 `relay.go`: own the connection. Dial through `internal/platform/rabbitmq.Open` inside the goroutine, retry with backoff on failure, and re-dial on `NotifyClose`. `Run(ctx)` returns when the context is cancelled, resolving any in-flight transaction first.
+
+## 5. cmd/api wiring
+
+- [ ] 5.1 `cmd/api/video.go`: load `rabbitmq.Config` in `setupVideo` (or beside it) so an unset `RABBITMQ_URL` stops startup with a clear error, like every other required variable. Do **not** dial here — connectivity is the relay's, per design.md decision 6, and a fatal first dial would couple API availability to broker availability for a subsystem that is in no request path.
+- [ ] 5.2 `cmd/api/main.go`: start the relay goroutine after wiring and cancel it on shutdown. Log its lifecycle transitions (started, connection lost, reconnected) — a relay is invisible when healthy, so its state changes are the only signal it exists.
+- [ ] 5.3 `cmd/api/video.go`'s `handleVideoUpload`: call `EnqueueVideoJob` immediately after `CreateVideoJob`, before `ProcessVideoJob`, and pass `sourceKey` into `CreateVideoJobInput`. On an enqueue failure, fail the request the way a `CreateVideoJob` failure is already handled — the job exists but is unqueued, and the source object's `defer` cleanup still runs.
+- [ ] 5.4 `cmd/api/main_test.go`'s `TestMain`: require `RABBITMQ_URL` to be **set**, alongside `ffmpeg` and the `VIDEO_MINIO_*` variables. Do not require a reachable broker — `cmd/api` does not, so a suite that did would assert a stronger contract than the code has.
+
+## 6. Tests
+
+- [ ] 6.1 `domain`: `NewVideoJob`/`RestoreVideoJob` round-trip the source key; `Enqueue` rejects an empty one with the new sentinel; and — the regression this change's migration hazard turns on — `RestoreVideoJob` **succeeds** for a `queued` row with an empty source key. Write that last one as an explicit test with the reason in a comment, since it is a deliberate absence of validation and reads like an oversight.
+- [ ] 6.2 `postgres`: `source_key` round-trips through every read method; a row inserted without it (simulating a pre-migration row) loads with an empty key.
+- [ ] 6.3 `postgres`: `Enqueue` writes both the status update and the outbox row; a forced outbox-insert failure leaves the job `pending`, proving the transaction rolls back both.
+- [ ] 6.4 `postgres`: the outbox claim returns only `video_job.queued` rows and skips `video_job.created` ones — seed a backlog of creation rows larger than the batch size plus one queued row, and assert the queued row is still returned. That is the starvation scenario the event-type filter exists for.
+- [ ] 6.5 `postgres`: two concurrent claims split the rows and neither blocks — the `SKIP LOCKED` guard. Run them in parallel goroutines against the real database; a fake proves nothing about row locking.
+- [ ] 6.6 `cache`: `Enqueue` writes through, so a cached read after it returns `queued`.
+- [ ] 6.7 `application`: `EnqueueVideoJob` persists via `Enqueue` (assert on a fake repository that `Enqueue`, not `Update`, was called); `ProcessVideoJob` no longer enqueues, and returns an error for a job still in `pending`.
+- [ ] 6.8 `messaging`: against a real broker, the relay publishes an unpublished row, stamps `published_at`, and does not republish it; a message it published is persistent and carries no `expiration`; and a nacked publish (queue at max length) leaves the row unstamped without erroring. Skip on absent `RABBITMQ_TEST_URL`, like every other adapter suite.
+- [ ] 6.9 `cmd/api`: `POST /upload` still returns a finished result, and the job's outbox now carries a `video_job.queued` row. This is the end-to-end assertion that the handler's new ordering did not break the synchronous path.
+
+## 7. Local dev & CI
+
+- [ ] 7.1 `docker-compose.yml`: add `RABBITMQ_URL: amqp://video:video@rabbitmq:5672/` to both the `app` and `app-test` services, and add `rabbitmq` to `app`'s `depends_on` with `condition: service_healthy`. Unlike the previous change, the runtime variable now belongs on `app` too — `cmd/api` requires it at startup.
+- [ ] 7.2 `.github/workflows/ci.yml`: add `RABBITMQ_URL: amqp://video:video@localhost:5672/` to the `Test` step's env, beside the existing `RABBITMQ_TEST_URL` — `cmd/api`'s `TestMain` now requires it.
+
+## 8. Verification
+
+- [ ] 8.1 `go vet ./...` passes.
+- [ ] 8.2 `go test ./... -v` passes locally via `docker compose run --build --rm app-test go test ./... -v`. Use `--build`: a stale image silently runs the previously baked tests.
+- [ ] 8.3 Confirm the new broker-backed tests reported `PASS`, not `SKIP`.
+- [ ] 8.4 Confirm the migration is safe against existing data: run the suite against a database that already has `video_jobs` rows from before this change, and confirm they load. If none exist locally, insert one in `queued` status with an empty `source_key` and read it back — this is the hazard task 1.2 exists to avoid, and it must be verified rather than reasoned about.
+- [ ] 8.5 Confirm the API serves with the broker down: start `cmd/api` with `RABBITMQ_URL` pointing at a dead address and check that it starts, serves, and retries in the background rather than exiting.
+- [ ] 8.6 Confirm startup fails cleanly with `RABBITMQ_URL` unset.
+- [ ] 8.7 Manual end-to-end: upload a video through the running stack, confirm the response still carries a finished result, and confirm the broker's job queue received exactly one message for it while the outbox row is stamped.
+- [ ] 8.8 `gosec ./...` and `govulncheck ./...` pass.
+
+## 9. Finalization (separate PR, per repo-workflow)
+
+- [ ] 9.1 Check off sections 1–8 above.
+- [ ] 9.2 Promote the delta specs: `videojob-outbox-relay` (new), and the modified `videojob-lifecycle`, `videojob-persistence`, `videojob-execution`, `videojob-messaging`, and `rabbitmq-infrastructure`. Audit every promoted requirement's prose against its predecessor, not just its scenario list — a wholesale block replacement loses paragraphs silently, which is the failure this project has caught twice.
+- [ ] 9.3 Confirm `rabbitmq-infrastructure`'s "No composition root opens a connection yet" scenario is actually gone from the canonical spec after promotion, replaced by the narrower one. It was written with a scheduled expiry and this is the change that owes it.
+- [ ] 9.4 Run `npx --yes @fission-ai/openspec validate --all --strict --no-interactive` and fix every error before archiving.
+- [ ] 9.5 `/opsx:archive`.
+- [ ] 9.6 `docs/architecture.md`: the request pipeline gains the enqueue step; the topology tree gains `messaging/`'s relay and publisher; the RabbitMQ row in Infrastructure Components stops saying nothing is wired.
+- [ ] 9.7 `docs/operations.md`: `RABBITMQ_URL` moves from "not required" to required, with the posture spelled out — the variable is a startup gate, broker reachability is not. Document the relay: what it does, that a full queue stalls it by design, and that unpublished outbox rows are the symptom to look at.
+- [ ] 9.8 `docs/domain-model.md`: the `CreateVideoJob` row's post-condition says "upload stored at `StorageKey`", which was imprecise before this change and is wrong after it — a real source-key field now exists, distinct from the result key. Also confirm the `EnqueueVideoJob` row's "message published to async queue" is now accurate rather than aspirational.
+- [ ] 9.9 `docs/roadmap.md`: flip this row to `archived` with links to the archive folder and every promoted spec. Do **not** touch the cutover row — the exchange-versioning question recorded in `add-rabbitmq-infrastructure`'s archived `design.md` belongs to that change's own proposal.
+- [ ] 9.10 `CLAUDE.md`: the RabbitMQ constraint bullet says the adapter is wired into nothing and `RABBITMQ_URL` is not required; both become false. The `/upload` pipeline description in Architecture gains the enqueue step.
