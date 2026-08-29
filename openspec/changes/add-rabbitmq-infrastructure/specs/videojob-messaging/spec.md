@@ -1,0 +1,62 @@
+## ADDED Requirements
+
+### Requirement: The Video Processing Context Owns Its Job-Dispatch Topology
+
+`internal/video/infrastructure/messaging` SHALL define the Video Processing context's job-dispatch topology and expose it as a `JobDispatchTopology` function returning the `internal/platform/rabbitmq.Topology` descriptor that context declares.
+
+The definition lives in the context rather than in `internal/platform/rabbitmq` because `ddd-architecture` confines that package to "connection/lifecycle plumbing — never domain or application logic for a specific context's use case", and an exchange named `video.jobs` carrying a routing key named after a `VideoJob` event is precisely a specific context's use case. The generic descriptor and the function that declares it are plumbing and stay in `internal/platform`; the names are Video Processing's and live here. Phase 7's Notification context will define its own topology in its own `infrastructure` package the same way, rather than extending this one.
+
+#### Scenario: The names live in the video context
+
+- **GIVEN** the strings `video.jobs`, `video_job.queued`, and the job queue's name
+- **WHEN** the repository is searched for them outside test files
+- **THEN** they appear under `internal/video/`, and not under `internal/platform/`
+
+### Requirement: The Job-Dispatch Topology Is Pinned
+
+`JobDispatchTopology` SHALL return exactly:
+
+| Entity | Name | Type | Arguments |
+|---|---|---|---|
+| Job exchange | `video.jobs.v1` | `direct`, durable | — |
+| Routing key | `video_job.queued` | — | — |
+| Job queue | `video.jobs.queued.v1` | durable | `x-max-length` 10 000, `x-overflow` `reject-publish`, `x-dead-letter-exchange` `video.jobs.dlx` |
+| Dead-letter exchange | `video.jobs.dlx` | `fanout`, durable | — |
+| Dead-letter queue | `video.jobs.dead` | durable | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, **no** `x-dead-letter-exchange` |
+
+The routing key SHALL equal the persisted outbox `event_type` string for the same event, so the database and the broker name it identically.
+
+The **exchange**, not the routing key, SHALL carry the generation suffix, and the queue name SHALL follow it. A later change cuts over from in-request processing to a worker and must not let a not-yet-redeployed replica's messages reach the new consumer. Versioning only the queue does not achieve that: a direct exchange delivers each publish to *every* queue bound with the matching routing key, so a second queue bound to the same exchange with the same key receives the old replicas' messages too. Versioning the exchange gives the old and new publishers genuinely separate paths while leaving the routing key equal to the event type, which versioning the key would have broken.
+
+The dead-letter exchange and dead-letter queue SHALL NOT carry a generation suffix. Both generations dead-letter into the same fanout sink deliberately: a dead-lettered message is for inspection, and one place to look is better than one per generation.
+
+#### Scenario: JobDispatchTopology returns the pinned values
+
+- **WHEN** `JobDispatchTopology` is called
+- **THEN** its exchange, routing key, job queue, dead-letter exchange, and dead-letter queue names are exactly the values tabulated above, and its bound values are 10 000, 24 h, and 10 000
+
+#### Scenario: A later generation changes the exchange, not the routing key
+
+- **GIVEN** a future change introducing a second generation of this topology
+- **WHEN** it derives its descriptor from this one
+- **THEN** it changes the exchange and queue names and leaves the routing key equal to the outbox `event_type`, so publishers of different generations do not share a delivery path
+
+### Requirement: Job Messages Are Published Persistently
+
+Any publisher of a job message to this topology SHALL mark it persistent (AMQP delivery mode 2).
+
+A queue declared durable survives a broker restart; the messages in it do not unless each was published persistently, and a transient message in a durable queue is discarded on restart with no error to anyone. Durable queue, persistent message, and persisted broker storage are three conditions, and the guarantee needs all three — which matters here because the relay that publishes these messages stamps its outbox row as published once the broker acknowledges, after which the message is the only remaining record that the job is waiting.
+
+This change adds no publisher, so it does not verify the scenarios below; they describe broker behavior reachable only once something publishes. The change that introduces the relay owns demonstrating them end to end — publish, confirm, restart the broker, observe the message still queued — and this requirement is what obliges it to. Recording the obligation here rather than there is deliberate: a relay written without it would look correct against every test this change can run.
+
+#### Scenario: A transient message does not survive a broker restart
+
+- **GIVEN** a durable job queue holding a message published with the default (transient) delivery mode
+- **WHEN** the broker is restarted
+- **THEN** the message is gone, demonstrating that queue durability alone does not carry it
+
+#### Scenario: A persistent message survives a broker restart
+
+- **GIVEN** the same durable job queue holding a message published with delivery mode 2
+- **WHEN** the broker is restarted
+- **THEN** the message is still queued
