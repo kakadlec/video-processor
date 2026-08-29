@@ -1,10 +1,18 @@
-## ADDED Requirements
+# rabbitmq-infrastructure Specification
+
+## Purpose
+
+Define `internal/platform/rabbitmq`, the shared, context-free AMQP adapter: configuration, connection lifecycle, a health check, and a generic idempotent topology declaration. This is plumbing only — it names no exchange, queue, or routing key, publishes nothing, and consumes nothing. The Video Processing context's own topology lives in `videojob-messaging`; Phase 7's Notification context will define its own the same way. The relay that publishes job messages and the worker that consumes them are separate Phase 6 changes.
+
+The package sits under `internal/platform/` rather than inside a bounded context, unlike MinIO's adapter, because more than one context connects to the same broker — the case `ddd-architecture`'s "Monorepo Package Topology" requirement reserves that namespace for.
+
+## Requirements
 
 ### Requirement: The AMQP Adapter Holds Only Connection And Lifecycle Plumbing
 
 The AMQP connection adapter SHALL live at `internal/platform/rabbitmq`, alongside `internal/platform/redis` and `internal/platform/ratelimit`, and SHALL contain no exchange name, routing key, or queue name belonging to a specific bounded context's use case.
 
-`ddd-architecture`'s "Shared infrastructure with no owning context lives under internal/platform" scenario permits this package "only connection/lifecycle plumbing — never domain or application logic for a specific context's use case", and that boundary decides the split precisely. Opening, health-checking, and closing a connection, and declaring an arbitrary exchange/queue/dead-letter topology, are plumbing: Phase 7's Notification context will declare its own topology through the same functions. The concrete names `video.jobs` and `video_job.queued` are Video Processing's and live in that context (see the `videojob-messaging` capability) — which is why this change needs no delta against that canonical scenario rather than quietly straining it.
+`ddd-architecture`'s "Shared infrastructure with no owning context lives under internal/platform" scenario permits this package "only connection/lifecycle plumbing — never domain or application logic for a specific context's use case", and that boundary decides the split precisely. Opening, health-checking, and closing a connection, and declaring an arbitrary exchange/queue/dead-letter topology, are plumbing: Phase 7's Notification context will declare its own topology through the same functions. The concrete names `video.jobs` and `video_job.queued` are Video Processing's and live in that context (see the `videojob-messaging` capability). That split is what keeps this package inside the canonical scenario rather than quietly straining it, and it is the reason a topology default belongs nowhere in this package.
 
 This placement is the opposite of MinIO's, deliberately: `internal/video/infrastructure/storage` sits inside the Video Processing context because every one of its consumers belongs to that context, and the broker's do not.
 
@@ -18,9 +26,11 @@ This is an allow-list rather than a prohibition naming `identity` and `video`, b
 
 #### Scenario: The package names no context's entities
 
-- **GIVEN** any Go file under `internal/platform/rabbitmq/`
+- **GIVEN** any non-test Go file under `internal/platform/rabbitmq/`
 - **WHEN** its string literals are inspected
 - **THEN** none is an exchange, queue, or routing-key name specific to a bounded context
+
+Test files are excluded because the test that enforces this rule necessarily contains the literals it forbids.
 
 ### Requirement: AMQP Connection Is Configured From The Environment
 
@@ -154,7 +164,7 @@ A publish outside confirm mode returns nothing to the publisher: AMQP's `basic.p
 
 A fake proves nothing about the two behaviors this package exists to get right: that a handshake against a real broker succeeds or fails as reported, and that a redeclaration with the arguments it declares is accepted while a conflicting one is not. Both are broker-enforced, and a test double would assert only that the package calls the functions the test double was written to expect.
 
-The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. Nothing in the running application opens an AMQP connection after this change, so there is no such coverage to lose here; when a later change makes the broker load-bearing for a composition root, that change owns tightening its own entrypoint's `TestMain`.
+The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. No composition root opens an AMQP connection yet, so there is no such coverage to lose here; the change that first makes the broker load-bearing for an entrypoint owns tightening that entrypoint's `TestMain`.
 
 The broker SHALL be reached through a dedicated account rather than the built-in `guest`. RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection in this project's local and CI environments arrives over a Docker network from another address — so a `guest` URI fails with `ACCESS_REFUSED` in both, presenting as every test in the package failing at `Open` and reading like an absent broker.
 
@@ -172,8 +182,10 @@ Tests SHALL exercise the exported `DeclareTopology` itself, passing descriptors 
 - **WHEN** it finishes, whether it passed or failed
 - **THEN** none of the entities it declared remains on the broker
 
-#### Scenario: This change wires no composition root
+#### Scenario: No composition root opens a connection yet
 
-- **GIVEN** this change's diff
+- **GIVEN** the repository as it stands
 - **WHEN** `cmd/api` and `cmd/worker` are inspected
-- **THEN** neither opens an AMQP connection, and the running application starts and serves every existing endpoint with no broker reachable
+- **THEN** neither opens an AMQP connection, `RABBITMQ_URL` is required by nothing at startup, and the application starts and serves every existing endpoint with no broker reachable
+
+This is a current-state requirement with a deliberate expiry: the change that wires the outbox relay into `cmd/api` makes it false and SHALL modify it in the same change rather than leaving a canonical spec asserting something the code has stopped doing.
