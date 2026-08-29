@@ -76,6 +76,7 @@ type cachedJobRecord struct {
 	ID               string    `json:"id"`
 	UserID           string    `json:"user_id"`
 	OriginalFilename string    `json:"original_filename"`
+	SourceKey        string    `json:"source_key,omitempty"`
 	StorageKey       string    `json:"storage_key,omitempty"`
 	FrameCount       int       `json:"frame_count"`
 	ErrorReason      string    `json:"error_reason,omitempty"`
@@ -88,6 +89,7 @@ func newCachedJobRecord(job *domain.VideoJob) cachedJobRecord {
 		ID:               job.ID().String(),
 		UserID:           job.UserID().String(),
 		OriginalFilename: job.OriginalFilename().String(),
+		SourceKey:        job.SourceKey().String(),
 		StorageKey:       job.StorageKey().String(),
 		FrameCount:       job.FrameCount(),
 		ErrorReason:      job.ErrorReason(),
@@ -114,6 +116,19 @@ func (rec cachedJobRecord) toVideoJob(idParser domain.VideoJobIDParser) (*domain
 	if err != nil {
 		return nil, fmt.Errorf("cache: stored original filename is invalid: %w", err)
 	}
+	// Each key is parsed only when present, mirroring
+	// postgres.Repository.scanJobRow: NewStorageKey rejects an empty value,
+	// and both fields are legitimately empty (a job created through
+	// POST /api/video-jobs has no source object, and only a completed job
+	// has a result). They are the same type and adjacent in
+	// RestoreVideoJob's signature, so keep the source key first in both.
+	var sourceKey domain.StorageKey
+	if rec.SourceKey != "" {
+		sourceKey, err = domain.NewStorageKey(rec.SourceKey)
+		if err != nil {
+			return nil, fmt.Errorf("cache: stored source key is invalid: %w", err)
+		}
+	}
 	var storageKey domain.StorageKey
 	if rec.StorageKey != "" {
 		storageKey, err = domain.NewStorageKey(rec.StorageKey)
@@ -121,7 +136,7 @@ func (rec cachedJobRecord) toVideoJob(idParser domain.VideoJobIDParser) (*domain
 			return nil, fmt.Errorf("cache: stored storage key is invalid: %w", err)
 		}
 	}
-	return domain.RestoreVideoJob(id, userID, filename, storageKey, rec.FrameCount, rec.ErrorReason, domain.JobStatus(rec.Status), rec.CreatedAt)
+	return domain.RestoreVideoJob(id, userID, filename, sourceKey, storageKey, rec.FrameCount, rec.ErrorReason, domain.JobStatus(rec.Status), rec.CreatedAt)
 }
 
 func cacheKey(id domain.VideoJobID) string {
@@ -283,11 +298,35 @@ func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.Video
 	if err := r.inner.Update(ctx, job); err != nil {
 		return err
 	}
+	r.writeThrough(job)
+	return nil
+}
 
+// Enqueue implements domain.VideoJobRepository as write-through, exactly
+// like Update: the inner repository's write (the status update and its
+// outbox row, in one transaction) must succeed first, and only then is the
+// cache entry overwritten.
+//
+// It deliberately does not pass through uncached the way Create does. The
+// entry it would leave behind is not merely stale, it contradicts the row
+// the relay is about to publish a dispatch for: GET /api/video-jobs/:id
+// would report pending for a job PostgreSQL already has as queued.
+func (r *CachedVideoJobRepository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
+	if err := r.inner.Enqueue(ctx, job); err != nil {
+		return err
+	}
+	r.writeThrough(job)
+	return nil
+}
+
+// writeThrough overwrites job's cache entry after its authoritative write
+// has already committed. Shared by Update and Enqueue, which differ only in
+// what they persist, never in how the cache follows.
+func (r *CachedVideoJobRepository) writeThrough(job *domain.VideoJob) {
 	data, err := json.Marshal(newCachedJobRecord(job))
 	if err != nil {
 		log.Printf("video: cache: marshal %s: %v", job.ID().String(), err)
-		return nil
+		return
 	}
 	cleanupCtx, cancel := detachedCleanupContext()
 	defer cancel()
@@ -297,7 +336,6 @@ func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.Video
 			log.Printf("video: cache: write-through fallback delete %s: %v", job.ID().String(), delErr)
 		}
 	}
-	return nil
 }
 
 // Create passes straight through, uncached — the job's first FindByID call

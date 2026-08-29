@@ -24,6 +24,7 @@ import (
 	"github.com/minio/minio-go/v7"
 
 	"video-processor/internal/identity/infrastructure/jwtauth"
+	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
@@ -172,6 +173,10 @@ func (alwaysAllowRateLimiter) Allow(context.Context, string) (bool, time.Duratio
 type inMemoryVideoJobRepository struct {
 	mu   sync.Mutex
 	byID map[string]*videodomain.VideoJob
+	// enqueueErr, when set, fails every Enqueue — the branch POST /upload
+	// takes when a job cannot be queued for the relay to dispatch.
+	enqueueErr   error
+	enqueueCalls int
 }
 
 func newInMemoryVideoJobRepository() *inMemoryVideoJobRepository {
@@ -179,7 +184,7 @@ func newInMemoryVideoJobRepository() *inMemoryVideoJobRepository {
 }
 
 func cloneVideoJob(job *videodomain.VideoJob) *videodomain.VideoJob {
-	clone, err := videodomain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := videodomain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
 	if err != nil {
 		panic("inMemoryVideoJobRepository: failed to clone video job: " + err.Error())
 	}
@@ -206,6 +211,20 @@ func (r *inMemoryVideoJobRepository) FindByID(_ context.Context, id videodomain.
 func (r *inMemoryVideoJobRepository) Update(_ context.Context, job *videodomain.VideoJob) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, ok := r.byID[job.ID().String()]; !ok {
+		return videodomain.ErrVideoJobNotFound
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return nil
+}
+
+func (r *inMemoryVideoJobRepository) Enqueue(_ context.Context, job *videodomain.VideoJob) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enqueueCalls++
+	if r.enqueueErr != nil {
+		return r.enqueueErr
+	}
 	if _, ok := r.byID[job.ID().String()]; !ok {
 		return videodomain.ErrVideoJobNotFound
 	}
@@ -451,8 +470,8 @@ func newTestVideoModuleWithBothStorages(t *testing.T) (*videoModule, *inMemoryVi
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewEnqueueVideoJob(repo, ids),
 		videoapplication.NewProcessVideoJob(
-			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
@@ -806,7 +825,7 @@ func postJSONWithAuthorization(t *testing.T, url, authorizationHeader string, pa
 func TestSetupVideo_DSNMissing_ReturnsError(t *testing.T) {
 	t.Setenv("VIDEO_POSTGRES_DSN", "")
 
-	module, db, _, err := setupVideo(context.Background())
+	module, db, _, _, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when VIDEO_POSTGRES_DSN is not set")
 	}
@@ -826,12 +845,32 @@ func TestSetupVideo_UnreachablePostgres_ReturnsError(t *testing.T) {
 	// refused) rather than hanging, so this stays a fast unit-style test.
 	t.Setenv("VIDEO_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/video?sslmode=disable&connect_timeout=1")
 
-	_, _, _, err := setupVideo(context.Background())
+	_, _, _, _, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when configured PostgreSQL is unreachable")
 	}
 	if strings.TrimSpace(err.Error()) == "" {
 		t.Fatal("expected a non-empty error message")
+	}
+}
+
+func TestSetupVideo_RabbitMQURLMissing_ReturnsError(t *testing.T) {
+	// t.Setenv registers the restore; Unsetenv is what actually produces the
+	// unset case a bare t.Setenv("", ...) would not.
+	t.Setenv("RABBITMQ_URL", "")
+	if err := os.Unsetenv("RABBITMQ_URL"); err != nil {
+		t.Fatalf("unsetenv: %v", err)
+	}
+
+	module, db, _, relay, err := setupVideo(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when RABBITMQ_URL is not set")
+	}
+	if !errors.Is(err, platformrabbitmq.ErrURLRequired) {
+		t.Fatalf("expected error to wrap platformrabbitmq.ErrURLRequired, got: %v", err)
+	}
+	if module != nil || db != nil || relay != nil {
+		t.Fatalf("expected nil module, db, and relay on error, got %+v %+v %+v", module, db, relay)
 	}
 }
 
@@ -905,8 +944,8 @@ func newIdempotencyTestVideoModule(extractor videodomain.FrameExtractor) (*video
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewEnqueueVideoJob(repo, ids),
 		videoapplication.NewProcessVideoJob(
-			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
@@ -957,8 +996,8 @@ func newIdempotencyTestVideoModuleWithRepoAndStorage(extractor videodomain.Frame
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewEnqueueVideoJob(repo, ids),
 		videoapplication.NewProcessVideoJob(
-			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
@@ -1653,8 +1692,8 @@ func startSourceStorageTestServer(t *testing.T) (*httptest.Server, string, bucke
 		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewEnqueueVideoJob(repo, ids),
 		videoapplication.NewProcessVideoJob(
-			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			videoffmpeg.New(),
@@ -1731,5 +1770,114 @@ func TestUpload_NonMp4Container_ExtractsFromExtensionlessLocalCopy(t *testing.T)
 	}
 	if result.FrameCount < 1 {
 		t.Fatalf("result.FrameCount = %d, want at least 1", result.FrameCount)
+	}
+}
+
+// newEnqueueTestVideoModule is newIdempotencyTestVideoModule but also hands
+// back the SourceStorage fake, so a test can assert the handler's deferred
+// cleanup ran on a branch that never reaches processing.
+func newEnqueueTestVideoModule(extractor videodomain.FrameExtractor) (*videoModule, *fakeIdempotencyStore, *inMemoryVideoJobRepository, *fakeSourceStorage) {
+	repo := newInMemoryVideoJobRepository()
+	sources := newFakeSourceStorage()
+	results := newFakeResultStorage()
+	ids := videoidgen.New()
+	completeJob := videoapplication.NewCompleteJob(repo, ids)
+	failJob := videoapplication.NewFailJob(repo, ids)
+	store := newFakeIdempotencyStore()
+	module := newVideoModule(
+		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewGetJobStatus(repo, ids),
+		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewEnqueueVideoJob(repo, ids),
+		videoapplication.NewProcessVideoJob(
+			videoapplication.NewStartProcessing(repo, ids),
+			failJob,
+			extractor,
+			sources,
+			results,
+			ids,
+		),
+		videoapplication.NewListUserResults(repo, results),
+		completeJob,
+		failJob,
+		store,
+		repo,
+		sources,
+		results,
+		ids,
+	)
+	return module, store, repo, sources
+}
+
+// TestHandleVideoUpload_EnqueuesBeforeProcessing is the end-to-end check that
+// the handler's new ordering did not break the synchronous path: the response
+// still carries a finished result, and the job went through Enqueue — the
+// only repository method that writes the video_job.queued outbox row the
+// relay dispatches from. A handler that skipped the step would still return a
+// completed result and pass every other assertion in this file.
+func TestHandleVideoUpload_EnqueuesBeforeProcessing(t *testing.T) {
+	extractor := newImmediateFrameExtractor(t, 3)
+	module, _, repo, _ := newEnqueueTestVideoModule(extractor)
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	videoPath := writeTestUploadContent(t, []byte("enqueue ordering content"))
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "movie.mp4")
+	defer resp.Body.Close()
+
+	if !result.Success {
+		t.Fatalf("upload should still succeed, got: %+v", result)
+	}
+	repo.mu.Lock()
+	calls := repo.enqueueCalls
+	repo.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("repo.enqueueCalls = %d, want 1 — the job must be queued through the outbox-writing path", calls)
+	}
+}
+
+// TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything
+// covers the failure branch the enqueue step introduces, in a handler that
+// already coordinates a reservation, a stored object, and a job row. The
+// success path cannot catch a regression here, and each of the three
+// resources has its own way of leaking.
+func TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything(t *testing.T) {
+	extractor := newImmediateFrameExtractor(t, 3)
+	module, store, repo, sources := newEnqueueTestVideoModule(extractor)
+	repo.enqueueErr = errors.New("outbox write failed")
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("enqueue failure content")
+	videoPath := writeTestUploadContent(t, content)
+	resp, result := uploadVideo(t, srv.URL, token, videoPath, "movie.mp4")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+	if result.Success {
+		t.Fatalf("expected a failed result, got: %+v", result)
+	}
+	if extractor.Invocations() != 0 {
+		t.Fatalf("extractor invocations = %d, want 0 — a job that was never queued must not be processed", extractor.Invocations())
+	}
+	// The handler's deferred cleanup owns the source object on every exit
+	// path, this new one included.
+	if sources.count() != 0 {
+		t.Fatalf("source objects remaining = %d, want 0", sources.count())
+	}
+	// The reservation must not outlive the request, or an immediate retry of
+	// the same content is blocked for the sentinel's full TTL.
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.hasReservation(idemKey) {
+		t.Fatal("the idempotency reservation survived an enqueue failure; a retry of the same content would be blocked")
 	}
 }

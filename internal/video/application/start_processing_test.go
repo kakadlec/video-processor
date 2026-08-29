@@ -9,6 +9,12 @@ import (
 	"video-processor/internal/video/domain"
 )
 
+// newQueuedRepoJob persists a job already in queued — the state both
+// StartProcessing and ProcessVideoJob expect, the latter because it no
+// longer performs that transition itself. It persists through Update rather
+// than Enqueue on purpose: this is test setup arriving at a state, not an
+// exercise of the dispatch path, and going through Enqueue here would make
+// every one of these tests also depend on the outbox write.
 func newQueuedRepoJob(t *testing.T, repo *fakeVideoJobRepository, jobID, userID string) *domain.VideoJob {
 	t.Helper()
 	job := newPendingRepoJob(t, repo, jobID, userID)

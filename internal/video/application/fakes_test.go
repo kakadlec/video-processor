@@ -24,8 +24,10 @@ import (
 // case that forgot to call Update could still pass its own tests purely
 // because it mutated the same pointer the repository already held.
 type fakeVideoJobRepository struct {
-	mu   sync.Mutex
-	byID map[string]*domain.VideoJob
+	mu           sync.Mutex
+	byID         map[string]*domain.VideoJob
+	updateCalls  int
+	enqueueCalls int
 }
 
 func newFakeVideoJobRepository() *fakeVideoJobRepository {
@@ -33,7 +35,7 @@ func newFakeVideoJobRepository() *fakeVideoJobRepository {
 }
 
 func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
-	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
 	if err != nil {
 		panic("fakeVideoJobRepository: failed to clone video job: " + err.Error())
 	}
@@ -111,6 +113,23 @@ func (r *fakeVideoJobRepository) Update(_ context.Context, job *domain.VideoJob)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.updateCalls++
+	return r.persistLocked(job)
+}
+
+// Enqueue records that it, rather than Update, was the path taken — the
+// distinction matters because only Enqueue writes the outbox row the relay
+// publishes from, so a use case that quietly fell back to Update would still
+// pass every status assertion while dispatching nothing.
+func (r *fakeVideoJobRepository) Enqueue(_ context.Context, job *domain.VideoJob) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.enqueueCalls++
+	return r.persistLocked(job)
+}
+
+func (r *fakeVideoJobRepository) persistLocked(job *domain.VideoJob) error {
 	if _, ok := r.byID[job.ID().String()]; !ok {
 		return domain.ErrVideoJobNotFound
 	}

@@ -42,7 +42,6 @@ func writeTestZip(t *testing.T) string {
 func newProcessVideoJobUseCase(repo *fakeVideoJobRepository, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage) *application.ProcessVideoJob {
 	parser := fakeVideoJobIDParser{}
 	return application.NewProcessVideoJob(
-		application.NewEnqueueVideoJob(repo, parser),
 		application.NewStartProcessing(repo, parser),
 		application.NewFailJob(repo, parser),
 		extractor,
@@ -76,9 +75,34 @@ func localSourcePathFor(jobID string) string {
 	return filepath.Join("temp", jobID+"_source")
 }
 
-func TestProcessVideoJob_Success_ExtractsAndLeavesJobProcessing(t *testing.T) {
+// TestProcessVideoJob_PendingJob_ReturnsInvalidTransition pins the contract
+// change: this use case no longer enqueues, so a job still in pending has no
+// legal edge to processing and the sequence stops before touching storage or
+// ffmpeg. The caller (POST /upload) is what enqueues now, because that
+// transition writes the outbox row the relay dispatches from.
+func TestProcessVideoJob_PendingJob_ReturnsInvalidTransition(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newPendingRepoJob(t, repo, "job-1", "user-1")
+
+	extractor := fakeFrameExtractor{zipPath: writeTestZip(t), frameCount: 1}
+	uc := newProcessVideoJobUseCase(repo, extractor, seededSources(t), newFakeResultStorage())
+
+	if _, err := uc.Execute(context.Background(), "job-1", testSourceKey(t)); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrInvalidStatusTransition)
+	}
+
+	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusPending {
+		t.Fatalf("job.Status() = %v, want the job left in %v", job.Status(), domain.JobStatusPending)
+	}
+}
+
+func TestProcessVideoJob_Success_ExtractsAndLeavesJobProcessing(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	zipPath := writeTestZip(t)
 	extractor := fakeFrameExtractor{zipPath: zipPath, frameCount: 3, imageNames: []string{"frame_0001.png", "frame_0002.png", "frame_0003.png"}}
@@ -124,7 +148,7 @@ func TestProcessVideoJob_Success_ExtractsAndLeavesJobProcessing(t *testing.T) {
 
 func TestProcessVideoJob_ExtractionFailure_FailsJob(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newPendingRepoJob(t, repo, "job-1", "user-1")
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	extractor := fakeFrameExtractor{err: errors.New("ffmpeg exploded")}
 	sources := seededSources(t)
@@ -155,7 +179,7 @@ func TestProcessVideoJob_ExtractionFailure_FailsJob(t *testing.T) {
 
 func TestProcessVideoJob_ExtractionFailure_EmptyErrorMessage_UsesFallbackReason(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newPendingRepoJob(t, repo, "job-1", "user-1")
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	extractor := fakeFrameExtractor{err: errors.New("")}
 	sources := seededSources(t)
@@ -186,7 +210,7 @@ func TestProcessVideoJob_ExtractionFailure_EmptyErrorMessage_UsesFallbackReason(
 // precisely so this path still runs it.
 func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newPendingRepoJob(t, repo, "job-1", "user-1")
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	zipPath := writeTestZip(t)
 	extractor := fakeFrameExtractor{zipPath: zipPath, frameCount: 3, imageNames: []string{"frame_0001.png"}}
@@ -239,7 +263,7 @@ func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T)
 // responsibility, and nothing of it survives a successful run.
 func TestProcessVideoJob_Success_RemovesDownloadedSource(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newPendingRepoJob(t, repo, "job-1", "user-1")
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	extractor := fakeFrameExtractor{zipPath: writeTestZip(t), frameCount: 1, imageNames: []string{"frame_0001.png"}}
 	sources := seededSources(t)
@@ -259,7 +283,7 @@ func TestProcessVideoJob_Success_RemovesDownloadedSource(t *testing.T) {
 // cleanup registered after ExtractFrames would never run.
 func TestProcessVideoJob_ExtractionFailure_RemovesDownloadedSource(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newPendingRepoJob(t, repo, "job-1", "user-1")
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	extractor := fakeFrameExtractor{err: errors.New("ffmpeg exploded")}
 	sources := seededSources(t)
@@ -280,7 +304,7 @@ func TestProcessVideoJob_ExtractionFailure_RemovesDownloadedSource(t *testing.T)
 // error text — which names the endpoint and bucket.
 func TestProcessVideoJob_FetchFailure_FailsJobWithoutInvokingFfmpeg(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newPendingRepoJob(t, repo, "job-1", "user-1")
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
 
 	extractor := &countingFrameExtractor{}
 	sources := newFakeSourceStorage()

@@ -40,7 +40,7 @@ func mustVideoJob(t *testing.T, status domain.JobStatus, storageKey string, fram
 			t.Fatalf("NewStorageKey: %v", err)
 		}
 	}
-	job, err := domain.RestoreVideoJob(id, userID, filename, key, frameCount, errorReason, status, time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	job, err := domain.RestoreVideoJob(id, userID, filename, domain.StorageKey{}, key, frameCount, errorReason, status, time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("RestoreVideoJob: %v", err)
 	}

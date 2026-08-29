@@ -21,7 +21,7 @@ func seedCompletedJob(t *testing.T, repo *fakeVideoJobRepository, results *fakeR
 	id := newTestVideoJobID(t, jobID)
 	key := domain.ResultStorageKey(id)
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
-	job, err := domain.RestoreVideoJob(id, newTestVideoUserID(t, userID), filename, key, 1, "", domain.JobStatusCompleted, createdAt)
+	job, err := domain.RestoreVideoJob(id, newTestVideoUserID(t, userID), filename, domain.StorageKey{}, key, 1, "", domain.JobStatusCompleted, createdAt)
 	if err != nil {
 		t.Fatalf("unexpected error building job: %v", err)
 	}

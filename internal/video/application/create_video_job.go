@@ -8,9 +8,14 @@ import (
 )
 
 // CreateVideoJobInput carries the caller-supplied job creation fields.
+// SourceKey names the already-stored upload this job will process and is
+// optional: POST /api/video-jobs creates a job from a filename alone, with
+// no object behind it. Such a job simply cannot be enqueued — see
+// domain.VideoJob.Enqueue.
 type CreateVideoJobInput struct {
 	UserID           string
 	OriginalFilename string
+	SourceKey        string
 }
 
 // CreateVideoJobResult describes the newly created job.
@@ -48,7 +53,18 @@ func (uc *CreateVideoJob) Execute(ctx context.Context, input CreateVideoJobInput
 		return CreateVideoJobResult{}, err
 	}
 
-	job, err := domain.NewVideoJob(uc.ids, userID, filename, uc.clock.Now())
+	// Parsed only when present: NewStorageKey rejects the empty string, so
+	// an unconditional parse here would reject every job created without a
+	// source object.
+	var sourceKey domain.StorageKey
+	if input.SourceKey != "" {
+		sourceKey, err = domain.NewStorageKey(input.SourceKey)
+		if err != nil {
+			return CreateVideoJobResult{}, err
+		}
+	}
+
+	job, err := domain.NewVideoJob(uc.ids, userID, filename, sourceKey, uc.clock.Now())
 	if err != nil {
 		return CreateVideoJobResult{}, err
 	}

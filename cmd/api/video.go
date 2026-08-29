@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 	platformredis "video-processor/internal/platform/redis"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
@@ -26,6 +27,7 @@ import (
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
+	videomessaging "video-processor/internal/video/infrastructure/messaging"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 	videostorage "video-processor/internal/video/infrastructure/storage"
 )
@@ -53,9 +55,15 @@ const (
 // videoModule wires the Video Processing bounded context's job-lifecycle
 // use cases to the HTTP layer.
 type videoModule struct {
-	createVideoJob  *videoapplication.CreateVideoJob
-	getJobStatus    *videoapplication.GetJobStatus
-	listUserJobs    *videoapplication.ListUserJobs
+	createVideoJob *videoapplication.CreateVideoJob
+	getJobStatus   *videoapplication.GetJobStatus
+	listUserJobs   *videoapplication.ListUserJobs
+	// enqueueVideoJob is called by handleVideoUpload, not composed inside
+	// processVideoJob: the pending -> queued transition now writes the
+	// outbox row the relay publishes from, so it belongs to the caller that
+	// decides a job is ready for a worker rather than to the use case that
+	// immediately does the work itself.
+	enqueueVideoJob *videoapplication.EnqueueVideoJob
 	processVideoJob *videoapplication.ProcessVideoJob
 	listUserResults *videoapplication.ListUserResults
 	// completeJob and failJob are called directly by handleVideoUpload,
@@ -82,11 +90,12 @@ type videoModule struct {
 	idsFor  videodomain.VideoJobIDParser
 }
 
-func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, processVideoJob *videoapplication.ProcessVideoJob, listUserResults *videoapplication.ListUserResults, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, sources videodomain.SourceStorage, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
+func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, enqueueVideoJob *videoapplication.EnqueueVideoJob, processVideoJob *videoapplication.ProcessVideoJob, listUserResults *videoapplication.ListUserResults, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, sources videodomain.SourceStorage, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
 	return &videoModule{
 		createVideoJob:  createVideoJob,
 		getJobStatus:    getJobStatus,
 		listUserJobs:    listUserJobs,
+		enqueueVideoJob: enqueueVideoJob,
 		processVideoJob: processVideoJob,
 		listUserResults: listUserResults,
 		completeJob:     completeJob,
@@ -101,34 +110,33 @@ func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatu
 
 // setupVideo builds the production Video Processing module from environment
 // configuration, mirroring setupIdentity's fail-clearly-on-misconfiguration
-// posture. VIDEO_POSTGRES_DSN and REDIS_ADDR are always required — the
-// latter as of add-upload-idempotency-keys, whose idempotency mechanism is
-// this videoModule's first real Redis consumer. The opened *redis.Client is
-// also returned so callers (main's rate-limiter wiring) can reuse the same
-// connection instead of opening a second one.
-func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, error) {
+// posture. VIDEO_POSTGRES_DSN, REDIS_ADDR, and RABBITMQ_URL are always
+// required. The opened *redis.Client is also returned so callers (main's
+// rate-limiter wiring) can reuse the same connection instead of opening a
+// second one, and so is the outbox relay, which main owns the lifetime of.
+func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, error) {
 	pgConfig, err := videopostgres.LoadConfigFromEnv()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 
 	db, err := videopostgres.Open(pgConfig)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if err := videopostgres.Migrate(ctx, db); err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if err := db.PingContext(ctx); err != nil {
 		closeDB(db)
-		return nil, nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
 	}
 
 	redisConfig, err := platformredis.LoadConfigFromEnv()
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 	// Open never itself connects (platformredis.Open's own contract) — a
 	// Ping/command failure surfaces at request time instead of here, per
@@ -136,17 +144,31 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	redisClient := platformredis.Open(redisConfig)
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
 
+	// Loaded, not dialed. An unset RABBITMQ_URL is misconfiguration and
+	// stops startup like every other required variable, but broker
+	// reachability is the relay's own concern: it is in no request path, it
+	// needs a redial loop regardless because an AMQP connection can drop at
+	// any time, and making the first dial fatal would couple this API's
+	// availability to the broker's for a subsystem no request touches. See
+	// design.md decision 6 — deliberately neither MinIO's fail-closed nor
+	// Redis's fail-open.
+	rabbitConfig, err := platformrabbitmq.LoadConfigFromEnv()
+	if err != nil {
+		closeDB(db)
+		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
+	}
+
 	// Returned unwrapped, like videostorage.Open's error below: this
 	// package's errors already carry the "video:" prefix.
 	minioConfig, err := videostorage.LoadConfigFromEnv()
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	minioClient, err := videostorage.Open(minioConfig)
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	// Fail-closed, deliberately unlike the Redis wiring above: rate
 	// limiting, idempotency, and the status cache all degrade to a slower
@@ -156,11 +178,11 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	// confirmed here rather than discovered on the first upload.
 	if err := videostorage.Ping(ctx, minioClient, minioConfig.Bucket); err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	if err := videostorage.EnsureBucket(ctx, minioClient, minioConfig.Bucket); err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	// The region is discovered here, on the reachable client, and handed to
 	// the presigning client rather than configured: the server can simply
@@ -172,12 +194,12 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	region, err := videostorage.BucketRegion(ctx, minioClient, minioConfig.Bucket)
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	presignClient, err := videostorage.OpenPresigner(minioConfig, region)
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	resultStorage := videostorage.NewResultStorage(minioClient, presignClient, minioConfig.Bucket)
 	sourceStorage := videostorage.NewSourceStorage(minioClient, minioConfig.Bucket)
@@ -199,6 +221,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 	// lost by skipping the cache on this path.
 	authoritativeRepo := videopostgres.NewRepository(db, ids)
 	repo := videocache.NewCachedVideoJobRepository(authoritativeRepo, redisClient, ids)
+	relay := videomessaging.NewRelay(videopostgres.NewOutboxRepository(db), rabbitConfig)
 	clock := systemClock{}
 	extractor := videoffmpeg.New()
 	completeJob := videoapplication.NewCompleteJob(repo, ids)
@@ -208,8 +231,8 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 		videoapplication.NewCreateVideoJob(repo, ids, clock),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
+		videoapplication.NewEnqueueVideoJob(repo, ids),
 		videoapplication.NewProcessVideoJob(
-			videoapplication.NewEnqueueVideoJob(repo, ids),
 			videoapplication.NewStartProcessing(repo, ids),
 			failJob,
 			extractor,
@@ -226,7 +249,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, erro
 		resultStorage,
 		ids,
 	)
-	return module, db, redisClient, nil
+	return module, db, redisClient, relay, nil
 }
 
 func (m *videoModule) registerRoutes(videoRoutes *gin.RouterGroup) {
@@ -621,6 +644,7 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	created, err := m.createVideoJob.Execute(c.Request.Context(), videoapplication.CreateVideoJobInput{
 		UserID:           userID.String(),
 		OriginalFilename: safeFilename,
+		SourceKey:        sourceKey.String(),
 	})
 	if err != nil {
 		// A detached context: c.Request.Context() may already be canceled
@@ -638,6 +662,32 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Erro ao registrar o processamento",
+		})
+		return
+	}
+
+	// Enqueued before the job is processed, and before the idempotency key
+	// is finalized so this failure branch clears a plain reservation rather
+	// than a finalized entry. The transition writes the outbox row the relay
+	// publishes from; ProcessVideoJob no longer performs it, and expects a
+	// job already in queued.
+	if _, err := m.enqueueVideoJob.Execute(c.Request.Context(), created.JobID); err != nil {
+		// Handled like a CreateVideoJob failure: the job row exists but is
+		// unqueued, and the source object's deferred cleanup above still
+		// runs. A detached context for the same reason as there — the
+		// request's may already be canceled, and leaving the reservation
+		// behind would block an immediate retry for its full TTL.
+		if hasReservation {
+			clearCtx, cancel := videoapplication.NewFinalizationContext()
+			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
+				log.Printf("clear idempotency reservation after EnqueueVideoJob error for upload %s: cleared=%v err=%v", sourceKey.String(), cleared, clearErr)
+			}
+			cancel()
+		}
+		log.Printf("enqueue video job %s: %v", created.JobID, err)
+		c.JSON(500, ProcessingResult{
+			Success: false,
+			Message: "Failed to queue the video for processing",
 		})
 		return
 	}

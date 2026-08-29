@@ -35,7 +35,7 @@ const tempDirName = "temp"
 const localSourceSuffix = "_source"
 
 // ProcessVideoJobResult describes the outcome of running a VideoJob's
-// enqueue/start/extract sequence. On success the job is left in
+// start/fetch/extract/store sequence. On success the job is left in
 // "processing" status, not "completed" — see ProcessVideoJob's doc comment
 // for why the caller, not this use case, is responsible for calling
 // CompleteJob.
@@ -55,9 +55,16 @@ type ProcessVideoJobResult struct {
 	ExtractionError error
 }
 
-// ProcessVideoJob runs a VideoJob's enqueue/start-processing/fetch/extract/
-// store sequence synchronously, in-process, failing the job if any of those
-// steps errors.
+// ProcessVideoJob runs a VideoJob's start-processing/fetch/extract/store
+// sequence synchronously, in-process, failing the job if any of those steps
+// errors.
+//
+// It does not enqueue. The pending -> queued transition is the caller's, and
+// it moved there because that transition now writes an outbox row the relay
+// publishes from: a use case that both queued a job and immediately
+// processed it would announce a dispatch for work it had already done.
+// Execute therefore expects a job already in queued, and errors on one still
+// in pending.
 //
 // Execute takes a source StorageKey rather than a local file path, and that
 // is the point of the signature: a path written by the calling HTTP handler
@@ -92,7 +99,6 @@ type ProcessVideoJobResult struct {
 // which is Phase 6's queue work, not something a synchronous in-request
 // pipeline can do correctly.
 type ProcessVideoJob struct {
-	enqueue   *EnqueueVideoJob
 	start     *StartProcessing
 	fail      *FailJob
 	extractor domain.FrameExtractor
@@ -102,21 +108,18 @@ type ProcessVideoJob struct {
 }
 
 // NewProcessVideoJob wires the ProcessVideoJob use case to its dependencies.
-func NewProcessVideoJob(enqueue *EnqueueVideoJob, start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
-	return &ProcessVideoJob{enqueue: enqueue, start: start, fail: fail, extractor: extractor, sources: sources, results: results, idsFor: idsFor}
+func NewProcessVideoJob(start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
+	return &ProcessVideoJob{start: start, fail: fail, extractor: extractor, sources: sources, results: results, idsFor: idsFor}
 }
 
-// Execute runs jobID's enqueue/start-processing/fetch/extract/store sequence
-// against the source video stored under sourceKey.
+// Execute runs jobID's start-processing/fetch/extract/store sequence against
+// the source video stored under sourceKey.
 func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey domain.StorageKey) (ProcessVideoJobResult, error) {
 	id, err := uc.idsFor.ParseVideoJobID(jobID)
 	if err != nil {
 		return ProcessVideoJobResult{}, err
 	}
 
-	if _, err := uc.enqueue.Execute(ctx, jobID); err != nil {
-		return ProcessVideoJobResult{}, err
-	}
 	if _, err := uc.start.Execute(ctx, jobID); err != nil {
 		return ProcessVideoJobResult{}, err
 	}

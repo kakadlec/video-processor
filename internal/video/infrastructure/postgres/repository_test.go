@@ -46,6 +46,13 @@ func testDB(t *testing.T) *sql.DB {
 
 func newTestJob(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename string, createdAt time.Time) *domain.VideoJob {
 	t.Helper()
+	return newTestJobWithSourceKey(t, ids, userID, filename, "uploads/"+filename, createdAt)
+}
+
+// newTestJobWithSourceKey builds a job whose source key is set explicitly,
+// including to "" for a job with no stored source (POST /api/video-jobs).
+func newTestJobWithSourceKey(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename, sourceKey string, createdAt time.Time) *domain.VideoJob {
+	t.Helper()
 
 	uid, err := domain.NewUserID(userID)
 	if err != nil {
@@ -55,7 +62,14 @@ func newTestJob(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename s
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	job, err := domain.NewVideoJob(ids, uid, fn, createdAt)
+	var key domain.StorageKey
+	if sourceKey != "" {
+		key, err = domain.NewStorageKey(sourceKey)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	job, err := domain.NewVideoJob(ids, uid, fn, key, createdAt)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -280,7 +294,7 @@ func TestRepository_Create_DuplicateID_LeavesNoOutboxRow(t *testing.T) {
 	}
 
 	// Reuse the same ID to force a primary-key violation on the second Create.
-	dup, err := domain.RestoreVideoJob(first.ID(), first.UserID(), first.OriginalFilename(), first.StorageKey(), 0, "", domain.JobStatusPending, time.Now().UTC())
+	dup, err := domain.RestoreVideoJob(first.ID(), first.UserID(), first.OriginalFilename(), first.SourceKey(), first.StorageKey(), 0, "", domain.JobStatusPending, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -594,5 +608,106 @@ func TestRepository_FindCompletedByUserID_OrdersNewestFirst(t *testing.T) {
 	}
 	if !jobs[0].ID().Equal(newer.ID()) || !jobs[1].ID().Equal(older.ID()) {
 		t.Fatalf("jobs = [%v, %v], want [newer, older]", jobs[0].ID(), jobs[1].ID())
+	}
+}
+
+// TestRepository_SourceKeyRoundTripsThroughEveryReadMethod covers all four
+// read paths at once, because they share one scan helper and a mistake in it
+// reaches all of them. Both keys are asserted, not just the new one: they are
+// the same type and adjacent in RestoreVideoJob's signature, so transposing
+// them compiles and — for a completed job — passes the aggregate's own
+// validation, surfacing only as GET /download/:filename rejecting every
+// result.
+func TestRepository_SourceKeyRoundTripsThroughEveryReadMethod(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := newTestJobWithSourceKey(t, ids, "user-1", "movie.mp4", "uploads/upload-1_movie.mp4", time.Now().UTC())
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resultKey := domain.ResultStorageKey(job.ID())
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := job.Complete(resultKey, 3); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertKeys := func(t *testing.T, method string, found *domain.VideoJob) {
+		t.Helper()
+		if !found.SourceKey().Equal(job.SourceKey()) {
+			t.Fatalf("%s: SourceKey = %v, want %v", method, found.SourceKey(), job.SourceKey())
+		}
+		if !found.StorageKey().Equal(resultKey) {
+			t.Fatalf("%s: StorageKey = %v, want %v", method, found.StorageKey(), resultKey)
+		}
+	}
+
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertKeys(t, "FindByID", found)
+
+	page, err := repo.FindByUserID(ctx, job.UserID(), 0, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(page) != 1 {
+		t.Fatalf("len(FindByUserID) = %d, want 1", len(page))
+	}
+	assertKeys(t, "FindByUserID", page[0])
+
+	completed, err := repo.FindCompletedByUserID(ctx, job.UserID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(completed) != 1 {
+		t.Fatalf("len(FindCompletedByUserID) = %d, want 1", len(completed))
+	}
+	assertKeys(t, "FindCompletedByUserID", completed[0])
+}
+
+// TestRepository_FindByID_PreMigrationRowLoadsWithAnEmptySourceKey is the
+// migration hazard this change turns on. source_key ships with an empty
+// default and cannot be backfilled, and a row can legitimately already be
+// sitting in queued — POST /upload drives the whole sequence inside one
+// request, so a crash or a client disconnect strands one. Such a row must
+// load, not error: pairing the field with status at reconstitution would
+// turn every one of them into a FindByID failure at deploy time.
+func TestRepository_FindByID_PreMigrationRowLoadsWithAnEmptySourceKey(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	// Inserted directly, without source_key, exactly as a row written before
+	// the column existed reads back today.
+	id := ids.NewVideoJobID()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO video_jobs (id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at)
+		VALUES ($1, $2, $3, $4, 0, '', '', $5)
+	`, id.String(), "user-1", "legacy.mp4", string(domain.JobStatusQueued), time.Now().UTC()); err != nil {
+		t.Fatalf("unexpected error inserting a pre-migration row: %v", err)
+	}
+
+	found, err := repo.FindByID(ctx, id)
+	if err != nil {
+		t.Fatalf("unexpected error loading a pre-migration row: %v", err)
+	}
+	if !found.SourceKey().IsZero() {
+		t.Fatalf("SourceKey = %v, want unset", found.SourceKey())
+	}
+	if found.Status() != domain.JobStatusQueued {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
 	}
 }

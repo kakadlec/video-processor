@@ -15,7 +15,16 @@ import (
 
 var _ domain.VideoJobRepository = (*Repository)(nil)
 
-const videoJobCreatedEventType = "video_job.created"
+// Outbox event types. videoJobQueuedEventType is also the AMQP routing key
+// the relay publishes under — it must stay equal to
+// internal/video/infrastructure/messaging.RoutingKeyJobQueued, which is what
+// keeps the database and the broker naming the same event identically. That
+// package's tests assert the equality; this package does not import it,
+// because infrastructure adapters do not depend on one another.
+const (
+	videoJobCreatedEventType = "video_job.created"
+	videoJobQueuedEventType  = "video_job.queued"
+)
 
 // Repository implements domain.VideoJobRepository against PostgreSQL using
 // parameterized queries.
@@ -36,6 +45,18 @@ type videoJobCreatedPayload struct {
 	UserID           string    `json:"user_id"`
 	OriginalFilename string    `json:"original_filename"`
 	OccurredAt       time.Time `json:"occurred_at"`
+}
+
+// videoJobQueuedPayload is the body of a video_job.queued outbox row, and
+// therefore of the AMQP message the relay publishes from it. SourceKey is
+// the field that makes the message actionable: a consumer needs the pair
+// (job_id, source_key) to fetch the video it is being asked to process.
+type videoJobQueuedPayload struct {
+	Type       string    `json:"type"`
+	JobID      string    `json:"job_id"`
+	UserID     string    `json:"user_id"`
+	SourceKey  string    `json:"source_key"`
+	OccurredAt time.Time `json:"occurred_at"`
 }
 
 // Create persists a new VideoJob and, in the same transaction, an outbox row
@@ -59,8 +80,8 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 	defer func() { _ = tx.Rollback() }()
 
 	const insertJob = `
-		INSERT INTO video_jobs (id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO video_jobs (id, user_id, original_filename, status, frame_count, error_reason, source_key, storage_key, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 	if _, err := tx.ExecContext(ctx, insertJob,
 		job.ID().String(),
@@ -69,6 +90,7 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 		string(job.Status()),
 		job.FrameCount(),
 		job.ErrorReason(),
+		job.SourceKey().String(),
 		job.StorageKey().String(),
 		job.CreatedAt(),
 	); err != nil {
@@ -97,7 +119,7 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 // FindByID looks up a job by ID, returning domain.ErrVideoJobNotFound if none exists.
 func (r *Repository) FindByID(ctx context.Context, id domain.VideoJobID) (*domain.VideoJob, error) {
 	const query = `
-		SELECT id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, storage_key, created_at
 		FROM video_jobs WHERE id = $1
 	`
 	return r.scanJob(r.db.QueryRowContext(ctx, query, id.String()))
@@ -107,7 +129,7 @@ func (r *Repository) FindByID(ctx context.Context, id domain.VideoJobID) (*domai
 // VideoJobID ascending as a tie-breaker, bounded by offset and limit.
 func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, offset, limit int) ([]*domain.VideoJob, error) {
 	const query = `
-		SELECT id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, storage_key, created_at
 		FROM video_jobs
 		WHERE user_id = $1
 		ORDER BY created_at DESC, id ASC
@@ -139,7 +161,7 @@ func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, off
 // recent pending/failed jobs hide a user's completed results entirely.
 func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.UserID) ([]*domain.VideoJob, error) {
 	const query = `
-		SELECT id, user_id, original_filename, status, frame_count, error_reason, storage_key, created_at
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, storage_key, created_at
 		FROM video_jobs
 		WHERE user_id = $1 AND status = $2
 		ORDER BY created_at DESC, id ASC
@@ -164,16 +186,26 @@ func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.Us
 	return jobs, nil
 }
 
+// updateJobStatement is shared by Update and Enqueue, which persist exactly
+// the same columns — the only difference between them is the outbox row
+// Enqueue writes alongside. source_key is absent because it is written once,
+// by Create, and never changes afterwards.
+//
+// Enqueue writing frame_count, error_reason, and storage_key is a stated
+// precondition rather than an accident: it only ever runs on a job the
+// aggregate has just moved from pending to queued, where all three are still
+// their zero values. It must not be called on a job carrying a result.
+const updateJobStatement = `
+	UPDATE video_jobs
+	SET status = $1, frame_count = $2, error_reason = $3, storage_key = $4
+	WHERE id = $5
+`
+
 // Update persists job's current status, frame count, error reason, and
 // storage key to its existing row, identified by its unchanging id. Unlike
-// Create, it writes no video_job_outbox row.
+// Create and Enqueue, it writes no video_job_outbox row.
 func (r *Repository) Update(ctx context.Context, job *domain.VideoJob) error {
-	const query = `
-		UPDATE video_jobs
-		SET status = $1, frame_count = $2, error_reason = $3, storage_key = $4
-		WHERE id = $5
-	`
-	if _, err := r.db.ExecContext(ctx, query,
+	if _, err := r.db.ExecContext(ctx, updateJobStatement,
 		string(job.Status()),
 		job.FrameCount(),
 		job.ErrorReason(),
@@ -181,6 +213,62 @@ func (r *Repository) Update(ctx context.Context, job *domain.VideoJob) error {
 		job.ID().String(),
 	); err != nil {
 		return fmt.Errorf("video: update video job: %w", err)
+	}
+	return nil
+}
+
+// Enqueue persists job's queued state and, in the same transaction, the
+// video_job.queued outbox row the relay publishes from — mirroring what
+// Create does for video_job.created, so the row and the dispatch announcing
+// it commit together or not at all.
+//
+// occurred_at is the moment of the enqueue, not job.CreatedAt(): the outbox
+// is ordered by it, and reusing the creation timestamp would place a job
+// enqueued long after it was created behind rows that were queued first.
+func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
+	occurredAt := time.Now().UTC()
+	payload, err := json.Marshal(videoJobQueuedPayload{
+		Type:       videoJobQueuedEventType,
+		JobID:      job.ID().String(),
+		UserID:     job.UserID().String(),
+		SourceKey:  job.SourceKey().String(),
+		OccurredAt: occurredAt,
+	})
+	if err != nil {
+		return fmt.Errorf("video: marshal outbox payload: %w", err)
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("video: begin enqueue transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, updateJobStatement,
+		string(job.Status()),
+		job.FrameCount(),
+		job.ErrorReason(),
+		job.StorageKey().String(),
+		job.ID().String(),
+	); err != nil {
+		return fmt.Errorf("video: enqueue video job: %w", err)
+	}
+
+	const insertOutbox = `
+		INSERT INTO video_job_outbox (id, event_type, payload, occurred_at)
+		VALUES ($1, $2, $3, $4)
+	`
+	if _, err := tx.ExecContext(ctx, insertOutbox,
+		uuid.NewString(),
+		videoJobQueuedEventType,
+		payload,
+		occurredAt,
+	); err != nil {
+		return fmt.Errorf("video: record outbox event: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("video: commit enqueue transaction: %w", err)
 	}
 	return nil
 }
@@ -205,10 +293,17 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 		statusValue   string
 		frameCount    int
 		errorReason   string
+		sourceKeyVal  string
 		storageKeyVal string
 		createdAt     time.Time
 	)
-	if err := row.Scan(&idValue, &userIDValue, &filenameValue, &statusValue, &frameCount, &errorReason, &storageKeyVal, &createdAt); err != nil {
+	// Scan order follows the SELECT column list above, and source_key sits
+	// before storage_key in both. The two are the same type, so transposing
+	// them compiles and passes RestoreVideoJob's validation for a completed
+	// job — it surfaces only as GET /download/:filename rejecting every
+	// result. Keep the SELECT list, this Scan, and the RestoreVideoJob call
+	// below in one order.
+	if err := row.Scan(&idValue, &userIDValue, &filenameValue, &statusValue, &frameCount, &errorReason, &sourceKeyVal, &storageKeyVal, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
@@ -227,6 +322,18 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 	if err != nil {
 		return nil, fmt.Errorf("video: stored original filename is invalid: %w", err)
 	}
+	// Both keys are optional in the column and rejected as empty by
+	// NewStorageKey, so each is parsed only when present. For source_key
+	// that is not merely symmetry: the column ships with an empty default
+	// and every row predating it carries one, so an unconditional parse
+	// here would make those rows unloadable.
+	var sourceKey domain.StorageKey
+	if sourceKeyVal != "" {
+		sourceKey, err = domain.NewStorageKey(sourceKeyVal)
+		if err != nil {
+			return nil, fmt.Errorf("video: stored source key is invalid: %w", err)
+		}
+	}
 	var storageKey domain.StorageKey
 	if storageKeyVal != "" {
 		storageKey, err = domain.NewStorageKey(storageKeyVal)
@@ -235,5 +342,5 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 		}
 	}
 
-	return domain.RestoreVideoJob(id, userID, filename, storageKey, frameCount, errorReason, domain.JobStatus(statusValue), createdAt)
+	return domain.RestoreVideoJob(id, userID, filename, sourceKey, storageKey, frameCount, errorReason, domain.JobStatus(statusValue), createdAt)
 }
