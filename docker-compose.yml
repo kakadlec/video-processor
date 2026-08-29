@@ -84,8 +84,11 @@ services:
   # volume would be reopened by a node with a different name, starting empty
   # beside the old directory rather than resuming it.
   #
-  # Consequence worth knowing: clearing queued messages needs
-  # `docker compose down -v`, not a plain `down`.
+  # Consequence worth knowing: a plain `docker compose down` no longer
+  # clears queued messages. Do NOT reach for `down -v` to clear them — that
+  # removes every named volume in this project, destroying postgres_data and
+  # minio_data too. Reset this service alone: stop it, `rm -f` it, then
+  # `docker volume rm <project>_rabbitmq_data`. See docs/operations.md.
   rabbitmq:
     image: rabbitmq:4-alpine
     hostname: rabbitmq

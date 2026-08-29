@@ -174,7 +174,16 @@ The declared topology, and the two operational policies in it that are decisions
 - **Job messages never expire.** The job queue deliberately carries no message TTL. An expired message would be dead-lettered without any update to its `video_jobs` row, and the state machine has no transition out of `queued` except to `processing` — so the job would report `queued` to its owner forever. A backlog therefore persists until it is consumed rather than aging out, which is the intended trade.
 - **The generation suffix is on the exchange**, and the queue name follows it. A `direct` exchange delivers each publish to every queue bound with the matching routing key, so a future generation gets a new exchange rather than only a new queue.
 
-Like PostgreSQL's and MinIO's, this broker's contents are authoritative once the relay ships: an acknowledged, `published_at`-stamped message is the only record that a job is waiting. `docker-compose.yml` gives the local service a named `rabbitmq_data` volume and a pinned `hostname` for that reason — RabbitMQ keys its Mnesia directory by hostname, so the volume does nothing without it, and clearing queued messages locally needs `docker compose down -v` rather than a plain `down`.
+Like PostgreSQL's and MinIO's, this broker's contents are authoritative once the relay ships: an acknowledged, `published_at`-stamped message is the only record that a job is waiting. `docker-compose.yml` gives the local service a named `rabbitmq_data` volume and a pinned `hostname` for that reason — RabbitMQ keys its Mnesia directory by hostname, so the volume does nothing without it.
+
+Because the volume persists, a plain `docker compose down` no longer clears queued messages. **Do not reach for `docker compose down -v` to clear them:** that flag removes every named volume in the project, so it destroys the local PostgreSQL database and the MinIO bucket along with the queue. Reset the broker alone instead:
+
+```bash
+docker compose stop rabbitmq
+docker compose rm -f rabbitmq
+docker volume rm hackathon_rabbitmq_data   # <project>_rabbitmq_data; the project defaults to the directory name
+docker compose up -d rabbitmq
+```
 
 - **Local/CI service:** `docker-compose.yml` and CI both start `rabbitmq:4-alpine`. CI uses a service container, unlike MinIO, whose image needs command arguments a service container cannot supply.
 - **Local/CI credentials** (`video`/`video`) are fixed, non-secret defaults. They are a dedicated account rather than the built-in `guest` because RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection here arrives over a Docker network.
