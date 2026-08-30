@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define `internal/platform/rabbitmq`, the shared, context-free AMQP adapter: configuration, connection lifecycle, a health check, and a generic idempotent topology declaration. This is plumbing only — it names no exchange, queue, or routing key, publishes nothing, and consumes nothing. The Video Processing context's own topology lives in `videojob-messaging`; Phase 7's Notification context will define its own the same way. The relay that publishes job messages and the worker that consumes them are separate Phase 6 changes.
+Define `internal/platform/rabbitmq`, the shared, context-free AMQP adapter: configuration, connection lifecycle, a health check, and a generic idempotent topology declaration. This is plumbing only — it names no exchange, queue, or routing key, publishes nothing, and consumes nothing. The Video Processing context's own topology lives in `videojob-messaging`; Phase 7's Notification context will define its own the same way. The relay that publishes job messages is `videojob-outbox-relay`, which owns the only AMQP connection any composition root opens; the worker that consumes them is a separate Phase 6 change.
 
 The package sits under `internal/platform/` rather than inside a bounded context, unlike MinIO's adapter, because more than one context connects to the same broker — the case `ddd-architecture`'s "Monorepo Package Topology" requirement reserves that namespace for.
 
@@ -164,7 +164,9 @@ A publish outside confirm mode returns nothing to the publisher: AMQP's `basic.p
 
 A fake proves nothing about the two behaviors this package exists to get right: that a handshake against a real broker succeeds or fails as reported, and that a redeclaration with the arguments it declares is accepted while a conflicting one is not. Both are broker-enforced, and a test double would assert only that the package calls the functions the test double was written to expect.
 
-The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. No composition root opens an AMQP connection yet, so there is no such coverage to lose here; the change that first makes the broker load-bearing for an entrypoint owns tightening that entrypoint's `TestMain`.
+The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. `cmd/api` now opens an AMQP connection, so its own `TestMain` requires `RABBITMQ_URL` to be **set**, alongside `ffmpeg` and the `VIDEO_MINIO_*` variables — but it does not require a reachable broker, because `cmd/api` does not either: the connection belongs to the outbox relay, which dials it in its own goroutine and retries rather than blocking startup. A `TestMain` demanding a live broker would assert a stronger contract than the code has.
+
+The guarantee that survives from before a composition root opened a connection is the narrow one, stated in the scenario below: the variable is required at startup, a reachable broker is not. `cmd/worker` still does not exist and still opens nothing.
 
 The broker SHALL be reached through a dedicated account rather than the built-in `guest`. RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection in this project's local and CI environments arrives over a Docker network from another address — so a `guest` URI fails with `ACCESS_REFUSED` in both, presenting as every test in the package failing at `Open` and reading like an absent broker.
 
@@ -182,10 +184,8 @@ Tests SHALL exercise the exported `DeclareTopology` itself, passing descriptors 
 - **WHEN** it finishes, whether it passed or failed
 - **THEN** none of the entities it declared remains on the broker
 
-#### Scenario: No composition root opens a connection yet
+#### Scenario: cmd/api requires the variable but not a reachable broker
 
-- **GIVEN** the repository as it stands
-- **WHEN** `cmd/api` and `cmd/worker` are inspected
-- **THEN** neither opens an AMQP connection, `RABBITMQ_URL` is required by nothing at startup, and the application starts and serves every existing endpoint with no broker reachable
-
-This is a current-state requirement with a deliberate expiry: the change that wires the outbox relay into `cmd/api` makes it false and SHALL modify it in the same change rather than leaving a canonical spec asserting something the code has stopped doing.
+- **GIVEN** `RABBITMQ_URL` is set to an address with no broker listening
+- **WHEN** `cmd/api` starts, or its test suite runs
+- **THEN** it starts and serves every route, and the suite runs — the relay retries in the background and no request or test depends on the broker being up

@@ -12,7 +12,7 @@ A Go web service that accepts a video upload, extracts frames at 1 fps via `ffmp
 
 ## Quickstart
 
-The server requires identity, video, and Redis configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`) to start — see [docs/development.md](docs/development.md) for running it directly with `go run ./cmd/api`. The fastest path with no manual wiring is Docker:
+The server requires identity, video, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since the broker is reached by a background relay rather than by any request — see [docs/development.md](docs/development.md) for running it directly with `go run ./cmd/api`. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
@@ -38,7 +38,7 @@ The application is a synchronous monolith at this stage:
 
 - **No async processing** — `POST /upload` blocks until `ffmpeg` finishes. Large videos will hold the HTTP connection open for minutes.
 - **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so each request downloads its source into `temp/`, extracts frames there, and builds the zip there, removing all of it before responding. Nothing durable lives on local disk any more (Phase 5): uploaded source videos go to MinIO too, but only as **transient** objects each request deletes before it finishes — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
-- **No job queue** — concurrent uploads each run their own `ffmpeg` process with no concurrency limit.
+- **Nothing consumes the job queue** — `POST /upload` does enqueue the job and an outbox relay publishes it to RabbitMQ (Phase 6), but no worker dequeues it, so concurrent uploads still each run their own `ffmpeg` process in-request with no concurrency limit.
 - **No notifications** — users must stay on the page or poll `GET /api/status` to find out when processing completes.
 - **In-flight work is lost on restart** — job records live in PostgreSQL and results in MinIO, both of which survive a restart, but a job being processed when the process dies is never resumed and stays stuck in `processing`.
 

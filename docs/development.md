@@ -7,7 +7,7 @@
 | Go | 1.27+ | Build and test the application |
 | ffmpeg | any recent | Frame extraction; must be on `PATH` |
 | MinIO | any recent | Result storage; `cmd/api` requires `VIDEO_MINIO_*` at startup, and its tests require it too |
-| RabbitMQ | any recent | Not needed to build or run the app — `cmd/api` never opens a connection. `internal/platform/rabbitmq`'s own tests use it via `RABBITMQ_TEST_URL` and skip cleanly when it is unset |
+| RabbitMQ | any recent | `RABBITMQ_URL` must be **set** to run the app or the suite, but the broker does not have to be reachable — the outbox relay owns the connection and retries in its own goroutine. Needed for real coverage of `internal/platform/rabbitmq` and `internal/video/infrastructure/messaging`, whose tests use `RABBITMQ_TEST_URL` and skip cleanly when it is unset |
 | Docker | any recent | Alternative if Go/ffmpeg/MinIO/RabbitMQ are not installed locally — `docker compose` provides all of them |
 | git | any | Source control |
 
@@ -26,17 +26,17 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity, Video Processing, Redis, and MinIO configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are set (see [docs/operations.md](operations.md) for every variable, required and optional). Start PostgreSQL, Redis, and MinIO (`docker compose up -d postgres redis minio`) and export them before `go run ./cmd/api`:
+Identity, Video Processing, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`:
 
 ```bash
 # Download dependencies
 go mod download
 
-# Start PostgreSQL, Redis, and MinIO for the identity, video, idempotency-key,
-# and storage modules
-docker compose up -d postgres redis minio
+# Start PostgreSQL, Redis, MinIO, and RabbitMQ for the identity, video,
+# idempotency-key, storage, and outbox-relay modules
+docker compose up -d postgres redis minio rabbitmq
 
-# Set required identity, video, Redis, and MinIO configuration
+# Set required identity, video, Redis, MinIO, and broker configuration
 export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
 export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
@@ -45,6 +45,7 @@ export VIDEO_MINIO_ENDPOINT="localhost:9000"
 export VIDEO_MINIO_ACCESS_KEY="minioadmin"
 export VIDEO_MINIO_SECRET_KEY="minioadmin"
 export VIDEO_MINIO_BUCKET="video-results"
+export RABBITMQ_URL="amqp://video:video@localhost:5672/"
 # VIDEO_MINIO_USE_SSL, VIDEO_MINIO_PUBLIC_ENDPOINT, and
 # VIDEO_MINIO_PUBLIC_USE_SSL are optional and correct unset for this setup:
 # the browser reaches MinIO at the same localhost:9000 the server does, so the
@@ -66,9 +67,9 @@ To skip the manual wiring entirely, use `docker compose up --build`, which runs 
 
 ## Running Tests
 
-Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, and the `VIDEO_MINIO_*` variables must point at a reachable MinIO.
+Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, the `VIDEO_MINIO_*` variables must point at a reachable MinIO, and `RABBITMQ_URL` must be **set** — `cmd/api`'s `TestMain` requires the variable because `setupVideo` does, but deliberately does not require a live broker, because `cmd/api` does not either.
 
-RabbitMQ is a prerequisite for **full coverage**, not for a passing run: `internal/platform/rabbitmq`'s tests skip with a clear message when `RABBITMQ_TEST_URL` is unset, the same way the Redis and MinIO adapter suites do. A local run without a broker passes while exercising none of that package, so exercise it through the Docker command below (or CI, which always provides one) before trusting a green result for a change that touches it.
+A *reachable* broker is a prerequisite for **full coverage**, not for a passing run: `internal/platform/rabbitmq`'s and `internal/video/infrastructure/messaging`'s tests skip with a clear message when `RABBITMQ_TEST_URL` is unset, the same way the Redis and MinIO adapter suites do. A local run without a broker passes while exercising none of those two packages — which between them cover the publisher, the relay, and its reconnect and shutdown paths — so exercise them through the Docker command below (or CI, which always provides one) before trusting a green result for a change that touches them.
 
 ```bash
 go test ./... -v

@@ -2,12 +2,14 @@
 
 ## Purpose
 
-Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in the Video Processing bounded context's `infrastructure` layer, and the transactional-outbox behavior on job creation. This is infrastructure only — no HTTP route or composition-root wiring is in scope here; see `videojob-lifecycle` for the domain/application use cases this repository implements the port for, and the Change Backlog in `docs/roadmap.md` for what wires it in.
+Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in the Video Processing bounded context's `infrastructure` layer, and the transactional-outbox behavior on job creation and on the `pending → queued` transition. This is infrastructure only — no HTTP route or composition-root wiring is in scope here; see `videojob-lifecycle` for the domain/application use cases this repository implements the port for, and the Change Backlog in `docs/roadmap.md` for what wires it in.
 
 ## Requirements
 ### Requirement: PostgreSQL Repository Implements VideoJobRepository
 
 `internal/video/infrastructure/postgres.Repository` SHALL implement `domain.VideoJobRepository`'s `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID(ctx, userID)` against a `video_jobs` table, using parameterized queries and reconstructing `*domain.VideoJob` via `domain.RestoreVideoJob` from stored rows.
+
+The `video_jobs` table SHALL carry a `source_key` column holding the job's **source** object key, distinct from `storage_key`, which holds the result key set at completion. It SHALL be added as `TEXT NOT NULL DEFAULT ''` — an additive migration with no backfill, because the key embeds a generated `uploadID` that exists in no other column and cannot be reconstructed for a pre-existing row. `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID` SHALL all round-trip it.
 
 `FindCompletedByUserID` SHALL restrict to `completed` jobs **in the query** and SHALL return all of them, taking no offset or limit. It orders identically to `FindByUserID`: `CreatedAt` descending with `VideoJobID` ascending as a tie-breaker.
 
@@ -19,7 +21,13 @@ The absence of pagination is deliberate and is the reason this method exists sep
 
 - **GIVEN** a `VideoJob` persisted via `Repository.Create`
 - **WHEN** `Repository.FindByID` is called with that job's ID
-- **THEN** it returns a `*domain.VideoJob` with the same `ID`, `UserID`, `OriginalFilename`, `StorageKey`, `FrameCount`, `ErrorReason`, `Status`, and `CreatedAt`
+- **THEN** it returns a `*domain.VideoJob` with the same `ID`, `UserID`, `OriginalFilename`, source key, `StorageKey`, `FrameCount`, `ErrorReason`, `Status`, and `CreatedAt`
+
+#### Scenario: A pre-migration row loads with an empty source key
+
+- **GIVEN** a `video_jobs` row written before the `source_key` column existed, in any status
+- **WHEN** `Repository.FindByID` is called for it
+- **THEN** it returns the job with an empty source key rather than an error
 
 #### Scenario: FindByID reports not-found for an unknown ID
 
@@ -85,9 +93,41 @@ The absence of pagination is deliberate and is the reason this method exists sep
 - **WHEN** the call returns an error
 - **THEN** no corresponding `video_jobs` row was committed either — the transaction rolls back both writes, not just the one that failed
 
+### Requirement: Enqueue Persists the Queued Transition and Its Event Transactionally
+
+`domain.VideoJobRepository` SHALL expose an `Enqueue` method, and `internal/video/infrastructure/postgres.Repository` SHALL implement it by updating the job's `video_jobs` row to `queued` and inserting a `video_job_outbox` row describing that transition, in a single database transaction — so that a queued job and the event announcing it are never observably inconsistent, exactly as `Create` already guarantees for job creation.
+
+The outbox row's `event_type` SHALL be `video_job.queued`, following the `video_job.created` constant already in this package, and that string SHALL be a single shared constant rather than a literal repeated at the insert and at the relay's claim. A drifted literal produces a relay that matches nothing and reports no error.
+
+The payload SHALL carry `type` (`"video_job.queued"`), `job_id`, `user_id`, `source_key`, and `occurred_at`, matching the `VideoJobQueued` event `docs/domain-model.md` already defines and mirroring the shape `video_job.created` already persists. The discriminator and the timestamp are not optional extras: the relay forwards the stored payload verbatim, so whatever is written here *is* the wire contract a consumer parses, and an event without a `type` cannot be dispatched on by a subscriber that will eventually see more than one kind.
+
+This is a dedicated method rather than a status-dependent behavior added to `Update`. `Update` is also `CompleteJob`'s and `FailJob`'s path, so making it outbox-aware would turn event emission into a side effect of a general-purpose method and would decide, as a by-product, the shape Phase 7 inherits for `VideoJobCompleted`/`VideoJobFailed`.
+
+`internal/video/infrastructure/cache.CachedVideoJobRepository` SHALL implement `Enqueue` write-through, like `Update`: PostgreSQL first, then an unconditional cache write. It SHALL NOT pass the call through uncached — a job left `pending` in the cache while `queued` in PostgreSQL would make `GET /api/video-jobs/:id` contradict the row the relay is about to publish.
+
+#### Scenario: Enqueue records a matching outbox row
+
+- **GIVEN** a persisted `VideoJob` in `pending` status with a non-empty source key
+- **WHEN** `Repository.Enqueue` is called with it after its `Enqueue` transition has been applied
+- **THEN** its row's status is `queued`, and a `video_job_outbox` row exists whose `event_type` is `video_job.queued`, whose payload carries `type: "video_job.queued"` plus that job's `job_id`, `user_id`, `source_key`, and `occurred_at`, and whose `published_at` is `NULL`
+
+#### Scenario: A failed outbox insert leaves the job unqueued
+
+- **GIVEN** `Repository.Enqueue` is called and the `video_jobs` update succeeds but the `video_job_outbox` insert fails
+- **WHEN** the call returns an error
+- **THEN** the job's persisted status is still `pending` — the transaction rolls back both writes, so no job is left `queued` with nothing to dispatch it
+
+#### Scenario: The cached decorator writes through
+
+- **GIVEN** a cached `VideoJob` in `pending` status
+- **WHEN** `CachedVideoJobRepository.Enqueue` succeeds
+- **THEN** a subsequent `FindByID` served from cache returns `queued`, not `pending`
+
 ### Requirement: Update Persists a VideoJob's Transitioned State
 
-`Repository.Update` SHALL persist an already-loaded `VideoJob`'s current `status`, `frame_count`, `error_reason`, and `storage_key` to its existing `video_jobs` row, identified by its unchanging `id`. Unlike `Create`, `Update` SHALL NOT write a `video_job_outbox` row — the outbox requirement above is scoped to job creation only.
+`Repository.Update` SHALL persist an already-loaded `VideoJob`'s current `status`, `frame_count`, `error_reason`, and `storage_key` to its existing `video_jobs` row, identified by its unchanging `id`. It SHALL NOT write a `video_job_outbox` row.
+
+That exclusion is now load-bearing rather than incidental. Two repository methods write outbox rows — `Create` for `video_job.created` and `Enqueue` for `video_job.queued` — and `Update` is deliberately not a third. It is the path `StartProcessing`, `CompleteJob`, and `FailJob` all take, so emitting an event from it would make event production a status-dependent side effect of a general-purpose write, and would settle the shape of `VideoJobCompleted`/`VideoJobFailed` as a by-product rather than as Phase 7's own decision. `Update` SHALL NOT be given an outbox write to avoid adding a dedicated method.
 
 #### Scenario: Update persists a transitioned job
 

@@ -92,6 +92,22 @@ The consequence is worth stating rather than discovering: while nothing consumes
 - **WHEN** the broker refuses a message
 - **THEN** that implementation cannot distinguish acceptance from refusal, and marking `published_at` on the basis of a nil return would lose the dispatch — so confirm mode is required, not optional
 
+### Requirement: Pre-Existing Unpublished Rows Are Bounded by the Cutover, Not by This Change
+
+The change that switches the job-dispatch topology to a new generation SHALL define an explicit cutoff for pre-existing unpublished `video_job.queued` rows before it begins publishing into that generation, and SHALL modify this requirement in the same change. `video_job_outbox.occurred_at` is what makes such a cutoff expressible.
+
+Nothing consumes the job queue yet. Every message this relay publishes names a job that the same `POST /upload` request has already driven to `completed` or `failed`, with its source object deleted, so a **published** message is inert by construction: the cutover consumes a different generation of the topology, and nothing can ever read the messages sitting in this one.
+
+**Unpublished** rows are a different matter, and a separate queue generation does not isolate them. A row that was never successfully published — nacked against a full queue, or written while the broker was unreachable — is still claimable, so a relay later repointed at the cutover's generation would deliver it there: a live dispatch for a job that finished long ago and whose source object no longer exists.
+
+This is a current-state requirement with a deliberate expiry, recorded in a canonical spec rather than in a proposal that archives: the obligation cannot be discharged by the change that created it, because that change is not the one that switches generations.
+
+#### Scenario: A stale unpublished row is not delivered as a live dispatch
+
+- **GIVEN** an unpublished `video_job.queued` row written before the cutover, naming a job already `completed` with its source object deleted
+- **WHEN** a relay begins publishing into the cutover's generation of the topology
+- **THEN** that row is excluded by an explicit cutoff rather than dispatched to a worker that would fail to fetch its source
+
 ### Requirement: Published Messages Are Persistent and Carry No Expiry
 
 The relay SHALL publish with delivery mode 2 and SHALL leave the per-message `expiration` property unset, satisfying `videojob-messaging`'s publisher obligation.

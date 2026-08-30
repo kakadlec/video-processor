@@ -43,6 +43,12 @@ Nothing consumes the queue. Every message this relay publishes names a job that 
 - `videojob-messaging`: the persistent-publish requirement stops saying no publisher exists and points at the relay that now satisfies it.
 - `rabbitmq-infrastructure`: two passages. The "No composition root opens a connection yet" scenario — which that spec already declared this change must modify — and the testing requirement's claim that no entrypoint's `TestMain` needs a broker.
 
+Three further capabilities were identified during finalization, not at proposal time, and their deltas were written then. They are recorded here so this list matches what the change actually modified:
+
+- `upload-idempotency`: the handler finalizes its reservation after `EnqueueVideoJob`, not immediately after `CreateVideoJob`, and clears it on an enqueue failure as well as a creation failure.
+- `videojob-status-cache`: the write-through requirement said all four transitions converge on `Update`; `EnqueueVideoJob` now goes through `Enqueue`, and the cached record has to carry the source key.
+- `ddd-architecture`: the foundational "Job advances from pending to queued" scenario is now false for a sourceless job.
+
 ## Impact
 
 - **Schema migration**, additive only: `ALTER TABLE video_jobs ADD COLUMN source_key TEXT NOT NULL DEFAULT ''` and a partial index on `video_job_outbox`. No backfill, and no existing row becomes unloadable — that is what keeps the `Enqueue`-only invariant above from being a nicety.
