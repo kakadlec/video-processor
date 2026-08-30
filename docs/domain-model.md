@@ -61,7 +61,8 @@
 | `VideoJobID` | UUID v4 | Immutable after creation; globally unique |
 | `UserID` | UUID v4 (foreign, from Identity) | Non-nil; not validated beyond format |
 | `OriginalFilename` | string | Non-empty; extension must be in the allowed set |
-| `StorageKey` | string | Non-empty; opaque path within the configured storage backend |
+| `StorageKey` | string | Non-empty; opaque path within the configured storage backend. Held by the aggregate in **two distinct roles** — see `SourceKey` below — which must never be conflated |
+| `SourceKey` | `StorageKey` | The uploaded video's object key (`uploads/<uploadID>_<filename>`). Set at creation and never after; MAY be zero, because `POST /api/video-jobs` creates a job from a filename with no stored object. A job whose `SourceKey` is zero cannot be enqueued — the invariant lives on the `Enqueue` transition, deliberately not on reconstitution, so rows predating the column still load |
 | `FrameCount` | int | ≥ 0; set only on transition to `completed` |
 | `ErrorReason` | string | Non-empty only in `failed` state |
 | `JobStatus` | enum | Transitions only via defined commands (see state machine below) |
@@ -76,7 +77,7 @@ pending → queued → processing → completed
 | State | Meaning | Entered by |
 |---|---|---|
 | `pending` | Job created, upload stored; not yet on the queue | `CreateVideoJob` use case |
-| `queued` | Job published to the async queue; worker has not picked it up | `EnqueueVideoJob` use case |
+| `queued` | Dispatch recorded in the outbox and committed with the transition; the broker message follows, published out of band by the relay | `EnqueueVideoJob` use case |
 | `processing` | Worker has dequeued the job and started extracting frames | Worker `StartProcessing` command |
 | `completed` | Frames extracted and ZIP stored; `FrameCount` and `StorageKey` populated | Worker `CompleteJob` command |
 | `failed` | Processing failed; `ErrorReason` populated | Worker `FailJob` command |
@@ -86,6 +87,7 @@ pending → queued → processing → completed
 - `FrameCount` MUST be zero until the job reaches `completed`.
 - `ErrorReason` MUST be empty unless the job is `failed`.
 - `StorageKey` for the result MUST be set atomically with the `completed` transition.
+- `SourceKey` MUST be non-zero to enter `queued`, and is fixed at creation — it is never rewritten by a transition.
 
 ### Use Cases
 
@@ -93,8 +95,8 @@ pending → queued → processing → completed
 
 | Use case | Actor | Pre-condition | Post-condition |
 |---|---|---|---|
-| `CreateVideoJob` | Authenticated user (via API) | Valid video file uploaded; `UserID` verified | `VideoJob` persisted in `pending`; upload stored at `StorageKey` |
-| `EnqueueVideoJob` | API (post-upload) | Job in `pending` | Job transitions to `queued`; message published to async queue |
+| `CreateVideoJob` | Authenticated user (via API) | Valid video file uploaded; `UserID` verified | `VideoJob` persisted in `pending`, carrying the `SourceKey` the upload was stored under (empty when the caller supplied no object) |
+| `EnqueueVideoJob` | API (post-upload) | Job in `pending` with a non-zero `SourceKey` | Job transitions to `queued` and a `VideoJobQueued` outbox row is committed in the **same transaction** — the dispatch is *recorded for relay*, not published. The broker message is the relay's separate step and may not arrive at all while the broker is down |
 | `GetJobStatus` | Authenticated user (via API) | Job exists; caller's `UserID` matches job's `UserID` | Returns current `JobStatus`, `FrameCount`, and result URL if `completed` |
 | `ListUserJobs` | Authenticated user (via API) | — | Returns paginated list of the caller's jobs with their statuses |
 | `StartProcessing` | Worker (internal) | Job in `queued` | Job transitions to `processing` |
@@ -126,14 +128,14 @@ All events are serialized as JSON. The `type` field is the canonical discriminat
 | Event | JSON fields | Crosses context boundary? | Status |
 |---|---|---|---|
 | `VideoJobCreated` | `type`, `job_id`, `user_id`, `original_filename`, `occurred_at` | No (internal) | **Recorded** (Phase 3): `internal/video/infrastructure/postgres.Repository.Create` writes this exact payload to the `video_job_outbox` table transactionally with the `video_jobs` row — not yet published anywhere, since nothing consumes it (marked "No" cross-context above) |
-| `VideoJobQueued` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
+| `VideoJobQueued` | `type`, `job_id`, `user_id`, `source_key`, `occurred_at` | No (internal) | **Recorded and published** (Phase 6): `postgres.Repository.Enqueue` writes this payload to `video_job_outbox` transactionally with the `pending → queued` update, and `messaging.Relay` publishes it verbatim to `video.jobs.v1`. `source_key` is what a consumer needs to fetch the video; nothing consumes it yet |
 | `VideoJobStarted` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
 | `VideoJobCompleted` | `type`, `job_id`, `user_id`, `frame_count`, `storage_key`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
 | `VideoJobFailed` | `type`, `job_id`, `user_id`, `error_reason`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
 | `UserRegistered` | `type`, `user_id`, `email`, `occurred_at` | Yes (optionally) — Identity → Notification | Planned — deferred until Notification (Phase 7) needs it; Identity itself (Phase 2) is implemented |
 | `UserAuthenticated` | `type`, `user_id`, `occurred_at` | No (internal) | Planned; not emitted by the current `AuthenticateUser` use case |
 
-Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay. `video_job_outbox` (Phase 3) is that relay's future source table, but today it only records `VideoJobCreated` — an internal event, not one of the two that actually cross to Notification (`VideoJobCompleted`, `VideoJobFailed`). Those two remain fully "Planned": no code writes them anywhere yet, since the use cases that would (`CompleteJob`, `FailJob`) don't exist yet either. See `openspec/specs/videojob-persistence/spec.md` for what `video_job_outbox` currently does. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
+Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay. That relay now exists (`openspec/specs/videojob-outbox-relay/spec.md`) and its source table is `video_job_outbox` (Phase 3), but it dispatches **only** `VideoJobQueued`. `VideoJobCreated` rows are written and deliberately never published — an internal event, and the relay's claim filters on `event_type` precisely so that permanent backlog cannot starve the rows that are meant to go out. Neither of the two events that actually cross to Notification (`VideoJobCompleted`, `VideoJobFailed`) is written anywhere yet: `CompleteJob` and `FailJob` persist through `Repository.Update`, which is deliberately not an outbox writer, so Phase 7 decides their shape on its own terms. See `openspec/specs/videojob-persistence/spec.md` for what `video_job_outbox` currently records. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
 
 ---
 

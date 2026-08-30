@@ -44,7 +44,7 @@ The Dockerfile is a multi-stage build. The default (final) stage — used by the
 | `VIDEO_MINIO_BUCKET` | unset | Bucket holding processed ZIP results, keyed `frames_<jobID>.zip`. Required at startup; created automatically if absent. |
 | `VIDEO_MINIO_USE_SSL` | `false` | Whether to connect over TLS. Optional, but a value that is *set* and not parseable as a boolean is a configuration error, never a silent `false` — a typo must not quietly downgrade an intended TLS connection to plaintext. |
 | `VIDEO_MINIO_PUBLIC_ENDPOINT` | `VIDEO_MINIO_ENDPOINT` | Address (`host:port`) clients reach MinIO at, used **only** to construct presigned download URLs. Optional as of Phase 5's `add-presigned-download-urls`; defaults to the internal endpoint, so a deployment where one address serves both the server and its clients needs nothing here. The server never dials this address. |
-| `RABBITMQ_URL` | unset | Full AMQP URI for the shared broker (e.g. `amqp://video:video@rabbitmq:5672/`) — a URI, not a `host:port` pair like `REDIS_ADDR`, because it carries the TLS scheme, the credentials, and the virtual host. **Not required at startup** as of Phase 6's `add-rabbitmq-infrastructure`: no composition root opens a connection, so the server starts and serves every endpoint with no broker reachable. It becomes required when `add-videojob-source-key-and-outbox-relay` wires the outbox relay into `cmd/api`. |
+| `RABBITMQ_URL` | unset | Full AMQP URI for the shared broker (e.g. `amqp://video:video@rabbitmq:5672/`) — a URI, not a `host:port` pair like `REDIS_ADDR`, because it carries the TLS scheme, the credentials, and the virtual host. **Required at startup** as of Phase 6's `add-videojob-source-key-and-outbox-relay`: an unset value stops `cmd/api` with a clear error. A *reachable* broker is not required — the outbox relay owns the connection, dials it in its own goroutine, and retries with backoff, so the server starts and serves every route with the broker down. |
 | `VIDEO_MINIO_PUBLIC_USE_SSL` | `VIDEO_MINIO_USE_SSL` | Scheme for the URLs issued against `VIDEO_MINIO_PUBLIC_ENDPOINT`. Optional; defaults to the *resolved* `VIDEO_MINIO_USE_SSL`, not to `false` — declaring TLS once must not silently produce `http://` links. Set it explicitly when TLS terminates in front of the public address but the server talks plaintext internally. A set-but-unparseable value is a configuration error, same as above. |
 
 The first four `VIDEO_MINIO_*` variables are **required**; `VIDEO_MINIO_USE_SSL`, `VIDEO_MINIO_PUBLIC_ENDPOINT`, and `VIDEO_MINIO_PUBLIC_USE_SSL` are optional. `setupVideo` loads the configuration, opens the client, pings it, ensures the bucket exists, and discovers the bucket's region for the presign-only client, and **any of those steps failing stops startup**. This is deliberately fail-closed, unlike the Redis-backed features above, which degrade to a slower but correct system when Redis is down: a result that cannot be stored cannot be delivered, so there is nothing to degrade to.
@@ -150,13 +150,13 @@ Unlike Redis's, MinIO's contents are authoritative once results move there: `doc
 
 ---
 
-### RabbitMQ — Connection adapter and topology implemented, nothing wired (Phase 6)
+### RabbitMQ — Topology declared and published to by the outbox relay; nothing consumes (Phase 6)
 
 `internal/platform/rabbitmq` opens, health-checks, and closes an AMQP connection and declares a topology; `internal/video/infrastructure/messaging` defines the one this context uses. Both shipped with `add-rabbitmq-infrastructure`.
 
-**Nothing in the deployed application uses either yet.** No composition root opens a connection, nothing publishes, nothing consumes, and `RABBITMQ_URL` is **not required at startup** — the server starts and serves every endpoint with no broker reachable. That changes when `add-videojob-source-key-and-outbox-relay` wires the relay into `cmd/api`; until then a broker is needed only to run `internal/platform/rabbitmq`'s own tests, through `RABBITMQ_TEST_URL`.
+**`cmd/api` now opens a connection**, as of `add-videojob-source-key-and-outbox-relay`: the outbox relay runs as a goroutine inside it, publishing `video_job.queued` events. **Nothing consumes the queue** — the worker is a separate Phase 6 change, so messages accumulate there by design. See "The outbox relay" below for what that means operationally.
 
-- **`RABBITMQ_URL`** holds a full AMQP URI (`amqp://user:pass@host:5672/vhost`), not a `host:port` pair like `REDIS_ADDR`: the URI carries the scheme that selects TLS, the credentials, and the virtual host. It is read by `LoadConfigFromEnv` and by nothing else today.
+- **`RABBITMQ_URL`** holds a full AMQP URI (`amqp://user:pass@host:5672/vhost`), not a `host:port` pair like `REDIS_ADDR`: the URI carries the scheme that selects TLS, the credentials, and the virtual host. `setupVideo` loads it through `LoadConfigFromEnv` as its **first** step, before any I/O, so a missing variable fails fast and clearly instead of after PostgreSQL and MinIO have already been opened.
 - **`Open` connects**, unlike the Redis and MinIO adapters, which construct a client without touching the network. AMQP has no lazy client, so an unreachable broker or wrong credentials surface immediately rather than on first use.
 - **The health check is a real round trip** — it opens a channel and closes it. The client's own `IsClosed()` predicate reports only what the process has already observed, which is stale for a broker that stopped answering without the connection being torn down.
 
@@ -190,6 +190,30 @@ The volume is named `<project>_rabbitmq_data`, and Compose derives `<project>` f
 
 - **Local/CI service:** `docker-compose.yml` and CI both start `rabbitmq:4-alpine`. CI uses a service container, unlike MinIO, whose image needs command arguments a service container cannot supply.
 - **Local/CI credentials** (`video`/`video`) are fixed, non-secret defaults. They are a dedicated account rather than the built-in `guest` because RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection here arrives over a Docker network.
+
+#### The outbox relay
+
+`cmd/api` starts one relay goroutine (`internal/video/infrastructure/messaging.Relay`) and stops it on `SIGINT`/`SIGTERM`. It exists because `POST /upload` must not depend on the broker: `Repository.Enqueue` commits the `pending → queued` update and a `video_job.queued` outbox row in one transaction, and the relay carries that row to RabbitMQ afterwards.
+
+Each cycle it opens a transaction, claims a bounded batch of unpublished rows with `SELECT … FOR UPDATE SKIP LOCKED` (so several `cmd/api` replicas can each run one without dispatching the same row twice), publishes them **mandatory** on a confirm-mode channel, stamps `published_at` only for the messages the broker both acknowledged and did not return, and commits. The poll interval (2 s), the batch size (100 rows), the confirmation timeout (15 s), and the dial backoff are compile-time constants — there is no environment variable to tune them, matching the status cache's fixed TTL.
+
+Operationally, three things are worth knowing before they surprise you:
+
+- **A full job queue stalls the relay, by design.** `reject-publish` nacks the publish instead of evicting a queued job, so the row stays unstamped and the next poll retries it. Nothing is lost and uploads are unaffected — they still complete in-request. Since nothing consumes `video.jobs.queued.v1` yet, this is the expected end state once the queue reaches its 10 000-message limit.
+- **Unpublished outbox rows are the symptom to look at**, not a missing-message count on the broker:
+
+  ```sql
+  SELECT event_type, count(*), min(occurred_at)
+    FROM video_job_outbox
+   WHERE published_at IS NULL
+   GROUP BY event_type;
+  ```
+
+  A growing `video_job.queued` count with an ageing `min(occurred_at)` means the relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. A large, static `video_job.created` count is **normal and permanent**: those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`).
+- **Delivery is at-least-once.** The relay commits only after the broker acknowledges, so a crash in between republishes rather than loses. A consumer must tolerate a duplicate regardless, since a nack or a consumer crash produces one too.
+
+Its lifecycle transitions are logged — started, connection lost, reconnected, stopped — because a healthy relay is otherwise invisible. Repeated dial failures back off from 1 s to a 30 s ceiling, and the topology is redeclared after every successful dial, so a broker that was recreated while the relay was disconnected gets its exchange and queues back before the next publish.
+
 
 A fourth Redis-backed responsibility — a **distributed lease** preventing a redelivered message from being processed alongside the job a live worker still holds — is planned for later in Phase 6, once `cmd/worker` exists to contend over job pickup.
 

@@ -4,7 +4,7 @@
 
 Define `internal/video/infrastructure/messaging`, the Video Processing context's job-dispatch topology on the shared AMQP broker: the pinned exchange, routing key, queue, and dead-letter sink; the generation scheme a later cutover extends; and the obligation on any publisher to publish persistently.
 
-The names live in the context rather than in `internal/platform/rabbitmq` because `ddd-architecture` confines that package to connection/lifecycle plumbing, never a specific context's use case. The generic descriptor and the function that declares it are defined by `rabbitmq-infrastructure`; only the values are here. Nothing publishes to or consumes from this topology yet — that is `add-videojob-source-key-and-outbox-relay`'s and `migrate-upload-to-async-processing`'s.
+The names live in the context rather than in `internal/platform/rabbitmq` because `ddd-architecture` confines that package to connection/lifecycle plumbing, never a specific context's use case. The generic descriptor and the function that declares it are defined by `rabbitmq-infrastructure`; only the values are here. The outbox relay (`videojob-outbox-relay`) publishes to this topology and declares it on every connection; nothing consumes it yet — that is `migrate-upload-to-async-processing`'s.
 
 ## Requirements
 
@@ -59,7 +59,7 @@ The two obligations are separate and both are load-bearing. RabbitMQ honours a m
 
 A queue declared durable survives a broker restart; the messages in it do not unless each was published persistently, and a transient message in a durable queue is discarded on restart with no error to anyone. Durable queue, persistent message, and persisted broker storage are three conditions, and the guarantee needs all three — which matters here because the relay that publishes these messages stamps its outbox row as published once the broker acknowledges, after which the message is the only remaining record that the job is waiting.
 
-No publisher exists yet, so the scenarios below are not currently verified by any test; they describe broker behavior reachable only once something publishes. The change that introduces the outbox relay owns demonstrating them end to end — publish, confirm, restart the broker, observe the message still queued — and this requirement is what obliges it to. The obligation is recorded against the topology rather than against the publisher deliberately: a relay written without it would look correct against every test that can be written before it exists.
+The outbox relay is the publisher that satisfies this requirement, and it is the only one. Its own capability (`videojob-outbox-relay`) is where the first two conditions are verified against a real broker, including a restart.
 
 #### Scenario: A transient message does not survive a broker restart
 

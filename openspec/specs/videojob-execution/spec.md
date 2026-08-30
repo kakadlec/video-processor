@@ -2,15 +2,17 @@
 
 ## Purpose
 
-Define the `ProcessVideoJob` application-layer orchestration use case and the `FrameExtractor` domain port/`ffmpeg`-backed adapter that actually runs frame extraction for a `VideoJob`, synchronously and in-process. This is the piece that drives `internal/video/application`'s `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` use cases (defined in `videojob-lifecycle`) end to end for a real video file, wired into `cmd/api`'s `POST /upload` handler. No queue or worker is in scope here — that's Phase 6.
+Define the `ProcessVideoJob` application-layer orchestration use case and the `FrameExtractor` domain port/`ffmpeg`-backed adapter that actually runs frame extraction for a `VideoJob`, synchronously and in-process. This is the piece that drives `internal/video/application`'s `StartProcessing`/`CompleteJob`/`FailJob` use cases (defined in `videojob-lifecycle`) end to end for a real video file, wired into `cmd/api`'s `POST /upload` handler. `EnqueueVideoJob` is deliberately not among them: the handler performs that transition itself, before calling this use case, so that it commits with the outbox row describing it. No queue or worker is in scope here — the dispatch this produces is `videojob-outbox-relay`'s, and the worker that eventually consumes it is a later Phase 6 change.
 
 ## Requirements
 
-### Requirement: ProcessVideoJob Runs a VideoJob's Enqueue/Start/Extract Sequence Synchronously
+### Requirement: ProcessVideoJob Runs a VideoJob's Start/Extract Sequence Synchronously
 
-The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID and a **source storage key**, call `EnqueueVideoJob`, then `StartProcessing`, then download the source object to a transient local path through the `SourceStorage` port, then `FrameExtractor.ExtractFrames` against that local path, then store the extracted zip through `ResultStorage`, synchronously, in-process, with no queue or worker involved. On a download failure, an extraction failure, or a storage failure it SHALL call `FailJob` and leave the job `failed`. On success it SHALL NOT call `CompleteJob` itself — the job SHALL remain `processing`, and the caller completes it.
+The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID and a **source storage key**, call `StartProcessing`, then download the source object to a transient local path through the `SourceStorage` port, then `FrameExtractor.ExtractFrames` against that local path, then store the extracted zip through `ResultStorage`, synchronously, in-process, with no queue or worker involved. On a download failure, an extraction failure, or a storage failure it SHALL call `FailJob` and leave the job `failed`. On success it SHALL NOT call `CompleteJob` itself — the job SHALL remain `processing`, and the caller completes it.
 
-The second parameter is a storage key rather than a local file path, and that is the point of the signature: a path written by the calling HTTP handler is only meaningful to a process that shares that handler's filesystem. Phase 6 runs this sequence in `cmd/worker`, which does not. An implementer SHALL NOT reintroduce a local-path parameter, and SHALL NOT move the download into the `ffmpeg` adapter — the adapter takes a local path and knows nothing about object storage, which is the same attribution `videojob-result-storage` established for the result zip.
+It SHALL NOT call `EnqueueVideoJob`. That transition now belongs to the caller, and calling it here would be a rejected `queued → queued` transition: `POST /upload` enqueues the job itself, immediately after creating it, so that the `pending → queued` update commits in the same transaction as the event describing it. `docs/domain-model.md`'s use-case table has always assigned `EnqueueVideoJob` the actor "API (post-upload)"; this aligns the code with it. An implementer SHALL NOT restore the call to keep the use case's sequence "complete".
+
+The second parameter is a storage key rather than a local file path, and that is the point of the signature: a path written by the calling HTTP handler is only meaningful to a process that shares that handler's filesystem. A later change runs this sequence in `cmd/worker`, which does not. An implementer SHALL NOT reintroduce a local-path parameter, and SHALL NOT move the download into the `ffmpeg` adapter — the adapter takes a local path and knows nothing about object storage, which is the same attribution `videojob-result-storage` established for the result zip.
 
 `ProcessVideoJob` SHALL own the downloaded copy's lifetime and remove it before returning on every path, registering that removal before the extraction attempt so an early return cannot skip it. It SHALL NOT delete the source **object**; that is the caller's, since the caller stored it and reaches exit paths this use case never runs on (see `videojob-source-storage`).
 
@@ -18,13 +20,19 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 
 #### Scenario: Successful extraction and storage leaves the job processing, with the result available to the caller
 
-- **GIVEN** a `VideoJob` in `pending` status and a stored source object `ffmpeg` can decode
+- **GIVEN** a `VideoJob` in `queued` status and a stored source object `ffmpeg` can decode
 - **WHEN** `ProcessVideoJob.Execute` is called with that job's ID and the source key
 - **THEN** it returns a non-zero `StorageKey` and a `FrameCount` matching the number of extracted frames, the zip is present in the bucket under that key, the job's persisted status is still `processing`, and the transient local copy no longer exists
 
+#### Scenario: A job that has not been enqueued cannot be processed
+
+- **GIVEN** a `VideoJob` still in `pending` status
+- **WHEN** `ProcessVideoJob.Execute` is called with its ID
+- **THEN** it returns an error from the `StartProcessing` transition and does not invoke `ffmpeg`, because this use case no longer performs the enqueue itself
+
 #### Scenario: Failed extraction fails the job
 
-- **GIVEN** a `VideoJob` in `pending` status and a stored source object `ffmpeg` cannot decode
+- **GIVEN** a `VideoJob` in `queued` status and a stored source object `ffmpeg` cannot decode
 - **WHEN** `ProcessVideoJob.Execute` is called with that job's ID and the source key
 - **THEN** the job ends in `failed` status with a non-empty `ErrorReason`, and the transient local copy no longer exists
 

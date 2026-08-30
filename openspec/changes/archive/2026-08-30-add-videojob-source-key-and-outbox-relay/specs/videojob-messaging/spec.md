@@ -6,7 +6,9 @@ Any publisher of a job message to this topology SHALL mark it persistent (AMQP d
 
 The two obligations are separate and both are load-bearing. RabbitMQ honours a message's own `expiration` independently of the queue's arguments, so a publisher that set one would expire the message into the dead-letter queue even though the job queue deliberately carries no `x-message-ttl` — reproducing exactly the failure that omission exists to prevent: a message dead-lettered with no update to its `video_jobs` row, against a state machine with no transition out of `queued` except to `processing`, leaving the job reporting `queued` to its owner forever.
 
-The outbox relay is the publisher that satisfies this requirement, and it is the only one. A queue durable, a message persistent, and the broker's storage persisted are three conditions and the guarantee needs all three; the relay's own capability (`videojob-outbox-relay`) is where the first two are verified against a real broker, including a restart.
+A queue declared durable survives a broker restart; the messages in it do not unless each was published persistently, and a transient message in a durable queue is discarded on restart with no error to anyone. Durable queue, persistent message, and persisted broker storage are three conditions, and the guarantee needs all three — which matters here because the relay that publishes these messages stamps its outbox row as published once the broker acknowledges, after which the message is the only remaining record that the job is waiting.
+
+The outbox relay is the publisher that satisfies this requirement, and it is the only one. Its own capability (`videojob-outbox-relay`) is where the first two conditions are verified against a real broker, including a restart.
 
 #### Scenario: A transient message does not survive a broker restart
 
