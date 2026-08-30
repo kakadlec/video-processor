@@ -62,13 +62,15 @@ Browser / client
         │    │    (200), an unresolved one returns 409 — no CreateVideoJob call
         │    └─ reserved=true  → proceed below
         ├─ CreateVideoJob                          (application, status: pending,
-        │    │                                       carrying the source key)
+        │                                            carrying the source key)
         │    └─ on failure: Clear the idempotency reservation if one was
         │         obtained, return 500
-        ├─ EnqueueVideoJob                         (pending → queued)
-        │    │  Repository.Enqueue writes the status update AND a
-        │    │  video_job.queued outbox row in one transaction; the relay
-        │    │  below publishes it later, out of band
+        ├─ EnqueueVideoJob                         (pending → queued; the status
+        │                                            update AND a video_job.queued
+        │                                            outbox row commit in one
+        │                                            transaction — the relay
+        │                                            publishes it later, out of
+        │                                            band)
         │    └─ on failure: Clear the reservation, return 500 — the job row
         │         exists but is unqueued, and the source object's defer
         │         still deletes it
