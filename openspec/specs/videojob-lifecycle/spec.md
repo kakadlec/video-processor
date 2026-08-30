@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the `VideoJob` aggregate's full lifecycle behavior in the Video Processing bounded context's `domain` and `application` layers: `CreateVideoJob`, `GetJobStatus`, `ListUserJobs`, plus the state-transition use cases `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` and the `VideoJob` transition methods and pure `JobStatus` transition-validity function they rest on. No infrastructure or HTTP route is in scope here — see `ddd-architecture` for the aggregate's full canonical shape, `videojob-execution` for the orchestration use case and `ffmpeg` adapter that actually calls these four transition use cases, and `videojob-http-api` for the HTTP routes that call `CreateVideoJob`/`GetJobStatus`/`ListUserJobs`.
+Define the `VideoJob` aggregate's full lifecycle behavior in the Video Processing bounded context's `domain` and `application` layers: `CreateVideoJob`, `GetJobStatus`, `ListUserJobs`, plus the state-transition use cases `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` and the `VideoJob` transition methods and pure `JobStatus` transition-validity function they rest on. No infrastructure or HTTP route is in scope here — see `ddd-architecture` for the aggregate's full canonical shape, `videojob-execution` for the orchestration use case and `ffmpeg` adapter that calls `StartProcessing`/`CompleteJob`/`FailJob` (`EnqueueVideoJob` is called by `POST /upload`'s handler instead, so that it commits with its outbox row — see `videojob-persistence`), and `videojob-http-api` for the HTTP routes that call `CreateVideoJob`/`GetJobStatus`/`ListUserJobs`.
 
 ## Requirements
 

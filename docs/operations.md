@@ -209,7 +209,7 @@ Operationally, three things are worth knowing before they surprise you:
    GROUP BY event_type;
   ```
 
-  A growing `video_job.queued` count with an ageing `min(occurred_at)` means the relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. A large, static `video_job.created` count is **normal and permanent**: those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`).
+  A growing `video_job.queued` count with an ageing `min(occurred_at)` means the relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. A large and **steadily growing** `video_job.created` count is normal: one row is written per job created and none is ever marked published, so that number only ever goes up. Those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`) — which is exactly why an unbounded backlog there is harmless rather than a leak to chase.
 - **Delivery is at-least-once.** The relay commits only after the broker acknowledges, so a crash in between republishes rather than loses. A consumer must tolerate a duplicate regardless, since a nack or a consumer crash produces one too.
 
 Its lifecycle transitions are logged — started, connection lost, reconnected, stopped — because a healthy relay is otherwise invisible. Repeated dial failures back off from 1 s to a 30 s ceiling, and the topology is redeclared after every successful dial, so a broker that was recreated while the relay was disconnected gets its exchange and queues back before the next publish.
