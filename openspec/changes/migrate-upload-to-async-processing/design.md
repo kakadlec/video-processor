@@ -65,7 +65,36 @@ replica A (old, inline)              worker (new)
                                          └─ FailJob
 ```
 
-The atomic claim prevents double processing but not this: the loser's cleanup destroys the winner's input. Separate generations make the overlap impossible — old replicas publish to `.v1`, which nothing consumes; new replicas publish to `.v2`, which only the worker consumes. Versioning the routing key was rejected in 6.1 (it is deliberately equal to the outbox `event_type`); versioning only the queue does not isolate anything, because a `direct` exchange delivers to every queue bound with the matching key.
+The atomic claim prevents double processing but not this: the loser's cleanup destroys the winner's input. Separate generations make the overlap impossible — old replicas publish to `.v1`, which nothing consumes; new replicas publish to `.v2`, which only the worker consumes. Versioning only the queue does not isolate anything, because a `direct` exchange delivers to every queue bound with the matching key.
+
+### Decision 4a: The generation lives in the `event_type` too, not only in the exchange
+
+Versioning the exchange alone does **not** achieve the isolation Decision 4 needs, and this is the correction that decision turned out to require. The crossing happens in the database, before anything is published:
+
+```
+        video_job_outbox  (one table, every replica's relay reads it)
+                  │
+      ┌───────────┴───────────┐
+  relay (old)              relay (new)
+  claims event_type=…      claims event_type=…
+      │                        │
+      ▼                        ▼
+  video.jobs.v1            video.jobs.v2
+```
+
+`OutboxRepository.Claim` filters on `event_type` and nothing else. With one string across both generations, a new replica's relay claims an old replica's row and publishes it to `.v2` — the worker picks it up and the source-deletion race is back, unchanged — while an old replica's relay claims a new replica's row and publishes it to `.v1`, where nothing consumes it and the job waits in `queued` forever.
+
+So the generation moves onto the `event_type` string as well: `video_job.queued.v2`. Since `videojob-messaging` pins the routing key equal to the event type, the routing key follows. The old relay's filter is a literal it will simply never match, and **that is the property that matters** — the old relay is already deployed and cannot be taught a new predicate, which is what rules out every fix that lives on the reading side.
+
+Alternatives considered:
+
+- **A `dispatch_generation` column on `video_job_outbox`, with the claim scoped to it.** Semantically the cleanest — the event *is* `video_job.queued` regardless of which topology carries it — and it does not work. The already-running old relay has no such predicate, so it would still claim new rows and publish them into the dead generation.
+- **Deploy without overlap: stop every API replica, then start the new build.** Correct, and it is exactly the "documented sequence someone has to get right" that this change's whole generation scheme exists to avoid.
+- **Accept the stranding and let 6.4 recover it.** 6.4 recovers a job stuck in `processing`. A job stranded in `queued` with its only message on a dead queue is not in that class and would need a different mechanism.
+
+The cost is real and worth naming: 6.1 made the event type and the routing key one vocabulary deliberately, so bumping a generation now renames a persisted domain event. That coupling is the price of the single-string design, not a new mistake.
+
+This also changes what Decision 6's migration is doing, and that decision is amended rather than left implying more than it delivers.
 
 ### Decision 5: Retiring `.v1` is an operator action, not a code path
 
@@ -73,9 +102,11 @@ The job queue carries no message TTL by design, so `.v1`'s residue does not drai
 
 ### Decision 6: The outbox cutoff is a migration that stamps rows published
 
-Pre-existing unpublished `video_job.queued` rows are stamped `published_at = now()` by a migration, bounded by `occurred_at` at the migration's own execution. They are not dispatched: each names a job the inline flow already finished and whose source object it already deleted.
+With Decision 4a in place, the *mechanism* excluding pre-existing rows is the event-type scoping: the new relay's claim cannot match `video_job.queued`, so those rows are unreachable to it regardless of when they were written. The migration is the *record*, not the mechanism, and stating it the other way round would overclaim.
 
-Letting Decision 2 dead-letter them was considered and is *nearly* equivalent — but `videojob-outbox-relay`'s requirement asks for an explicit cutoff, and "most of them fail a predicate downstream" is an accidental boundary, not a defined one. The migration also keeps the dead-letter queue meaningful: it should hold anomalies, not a batch of expected garbage from a migration.
+It still earns its place. A migration stamps `published_at` on unpublished rows carrying the **previous** generation's event type, so their exclusion is a fact on each row rather than an inference a future reader has to reconstruct from two string literals — and so an old relay still running does not keep re-reading a set that will never shrink. It must be bounded to the previous generation's event type: one written against "any unpublished dispatch row" would stamp live work as published and drop it silently.
+
+Letting Decision 2 dead-letter them was considered and rejected before Decision 4a existed; it is now moot, but the reason stands for the general case. "Most of them fail a predicate downstream" is an accidental boundary, and it would fill the dead-letter queue with a batch of expected garbage, degrading the one place operators look for anomalies.
 
 ### Decision 7: The idempotency clear moves to the worker, keyed by job ID
 
@@ -101,12 +132,17 @@ Message classes and their disposition:
 | Unknown job ID | `nack`, no requeue → DLQ | Same |
 | Claim lost (not `queued`) | `nack`, no requeue → DLQ | A duplicate, or 6.4's stranded case; either way this worker must not touch it |
 | Broker/infra error mid-run | `nack`, no requeue → DLQ | The job is already `failed` by `ProcessVideoJob`; a requeue could not claim it anyway |
+| Terminal write will not commit after bounded retry | `nack`, no requeue → DLQ, **source kept** | The job is stuck in `processing` with a durable result; the bytes and the dead-lettered message are what a recovery works from |
 
 Nothing is acked away silently: an acked message is gone from the broker, and the dead-letter queue is what keeps the anomalies enumerable.
 
 ### Decision 9: Source-object ownership follows the claim
 
-The worker deletes the source object after a terminal outcome, success or failure alike — but **only if it won the claim**. A worker that lost the claim deletes nothing, or it would destroy the winner's input, which is the same failure Decision 4 designs against.
+The worker deletes the source object after a **committed** terminal outcome, success or failure alike — but only if it won the claim, and only if the terminal state actually committed. Two guards, and the second is the one easy to get wrong.
+
+A deferred delete registered at claim time looks like the careful choice — it covers a panic — and it is the dangerous one. A panic mid-extraction, a `CompleteJob` write that will not commit, or an expired shutdown deadline all leave the job in `processing`, and the source bytes are the only thing from which such a job can ever be finished. Deleting them converts a job 6.4's fenced takeover could have recovered into one that can only be failed. The leak is the better outcome: a leaked object is reclaimable by the lifecycle rule; a deleted one is not.
+
+A worker that lost the claim deletes nothing either, or it would destroy the winner's input — the same failure Decision 4 designs against, reintroduced from inside.
 
 `handleVideoUpload`'s unconditional `defer` therefore becomes conditional: it still deletes on every path that fails *before* the enqueue commits (storage failure, `CreateVideoJob` failure, `EnqueueVideoJob` failure, a duplicate-content conflict), and stops deleting once the job is queued, because the object now belongs to whoever claims it.
 
@@ -126,6 +162,8 @@ A fixed 2 s poll costs 30 requests/minute sustained — half the budget for one 
 
 ## Risks / Trade-offs
 
+- **The generation scheme now depends on two string literals matching across three call sites** (the outbox insert, the relay's claim, and the routing key) → They are one shared constant, `videojob-outbox-relay` requires it, and `TestRoutingKeyMatchesTheOutboxEventType` already pins two of the three; extend it to the third.
+- **A job whose terminal write never commits sits in `processing` with a durable result and a dead-lettered message** → Bounded retry first, then logged with the job ID and result key so the orphan is enumerable, and the source object is deliberately kept so a recovery has something to work from. Reconciling it stays out of scope, as it was before this change.
 - **A worker dies mid-`ffmpeg`; the job is stranded in `processing` forever** → Accepted and bounded: it fires on a crash, not on every upload; the symptom is operator-visible; the message is in the DLQ. 6.4 closes it, and Non-Goals says so rather than implying this change is complete.
 - **A job whose message never reaches a worker leaks its source object** → Decision 9 states it; the `uploads/` lifecycle rule becomes the guarantee; `docs/operations.md` is updated to stop calling it a backstop.
 - **`.v1` is never deleted** → The system stays correct; a bounded idle queue remains. Documented as a post-deploy step with the reason it cannot be automated.
@@ -135,7 +173,7 @@ A fixed 2 s poll costs 30 requests/minute sustained — half the budget for one 
 
 ## Migration Plan
 
-1. Deploy the new build. Old replicas publish to `.v1` and finish their in-flight inline work; new replicas publish to `.v2` and the worker consumes it.
+1. Deploy the new build. Old replicas write outbox rows under the old event type, which only their own relays claim, publish to `.v1`, and finish their in-flight inline work; new replicas write under the new event type, publish to `.v2`, and the worker consumes it. No row crosses.
 2. The cutoff migration runs at startup with the others, stamping pre-existing unpublished `video_job.queued` rows published.
 3. Once every replica is on the new build, delete `video.jobs.v1` and `video.jobs.queued.v1`.
 

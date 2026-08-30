@@ -46,7 +46,7 @@ The limit governs **requests to this API**, and after result downloads became pr
 
 - **GIVEN** an authenticated user who has exhausted their window
 - **WHEN** they request `GET /download/:filename`
-- **THEN** the response is `429 Too Many Requests`, with no object stated in storage and no URL issued
+- **THEN** the response is `429 Too Many Requests`, with no object read from storage and no URL issued
 
 #### Scenario: The upload route remains rate limited after its static mount is removed
 

@@ -8,6 +8,12 @@ It SHALL call `CompleteJob` on success **only**, and only after `ProcessVideoJob
 
 It SHALL NOT call `FailJob`: `ProcessVideoJob` already fails the job itself for a fetch, extraction, or storage failure, so a worker that also called it would ask the domain for a rejected `failed → failed` transition. An implementer SHALL NOT add a failure call "for symmetry".
 
+**The terminal write can fail after the result is already durable, and the worker SHALL have a policy for it rather than discovering one.** `CompleteJob` returns its repository error and leaves the stored job in `processing`, so a transient database failure at that moment produces a job with a usable result that no listing shows. The worker SHALL retry the terminal write a bounded number of times with backoff, on a context detached from any cancellation that may have caused the failure, because the overwhelmingly likely cause is transient and one more attempt costs nothing next to a re-extraction.
+
+If the write still cannot commit, the worker SHALL reject the message without requeue, SHALL leave the job as it stands, and SHALL log the job identifier and the result `StorageKey` — never a credential — so the orphan is enumerable. It SHALL NOT delete the source object in that case (see the source-ownership requirement below), and SHALL NOT acknowledge the message: the job did not reach a terminal state, and both the bytes and the dead-lettered message are what a later recovery has to work from.
+
+This orphan class is not introduced here — the synchronous pipeline produced the same shape when the post-processing write failed — but it becomes the worker's to bound, and reconciling it remains out of scope.
+
 The worker SHALL take the source location from the message rather than reconstructing it. `ProcessVideoJob` accepts a source `StorageKey` precisely so a process that shares no filesystem with the HTTP handler can run it, and the key embeds a generated upload identifier that is not derivable from any other field.
 
 The worker SHALL NOT serve HTTP, SHALL NOT be reachable from outside the deployment, and SHALL NOT perform an access-control decision (see `video-processing-access`).
@@ -92,9 +98,13 @@ A rejected message SHALL NOT cause a transition. In particular a lost claim SHAL
 
 ### Requirement: The Worker Deletes the Source Object, and Only If It Won the Claim
 
-The worker SHALL delete the source object named by the message once the job it claimed has reached a terminal state, on success and on failure alike, and SHALL do so on every exit path from a successful claim including a panic.
+The worker SHALL delete the source object named by the message once the job it claimed has **committed** a terminal state — `completed` or `failed` — on success and on failure alike. The deletion SHALL be attempted on every exit path from that point, including a panic that unwinds afterwards.
 
-It SHALL NOT delete the source object when it did not win the claim. Another consumer is processing that job from those exact bytes, and deleting them would destroy a running extraction's input — the failure mode generation isolation exists to prevent, reintroduced from inside.
+**It SHALL NOT delete the source object on any path where the job did not reach a committed terminal state**, and this is the condition that matters most, because getting it wrong is unrecoverable rather than merely untidy. A panic mid-extraction, a `CompleteJob` write that would not commit, a shutdown deadline that expired — each leaves the job in `processing`, and the source bytes are the only thing from which that job can ever be finished. Deleting them turns a job a later fenced takeover could have recovered into one that can only be failed. An unconditional deferred delete registered at claim time therefore SHALL NOT be used; the delete SHALL be guarded on the committed outcome.
+
+The bytes left behind in that case leak, and that is the deliberate trade: a leaked object is reclaimable by the storage lifecycle rule, while a deleted one is gone.
+
+It SHALL NOT delete the source object when it did not win the claim either. Another consumer is processing that job from those exact bytes, and deleting them would destroy a running extraction's input — the failure mode generation isolation exists to prevent, reintroduced from inside.
 
 The deletion SHALL be best effort, as it was when the HTTP handler owned it: one attempt, no retry, a failure logged with the `StorageKey` and not escalated. A failed deletion SHALL NOT prevent the message from being acknowledged, because the job is already terminal and the dispatch must not be redelivered.
 
@@ -111,6 +121,18 @@ The deletion SHALL be best effort, as it was when the HTTP handler owned it: one
 - **GIVEN** a dispatched job whose extraction fails
 - **WHEN** the message has been acknowledged
 - **THEN** the job is `failed` and no object exists under its source key
+
+#### Scenario: A job left in processing keeps its source object
+
+- **GIVEN** a claimed job whose extraction succeeded but whose `CompleteJob` write cannot commit after the bounded retries
+- **WHEN** the worker gives up on the message
+- **THEN** the job is still `processing`, the source object is still present, the message is dead-lettered rather than acknowledged, and the job identifier and result storage key are logged
+
+#### Scenario: A panic mid-extraction does not delete the source object
+
+- **GIVEN** a claimed job whose processing panics before any terminal transition commits
+- **WHEN** the worker unwinds
+- **THEN** the source object is still present, because no terminal state was committed
 
 #### Scenario: A lost claim leaves the source object alone
 

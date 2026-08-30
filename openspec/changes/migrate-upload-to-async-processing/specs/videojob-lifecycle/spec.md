@@ -4,7 +4,11 @@
 
 Four application-layer use cases — `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` — SHALL each load a `VideoJob` by ID via `VideoJobRepository.FindByID`, apply exactly the one aggregate transition method matching their name, and persist the result. `CompleteJob` and `FailJob` persist via `VideoJobRepository.Update`; **`EnqueueVideoJob` persists via `VideoJobRepository.Enqueue`**, which commits the transition together with the event describing it; **`StartProcessing` persists via `VideoJobRepository.ClaimForProcessing`**, which applies the transition only if the stored status is still `queued` (see `videojob-persistence`). `CompleteJob` additionally accepts a `StorageKey` and `FrameCount`; `FailJob` additionally accepts a non-empty failure reason. None of the four SHALL be reachable from any HTTP route defined by `videojob-http-api`.
 
-**`StartProcessing` SHALL be an atomic claim, and losing that claim SHALL be a distinct, non-failing outcome.** When the conditional persist affects no row, `StartProcessing` SHALL return a distinct exported sentinel error, SHALL NOT retry, and SHALL NOT call `FailJob` or otherwise mutate the job — another consumer owns it, and writing anything would corrupt that consumer's work.
+**`StartProcessing` SHALL be an atomic claim, and losing that claim SHALL be a distinct, non-failing outcome.** It SHALL return a distinct exported sentinel error, SHALL NOT retry, and SHALL NOT call `FailJob` or otherwise mutate the job — another consumer owns it, and writing anything would corrupt that consumer's work.
+
+**That sentinel SHALL be reported for both ways of losing the claim, which are reached at different points in the use case.** The common one is decided before any write: `StartProcessing` loads the job first, and a job already in `processing`, `completed`, or `failed` is rejected by the aggregate's own transition method, which does not know a claim is being attempted and reports an invalid transition. The rarer one is the race after the read, where the conditional persist affects no row. Both mean the same thing — some other consumer holds or held this job — and both SHALL surface as the lost-claim sentinel, so a caller does not have to distinguish an ordinary duplicate delivery from a narrow race to decide what to do about it.
+
+A `pending` job SHALL NOT be reported as a lost claim. It was never dispatched, so a message naming it is an anomaly rather than a duplicate, and collapsing the two would hide the case worth investigating behind the case that is routine.
 
 The claim is what makes duplicate dispatch safe, and it is a *correctness* primitive rather than a *recovery* one. Dispatch is at-least-once by construction (`videojob-outbox-relay` can publish a message whose `published_at` never commits), and `Update` is a read-then-unconditional-write, so without the conditional persist two deliveries would both pass `queued → processing` and both run an extraction over the same source. With it, exactly one wins and the loser mutates nothing.
 
@@ -46,13 +50,19 @@ What it deliberately does **not** do is recover a job whose consumer died mid-ex
 
 - **GIVEN** a persisted `VideoJob` already in `processing` status
 - **WHEN** `StartProcessing.Execute` is called with its ID
-- **THEN** it returns the lost-claim sentinel, the job is still `processing`, its `ErrorReason` is unchanged, and no `FailJob` transition was attempted
+- **THEN** it returns the lost-claim sentinel — not a generic invalid-transition error — the job is still `processing`, its `ErrorReason` is unchanged, and no `FailJob` transition was attempted
+
+#### Scenario: A job that was never enqueued is not reported as a lost claim
+
+- **GIVEN** a persisted `VideoJob` in `pending` status
+- **WHEN** `StartProcessing.Execute` is called with its ID
+- **THEN** it returns an error that is **not** the lost-claim sentinel, so a dispatch naming an un-enqueued job is distinguishable from a duplicate delivery
 
 #### Scenario: A completed job cannot be re-claimed
 
 - **GIVEN** a persisted `VideoJob` in `completed` status, as a redelivered stale dispatch would name
 - **WHEN** `StartProcessing.Execute` is called with its ID
-- **THEN** it returns the lost-claim sentinel and the job's status, `StorageKey`, and `FrameCount` are unchanged
+- **THEN** it returns the lost-claim sentinel — decided before any write is attempted — and the job's status, `StorageKey`, and `FrameCount` are unchanged
 
 #### Scenario: CompleteJob transitions and persists a result
 

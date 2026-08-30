@@ -126,24 +126,26 @@ It SHALL NOT write a `video_job_outbox` row, and SHALL NOT lock the row beyond t
 
 ### Requirement: Outbox Rows Predating the Dispatch Generation Are Stamped Published by Migration
 
-A schema migration SHALL stamp `published_at` on every `video_job_outbox` row whose `event_type` is `video_job.queued` and whose `published_at` is null at the time it runs, so those rows are never claimed by a relay publishing into the current job-dispatch generation.
+`Repository.Enqueue` SHALL write its outbox row under the **current generation's** `event_type`, which is the same constant the relay's claim and the broker's routing key use (see `videojob-messaging`). A generation bump therefore changes the persisted event-type value, and the constant SHALL remain single so the three cannot drift.
+
+A schema migration SHALL stamp `published_at` on every `video_job_outbox` row that carries a **previous** generation's dispatch `event_type` and whose `published_at` is null at the time it runs. Those rows are already unreachable to the current relay, whose claim matches only its own generation's string; the migration records that fact rather than establishing it, and keeps them from being re-read forever by a relay of the old generation that is still running.
 
 The migration SHALL be bounded by the rows existing when it executes and SHALL NOT install a standing rule, trigger, or predicate that would suppress rows written afterwards. It is a one-time cutoff, and a mechanism that kept suppressing would silently disable dispatch.
 
-It SHALL be idempotent under re-execution, like every other migration this repository runs at startup, and SHALL NOT touch `video_job.created` rows, which have always been internal and unpublished by design.
+It SHALL be idempotent under re-execution, like every other migration this repository runs at startup, and SHALL NOT touch `video_job.created` rows, which have always been internal and unpublished by design. It SHALL NOT touch the current generation's rows either — a migration written against the *unversioned* dispatch event type is what keeps these two sets apart, and one written against "any unpublished dispatch row" would stamp live work as published and drop it silently.
 
 `videojob-outbox-relay` states why these rows must not be dispatched; this requirement is the mechanism.
 
-#### Scenario: Pre-existing unpublished queued rows are stamped
+#### Scenario: Pre-existing unpublished rows of the previous generation are stamped
 
-- **GIVEN** unpublished `video_job.queued` rows written before this migration
+- **GIVEN** unpublished dispatch rows written under the previous generation's `event_type`
 - **WHEN** the migration runs
-- **THEN** every one of them carries a `published_at` value and none is returned by a subsequent relay claim
+- **THEN** every one of them carries a `published_at` value and none is returned by a subsequent relay claim of either generation
 
 #### Scenario: Rows written after the migration are unaffected
 
 - **GIVEN** the migration has already run
-- **WHEN** a new job is enqueued, writing a fresh `video_job.queued` row
+- **WHEN** a new job is enqueued, writing a fresh row under the current generation's `event_type`
 - **THEN** that row is unpublished and the relay claims it normally
 
 #### Scenario: The created-event backlog is left alone
