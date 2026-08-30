@@ -52,9 +52,17 @@ Browser              cmd/api/video.go       internal/video/application   MinIO b
   │                        │  status (bounded) → return it, or 409 if the  │
   │                        │  bound elapses — no CreateVideoJob below      │
   │                        │  CreateVideoJob            │                  │
+  │                        │  (carrying the source key) │                  │
+  │                        │───────────────────────────►│                  │
+  │                        │  EnqueueVideoJob            │                 │
+  │                        │  (pending → queued AND a    │                 │
+  │                        │   video_job.queued outbox   │                 │
+  │                        │   row, one transaction —    │                 │
+  │                        │   the relay publishes it    │                 │
+  │                        │   later, out of band)       │                 │
   │                        │───────────────────────────►│                  │
   │                        │  ProcessVideoJob:           │                 │
-  │                        │    Enqueue → StartProcessing│                 │
+  │                        │    StartProcessing          │                 │
   │                        │───────────────────────────►│                  │
   │                        │                            │  ffmpeg exec,    │
   │                        │                            │  zip → temp/     │
@@ -98,7 +106,7 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 
 **Key characteristics (current):**
 - Content-hash idempotency: identical bytes uploaded twice by the same user reuse the first request's `VideoJob` rather than running `ffmpeg` again (Phase 4, `add-upload-idempotency-keys`) — see `docs/architecture.md`'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md` for the full reserve/finalize/clear protocol. `REDIS_ADDR` is required at startup for this.
-- Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous, in-process, no queue or worker (that's Phase 6).
+- Single HTTP request blocks for the full duration of `ffmpeg` execution — still fully synchronous and in-process. There **is** a queue now, and the outbox relay publishes a `video_job.queued` message for every upload (Phase 6, `add-videojob-source-key-and-outbox-relay`), but **nothing consumes it**: the message names a job this same request has already driven to `completed`/`failed` with its source object deleted. It is a side effect, not a trigger. The worker that turns it into one is `migrate-upload-to-async-processing`.
 - No status polling, no notifications, at this HTTP surface — but the `VideoJob` created for the upload does progress through the real `pending → queued → processing → completed`/`failed` state machine internally (see `openspec/specs/videojob-lifecycle/spec.md`), and is queryable via `GET /api/video-jobs/:id` below.
 - Nothing the client uploads touches local disk on the way in. The source is streamed straight into the bucket, and the only local copy is the one `ProcessVideoJob` downloads for `ffmpeg`, which it removes on every path (Phase 5, `migrate-upload-storage-to-minio`).
 - The source object is deleted on success **and** on failure, through a single `defer` registered the moment the object exists — so the ZIP object is the only artifact meant to survive the request. That deletion is best effort: one call, no retry, logged with the key if it fails. See `docs/operations.md` for the recommended `uploads/`-prefix lifecycle rule that backstops it.
@@ -109,7 +117,7 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 
 ## Target: Asynchronous Processing Flow (Phase 6+)
 
-> **This flow does not yet exist.** It is introduced in Phase 6 (`implement-rabbitmq-and-worker`), after Phases 2–5 lay the authentication, persistence, caching, and storage foundations. Phase 3's `wire-videojob-http-endpoints` added a separate, unrelated preview API (`POST /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /api/video-jobs` — see below) that shares the underlying `VideoJob` aggregate but accepts no file content and triggers no processing; it is not this flow and does not become it.
+> **The publishing half of this flow exists; the consuming half does not.** `add-rabbitmq-infrastructure` and `add-videojob-source-key-and-outbox-relay` shipped the broker, the topology, and the outbox relay, so `POST /upload` really does enqueue a job and a message really does reach RabbitMQ — but `cmd/worker` does not exist, nothing dequeues, and `POST /upload` still blocks and still returns a finished result rather than `202`. `migrate-upload-to-async-processing` is the cutover that makes the rest of this diagram true, after Phases 2–5 laid the authentication, persistence, caching, and storage foundations. Phase 3's `wire-videojob-http-endpoints` added a separate, unrelated preview API (`POST /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /api/video-jobs` — see below) that shares the underlying `VideoJob` aggregate but accepts no file content and triggers no processing; it is not this flow and does not become it.
 
 ```
 Browser              API server (cmd/api)    RabbitMQ    Worker (cmd/worker)    MinIO
@@ -197,7 +205,7 @@ GET /api/video-jobs?offset=0&limit=20
 
 **`EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob` do exist now**, added by `migrate-ffmpeg-execution-to-videojob-application`, but they're driven from `POST /upload`, not from these routes. Because `POST /upload` also calls `CreateVideoJob` (see the Synchronous Upload Flow above), `GET /api/video-jobs`/`GET /api/video-jobs/:id` now legitimately show `completed`/`failed` jobs for a user who has used `/upload`, alongside any still-`pending` jobs created directly via `POST /api/video-jobs` itself — both are the same `VideoJob` aggregate in the same repository, scoped by owner the same way. See `openspec/specs/videojob-http-api/spec.md`'s "Listing includes jobs created outside this API" scenario.
 
-See `openspec/specs/videojob-http-api/spec.md` for the full contract and `openspec/specs/videojob-execution/spec.md` for how `POST /upload` now drives those four transition use cases.
+See `openspec/specs/videojob-http-api/spec.md` for the full contract, `openspec/specs/videojob-lifecycle/spec.md` for the four transition use cases, and `openspec/specs/videojob-execution/spec.md` for how `POST /upload` drives them — `EnqueueVideoJob` from the handler itself, the other three through `ProcessVideoJob`.
 
 ---
 
