@@ -491,32 +491,17 @@ func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 
 func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
-	userID, err := domain.NewUserID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	token, err := tokens.Issue(userID, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
 	videoPath := generateTestVideo(t, 1)
 	uploadResp := uploadWithAuth(t, srv.URL, token, videoPath, "test-video.mp4")
 	defer uploadResp.Body.Close()
-
-	var result ProcessingResult
-	if err := json.NewDecoder(uploadResp.Body).Decode(&result); err != nil {
-		t.Fatalf("unexpected error decoding upload response: %v", err)
-	}
-
-	if uploadResp.StatusCode != http.StatusOK {
-		t.Fatalf("authenticated upload status = %d, want %d", uploadResp.StatusCode, http.StatusOK)
-	}
-	if !result.Success {
-		t.Fatalf("expected success=true, got message: %s", result.Message)
+	if uploadResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("authenticated upload status = %d, want %d", uploadResp.StatusCode, http.StatusAccepted)
 	}
 
 	statusResp := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+token)
@@ -525,7 +510,11 @@ func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 		t.Fatalf("authenticated /api/status status = %d, want %d", statusResp.StatusCode, http.StatusOK)
 	}
 
-	downloadResp := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+	// The upload's own job is only queued, so this route has nothing of its
+	// to hand back yet — a seeded completed job is what makes the download
+	// leg of the flow reachable at all.
+	key := seedCompletedJob(t, video, userID.String())
+	downloadResp := getWithAuthorization(t, srv.URL+"/download/"+key, "Bearer "+token)
 	defer downloadResp.Body.Close()
 	if downloadResp.StatusCode != http.StatusOK {
 		t.Fatalf("authenticated download status = %d, want %d", downloadResp.StatusCode, http.StatusOK)
@@ -547,37 +536,16 @@ func issueTestToken(t *testing.T, tokens jwtauth.Adapter, uuid string) (domain.U
 	return userID, token
 }
 
-// uploadAsUser uploads a freshly generated 1s test video authenticated as
-// token, and returns the resulting result artifact's storage key. Nothing
-// needs cleaning up: the artifact is an object in a dedicated test bucket,
-// keyed by the job's own UUID, not a file in the developer's working tree.
-func uploadAsUser(t *testing.T, baseURL, token string) string {
-	t.Helper()
-
-	videoPath := generateTestVideo(t, 1)
-	resp := uploadWithAuth(t, baseURL, token, videoPath, "owned-video.mp4")
-	defer resp.Body.Close()
-
-	var result ProcessingResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("unexpected error decoding upload response: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK || !result.Success {
-		t.Fatalf("upload failed: status=%d success=%v message=%q", resp.StatusCode, result.Success, result.Message)
-	}
-
-	return result.ZipPath
-}
-
 func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
-	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
 
-	zipFilename := uploadAsUser(t, srv.URL, tokenA)
+	zipFilename := seedCompletedJob(t, video, userA.String())
 
 	ownResp := getWithAuthorization(t, srv.URL+"/download/"+zipFilename, "Bearer "+tokenA)
 	defer ownResp.Body.Close()
@@ -594,13 +562,14 @@ func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
 
 func TestArtifactOwnership_StatusScopedToOwner(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
-	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
 
-	zipFilename := uploadAsUser(t, srv.URL, tokenA)
+	zipFilename := seedCompletedJob(t, video, userA.String())
 
 	statusA := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+tokenA)
 	defer statusA.Body.Close()
@@ -649,11 +618,12 @@ func containsFilename(files []struct {
 // guard is that no route answers there at all, for the owner or anyone else.
 func TestArtifactOwnership_StaticOutputsRouteIsGone(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
-	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	zipFilename := uploadAsUser(t, srv.URL, tokenA)
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	zipFilename := seedCompletedJob(t, video, userA.String())
 
 	resp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenA)
 	defer resp.Body.Close()

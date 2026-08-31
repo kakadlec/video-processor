@@ -64,6 +64,32 @@ end
 return 0
 `)
 
+// clearByJobScript atomically deletes a key only if it holds a finalized
+// value (ARGV[1] is finalPrefix) that names the given job (ARGV[2] is
+// ":<jobID>", the finalized value's trailing component).
+//
+// Both checks are load-bearing. The suffix alone would be a probabilistic
+// test — a reservation token is a UUID, and nothing in the format stops some
+// other value from happening to end in the same characters — whereas
+// requiring the finalized prefix makes "an in-flight reservation is never
+// removed" a property of the format rather than of luck. That matters
+// because a reservation belongs to a concurrent request that has not
+// finished yet; deleting it would let a duplicate submission through.
+var clearByJobScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if current == false then
+	return 0
+end
+if string.sub(current, 1, string.len(ARGV[1])) ~= ARGV[1] then
+	return 0
+end
+if string.sub(current, -string.len(ARGV[2])) ~= ARGV[2] then
+	return 0
+end
+redis.call("DEL", KEYS[1])
+return 1
+`)
+
 // RedisStore implements domain.IdempotencyStore against a shared
 // *redis.Client (internal/platform/redis).
 type RedisStore struct {
@@ -132,6 +158,15 @@ func (s *RedisStore) Clear(ctx context.Context, key domain.IdempotencyKey, token
 	res, err := clearScript.Run(ctx, s.client, []string{key.String()}, reservedValue, finalValuePrefix).Int()
 	if err != nil {
 		return false, fmt.Errorf("idempotency: clear: %w", err)
+	}
+	return res == 1, nil
+}
+
+// ClearByJob implements domain.IdempotencyStore.
+func (s *RedisStore) ClearByJob(ctx context.Context, key domain.IdempotencyKey, jobID domain.VideoJobID) (bool, error) {
+	res, err := clearByJobScript.Run(ctx, s.client, []string{key.String()}, finalPrefix, ":"+jobID.String()).Int()
+	if err != nil {
+		return false, fmt.Errorf("idempotency: clear by job: %w", err)
 	}
 	return res == 1, nil
 }

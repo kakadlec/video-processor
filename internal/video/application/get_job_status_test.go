@@ -33,7 +33,7 @@ func TestGetJobStatus_OwnerRetrievesOwnJob(t *testing.T) {
 	jobID := newTestVideoJobID(t, "job-1")
 	ownerID := newTestVideoUserID(t, "user-1")
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
-	job, err := domain.RestoreVideoJob(jobID, ownerID, filename, domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	job, err := domain.RestoreVideoJob(jobID, ownerID, filename, domain.StorageKey{}, "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestGetJobStatus_CompletedJob_IncludesStorageKey(t *testing.T) {
 	ownerID := newTestVideoUserID(t, "user-1")
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
 	storageKey, _ := domain.NewStorageKey("outputs/frames_job-1.zip")
-	job, err := domain.RestoreVideoJob(jobID, ownerID, filename, domain.StorageKey{}, storageKey, 42, "", domain.JobStatusCompleted, time.Now())
+	job, err := domain.RestoreVideoJob(jobID, ownerID, filename, domain.StorageKey{}, "", storageKey, 42, "", domain.JobStatusCompleted, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestGetJobStatus_NonOwner_RejectedAsNotFound(t *testing.T) {
 	jobID := newTestVideoJobID(t, "job-1")
 	ownerID := newTestVideoUserID(t, "user-1")
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
-	job, err := domain.RestoreVideoJob(jobID, ownerID, filename, domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	job, err := domain.RestoreVideoJob(jobID, ownerID, filename, domain.StorageKey{}, "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

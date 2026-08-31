@@ -337,3 +337,140 @@ func TestOutboxRepository_Claim_ConcurrentClaimsSplitTheRows(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+// previousGenerationEventType is the event_type the pre-cutover build wrote,
+// spelled out rather than derived: it is exactly the literal schema.sql's
+// cutoff statement names, and a test that computed it from the current
+// constant would move with the constant and stop testing the cutoff at all.
+const previousGenerationEventType = "video_job.queued"
+
+// seedOutboxRowOfType inserts one unpublished outbox row under an explicit
+// event_type, and returns its id.
+func seedOutboxRowOfType(t *testing.T, db *sql.DB, eventType string) string {
+	t.Helper()
+	id := uuid.NewString()
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO video_job_outbox (id, event_type, payload, occurred_at) VALUES ($1, $2, $3, now())`,
+		id, eventType, []byte(`{"type":"`+eventType+`"}`),
+	); err != nil {
+		t.Fatalf("unexpected error seeding outbox row: %v", err)
+	}
+	return id
+}
+
+func outboxPublishedAt(t *testing.T, db *sql.DB, id string) sql.NullTime {
+	t.Helper()
+	var stamped sql.NullTime
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT published_at FROM video_job_outbox WHERE id = $1`, id,
+	).Scan(&stamped); err != nil {
+		t.Fatalf("unexpected error reading published_at: %v", err)
+	}
+	return stamped
+}
+
+// TestMigrate_CutoffStampsOnlyThePreviousGenerationsUnpublishedRows covers
+// the migration this change ships. Rows written under the previous dispatch
+// generation can no longer be delivered — nothing declares that generation's
+// exchange or queue any more — so leaving them unstamped would have every
+// relay re-attempt them forever.
+//
+// The negative halves carry the weight. A statement that matched the current
+// event type would retire live dispatches, and one that matched on
+// published_at alone would retire the permanent video_job.created backlog,
+// which is a record rather than a queue.
+func TestMigrate_CutoffStampsOnlyThePreviousGenerationsUnpublishedRows(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	previous := seedOutboxRowOfType(t, db, previousGenerationEventType)
+	current := seedOutboxRowOfType(t, db, postgres.VideoJobQueuedEventType)
+	created := seedOutboxRowOfType(t, db, "video_job.created")
+
+	// testDB already migrated; this is the run under test, over rows that
+	// exist by the time it executes.
+	if err := postgres.Migrate(ctx, db); err != nil {
+		t.Fatalf("unexpected error migrating schema: %v", err)
+	}
+
+	if !outboxPublishedAt(t, db, previous).Valid {
+		t.Fatal("expected the previous generation's unpublished row to be stamped")
+	}
+	if outboxPublishedAt(t, db, current).Valid {
+		t.Fatal("the current generation's row must not be stamped — it is a live dispatch")
+	}
+	if outboxPublishedAt(t, db, created).Valid {
+		t.Fatal("video_job.created rows are a permanent record, not a backlog to retire")
+	}
+}
+
+// TestMigrate_CutoffIsRerunnableAndDoesNotRestampOrReachForward pins the two
+// properties that make it safe for Migrate to run the whole file on every
+// startup of every process.
+func TestMigrate_CutoffIsRerunnableAndDoesNotRestampOrReachForward(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	previous := seedOutboxRowOfType(t, db, previousGenerationEventType)
+	if err := postgres.Migrate(ctx, db); err != nil {
+		t.Fatalf("unexpected error migrating schema: %v", err)
+	}
+	first := outboxPublishedAt(t, db, previous)
+	if !first.Valid {
+		t.Fatal("expected the previous generation's row to be stamped")
+	}
+
+	// A row written after the cutoff ran, by a replica of the previous build
+	// not yet redeployed. It is undeliverable for the same reason, so the
+	// next run stamping it is the intended behaviour, not an accident.
+	late := seedOutboxRowOfType(t, db, previousGenerationEventType)
+
+	if err := postgres.Migrate(ctx, db); err != nil {
+		t.Fatalf("unexpected error re-migrating schema: %v", err)
+	}
+
+	if got := outboxPublishedAt(t, db, previous); !got.Valid || !got.Time.Equal(first.Time) {
+		t.Fatalf("published_at = %v, want the first run's %v — an already-stamped row must not be rewritten", got, first)
+	}
+	if !outboxPublishedAt(t, db, late).Valid {
+		t.Fatal("expected a late previous-generation row to be stamped by the next run")
+	}
+}
+
+// TestOutboxRepository_Claim_IsIsolatedToOneGeneration is the regression test
+// bumping the exchange alone would not have produced. The two generations
+// never meet at the broker: they meet in this one table, and the claim
+// filters on event_type and nothing else. An already-deployed relay of the
+// previous build cannot be taught a new predicate, so the only thing that
+// keeps it away from this build's dispatches is a literal it will never
+// match.
+func TestOutboxRepository_Claim_IsIsolatedToOneGeneration(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	previous := seedOutboxRowOfType(t, db, previousGenerationEventType)
+	current := seedOutboxRowOfType(t, db, postgres.VideoJobQueuedEventType)
+
+	// Discriminating pre-assertion: the previous-generation row has to be
+	// genuinely claimable at this point. testDB migrates before truncating,
+	// so nothing has stamped it — but if that ordering ever changed, the
+	// claim below would return nothing for the wrong reason and the test
+	// would pass while proving nothing about the predicate.
+	if outboxPublishedAt(t, db, previous).Valid {
+		t.Fatal("test setup: the previous generation's row is already stamped, so this proves nothing about the claim")
+	}
+
+	batch, err := postgres.NewOutboxRepository(db).Claim(ctx, postgres.VideoJobQueuedEventType, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer batch.Rollback()
+
+	messages := batch.Messages()
+	if len(messages) != 1 {
+		t.Fatalf("claimed %d messages, want exactly 1 — only the current generation's row is this relay's to dispatch", len(messages))
+	}
+	if messages[0].ID != current {
+		t.Fatalf("claimed row %s, want %s", messages[0].ID, current)
+	}
+}

@@ -77,6 +77,7 @@ type cachedJobRecord struct {
 	UserID           string    `json:"user_id"`
 	OriginalFilename string    `json:"original_filename"`
 	SourceKey        string    `json:"source_key,omitempty"`
+	ContentHash      string    `json:"content_hash,omitempty"`
 	StorageKey       string    `json:"storage_key,omitempty"`
 	FrameCount       int       `json:"frame_count"`
 	ErrorReason      string    `json:"error_reason,omitempty"`
@@ -90,6 +91,7 @@ func newCachedJobRecord(job *domain.VideoJob) cachedJobRecord {
 		UserID:           job.UserID().String(),
 		OriginalFilename: job.OriginalFilename().String(),
 		SourceKey:        job.SourceKey().String(),
+		ContentHash:      job.ContentHash(),
 		StorageKey:       job.StorageKey().String(),
 		FrameCount:       job.FrameCount(),
 		ErrorReason:      job.ErrorReason(),
@@ -120,8 +122,9 @@ func (rec cachedJobRecord) toVideoJob(idParser domain.VideoJobIDParser) (*domain
 	// postgres.Repository.scanJobRow: NewStorageKey rejects an empty value,
 	// and both fields are legitimately empty (a job created through
 	// POST /api/video-jobs has no source object, and only a completed job
-	// has a result). They are the same type and adjacent in
-	// RestoreVideoJob's signature, so keep the source key first in both.
+	// has a result). They are the same type, and in RestoreVideoJob's
+	// signature only the content hash separates them, so keep the source key
+	// first in both.
 	var sourceKey domain.StorageKey
 	if rec.SourceKey != "" {
 		sourceKey, err = domain.NewStorageKey(rec.SourceKey)
@@ -136,7 +139,7 @@ func (rec cachedJobRecord) toVideoJob(idParser domain.VideoJobIDParser) (*domain
 			return nil, fmt.Errorf("cache: stored storage key is invalid: %w", err)
 		}
 	}
-	return domain.RestoreVideoJob(id, userID, filename, sourceKey, storageKey, rec.FrameCount, rec.ErrorReason, domain.JobStatus(rec.Status), rec.CreatedAt)
+	return domain.RestoreVideoJob(id, userID, filename, sourceKey, rec.ContentHash, storageKey, rec.FrameCount, rec.ErrorReason, domain.JobStatus(rec.Status), rec.CreatedAt)
 }
 
 func cacheKey(id domain.VideoJobID) string {
@@ -317,6 +320,29 @@ func (r *CachedVideoJobRepository) Enqueue(ctx context.Context, job *domain.Vide
 	}
 	r.writeThrough(job)
 	return nil
+}
+
+// ClaimForProcessing implements domain.VideoJobRepository as a conditional
+// write-through: the inner repository's conditional UPDATE decides, and the
+// cache follows only when a row was actually claimed.
+//
+// The condition is the whole point. A loser must leave the cache untouched:
+// its in-memory aggregate says processing, but the row belongs to another
+// consumer and may already be completed. Writing through unconditionally
+// would publish the loser's view over the winner's, and GET
+// /api/video-jobs/:id would report processing for a finished job until the
+// entry expired.
+//
+// It deliberately does not pass through uncached the way Create does — a
+// won claim is a real state transition, and leaving a queued entry behind
+// would contradict the row for up to entryTTL.
+func (r *CachedVideoJobRepository) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, error) {
+	claimed, err := r.inner.ClaimForProcessing(ctx, job)
+	if err != nil || !claimed {
+		return claimed, err
+	}
+	r.writeThrough(job)
+	return true, nil
 }
 
 // writeThrough overwrites job's cache entry after its authoritative write

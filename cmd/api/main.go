@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -21,8 +20,10 @@ import (
 )
 
 // shutdownTimeout bounds how long in-flight requests get to finish once a
-// signal arrives. Generous because POST /upload runs ffmpeg in-request: a
-// shorter deadline would routinely cut off work that was nearly done.
+// signal arrives. It stays generous even though no request runs ffmpeg any
+// more: POST /upload still streams a whole video into object storage before
+// it answers, and a shorter deadline would cut off a large upload that was
+// nearly stored.
 const shutdownTimeout = 30 * time.Second
 
 // readHeaderTimeout bounds how long a client may take to send its request
@@ -33,8 +34,6 @@ const readHeaderTimeout = 10 * time.Second
 var webFS embed.FS
 
 func main() {
-	createDirs()
-
 	ctx := context.Background()
 
 	identity, identityDB, err := setupIdentity(ctx)
@@ -76,10 +75,10 @@ func main() {
 		Addr:    ":8080",
 		Handler: r,
 		// Only the header read is bounded. A ReadTimeout or WriteTimeout
-		// would cut off POST /upload, which streams a whole video in and
-		// runs ffmpeg before responding; headers arrive immediately
-		// regardless of body size, so bounding that alone costs nothing and
-		// closes the slow-header hold.
+		// would cut off POST /upload, which streams a whole video into the
+		// bucket before responding; headers arrive immediately regardless of
+		// body size, so bounding that alone costs nothing and closes the
+		// slow-header hold.
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
@@ -172,8 +171,7 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	// No static mount remains. Source videos and result artifacts are both
 	// objects in the bucket, reachable only through handlers that derive
 	// entitlement from the VideoJob row — GET /download/:filename for
-	// results, and nothing at all for sources, whose deletion each upload
-	// request attempts before it finishes.
+	// results, and nothing at all for sources, which no route exposes.
 	video.registerRoutes(videoRoutes)
 
 	identity.registerRoutes(r)
@@ -181,18 +179,11 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	return r
 }
 
-// createDirs creates the one directory the application still writes to.
-// Both uploads/ and outputs/ are gone: source videos and result artifacts
-// are objects in the bucket, and temp/ holds only per-request scratch —
-// the downloaded source, the extracted frames, and the zip built from them.
-func createDirs() {
-	dirs := []string{"temp"}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			log.Printf("Failed to create directory %s: %v", dir, err)
-		}
-	}
-}
+// No directory is created at startup any more. uploads/ and outputs/ were
+// already gone — source videos and results are objects in the bucket — and
+// temp/ went with the extraction: this process downloads nothing, runs no
+// ffmpeg, and writes no zip. cmd/worker creates the scratch directory it
+// needs, where the work actually happens.
 
 func isValidVideoFile(filename string) bool {
 	ext := strings.ToLower(filepath.Ext(filename))

@@ -24,7 +24,6 @@ import (
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
 	videocache "video-processor/internal/video/infrastructure/cache"
-	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
 	videomessaging "video-processor/internal/video/infrastructure/messaging"
@@ -58,21 +57,15 @@ type videoModule struct {
 	createVideoJob *videoapplication.CreateVideoJob
 	getJobStatus   *videoapplication.GetJobStatus
 	listUserJobs   *videoapplication.ListUserJobs
-	// enqueueVideoJob is called by handleVideoUpload, not composed inside
-	// processVideoJob: the pending -> queued transition now writes the
-	// outbox row the relay publishes from, so it belongs to the caller that
-	// decides a job is ready for a worker rather than to the use case that
-	// immediately does the work itself.
+	// enqueueVideoJob is the last thing POST /upload does to a job. The
+	// pending -> queued transition writes the outbox row the relay
+	// publishes from, and once it commits the job belongs to cmd/worker:
+	// this process runs no extraction, completes no job, and fails none.
+	// ProcessVideoJob, CompleteJob, and FailJob are deliberately absent
+	// from this module for that reason — reintroducing any of them here
+	// would put a second writer on a row a worker has claimed.
 	enqueueVideoJob *videoapplication.EnqueueVideoJob
-	processVideoJob *videoapplication.ProcessVideoJob
 	listUserResults *videoapplication.ListUserResults
-	// completeJob and failJob are called directly by handleVideoUpload,
-	// not just composed inside processVideoJob: ProcessVideoJob leaves a
-	// successfully-extracted job in "processing" so the handler owns the
-	// job's terminal state. See ProcessVideoJob's doc comment for why that
-	// split no longer has a failure branch behind it.
-	completeJob *videoapplication.CompleteJob
-	failJob     *videoapplication.FailJob
 	// idempotency backs POST /upload's content-hash duplicate detection —
 	// see internal/video/domain.IdempotencyStore.
 	idempotency videodomain.IdempotencyStore
@@ -90,16 +83,13 @@ type videoModule struct {
 	idsFor  videodomain.VideoJobIDParser
 }
 
-func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, enqueueVideoJob *videoapplication.EnqueueVideoJob, processVideoJob *videoapplication.ProcessVideoJob, listUserResults *videoapplication.ListUserResults, completeJob *videoapplication.CompleteJob, failJob *videoapplication.FailJob, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, sources videodomain.SourceStorage, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
+func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatus *videoapplication.GetJobStatus, listUserJobs *videoapplication.ListUserJobs, enqueueVideoJob *videoapplication.EnqueueVideoJob, listUserResults *videoapplication.ListUserResults, idempotency videodomain.IdempotencyStore, jobs videodomain.VideoJobRepository, sources videodomain.SourceStorage, results videodomain.ResultStorage, idsFor videodomain.VideoJobIDParser) *videoModule {
 	return &videoModule{
 		createVideoJob:  createVideoJob,
 		getJobStatus:    getJobStatus,
 		listUserJobs:    listUserJobs,
 		enqueueVideoJob: enqueueVideoJob,
-		processVideoJob: processVideoJob,
 		listUserResults: listUserResults,
-		completeJob:     completeJob,
-		failJob:         failJob,
 		idempotency:     idempotency,
 		jobs:            jobs,
 		sources:         sources,
@@ -229,26 +219,15 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	repo := videocache.NewCachedVideoJobRepository(authoritativeRepo, redisClient, ids)
 	relay := videomessaging.NewRelay(videopostgres.NewOutboxRepository(db), rabbitConfig)
 	clock := systemClock{}
-	extractor := videoffmpeg.New()
-	completeJob := videoapplication.NewCompleteJob(repo, ids)
-	failJob := videoapplication.NewFailJob(repo, ids)
-
+	// No extractor, no ProcessVideoJob, no CompleteJob, no FailJob. This
+	// process hands work to cmd/worker and reads the outcome back; the
+	// ffmpeg adapter is not wired here at all.
 	module := newVideoModule(
 		videoapplication.NewCreateVideoJob(repo, ids, clock),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
-		videoapplication.NewProcessVideoJob(
-			videoapplication.NewStartProcessing(repo, ids),
-			failJob,
-			extractor,
-			sourceStorage,
-			resultStorage,
-			ids,
-		),
 		videoapplication.NewListUserResults(repo, resultStorage),
-		completeJob,
-		failJob,
 		idempotencyStore,
 		authoritativeRepo,
 		sourceStorage,
@@ -304,6 +283,26 @@ type videoErrorResponse struct {
 
 // ProcessingResult is POST /upload's response body — unchanged since before
 // this handler ran its processing through the VideoJob application layer.
+// uploadAcceptedResponse is what POST /upload returns once a job is queued,
+// and equally what it returns for a duplicate submission naming the job that
+// already exists. There is one shape and no outcome branch: the submission
+// no longer knows an outcome to report, because nothing has been processed
+// by the time it answers.
+//
+// StatusURL names GET /api/video-jobs/:id, which is the client's channel for
+// everything that used to be in the synchronous response body.
+type uploadAcceptedResponse struct {
+	JobID     string `json:"job_id"`
+	Status    string `json:"status"`
+	StatusURL string `json:"status_url"`
+}
+
+// videoJobStatusPath builds the status URL an upload response hands back.
+// One place, so the route and the pointer to it cannot drift apart.
+func videoJobStatusPath(jobID string) string {
+	return "/api/video-jobs/" + jobID
+}
+
 type ProcessingResult struct {
 	Success    bool     `json:"success"`
 	Message    string   `json:"message"`
@@ -568,22 +567,33 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		return
 	}
 	// One deferred cleanup, registered the moment the object exists, rather
-	// than a delete on each exit path below: this covers the idempotency
-	// conflict, a CreateVideoJob error, a ProcessVideoJob error, a
-	// processing failure, success, and a panic. Source objects are
-	// transient — nothing is meant to outlive its request.
+	// than a delete on each exit path below — so no early return that gets
+	// added later can forget it. It covers the idempotency conflict, a
+	// CreateVideoJob error, an EnqueueVideoJob error, and a panic.
+	//
+	// Guarded on the enqueue, and that guard is the whole cutover in one
+	// line. Until the enqueue commits, these bytes belong to this request
+	// and nothing else will ever look at them. After it commits they are the
+	// worker's input, and deleting them here — on the way out of a request
+	// that has already answered 202 — would destroy an extraction that has
+	// very likely already started. The worker deletes them instead, once it
+	// has committed a terminal state.
 	//
 	// Best effort, deliberately: one call, no retry. If storage is
 	// unreachable at exactly this moment the object survives with nothing to
 	// reclaim it, which is why the log line carries the key (it is what
 	// makes the residual set enumerable) and why no spec here claims that no
 	// source object survives. The operator-side backstop is an expiration
-	// lifecycle rule on the uploads/ prefix; a real guarantee needs the
-	// reconciling worker Phase 6 introduces.
+	// lifecycle rule on the uploads/ prefix, which is now the only guarantee
+	// that a job enqueued but never dispatched has its source reclaimed.
+	var enqueued bool
 	defer func() {
+		if enqueued {
+			return
+		}
 		// A detached context: c.Request.Context() may already be canceled
-		// (client disconnect), which can itself be why processing failed,
-		// and the cleanup must still run.
+		// (client disconnect), which can itself be why the request is
+		// unwinding, and the cleanup must still run.
 		cleanupCtx, cancel := videoapplication.NewFinalizationContext()
 		defer cancel()
 		if err := m.sources.Delete(cleanupCtx, sourceKey); err != nil {
@@ -632,7 +642,11 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 				})
 				return
 			}
-			c.JSON(200, duplicateProcessingResult(status))
+			c.JSON(http.StatusAccepted, uploadAcceptedResponse{
+				JobID:     status.JobID,
+				Status:    status.Status,
+				StatusURL: videoJobStatusPath(status.JobID),
+			})
 			return
 		}
 		// The reservation never resolved within the bound — a genuine
@@ -651,6 +665,11 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		UserID:           userID.String(),
 		OriginalFilename: safeFilename,
 		SourceKey:        sourceKey.String(),
+		// Persisted with the job so the worker can rebuild this request's
+		// idempotency key from the job alone. Nothing else carries it: the
+		// reservation token is not stored, and this request is gone by the
+		// time a failure needs the key cleared.
+		ContentHash: contentHash,
 	})
 	if err != nil {
 		// A detached context: c.Request.Context() may already be canceled
@@ -672,11 +691,12 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		return
 	}
 
-	// Enqueued before the job is processed, and before the idempotency key
-	// is finalized so this failure branch clears a plain reservation rather
-	// than a finalized entry. The transition writes the outbox row the relay
-	// publishes from; ProcessVideoJob no longer performs it, and expects a
-	// job already in queued.
+	// The last thing this handler does to the job, and the point at which
+	// ownership of the source object transfers. It commits the pending ->
+	// queued transition together with the outbox row the relay publishes
+	// from, so a dispatch exists for exactly the jobs that reached queued.
+	// It runs before the idempotency key is finalized, so this failure
+	// branch clears a plain reservation rather than a finalized entry.
 	if _, err := m.enqueueVideoJob.Execute(c.Request.Context(), created.JobID); err != nil {
 		// Handled like a CreateVideoJob failure: the job row exists but is
 		// unqueued, and the source object's deferred cleanup above still
@@ -698,6 +718,26 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		return
 	}
 
+	// Set the instant the enqueue commits, before anything below can fail:
+	// past this point the source object is the worker's input, and the
+	// deferred cleanup above must not touch it whatever else goes wrong.
+	enqueued = true
+
+	// Finalized after the enqueue, not before, per upload-idempotency's
+	// "Reservation Is Finalized To The Real VideoJobID Only By Its Owning
+	// Token": a finalized key advertises its job to every duplicate for
+	// the full 24h window, so finalizing a job that then failed to reach
+	// queued would deduplicate later uploads of the same bytes onto a job
+	// stuck in pending that nothing will ever process.
+	//
+	// The order is not free, and the cost runs the other way: a worker
+	// that fails this job clears the key by job ID, and until this line
+	// runs the key is still a bare reservation, which ClearByJob leaves
+	// alone by design. A clear landing in that window is a no-op this line
+	// then overwrites, pinning the key to a failed job for its full
+	// window. Both orderings trade one narrow 24h-block for another, which
+	// is why the choice belongs to the spec and not to this function.
+	//
 	// A Finalize failure is non-fatal — the job just created is still
 	// valid in PostgreSQL either way; see design.md Decision 7. Skipped
 	// entirely when hasReservation is false: there is no reservation to
@@ -710,92 +750,14 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		}
 	}
 
-	processed, err := m.processVideoJob.Execute(c.Request.Context(), created.JobID, sourceKey)
-	if err != nil {
-		// The job's state here isn't confirmed failed (ProcessVideoJob's
-		// own FailJob call may itself have errored) — leave the
-		// idempotency key for its own TTL rather than clear it for an
-		// uncertain job state.
-		log.Printf("process video job %s: %v", created.JobID, err)
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Erro ao processar vídeo",
-		})
-		return
-	}
-
-	if !processed.Success {
-		// ProcessVideoJob only returns Success:false once FailJob has
-		// already succeeded internally (processing -> failed) — safe to
-		// clear, so a retry with the same content isn't blocked. A
-		// detached context, like above: the extraction error itself may
-		// be a symptom of c.Request.Context() already being canceled
-		// (ProcessVideoJob uses its own detached context for the same
-		// reason when it calls FailJob internally), and this cleanup must
-		// still succeed for the retry to actually work.
-		if hasReservation {
-			clearCtx, cancel := videoapplication.NewFinalizationContext()
-			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-				log.Printf("clear idempotency key for failed job %s: cleared=%v err=%v", created.JobID, cleared, clearErr)
-			}
-			cancel()
-		}
-		c.JSON(200, ProcessingResult{
-			Success: false,
-			Message: extractionFailureMessage(processed.ExtractionError, processed.FailureReason),
-		})
-		return
-	}
-
-	result := ProcessingResult{
-		Success:    true,
-		Message:    fmt.Sprintf("Processamento concluído! %d frames extraídos.", processed.FrameCount),
-		ZipPath:    processed.StorageKey,
-		FrameCount: processed.FrameCount,
-		Images:     processed.ImageNames,
-	}
-
-	// The result is already durable by this point: ProcessVideoJob stores
-	// the zip in the bucket as part of its own sequence, so a successful
-	// return means there is nothing left for this handler to make reachable
-	// before completing the job.
-	//
-	// A detached context: c.Request.Context() may already be canceled (e.g.
-	// client disconnect), and this write must still succeed so the job
-	// doesn't stay stuck in "processing".
-	finalizeCtx, cancel := videoapplication.NewFinalizationContext()
-	defer cancel()
-	if _, err := m.completeJob.Execute(finalizeCtx, videoapplication.CompleteJobInput{
-		JobID:      created.JobID,
-		StorageKey: processed.StorageKey,
-		FrameCount: processed.FrameCount,
-	}); err != nil {
-		log.Printf("complete video job %s: %v", created.JobID, err)
-		c.JSON(500, ProcessingResult{
-			Success: false,
-			Message: "Erro ao finalizar o processamento",
-		})
-		return
-	}
-
-	c.JSON(200, result)
-}
-
-// extractionFailureMessage maps ProcessVideoJob's classifiable
-// ExtractionError to the same distinct pt-BR messages POST /upload always
-// returned, instead of exposing the underlying (English, infrastructure)
-// error text directly in the response body.
-func extractionFailureMessage(extractionErr error, reason string) string {
-	switch {
-	case errors.Is(extractionErr, videoffmpeg.ErrNoFramesExtracted):
-		return "Nenhum frame foi extraído do vídeo"
-	case errors.Is(extractionErr, videoffmpeg.ErrFfmpegExecFailed):
-		return "Erro no ffmpeg: " + reason
-	case errors.Is(extractionErr, videoffmpeg.ErrZipCreationFailed):
-		return "Erro ao criar arquivo ZIP: " + reason
-	default:
-		return "Erro no processamento: " + reason
-	}
+	// 202, not 200: the work has been accepted, not done. No extraction has
+	// run, no frame count exists, and no artifact is reachable yet — the
+	// client learns all of that by polling StatusURL.
+	c.JSON(http.StatusAccepted, uploadAcceptedResponse{
+		JobID:     created.JobID,
+		Status:    string(videodomain.JobStatusQueued),
+		StatusURL: videoJobStatusPath(created.JobID),
+	})
 }
 
 // waitForFinalizedIdempotencyKey polls idempotency.Lookup for up to
@@ -818,34 +780,6 @@ func (m *videoModule) waitForFinalizedIdempotencyKey(ctx context.Context, key vi
 		case <-ctx.Done():
 			return videodomain.VideoJobID{}, false
 		case <-time.After(idempotencyLookupRetryInterval):
-		}
-	}
-}
-
-// duplicateProcessingResult translates an existing job's status into
-// ProcessingResult — the same response shape a non-duplicate POST /upload
-// returns, never GetJobStatusResult's own field names (see design.md
-// Decision 8). Per-frame Images names aren't persisted anywhere this status
-// lookup can reach, so they're omitted; the frontend never reads that field
-// regardless.
-func duplicateProcessingResult(status videoapplication.GetJobStatusResult) ProcessingResult {
-	switch status.Status {
-	case string(videodomain.JobStatusCompleted):
-		return ProcessingResult{
-			Success:    true,
-			Message:    fmt.Sprintf("Processing already completed for this content (%d frames extracted).", status.FrameCount),
-			ZipPath:    status.StorageKey,
-			FrameCount: status.FrameCount,
-		}
-	case string(videodomain.JobStatusFailed):
-		return ProcessingResult{
-			Success: false,
-			Message: "Processing already failed for this content: " + status.ErrorReason,
-		}
-	default:
-		return ProcessingResult{
-			Success: false,
-			Message: "This content is already being processed; try again shortly.",
 		}
 	}
 }
