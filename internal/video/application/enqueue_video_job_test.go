@@ -15,7 +15,7 @@ import (
 func newPendingRepoJob(t *testing.T, repo *fakeVideoJobRepository, jobID, userID string) *domain.VideoJob {
 	t.Helper()
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
-	job, err := domain.RestoreVideoJob(newTestVideoJobID(t, jobID), newTestVideoUserID(t, userID), filename, testSourceKey(t), domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	job, err := domain.RestoreVideoJob(newTestVideoJobID(t, jobID), newTestVideoUserID(t, userID), filename, testSourceKey(t), "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error building job: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestEnqueueVideoJob_PersistsThroughEnqueueNotUpdate(t *testing.T) {
 func TestEnqueueVideoJob_NoSourceKey_RejectedAndNotPersisted(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	filename, _ := domain.NewOriginalFilename("movie.mp4")
-	job, err := domain.RestoreVideoJob(newTestVideoJobID(t, "job-1"), newTestVideoUserID(t, "user-1"), filename, domain.StorageKey{}, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	job, err := domain.RestoreVideoJob(newTestVideoJobID(t, "job-1"), newTestVideoUserID(t, "user-1"), filename, domain.StorageKey{}, "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

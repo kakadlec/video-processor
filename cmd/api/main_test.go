@@ -19,8 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	platformrabbitmq "video-processor/internal/platform/rabbitmq"
-	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
+	videoapplication "video-processor/internal/video/application"
 
 	videodomain "video-processor/internal/video/domain"
 	videostorage "video-processor/internal/video/infrastructure/storage"
@@ -52,14 +54,13 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	// go test sets the working directory to this package's own directory
-	// (cmd/api), but the app's uploads/temp paths are relative to the repo
-	// root — chdir so tests exercise the same directories the running app
-	// actually uses, not a shadow copy under cmd/api.
+	// (cmd/api), while the app resolves every relative path against the
+	// repo root — chdir so tests see the same layout the running binary
+	// does, not a shadow copy under cmd/api.
 	if err := os.Chdir("../.."); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: failed to chdir to repo root: %v\n", err)
 		os.Exit(1)
 	}
-	createDirs()
 	os.Exit(m.Run())
 }
 
@@ -79,24 +80,6 @@ func generateTestVideo(t *testing.T, durationSeconds int) string {
 	return path
 }
 
-// generateTestVideoInContainer is generateTestVideo for a container other
-// than mp4, so a test can prove ffmpeg detects the format by probing rather
-// than from the filename — ProcessVideoJob downloads the source to an
-// extension-less local path.
-func generateTestVideoInContainer(t *testing.T, durationSeconds int, extension string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "test."+extension)
-	cmd := exec.Command("ffmpeg",
-		"-f", "lavfi",
-		"-i", fmt.Sprintf("testsrc=duration=%d:size=320x240:rate=1", durationSeconds),
-		"-y", path,
-	)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to generate %s test video: %v\n%s", extension, err, output)
-	}
-	return path
-}
-
 // generateUndecodableVideo writes a file with a valid video extension but
 // content ffmpeg cannot decode, to reliably trigger a processing failure
 // without relying on a specific ffmpeg error message.
@@ -109,40 +92,49 @@ func generateUndecodableVideo(t *testing.T, name string) string {
 	return path
 }
 
-// assertTempDirClean fails the test if temp/ has any leftover per-request
-// directories, which would mean the defer os.RemoveAll cleanup didn't run.
-func assertTempDirClean(t *testing.T) {
-	t.Helper()
-	entries, err := os.ReadDir("temp")
-	if err != nil {
-		t.Fatalf("failed to read temp dir: %v", err)
-	}
-	for _, e := range entries {
-		if e.Name() == ".gitkeep" {
-			continue
-		}
-		t.Fatalf("expected temp/ to have no leftover entries, found: %s", e.Name())
-	}
-}
-
 // startTestServer spins up the real router (real handlers, real ffmpeg calls,
 // real filesystem) on an in-process httptest server, backed by a configured
 // (in-memory) identity module, and returns a bearer token valid for that
 // server's fixed test user.
 func startTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	srv, token, _ := startTestServerWithModule(t)
+	return srv, token
+}
+
+// testStatusUserID is the user startTestServer mints its token for, needed
+// by callers that seed a job for that same caller.
+const testStatusUserID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+// startTestServerWithModule is startTestServer plus the videoModule it wired.
+// Callers that need a job in a terminal state need the module: POST /upload
+// only queues now, so a test of GET /download/:filename or GET /api/status
+// has to reach past the HTTP surface and drive the job there itself.
+func startTestServerWithModule(t *testing.T) (*httptest.Server, string, *videoModule) {
+	t.Helper()
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	return srv, token
+	return srv, token, video
 }
 
 // uploadVideo performs an authenticated multipart upload of the file at
 // videoPath under the given filename (the filename controls which extension
 // the server sees).
 func uploadVideo(t *testing.T, baseURL, token, videoPath, filename string) (*http.Response, ProcessingResult) {
+	t.Helper()
+	body, contentType := videoFormBody(t, videoPath, filename)
+	return doUpload(t, baseURL, token, body, contentType)
+}
+
+// videoFormBody builds the multipart body uploadVideo sends, separately from
+// sending it, so the two response shapes POST /upload can answer with — the
+// 202 acknowledgement and the rejection — each get their own decoder over
+// the same request.
+func videoFormBody(t *testing.T, videoPath, filename string) (*bytes.Buffer, string) {
 	t.Helper()
 
 	body := &bytes.Buffer{}
@@ -162,8 +154,7 @@ func uploadVideo(t *testing.T, baseURL, token, videoPath, filename string) (*htt
 	if err := writer.Close(); err != nil {
 		t.Fatalf("failed to close multipart writer: %v", err)
 	}
-
-	return doUpload(t, baseURL, token, body, writer.FormDataContentType())
+	return body, writer.FormDataContentType()
 }
 
 // uploadEmptyForm sends an authenticated multipart form with no "video"
@@ -203,86 +194,184 @@ func doUpload(t *testing.T, baseURL, token string, body *bytes.Buffer, contentTy
 	return resp, result
 }
 
-func TestUpload_ValidVideo_ExtractsFramesAndZip(t *testing.T) {
+// doUploadRaw is doUpload without a decoder, for callers that know which of
+// the two response shapes they expect.
+func doUploadRaw(t *testing.T, baseURL, token string, body *bytes.Buffer, contentType string) (*http.Response, []byte) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/upload", body)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	return resp, raw
+}
+
+// uploadVideoAccepted is uploadVideo for the success path, which no longer
+// speaks ProcessingResult: POST /upload queues the job and answers 202 with
+// the acknowledgement. It fails the test on any other status, so a caller
+// asserting on the acknowledgement never reads zero values out of a body
+// that was actually a rejection.
+func uploadVideoAccepted(t *testing.T, baseURL, token, videoPath, filename string) uploadAcceptedResponse {
+	t.Helper()
+
+	body, contentType := videoFormBody(t, videoPath, filename)
+	resp, raw := doUploadRaw(t, baseURL, token, body, contentType)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("upload status = %d, want %d (body: %s)", resp.StatusCode, http.StatusAccepted, raw)
+	}
+
+	var accepted uploadAcceptedResponse
+	if err := json.Unmarshal(raw, &accepted); err != nil {
+		t.Fatalf("failed to decode the acknowledgement %s: %v", raw, err)
+	}
+	if accepted.JobID == "" {
+		t.Fatalf("the 202 carries no job_id: %s", raw)
+	}
+	if want := videoJobStatusPath(accepted.JobID); accepted.StatusURL != want {
+		t.Fatalf("status_url = %q, want %q", accepted.StatusURL, want)
+	}
+	return accepted
+}
+
+// seedCompletedJob drives a job to completed and stores a small result
+// object for it, returning the result's storage key.
+//
+// It stands in for cmd/worker, which owns that half of the lifecycle now,
+// and deliberately runs no ffmpeg: GET /download/:filename and GET
+// /api/status care about entitlement, the presigned-URL shape, and the
+// object's own size and creation time — none of which depend on the bytes
+// having come from a frame extraction. The real pipeline is covered where it
+// lives, by internal/video/infrastructure/ffmpeg's and
+// internal/video/application's tests, and end to end by cmd/worker's.
+func seedCompletedJob(t *testing.T, m *videoModule, userID string) string {
+	t.Helper()
+
+	ctx := context.Background()
+	created, err := m.createVideoJob.Execute(ctx, videoapplication.CreateVideoJobInput{
+		UserID:           userID,
+		OriginalFilename: "seeded.mp4",
+		SourceKey:        "uploads/" + uuid.NewString() + "_seeded.mp4",
+		ContentHash:      strings.Repeat("a", 64),
+	})
+	if err != nil {
+		t.Fatalf("seed: create job: %v", err)
+	}
+	if _, err := m.enqueueVideoJob.Execute(ctx, created.JobID); err != nil {
+		t.Fatalf("seed: enqueue job: %v", err)
+	}
+	if _, err := videoapplication.NewStartProcessing(m.jobs, m.idsFor).Execute(ctx, created.JobID); err != nil {
+		t.Fatalf("seed: start processing: %v", err)
+	}
+
+	key := "frames_" + created.JobID + ".zip"
+	storageKey, err := videodomain.NewStorageKey(key)
+	if err != nil {
+		t.Fatalf("seed: storage key: %v", err)
+	}
+	if err := m.results.Put(ctx, storageKey, writeSeedZip(t)); err != nil {
+		t.Fatalf("seed: store result: %v", err)
+	}
+	if _, err := videoapplication.NewCompleteJob(m.jobs, m.idsFor).Execute(ctx, videoapplication.CompleteJobInput{
+		JobID:      created.JobID,
+		StorageKey: key,
+		FrameCount: seedFrameCount,
+	}); err != nil {
+		t.Fatalf("seed: complete job: %v", err)
+	}
+	return key
+}
+
+// seedFrameCount is what seedCompletedJob records on the job and how many
+// entries writeSeedZip puts in the archive, so the two agree.
+const seedFrameCount = 2
+
+// writeSeedZip writes a real (tiny) zip to a temp file and returns its path,
+// so the seeded result is a valid archive a download test can open.
+func writeSeedZip(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "frames.zip")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create seed zip: %v", err)
+	}
+	w := zip.NewWriter(f)
+	for i := 1; i <= seedFrameCount; i++ {
+		entry, err := w.Create(fmt.Sprintf("frame_%04d.png", i))
+		if err != nil {
+			t.Fatalf("create seed zip entry: %v", err)
+		}
+		if _, err := entry.Write([]byte("not really a png")); err != nil {
+			t.Fatalf("write seed zip entry: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close seed zip writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close seed zip: %v", err)
+	}
+	return path
+}
+
+// TestUpload_ValidVideo_QueuesTheJobAndAnswers202 is what POST /upload
+// promises now: the request ends at the queue. The acknowledgement names the
+// job and where to poll it, the job is queued rather than finished, and
+// nothing was extracted — the frames, the zip, and the completed job are
+// cmd/worker's, and are asserted there.
+func TestUpload_ValidVideo_QueuesTheJobAndAnswers202(t *testing.T) {
 	srv, token := startTestServer(t)
 	videoPath := generateTestVideo(t, 3)
 
-	resp, result := uploadVideo(t, srv.URL, token, videoPath, "test-video.mp4")
+	accepted := uploadVideoAccepted(t, srv.URL, token, videoPath, "test-video.mp4")
 
+	if accepted.Status != string(videodomain.JobStatusQueued) {
+		t.Fatalf("status = %q, want %q", accepted.Status, videodomain.JobStatusQueued)
+	}
+
+	// The status URL the response handed out has to resolve, or the client
+	// has an acknowledgement it cannot act on.
+	resp := getWithAuthorization(t, srv.URL+accepted.StatusURL, "Bearer "+token)
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+		t.Fatalf("GET %s = %d, want %d", accepted.StatusURL, resp.StatusCode, http.StatusOK)
 	}
-	if !result.Success {
-		t.Fatalf("expected success=true, got message: %s", result.Message)
+	var job videoJobStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		t.Fatalf("failed to decode job: %v", err)
 	}
-	if result.FrameCount != 3 {
-		t.Fatalf("expected frame_count=3 for a 3s video, got %d", result.FrameCount)
+	if job.JobID != accepted.JobID {
+		t.Fatalf("job id = %q, want %q", job.JobID, accepted.JobID)
 	}
-	if result.ZipPath == "" {
-		t.Fatal("expected a non-empty zip_path")
-	}
-
-	// The zip must be downloadable and contain exactly the reported frames.
-	// The API hands out a grant; the bytes come from storage directly.
-	issued := issueDownload(t, srv.URL, token, result.ZipPath)
-	zipBytes := followIssuedURL(t, issued.URL)
-	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-	if err != nil {
-		t.Fatalf("downloaded file is not a valid zip: %v", err)
-	}
-	if len(zr.File) != result.FrameCount {
-		t.Fatalf("expected zip to contain %d frames, got %d", result.FrameCount, len(zr.File))
+	if job.Status != string(videodomain.JobStatusQueued) {
+		t.Fatalf("job status = %q, want %q — POST /upload must not process", job.Status, videodomain.JobStatusQueued)
 	}
 
-	// The source video never touches the local filesystem on the way in;
-	// the only local trace is the copy ProcessVideoJob downloads for ffmpeg,
-	// which it owns and removes. The bucket side — that the source object
-	// itself is gone — is asserted by
-	// TestUpload_Success_StoresResultAndDeletesSourceObject.
-	sourceCopies, err := filepath.Glob(filepath.Join("temp", "*_source"))
-	if err != nil {
-		t.Fatalf("failed to glob temp dir: %v", err)
-	}
-	if len(sourceCopies) != 0 {
-		t.Fatalf("expected the downloaded source copy to be removed, found: %v", sourceCopies)
-	}
-
-	// The result is an object, not a file: no zip may be left behind.
-	strays, err := filepath.Glob(filepath.Join("temp", "*.zip"))
-	if err != nil {
-		t.Fatalf("failed to glob temp dir: %v", err)
-	}
-	if len(strays) != 0 {
-		t.Fatalf("expected no leftover zip under temp/, found: %v", strays)
-	}
-}
-
-// TestUpload_StoresResultInTheBucket asserts the artifact actually reached
-// object storage, against the same ResultStorage the handler was wired with
-// — not merely that the download endpoint served something.
-func TestUpload_StoresResultInTheBucket(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
-	video, _, results := newTestVideoModuleWithStorage(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
-	t.Cleanup(srv.Close)
-	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-
-	videoPath := generateTestVideo(t, 1)
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "bucket-check.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
-
-	key, err := videodomain.NewStorageKey(result.ZipPath)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	size, _, err := results.Stat(context.Background(), key)
-	if err != nil {
-		t.Fatalf("expected the result object to exist under %q: %v", key.String(), err)
-	}
-	if size == 0 {
-		t.Fatalf("stored object under %q is empty", key.String())
+	// No ffmpeg ran in this process, so temp/ has nothing in it: no
+	// downloaded source copy, no per-job frame directory, no zip.
+	for _, pattern := range []string{"*_source", "*.zip", "*"} {
+		strays, err := filepath.Glob(filepath.Join("temp", pattern))
+		if err != nil {
+			t.Fatalf("failed to glob temp dir: %v", err)
+		}
+		for _, stray := range strays {
+			if filepath.Base(stray) == ".gitkeep" {
+				continue
+			}
+			t.Fatalf("POST /upload left %q under temp/ — the API extracts nothing", stray)
+		}
 	}
 }
 
@@ -296,21 +385,17 @@ func TestDownload_EveryRejectionIsByteIdentical(t *testing.T) {
 	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
-	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
 
-	videoPath := generateTestVideo(t, 1)
-	_, result := uploadVideo(t, srv.URL, tokenA, videoPath, "leak-check.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
+	key := seedCompletedJob(t, video, userA.String())
 
 	cases := []struct {
 		name  string
 		path  string
 		token string
 	}{
-		{"another user's artifact", "/download/" + result.ZipPath, tokenB},
+		{"another user's artifact", "/download/" + key, tokenB},
 		{"a key belonging to no job", "/download/frames_3fa85f64-5717-4562-b3fc-2c963f66afff.zip", tokenA},
 		{"not a result key at all", "/download/whatever.txt", tokenA},
 		{"a key whose embedded id is malformed", "/download/frames_not-a-uuid.zip", tokenA},
@@ -418,19 +503,15 @@ func followIssuedURL(t *testing.T, signedURL string) []byte {
 // request would succeed and the failure would surface as MinIO's own 404 —
 // a different origin, an XML body — instead of this endpoint's rejection.
 func TestDownload_MissingObjectIsRejectedLikeEveryOtherCase(t *testing.T) {
-	srv, token, inspector := startSourceStorageTestServer(t)
+	srv, token, userID, module, _, inspector := startSourceStorageTestServer(t)
 
-	videoPath := generateTestVideo(t, 1)
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "deleted-object.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
+	key := seedCompletedJob(t, module, userID)
 
 	// Entitlement still passes: the VideoJob row is untouched and still
 	// records this key. Only the object is gone.
-	inspector.removeObject(t, result.ZipPath)
+	inspector.removeObject(t, key)
 
-	missing := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+	missing := getWithAuthorization(t, srv.URL+"/download/"+key, "Bearer "+token)
 	defer missing.Body.Close()
 
 	baseline := getWithAuthorization(t, srv.URL+"/download/whatever.txt", "Bearer "+token)
@@ -450,17 +531,13 @@ func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	repo := newInMemoryVideoJobRepository()
 	results := newFakeResultStorage()
-	module, _ := newIdempotencyTestVideoModuleWithRepoAndStorage(videoffmpeg.New(), repo, results)
+	module, _ := newIdempotencyTestVideoModuleWithRepoAndStorage(repo, results)
 	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
-	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
-	videoPath := generateTestVideo(t, 1)
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "storage-failure.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
+	key := seedCompletedJob(t, module, userID.String())
 
 	baseline := getWithAuthorization(t, srv.URL+"/download/whatever.txt", "Bearer "+token)
 	defer baseline.Body.Close()
@@ -497,7 +574,7 @@ func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
 				results.mu.Unlock()
 			})
 
-			failed := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+token)
+			failed := getWithAuthorization(t, srv.URL+"/download/"+key, "Bearer "+token)
 			defer failed.Body.Close()
 
 			if got := fingerprintRejection(t, failed); got != want {
@@ -516,16 +593,12 @@ func TestDownload_NonOwnerReceivesNoGrant(t *testing.T) {
 	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
-	_, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
 
-	videoPath := generateTestVideo(t, 1)
-	_, result := uploadVideo(t, srv.URL, tokenA, videoPath, "no-grant.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
+	key := seedCompletedJob(t, video, userA.String())
 
-	resp := getWithAuthorization(t, srv.URL+"/download/"+result.ZipPath, "Bearer "+tokenB)
+	resp := getWithAuthorization(t, srv.URL+"/download/"+key, "Bearer "+tokenB)
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -542,35 +615,19 @@ func TestDownload_NonOwnerReceivesNoGrant(t *testing.T) {
 		t.Fatalf("rejection body %q carries signature material", body)
 	}
 
-	// And the owner still gets one, so the assertion above is not passing
-	// because issuance is broken for everyone.
-	owner := issueDownload(t, srv.URL, tokenA, result.ZipPath)
+	// And the owner still gets one that actually redeems, so the assertion
+	// above is not passing because issuance is broken for everyone.
+	owner := issueDownload(t, srv.URL, tokenA, key)
 	if owner.URL == "" {
 		t.Fatal("owner issuance carries no url")
 	}
-}
-
-// TestCreateDirs_CreatesOnlyTemp pins the directory set the application owns
-// now that both source videos and results live in a bucket. temp/ is the
-// last one: per-request scratch for the downloaded source, the extracted
-// frames, and the zip built from them.
-func TestCreateDirs_CreatesOnlyTemp(t *testing.T) {
-	// os.Remove only succeeds on an empty directory, so a leftover directory
-	// from a pre-migration run of the binary is left alone and reported
-	// below rather than silently deleted.
-	_ = os.Remove("outputs")
-	_ = os.Remove("uploads")
-
-	createDirs()
-
-	if _, err := os.Stat("temp"); err != nil {
-		t.Fatalf("expected temp/ to exist: %v", err)
+	zipBytes := followIssuedURL(t, owner.URL)
+	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		t.Fatalf("the redeemed grant did not serve a valid zip: %v", err)
 	}
-	for _, dir := range []string{"uploads", "outputs"} {
-		if _, err := os.Stat(dir); !os.IsNotExist(err) {
-			t.Fatalf("expected %s/ not to be created, stat err = %v "+
-				"(if it exists and is non-empty, it is a leftover from a pre-migration run — remove it)", dir, err)
-		}
+	if len(zr.File) != seedFrameCount {
+		t.Fatalf("redeemed zip has %d entries, want %d", len(zr.File), seedFrameCount)
 	}
 }
 
@@ -628,13 +685,10 @@ func TestUpload_VideoFieldNotFirst_StillFound(t *testing.T) {
 		t.Fatalf("failed to close multipart writer: %v", err)
 	}
 
-	resp, result := doUpload(t, srv.URL, token, body, writer.FormDataContentType())
+	resp, raw := doUploadRaw(t, srv.URL, token, body, writer.FormDataContentType())
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d (message: %s)", resp.StatusCode, result.Message)
-	}
-	if !result.Success {
-		t.Fatalf("expected success=true when the video part follows another field, got message: %s", result.Message)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected HTTP 202 when the video part follows another field, got %d (body: %s)", resp.StatusCode, raw)
 	}
 }
 
@@ -730,14 +784,16 @@ func TestUpload_MissingFileField_Rejected(t *testing.T) {
 	}
 }
 
-func TestStatus_ListsProcessedZip(t *testing.T) {
-	srv, token := startTestServer(t)
+// TestStatus_ListsCompletedResults pins that GET /api/status lists a
+// caller's finished artifacts — and, by consequence, that it does not list a
+// job POST /upload merely queued: the upload below is the negative half, and
+// only the seeded completed job may appear.
+func TestStatus_ListsCompletedResults(t *testing.T) {
+	srv, token, video := startTestServerWithModule(t)
 	videoPath := generateTestVideo(t, 1)
 
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "status-check.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
+	queued := uploadVideoAccepted(t, srv.URL, token, videoPath, "status-check.mp4")
+	key := seedCompletedJob(t, video, testStatusUserID)
 
 	resp := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+token)
 	defer resp.Body.Close()
@@ -754,13 +810,15 @@ func TestStatus_ListsProcessedZip(t *testing.T) {
 
 	found := false
 	for _, f := range status.Files {
-		if f.Filename == result.ZipPath {
+		if f.Filename == key {
 			found = true
-			break
+		}
+		if f.Filename == "frames_"+queued.JobID+".zip" {
+			t.Fatalf("status listed %q for a job that is only queued", f.Filename)
 		}
 	}
 	if !found {
-		t.Fatalf("expected %q in status listing, got %+v", result.ZipPath, status.Files)
+		t.Fatalf("expected %q in status listing, got %+v", key, status.Files)
 	}
 }
 
@@ -809,33 +867,4 @@ func TestDownload_NonexistentFile_Returns404(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected HTTP 404, got %d", resp.StatusCode)
 	}
-}
-
-func TestProcessing_Failure_CleansTempDir(t *testing.T) {
-	srv, token := startTestServer(t)
-	videoPath := generateUndecodableVideo(t, "corrupt-temp-check.mp4")
-
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "corrupt-temp-check.mp4")
-
-	if result.Success {
-		t.Fatalf("expected processing to fail for undecodable content, got success")
-	}
-
-	// Nothing to clean up in the workspace any more: the upload never
-	// touches the local filesystem, and the source object is deleted on the
-	// failure path too — see
-	// TestProcessing_Failure_DeletesStoredSourceObject.
-	assertTempDirClean(t)
-}
-
-func TestProcessing_Success_CleansTempDir(t *testing.T) {
-	srv, token := startTestServer(t)
-	videoPath := generateTestVideo(t, 1)
-
-	_, result := uploadVideo(t, srv.URL, token, videoPath, "success-temp-check.mp4")
-	if !result.Success {
-		t.Fatalf("setup upload failed: %s", result.Message)
-	}
-
-	assertTempDirClean(t)
 }

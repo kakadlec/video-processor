@@ -19,9 +19,9 @@ func TestJobDispatchTopology_ReturnsThePinnedValues(t *testing.T) {
 		got   string
 		want  string
 	}{
-		{"Exchange", topo.Exchange, "video.jobs.v1"},
-		{"RoutingKey", topo.RoutingKey, "video_job.queued"},
-		{"WorkQueue", topo.WorkQueue, "video.jobs.queued.v1"},
+		{"Exchange", topo.Exchange, "video.jobs.v2"},
+		{"RoutingKey", topo.RoutingKey, "video_job.queued.v2"},
+		{"WorkQueue", topo.WorkQueue, "video.jobs.queued.v2"},
 		{"DeadExchange", topo.DeadExchange, "video.jobs.dlx"},
 		{"DeadQueue", topo.DeadQueue, "video.jobs.dead"},
 	} {
@@ -41,23 +41,38 @@ func TestJobDispatchTopology_ReturnsThePinnedValues(t *testing.T) {
 	}
 }
 
-// TestJobDispatchTopology_VersionsTheExchangeNotTheRoutingKey asserts the
-// property the generation scheme turns on. A direct exchange delivers each
-// publish to every queue bound with the matching routing key, so versioning
-// only the queue would let a replica that has not been redeployed reach a
-// later generation's consumer. Versioning the exchange separates the
-// delivery paths while leaving the routing key equal to the outbox
-// event_type string.
-func TestJobDispatchTopology_VersionsTheExchangeNotTheRoutingKey(t *testing.T) {
+// TestJobDispatchTopology_CarriesTheGenerationOnTheRoutingKey asserts the
+// property the generation scheme actually turns on, and it replaces the
+// assertion that versioning the *exchange* was enough.
+//
+// It is not. The two generations do not first meet at the broker; they meet
+// in the database, at the shared video_job_outbox table every replica's
+// relay claims from. That claim filters on event_type and nothing else, so
+// an old replica still running during a rolling deploy will happily claim a
+// new job's row and publish it into its own exchange — where its own inline
+// handler finishes the job and then deletes the source object out from
+// under the new worker's running ffmpeg. An already-deployed relay cannot be
+// taught a new predicate, so the only thing that stops it is a literal it
+// can never match: the generation has to be in the event_type string itself.
+//
+// The routing key equals that string (see
+// TestRoutingKeyMatchesTheOutboxEventType), so it carries the suffix too.
+// The exchange and work queue are versioned as well, so a message that
+// somehow slips out under the old names has nowhere to land.
+func TestJobDispatchTopology_CarriesTheGenerationOnTheRoutingKey(t *testing.T) {
 	topo := messaging.JobDispatchTopology()
 
-	if !strings.HasSuffix(topo.Exchange, ".v1") {
-		t.Errorf("Exchange = %q, want a generation suffix", topo.Exchange)
+	const generation = ".v2"
+	if !strings.HasSuffix(topo.RoutingKey, generation) {
+		t.Errorf("RoutingKey = %q, want the generation suffix %q — it is the outbox event_type, and that is what isolates the generations", topo.RoutingKey, generation)
 	}
-	if strings.Contains(topo.RoutingKey, ".v") {
-		t.Errorf("RoutingKey = %q carries a generation suffix; it must stay equal to the outbox event_type", topo.RoutingKey)
+	if !strings.HasSuffix(topo.Exchange, generation) {
+		t.Errorf("Exchange = %q, want the generation suffix %q", topo.Exchange, generation)
 	}
-	if strings.HasSuffix(topo.DeadExchange, ".v1") || strings.HasSuffix(topo.DeadQueue, ".v1") {
+	if !strings.HasSuffix(topo.WorkQueue, generation) {
+		t.Errorf("WorkQueue = %q, want the generation suffix %q", topo.WorkQueue, generation)
+	}
+	if strings.HasSuffix(topo.DeadExchange, generation) || strings.HasSuffix(topo.DeadQueue, generation) {
 		t.Errorf("the dead-letter sink is versioned (%q, %q); both generations share it deliberately", topo.DeadExchange, topo.DeadQueue)
 	}
 }

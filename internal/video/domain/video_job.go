@@ -74,7 +74,14 @@ type VideoJob struct {
 	// prevent. It may be empty: POST /api/video-jobs creates a job from a
 	// filename with no stored object at all. What such a job cannot do is be
 	// enqueued; see Enqueue.
-	sourceKey   StorageKey
+	sourceKey StorageKey
+	// contentHash is the SHA-256 of the uploaded bytes, hex-encoded. It is
+	// the second half of the IdempotencyKey the submitting request derived,
+	// persisted so a component that only has the job — the worker — can
+	// rebuild that key without the request that made it. It is empty for a
+	// job created without an upload, and deliberately not paired with any
+	// status: see RestoreVideoJob.
+	contentHash string
 	storageKey  StorageKey
 	frameCount  int
 	errorReason string
@@ -85,11 +92,11 @@ type VideoJob struct {
 // NewVideoJob creates a brand-new VideoJob, minting its VideoJobID through
 // the supplied generator. It always produces status pending, FrameCount 0,
 // an empty ErrorReason, and an unset StorageKey.
-func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, sourceKey StorageKey, createdAt time.Time) (*VideoJob, error) {
+func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, sourceKey StorageKey, contentHash string, createdAt time.Time) (*VideoJob, error) {
 	if generator == nil {
 		return nil, ErrVideoJobIDGeneratorRequired
 	}
-	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, StorageKey{}, 0, "", JobStatusPending, createdAt)
+	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, contentHash, StorageKey{}, 0, "", JobStatusPending, createdAt)
 }
 
 // RestoreVideoJob reconstructs a VideoJob from already-known, already-validated values, e.g. from storage.
@@ -100,7 +107,9 @@ func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename Original
 // client disconnect strands one. Pairing the field at reconstitution would
 // make those rows unloadable, turning FindByID into a domain error at deploy
 // time with no obvious cause. The invariant lives on Enqueue instead.
-func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, sourceKey StorageKey, storageKey StorageKey, frameCount int, errorReason string, status JobStatus, createdAt time.Time) (*VideoJob, error) {
+// contentHash is unpaired for the same reason: its column also ships with an
+// empty default, so every row written before it existed must stay loadable.
+func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, sourceKey StorageKey, contentHash string, storageKey StorageKey, frameCount int, errorReason string, status JobStatus, createdAt time.Time) (*VideoJob, error) {
 	if id.IsZero() {
 		return nil, ErrVideoJobIDRequired
 	}
@@ -131,6 +140,7 @@ func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, so
 		userID:           userID,
 		originalFilename: filename,
 		sourceKey:        sourceKey,
+		contentHash:      contentHash,
 		storageKey:       storageKey,
 		frameCount:       frameCount,
 		errorReason:      errorReason,
@@ -158,6 +168,12 @@ func (j *VideoJob) OriginalFilename() OriginalFilename {
 // unset for a job created without one.
 func (j *VideoJob) SourceKey() StorageKey {
 	return j.sourceKey
+}
+
+// ContentHash returns the hex-encoded SHA-256 of the uploaded bytes, empty
+// for a job created without an upload.
+func (j *VideoJob) ContentHash() string {
+	return j.contentHash
 }
 
 // StorageKey returns the job's result storage key, unset unless completed.

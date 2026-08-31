@@ -16,6 +16,12 @@ type CreateVideoJobInput struct {
 	UserID           string
 	OriginalFilename string
 	SourceKey        string
+	// ContentHash is the hex-encoded SHA-256 of the uploaded bytes, and is
+	// optional for the same reason SourceKey is: a job created from a
+	// filename alone has no bytes to hash. It is persisted so a later
+	// component holding only the job can rebuild the IdempotencyKey the
+	// submitting request derived from it.
+	ContentHash string
 }
 
 // CreateVideoJobResult describes the newly created job.
@@ -64,7 +70,7 @@ func (uc *CreateVideoJob) Execute(ctx context.Context, input CreateVideoJobInput
 		}
 	}
 
-	job, err := domain.NewVideoJob(uc.ids, userID, filename, sourceKey, uc.clock.Now())
+	job, err := domain.NewVideoJob(uc.ids, userID, filename, sourceKey, input.ContentHash, uc.clock.Now())
 	if err != nil {
 		return CreateVideoJobResult{}, err
 	}

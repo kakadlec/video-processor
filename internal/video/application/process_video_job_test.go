@@ -346,3 +346,75 @@ func (f *countingFrameExtractor) ExtractFrames(_ context.Context, _ domain.Video
 	f.calls++
 	return "", 0, nil, errors.New("should not be called")
 }
+
+// TestProcessVideoJob_LostClaim_AbandonsWithoutTouchingTheJob covers the
+// duplicate-delivery path this change makes safe. At-least-once delivery
+// means two consumers can be handed the same message; the claim is what
+// decides between them, and the loser must be inert. Not merely "does not
+// finish the job" — it must not download the source, must not run ffmpeg,
+// and above all must not call FailJob, which would mark the winner's job
+// failed while the winner is still extracting from it.
+//
+// Both routes to the sentinel are covered because they fail differently:
+// claimLoses is the post-read race (the row was queued when this consumer
+// read it and no longer is), while a stored job already in processing is
+// the aggregate refusing the transition outright.
+func TestProcessVideoJob_LostClaim_AbandonsWithoutTouchingTheJob(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, repo *fakeVideoJobRepository)
+	}{
+		{
+			name: "another consumer committed between the read and the write",
+			setup: func(t *testing.T, repo *fakeVideoJobRepository) {
+				newQueuedRepoJob(t, repo, "job-1", "user-1")
+				repo.claimLoses = true
+			},
+		},
+		{
+			name: "the stored job is already processing",
+			setup: func(t *testing.T, repo *fakeVideoJobRepository) {
+				job := newQueuedRepoJob(t, repo, "job-1", "user-1")
+				if err := job.StartProcessing(); err != nil {
+					t.Fatalf("unexpected error starting processing: %v", err)
+				}
+				if err := repo.Update(context.Background(), job); err != nil {
+					t.Fatalf("unexpected error persisting job: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeVideoJobRepository()
+			tc.setup(t, repo)
+			updatesBefore := repo.updateCalls
+
+			extractor := &countingFrameExtractor{}
+			sources := seededSources(t)
+
+			uc := newProcessVideoJobUseCase(repo, extractor, sources, newFakeResultStorage())
+			_, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+			if !errors.Is(err, domain.ErrJobClaimLost) {
+				t.Fatalf("error = %v, want %v", err, domain.ErrJobClaimLost)
+			}
+
+			if sources.downloads() != 0 {
+				t.Fatalf("source downloaded %d times, want 0 — a lost claim must cost no transfer", sources.downloads())
+			}
+			if extractor.calls != 0 {
+				t.Fatalf("ExtractFrames called %d times, want 0", extractor.calls)
+			}
+			if _, err := os.Stat(localSourcePathFor("job-1")); !os.IsNotExist(err) {
+				t.Fatalf("expected no local source copy, os.Stat err = %v", err)
+			}
+			// The discriminating assertion: a stray FailJob would go
+			// through Update, and would mark failed a job the winning
+			// consumer is still working on.
+			if repo.updateCalls != updatesBefore {
+				t.Fatalf("repo.updateCalls = %d, want %d — a lost claim must write nothing, least of all a failure", repo.updateCalls, updatesBefore)
+			}
+		})
+	}
+}

@@ -310,3 +310,120 @@ func rawTTL(t *testing.T, key domain.IdempotencyKey) time.Duration {
 	}
 	return ttl
 }
+
+// newTestJobID returns a fresh VideoJobID for a ClearByJob case.
+func newTestJobID(t *testing.T) domain.VideoJobID {
+	t.Helper()
+	jobID, err := domain.NewVideoJobID(uuid.NewString())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return jobID
+}
+
+// finalizedTo seeds key as finalized to jobID through the real Reserve and
+// Finalize calls, never by writing the stored string directly. ClearByJob
+// matches on that string's shape, so a test that built it itself would keep
+// passing if Finalize's format drifted — and that drift is exactly what
+// would make the worker's clear silently no-op in production, leaving the
+// user's 24-hour idempotency window pinned to a job that already finished.
+func finalizedTo(t *testing.T, store *idempotency.RedisStore, key domain.IdempotencyKey, jobID domain.VideoJobID) {
+	t.Helper()
+	ctx := context.Background()
+	token, reserved, err := store.Reserve(ctx, key)
+	if err != nil || !reserved {
+		t.Fatalf("reserve failed: reserved=%v err=%v", reserved, err)
+	}
+	finalized, err := store.Finalize(ctx, key, token, jobID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !finalized {
+		t.Fatal("finalize with the correct token should succeed")
+	}
+}
+
+// TestClearByJob_RemovesOnlyTheEntryFinalizedToThatJob covers the operation
+// the worker terminates a job with. It has no reservation token — the token
+// lives in the request that is long gone by the time the worker runs — so
+// the job ID is its whole authorization, and the four cases below are the
+// whole contract.
+func TestClearByJob_RemovesOnlyTheEntryFinalizedToThatJob(t *testing.T) {
+	t.Run("an entry finalized to the given job is deleted", func(t *testing.T) {
+		store := testStore(t)
+		key := testKey(t)
+		jobID := newTestJobID(t)
+		finalizedTo(t, store, key, jobID)
+
+		cleared, err := store.ClearByJob(context.Background(), key, jobID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cleared {
+			t.Fatal("cleared = false, want true")
+		}
+		if _, found, err := store.Lookup(context.Background(), key); err != nil || found {
+			t.Fatalf("expected the key to be gone: found=%v err=%v", found, err)
+		}
+	})
+
+	t.Run("an entry finalized to another job is left alone", func(t *testing.T) {
+		store := testStore(t)
+		key := testKey(t)
+		owner := newTestJobID(t)
+		finalizedTo(t, store, key, owner)
+
+		cleared, err := store.ClearByJob(context.Background(), key, newTestJobID(t))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cleared {
+			t.Fatal("cleared = true, want false — a job may only clear its own entry")
+		}
+		gotJobID, found, err := store.Lookup(context.Background(), key)
+		if err != nil || !found {
+			t.Fatalf("expected the key to survive: found=%v err=%v", found, err)
+		}
+		if !gotJobID.Equal(owner) {
+			t.Fatalf("Lookup returned %q, want %q", gotJobID.String(), owner.String())
+		}
+	})
+
+	t.Run("an in-flight reservation is left alone", func(t *testing.T) {
+		store := testStore(t)
+		key := testKey(t)
+		ctx := context.Background()
+		if _, reserved, err := store.Reserve(ctx, key); err != nil || !reserved {
+			t.Fatalf("reserve failed: reserved=%v err=%v", reserved, err)
+		}
+
+		// The reservation belongs to a request that has not finished yet.
+		// Deleting it would let a duplicate submission through and create
+		// a second job for the same bytes.
+		cleared, err := store.ClearByJob(ctx, key, newTestJobID(t))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cleared {
+			t.Fatal("cleared = true, want false — an unfinalized reservation must survive")
+		}
+		if _, reserved, err := store.Reserve(ctx, key); err != nil || reserved {
+			t.Fatalf("the reservation should still block a second Reserve: reserved=%v err=%v", reserved, err)
+		}
+	})
+
+	t.Run("an absent key reports false without an error", func(t *testing.T) {
+		store := testStore(t)
+
+		// The worker calls this on every terminal transition, so a key
+		// whose 24-hour window already expired is an ordinary outcome,
+		// not a failure to log.
+		cleared, err := store.ClearByJob(context.Background(), testKey(t), newTestJobID(t))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cleared {
+			t.Fatal("cleared = true, want false for an absent key")
+		}
+	})
+}

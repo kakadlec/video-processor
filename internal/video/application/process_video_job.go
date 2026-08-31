@@ -66,6 +66,14 @@ type ProcessVideoJobResult struct {
 // Execute therefore expects a job already in queued, and errors on one still
 // in pending.
 //
+// A lost claim is propagated unchanged. When StartProcessing reports
+// domain.ErrJobClaimLost — another consumer owns this job, or it is already
+// terminal — Execute returns that sentinel and nothing else happens: no
+// source is downloaded, no ffmpeg runs, and FailJob is emphatically not
+// called. Failing the job here would let a duplicate delivery overwrite the
+// winner's outcome, which is the exact damage the claim exists to prevent.
+// The caller's only correct response is to drop the dispatch.
+//
 // Execute takes a source StorageKey rather than a local file path, and that
 // is the point of the signature: a path written by the calling HTTP handler
 // is only meaningful to a process that shares that handler's filesystem, and

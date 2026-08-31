@@ -59,6 +59,9 @@ type fakeRepository struct {
 	updateCalls                int
 
 	enqueueCalls             int
+	claimCalls               int
+	claimResult              bool
+	claimErr                 error
 	findByIDErr              error
 	updateErr                error
 	enqueueErr               error
@@ -79,7 +82,7 @@ func newFakeRepository() *fakeRepository {
 // test like TestCachedVideoJobRepository_MissRepopulation_* pass whether or
 // not the production code actually handles the race correctly.
 func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
-	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
 	if err != nil {
 		panic("fakeRepository: failed to clone video job: " + err.Error())
 	}
@@ -150,6 +153,23 @@ func (r *fakeRepository) Enqueue(_ context.Context, job *domain.VideoJob) error 
 	return nil
 }
 
+// ClaimForProcessing reports whatever the test set up, so the decorator's
+// only interesting behaviour — whether it writes through — can be observed
+// independently of any real conditional-update semantics.
+func (r *fakeRepository) ClaimForProcessing(_ context.Context, job *domain.VideoJob) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.claimCalls++
+	if r.claimErr != nil {
+		return false, r.claimErr
+	}
+	if !r.claimResult {
+		return false, nil
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, nil
+}
+
 var jobIDCounter int
 
 func newTestJob(t *testing.T) *domain.VideoJob {
@@ -176,7 +196,7 @@ func newTestJob(t *testing.T) *domain.VideoJob {
 	if err != nil {
 		t.Fatalf("NewStorageKey: %v", err)
 	}
-	job, err := domain.RestoreVideoJob(id, userID, filename, sourceKey, domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	job, err := domain.RestoreVideoJob(id, userID, filename, sourceKey, "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
 	if err != nil {
 		t.Fatalf("RestoreVideoJob: %v", err)
 	}
@@ -348,6 +368,10 @@ func (b *blockingFindByID) Update(ctx context.Context, job *domain.VideoJob) err
 
 func (b *blockingFindByID) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	return b.fake.Enqueue(ctx, job)
+}
+
+func (b *blockingFindByID) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, error) {
+	return b.fake.ClaimForProcessing(ctx, job)
 }
 
 func (b *blockingFindByID) FindByID(ctx context.Context, id domain.VideoJobID) (*domain.VideoJob, error) {
@@ -734,4 +758,120 @@ func TestCachedVideoJobRepository_Enqueue_InnerFailureIsNotCached(t *testing.T) 
 	if _, err := client.Get(context.Background(), "videojob:status:"+job.ID().String()).Result(); !errors.Is(err, redis.Nil) {
 		t.Fatalf("expected no cache entry, got err = %v", err)
 	}
+}
+
+// TestCachedVideoJobRepository_ClaimForProcessing_WritesThroughOnlyOnAWin
+// pins the decorator's half of the atomic claim. The win case is the
+// ordinary write-through. The loss case is the one that matters: the
+// aggregate handed to ClaimForProcessing has already been mutated to
+// processing by its caller, so an unconditional write-through would push
+// that state into Redis even though PostgreSQL rejected the claim —
+// publishing a state no row ever held, and, in the setup below, overwriting
+// the *completed* entry the consumer that actually won the claim wrote.
+func TestCachedVideoJobRepository_ClaimForProcessing_WritesThroughOnlyOnAWin(t *testing.T) {
+	t.Run("a won claim is reflected in the cache", func(t *testing.T) {
+		client := newTestClient(t)
+		fake := newFakeRepository()
+		fake.claimResult = true
+		job := newTestJob(t)
+		if err := job.Enqueue(); err != nil {
+			t.Fatalf("job.Enqueue: %v", err)
+		}
+		if err := fake.Create(context.Background(), job); err != nil {
+			t.Fatalf("fake.Create: %v", err)
+		}
+		repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+		ctx := context.Background()
+
+		// Populate the cache with the queued state first, so the read
+		// below can only pass if the claim actually overwrote it.
+		if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if err := job.StartProcessing(); err != nil {
+			t.Fatalf("job.StartProcessing: %v", err)
+		}
+
+		claimed, err := repo.ClaimForProcessing(ctx, job)
+		if err != nil {
+			t.Fatalf("ClaimForProcessing: %v", err)
+		}
+		if !claimed {
+			t.Fatal("claimed = false, want true")
+		}
+
+		before := fake.findByIDCalls
+		found, err := repo.FindByID(ctx, job.ID())
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if fake.findByIDCalls != before {
+			t.Fatalf("fake.findByIDCalls = %d, want %d — the read should have been served from the cache", fake.findByIDCalls, before)
+		}
+		if found.Status() != domain.JobStatusProcessing {
+			t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusProcessing)
+		}
+	})
+
+	t.Run("a lost claim leaves the cache entry byte-identical", func(t *testing.T) {
+		client := newTestClient(t)
+		fake := newFakeRepository()
+		fake.claimResult = false
+		ctx := context.Background()
+
+		// The consumer that won the claim has already finished: the cache
+		// holds a completed entry. That is the state a write-through on
+		// the loss path would destroy.
+		job := newTestJob(t)
+		completed, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), resultKeyFor(t, job), 7, "", domain.JobStatusCompleted, job.CreatedAt())
+		if err != nil {
+			t.Fatalf("RestoreVideoJob: %v", err)
+		}
+		if err := fake.Create(ctx, completed); err != nil {
+			t.Fatalf("fake.Create: %v", err)
+		}
+		repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+		if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+
+		key := "videojob:status:" + job.ID().String()
+		before, err := client.Get(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("seeding the cache entry: %v", err)
+		}
+
+		// This consumer read the row while it was still queued and moved
+		// its own copy of the aggregate to processing before losing.
+		loser, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), domain.StorageKey{}, 0, "", domain.JobStatusProcessing, job.CreatedAt())
+		if err != nil {
+			t.Fatalf("RestoreVideoJob: %v", err)
+		}
+
+		claimed, err := repo.ClaimForProcessing(ctx, loser)
+		if err != nil {
+			t.Fatalf("ClaimForProcessing: %v", err)
+		}
+		if claimed {
+			t.Fatal("claimed = true, want false")
+		}
+
+		after, err := client.Get(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("reading the cache entry back: %v", err)
+		}
+		// Compared as raw strings rather than as decoded aggregates: a
+		// re-serialization that happened to round-trip would slip past a
+		// field-by-field comparison, and it would still mean the loser
+		// wrote to a key it has no claim on.
+		if after != before {
+			t.Fatalf("cache entry changed on a lost claim:\n before = %s\n  after = %s", before, after)
+		}
+	})
+}
+
+// resultKeyFor builds the result key a completed job would carry.
+func resultKeyFor(t *testing.T, job *domain.VideoJob) domain.StorageKey {
+	t.Helper()
+	return domain.ResultStorageKey(job.ID())
 }

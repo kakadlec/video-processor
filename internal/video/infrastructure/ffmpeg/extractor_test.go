@@ -47,6 +47,23 @@ func generateTestVideo(t *testing.T, durationSeconds int) string {
 	return path
 }
 
+// generateTestVideoInContainer is generateTestVideo for a container other
+// than mp4, so a test can prove the format is detected by probing rather
+// than from the filename.
+func generateTestVideoInContainer(t *testing.T, durationSeconds int, extension string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test."+extension)
+	cmd := exec.Command("ffmpeg",
+		"-f", "lavfi",
+		"-i", fmt.Sprintf("testsrc=duration=%d:size=320x240:rate=1", durationSeconds),
+		"-y", path,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to generate %s test video: %v\n%s", extension, err, output)
+	}
+	return path
+}
+
 func generateUndecodableVideo(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "not-a-video.mp4")
@@ -96,6 +113,38 @@ func TestExtractor_ExtractFrames_Success(t *testing.T) {
 	}
 	if _, err := os.Stat("outputs"); !os.IsNotExist(err) {
 		t.Fatalf("expected no outputs/ directory to be created, stat err = %v", err)
+	}
+}
+
+// TestExtractor_ExtractFrames_ExtensionlessPath_ProbesTheContainer is the
+// empirical check the extension-less naming owes. ProcessVideoJob downloads
+// the source to temp/<jobID>_source — deliberately no extension, so no part
+// of that path derives from a user-supplied filename — which leaves ffmpeg
+// with nothing but the content to identify the container from. A non-mp4
+// container proves it does: every other test here feeds it an .mp4 path, so
+// a filename-driven implementation would pass all of them.
+func TestExtractor_ExtractFrames_ExtensionlessPath_ProbesTheContainer(t *testing.T) {
+	requireFfmpeg(t)
+	prepareTempDir(t)
+
+	mkvPath := generateTestVideoInContainer(t, 1, "mkv")
+	extensionless := filepath.Join(t.TempDir(), "source")
+	content, err := os.ReadFile(mkvPath)
+	if err != nil {
+		t.Fatalf("read generated mkv: %v", err)
+	}
+	if err := os.WriteFile(extensionless, content, 0600); err != nil {
+		t.Fatalf("write extension-less copy: %v", err)
+	}
+
+	e := ffmpeg.New()
+	zipPath, frameCount, _, err := e.ExtractFrames(context.Background(), testJobID(t), extensionless)
+	if err != nil {
+		t.Fatalf("unexpected error: %v — ffmpeg must detect the container from content, not from a filename extension", err)
+	}
+	t.Cleanup(func() { os.Remove(zipPath) })
+	if frameCount < 1 {
+		t.Fatalf("frameCount = %d, want at least 1", frameCount)
 	}
 }
 

@@ -37,4 +37,22 @@ type IdempotencyStore interface {
 	// if token no longer matches — the caller should treat this as a
 	// no-op, not a failure.
 	Clear(ctx context.Context, key IdempotencyKey, token string) (cleared bool, err error)
+
+	// ClearByJob removes key's finalized mapping, but only if it currently
+	// points at jobID. It returns false (with no error) when key is absent,
+	// when it still holds an in-flight reservation, or when it names a
+	// different job.
+	//
+	// It exists alongside Clear because the component that clears a failed
+	// job's key is no longer the request that reserved it. The worker has
+	// the job and nothing else; the reservation token was never persisted
+	// and belongs to a request that returned long ago. Clear stays the
+	// stronger check and stays preferred wherever the token is in hand — a
+	// token is unique to one request, whereas a job ID identifies the
+	// mapping's target and not its owner.
+	//
+	// It never removes an unfinalized reservation: a reservation is another
+	// request's in-flight claim, and deleting it would let a concurrent
+	// duplicate through.
+	ClearByJob(ctx context.Context, key IdempotencyKey, jobID VideoJobID) (cleared bool, err error)
 }

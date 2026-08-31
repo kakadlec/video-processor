@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,7 +70,7 @@ func newTestJobWithSourceKey(t *testing.T, ids domain.VideoJobIDGenerator, userI
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
-	job, err := domain.NewVideoJob(ids, uid, fn, key, createdAt)
+	job, err := domain.NewVideoJob(ids, uid, fn, key, "", createdAt)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -294,7 +295,7 @@ func TestRepository_Create_DuplicateID_LeavesNoOutboxRow(t *testing.T) {
 	}
 
 	// Reuse the same ID to force a primary-key violation on the second Create.
-	dup, err := domain.RestoreVideoJob(first.ID(), first.UserID(), first.OriginalFilename(), first.SourceKey(), first.StorageKey(), 0, "", domain.JobStatusPending, time.Now().UTC())
+	dup, err := domain.RestoreVideoJob(first.ID(), first.UserID(), first.OriginalFilename(), first.SourceKey(), first.ContentHash(), first.StorageKey(), 0, "", domain.JobStatusPending, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -709,5 +710,213 @@ func TestRepository_FindByID_PreMigrationRowLoadsWithAnEmptySourceKey(t *testing
 	}
 	if found.Status() != domain.JobStatusQueued {
 		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
+	}
+}
+
+// seedJobInStatus persists a job already driven to status, returning it.
+// Every state is reached through the aggregate's own transitions, so the row
+// is one the application could actually have written.
+func seedJobInStatus(t *testing.T, repo *postgres.Repository, ids domain.VideoJobIDGenerator, status domain.JobStatus) *domain.VideoJob {
+	t.Helper()
+	ctx := context.Background()
+
+	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status == domain.JobStatusPending {
+		return job
+	}
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if status != domain.JobStatusQueued {
+		if err := job.StartProcessing(); err != nil {
+			t.Fatalf("unexpected error starting processing: %v", err)
+		}
+	}
+	switch status {
+	case domain.JobStatusCompleted:
+		storageKey, err := domain.NewStorageKey("frames_" + job.ID().String() + ".zip")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := job.Complete(storageKey, 7); err != nil {
+			t.Fatalf("unexpected error completing: %v", err)
+		}
+	case domain.JobStatusFailed:
+		if err := job.Fail("boom"); err != nil {
+			t.Fatalf("unexpected error failing: %v", err)
+		}
+	}
+
+	if err := repo.Update(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return job
+}
+
+// TestRepository_ClaimForProcessing_ClaimsAQueuedRow is the happy path of the
+// primitive that makes at-least-once delivery safe. Reporting claimed=true is
+// only half of it: the row itself has to be in processing afterwards, since
+// the UPDATE never reads the aggregate handed to it and an implementation
+// that wrote nothing at all could still return true.
+func TestRepository_ClaimForProcessing_ClaimsAQueuedRow(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := seedJobInStatus(t, repo, ids, domain.JobStatusQueued)
+
+	claimed, err := repo.ClaimForProcessing(ctx, job)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !claimed {
+		t.Fatal("claimed = false, want true for a queued row")
+	}
+
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found.Status() != domain.JobStatusProcessing {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusProcessing)
+	}
+}
+
+// TestRepository_ClaimForProcessing_RefusesEveryOtherStatus covers the
+// predicate's whole complement. completed and failed are the cases with
+// teeth: a claim that ignored the current status would overwrite a terminal
+// row, throwing away a result that was already delivered.
+func TestRepository_ClaimForProcessing_RefusesEveryOtherStatus(t *testing.T) {
+	for _, status := range []domain.JobStatus{
+		domain.JobStatusPending,
+		domain.JobStatusProcessing,
+		domain.JobStatusCompleted,
+		domain.JobStatusFailed,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			db := testDB(t)
+			ids := idgen.New()
+			repo := postgres.NewRepository(db, ids)
+			ctx := context.Background()
+
+			job := seedJobInStatus(t, repo, ids, status)
+			before, err := repo.FindByID(ctx, job.ID())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			claimed, err := repo.ClaimForProcessing(ctx, job)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if claimed {
+				t.Fatalf("claimed = true, want false for a %v row", status)
+			}
+
+			after, err := repo.FindByID(ctx, job.ID())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if after.Status() != before.Status() {
+				t.Fatalf("Status = %v, want the row left in %v", after.Status(), before.Status())
+			}
+			if after.StorageKey() != before.StorageKey() {
+				t.Fatalf("StorageKey = %v, want %v", after.StorageKey(), before.StorageKey())
+			}
+			if after.FrameCount() != before.FrameCount() {
+				t.Fatalf("FrameCount = %d, want %d", after.FrameCount(), before.FrameCount())
+			}
+			if after.ErrorReason() != before.ErrorReason() {
+				t.Fatalf("ErrorReason = %q, want %q", after.ErrorReason(), before.ErrorReason())
+			}
+		})
+	}
+}
+
+// TestRepository_ClaimForProcessing_ConcurrentClaimsProduceExactlyOneWinner
+// is the reason the claim is a single conditional UPDATE rather than a read
+// followed by a write. Two consumers handed the same message run this
+// against one row; under READ COMMITTED the loser blocks on the row lock,
+// re-evaluates status = 'queued' after the winner commits, and matches
+// nothing.
+func TestRepository_ClaimForProcessing_ConcurrentClaimsProduceExactlyOneWinner(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	job := seedJobInStatus(t, repo, ids, domain.JobStatusQueued)
+
+	const consumers = 8
+	start := make(chan struct{})
+	results := make(chan bool, consumers)
+	errs := make(chan error, consumers)
+	var wg sync.WaitGroup
+	for i := 0; i < consumers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			claimed, err := repo.ClaimForProcessing(ctx, job)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- claimed
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	winners := 0
+	for claimed := range results {
+		if claimed {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("winners = %d, want exactly 1", winners)
+	}
+}
+
+// TestRepository_ClaimForProcessing_UnknownIDIsDistinctFromALostClaim pins
+// the distinction the follow-up SELECT exists for. Both outcomes report
+// claimed=false, and the worker treats them very differently: a lost claim
+// is a duplicate delivery to ack quietly, while a job that does not exist is
+// a message to dead-letter.
+func TestRepository_ClaimForProcessing_UnknownIDIsDistinctFromALostClaim(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	unknown := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
+	claimed, err := repo.ClaimForProcessing(ctx, unknown)
+	if !errors.Is(err, domain.ErrVideoJobNotFound) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobNotFound)
+	}
+	if claimed {
+		t.Fatal("claimed = true, want false for an unknown id")
+	}
+
+	// The contrast: a row that exists but is no longer queued reports the
+	// same claimed=false with no error at all.
+	taken := seedJobInStatus(t, repo, ids, domain.JobStatusProcessing)
+	claimed, err = repo.ClaimForProcessing(ctx, taken)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if claimed {
+		t.Fatal("claimed = true, want false for a row already taken")
 	}
 }

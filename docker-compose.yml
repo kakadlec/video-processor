@@ -184,6 +184,48 @@ services:
       minio:
         condition: service_healthy
 
+  # The other half of the cutover: same image as "app", different binary.
+  # POST /upload now only queues a job, so without this service running,
+  # nothing ever moves one out of "queued".
+  #
+  # No IDENTITY_* variables and no published port, and both absences are the
+  # point. The worker acts on a job named by an internal dispatch, never on
+  # behalf of a caller, so it needs no signing key and no way in from
+  # outside; the only thing that can give it work is the broker.
+  #
+  # depends_on includes rabbitmq, unlike "app". The API serves fine with the
+  # broker down — its relay retries in the background — but a worker with no
+  # broker has nothing at all to do, so there is no availability to protect
+  # by starting it early. It still dials with retry: this only orders
+  # startup.
+  worker:
+    build: .
+    command: ["/app/worker"]
+    environment:
+      # Identical to the "app" service's Video Processing configuration —
+      # same database, same bucket, same broker. The two processes are two
+      # halves of one context.
+      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      REDIS_ADDR: redis:6379
+      VIDEO_MINIO_ENDPOINT: minio:9000
+      VIDEO_MINIO_ACCESS_KEY: minioadmin
+      VIDEO_MINIO_SECRET_KEY: minioadmin
+      VIDEO_MINIO_BUCKET: video-results
+      # Deliberately absent: VIDEO_MINIO_PUBLIC_ENDPOINT. The worker never
+      # presigns — issuing download grants is the API's job — so it has no
+      # reason to know the browser-facing address, and it defaults to the
+      # internal one it can actually reach.
+      RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
   # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
   # than "app"'s hardened "runtime" stage, which deliberately has neither.
   # `docker compose run --build --rm app-test go test ./... -v` is how the

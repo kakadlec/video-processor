@@ -28,6 +28,12 @@ type fakeVideoJobRepository struct {
 	byID         map[string]*domain.VideoJob
 	updateCalls  int
 	enqueueCalls int
+	claimCalls   int
+	// claimLoses makes ClaimForProcessing report a lost claim without
+	// writing, standing in for another consumer that committed between the
+	// caller's read and its own write.
+	claimLoses bool
+	claimErr   error
 }
 
 func newFakeVideoJobRepository() *fakeVideoJobRepository {
@@ -35,7 +41,7 @@ func newFakeVideoJobRepository() *fakeVideoJobRepository {
 }
 
 func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
-	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
 	if err != nil {
 		panic("fakeVideoJobRepository: failed to clone video job: " + err.Error())
 	}
@@ -127,6 +133,27 @@ func (r *fakeVideoJobRepository) Enqueue(_ context.Context, job *domain.VideoJob
 
 	r.enqueueCalls++
 	return r.persistLocked(job)
+}
+
+// ClaimForProcessing mirrors the real adapter: it persists only when the
+// stored row is still queued, and reports whether it did.
+func (r *fakeVideoJobRepository) ClaimForProcessing(_ context.Context, job *domain.VideoJob) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.claimCalls++
+	if r.claimErr != nil {
+		return false, r.claimErr
+	}
+	stored, ok := r.byID[job.ID().String()]
+	if !ok {
+		return false, domain.ErrVideoJobNotFound
+	}
+	if r.claimLoses || stored.Status() != domain.JobStatusQueued {
+		return false, nil
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, nil
 }
 
 func (r *fakeVideoJobRepository) persistLocked(job *domain.VideoJob) error {
@@ -237,6 +264,10 @@ func (s *fakeResultStorage) has(key string) bool {
 type fakeSourceStorage struct {
 	mu      sync.Mutex
 	objects map[string][]byte
+	// getCalls counts downloads, so a test can assert that a use case
+	// abandoned a job before spending the transfer rather than merely
+	// cleaning up after one.
+	getCalls int
 
 	putErr    error
 	getErr    error
@@ -262,6 +293,9 @@ func (s *fakeSourceStorage) Put(_ context.Context, key domain.StorageKey, r io.R
 }
 
 func (s *fakeSourceStorage) Get(_ context.Context, key domain.StorageKey, localPath string) error {
+	s.mu.Lock()
+	s.getCalls++
+	s.mu.Unlock()
 	if s.getErr != nil {
 		return s.getErr
 	}
@@ -285,6 +319,12 @@ func (s *fakeSourceStorage) Delete(_ context.Context, key domain.StorageKey) err
 	defer s.mu.Unlock()
 	delete(s.objects, key.String())
 	return nil
+}
+
+func (s *fakeSourceStorage) downloads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
 }
 
 // store seeds an object so a test can process a source it did not upload.
