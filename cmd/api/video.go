@@ -691,41 +691,22 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		return
 	}
 
-	// Finalized before the enqueue, and that order is load-bearing: the
-	// enqueue is what makes the job dispatchable, and the worker clears
-	// this key by job ID when it fails one. Finalizing afterwards leaves a
-	// window in which that clear finds a bare reservation, does nothing by
-	// design, and is then overwritten by this finalization — pinning the
-	// key to a failed job for its full 24h and blocking the retry.
-	//
-	// A Finalize failure is non-fatal — the job just created is still
-	// valid in PostgreSQL either way; see design.md Decision 7. Skipped
-	// entirely when hasReservation is false: there is no reservation to
-	// finalize.
-	if hasReservation {
-		if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
-			log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", sourceKey.String(), err)
-		} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
-			log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
-		}
-	}
-
 	// The last thing this handler does to the job, and the point at which
 	// ownership of the source object transfers. It commits the pending ->
 	// queued transition together with the outbox row the relay publishes
 	// from, so a dispatch exists for exactly the jobs that reached queued.
+	// It runs before the idempotency key is finalized, so this failure
+	// branch clears a plain reservation rather than a finalized entry.
 	if _, err := m.enqueueVideoJob.Execute(c.Request.Context(), created.JobID); err != nil {
 		// Handled like a CreateVideoJob failure: the job row exists but is
 		// unqueued, and the source object's deferred cleanup above still
-		// runs. Clear removes the key in either state, so it undoes the
-		// finalization above as readily as a bare reservation. A detached
-		// context for the same reason as there — the request's may already
-		// be canceled, and leaving the key behind would block an immediate
-		// retry for its full TTL.
+		// runs. A detached context for the same reason as there — the
+		// request's may already be canceled, and leaving the reservation
+		// behind would block an immediate retry for its full TTL.
 		if hasReservation {
 			clearCtx, cancel := videoapplication.NewFinalizationContext()
 			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-				log.Printf("clear idempotency key after EnqueueVideoJob error for upload %s: cleared=%v err=%v", sourceKey.String(), cleared, clearErr)
+				log.Printf("clear idempotency reservation after EnqueueVideoJob error for upload %s: cleared=%v err=%v", sourceKey.String(), cleared, clearErr)
 			}
 			cancel()
 		}
@@ -741,6 +722,33 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// past this point the source object is the worker's input, and the
 	// deferred cleanup above must not touch it whatever else goes wrong.
 	enqueued = true
+
+	// Finalized after the enqueue, not before, per upload-idempotency's
+	// "Reservation Is Finalized To The Real VideoJobID Only By Its Owning
+	// Token": a finalized key advertises its job to every duplicate for
+	// the full 24h window, so finalizing a job that then failed to reach
+	// queued would deduplicate later uploads of the same bytes onto a job
+	// stuck in pending that nothing will ever process.
+	//
+	// The order is not free, and the cost runs the other way: a worker
+	// that fails this job clears the key by job ID, and until this line
+	// runs the key is still a bare reservation, which ClearByJob leaves
+	// alone by design. A clear landing in that window is a no-op this line
+	// then overwrites, pinning the key to a failed job for its full
+	// window. Both orderings trade one narrow 24h-block for another, which
+	// is why the choice belongs to the spec and not to this function.
+	//
+	// A Finalize failure is non-fatal — the job just created is still
+	// valid in PostgreSQL either way; see design.md Decision 7. Skipped
+	// entirely when hasReservation is false: there is no reservation to
+	// finalize.
+	if hasReservation {
+		if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
+			log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", sourceKey.String(), err)
+		} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
+			log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
+		}
+	}
 
 	// 202, not 200: the work has been accepted, not done. No extraction has
 	// run, no frame count exists, and no artifact is reachable yet — the
