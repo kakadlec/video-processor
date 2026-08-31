@@ -324,7 +324,7 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 			ids,
 		),
 		complete: videoapplication.NewCompleteJob(repo, ids),
-		clearKey: videoapplication.NewClearJobIdempotencyKey(repo, keys, ids),
+		clearKey: videoapplication.NewClearJobIdempotencyKey(plain, keys, ids),
 		sources:  sources,
 	}
 
@@ -748,6 +748,57 @@ func TestHandle_UndecodableSourceFailsTheJobAndClearsItsIdempotencyKey(t *testin
 	}
 	if _, found, err := env.keys.Lookup(ctx, key); err != nil || found {
 		t.Fatalf("idempotency key still resolves after a failure: found=%v err=%v", found, err)
+	}
+}
+
+// TestHandle_ClearsTheKeyThroughAJobRecordThatPredatesContentHash is the
+// rolling-deploy case for the clear. `content_hash` is new in this change and
+// the cache record carries no version, so an API replica of the previous
+// release that serves one status poll for a v2 job repopulates the cache in
+// the old shape — every field it knew about, and no content_hash. omitempty
+// decodes that to "", which is not an error anywhere: the key simply cannot
+// be built, the clear logs and gives up, and the failed job's 24-hour mapping
+// silently outlives it, blocking the retry this whole mechanism exists to
+// allow.
+//
+// Reading the hash from PostgreSQL rather than through the decorator is what
+// makes that impossible, and this test is the only thing that says so.
+func TestHandle_ClearsTheKeyThroughAJobRecordThatPredatesContentHash(t *testing.T) {
+	env := newWorkerTestEnv(t, envOptions{})
+	job, body := seedQueuedJob(t, env, []byte("this is not a video"))
+	ctx := context.Background()
+
+	poisoned := fmt.Sprintf(
+		`{"id":%q,"user_id":%q,"original_filename":%q,"source_key":%q,"frame_count":0,"status":%q,"created_at":%q}`,
+		job.ID().String(), job.UserID().String(), job.OriginalFilename(), job.SourceKey().String(),
+		string(videodomain.JobStatusQueued), job.CreatedAt().UTC().Format(time.RFC3339Nano),
+	)
+	if err := env.deps.redis.Set(ctx, "videojob:status:"+job.ID().String(), poisoned, time.Minute).Err(); err != nil {
+		t.Fatalf("seed the previous release's cache record: %v", err)
+	}
+
+	key, err := videodomain.NewIdempotencyKey(job.UserID().String(), testContentHash)
+	if err != nil {
+		t.Fatalf("build idempotency key: %v", err)
+	}
+	token, reserved, err := env.keys.Reserve(ctx, key)
+	if err != nil || !reserved {
+		t.Fatalf("reserve idempotency key: reserved=%v err=%v", reserved, err)
+	}
+	finalized, err := env.keys.Finalize(ctx, key, token, job.ID())
+	if err != nil || !finalized {
+		t.Fatalf("finalize idempotency key: finalized=%v err=%v", finalized, err)
+	}
+
+	var inFlight atomic.Pointer[string]
+	if got := env.deps.handle(ctx, body, &inFlight); got != videomessaging.Ack {
+		t.Fatalf("disposition = %v, want Ack", got)
+	}
+	if status := statusOf(t, env, job); status != videodomain.JobStatusFailed {
+		t.Fatalf("status = %q, want %q", status, videodomain.JobStatusFailed)
+	}
+	if _, found, err := env.keys.Lookup(ctx, key); err != nil || found {
+		t.Fatalf("the key survived a failure whose cached job record carried no content hash: found=%v err=%v", found, err)
 	}
 }
 

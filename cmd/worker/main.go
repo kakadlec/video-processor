@@ -232,7 +232,8 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 	ids := videoidgen.New()
 	// The same cache decorator the API wires, so a status read served from
 	// Redis follows the worker's transitions rather than lagging them.
-	repo := videocache.NewCachedVideoJobRepository(videopostgres.NewRepository(db, ids), redisClient, ids)
+	plainRepo := videopostgres.NewRepository(db, ids)
+	repo := videocache.NewCachedVideoJobRepository(plainRepo, redisClient, ids)
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
 
 	return &workerDeps{
@@ -248,7 +249,14 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 			ids,
 		),
 		complete: videoapplication.NewCompleteJob(repo, ids),
-		clearKey: videoapplication.NewClearJobIdempotencyKey(repo, idempotencyStore, ids),
+		// Undecorated, for the same reason GET /download/:filename's
+		// entitlement lookup is: this use case reads a field, not a status,
+		// and a cache record written by a replica of the previous release
+		// carries no content_hash at all — omitempty decodes it to "", so
+		// the key would be unbuildable and a failed job's 24-hour mapping
+		// would silently outlive it. PostgreSQL is where the hash is
+		// persisted; read it from there.
+		clearKey: videoapplication.NewClearJobIdempotencyKey(plainRepo, idempotencyStore, ids),
 		sources:  sourceStorage,
 	}, nil
 }
