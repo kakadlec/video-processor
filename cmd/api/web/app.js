@@ -158,8 +158,9 @@ function retryAfterMs(response, fallbackMs) {
 // polled too fast would be a lie about work that is proceeding normally.
 async function pollJob(statusUrl) {
     let interval = POLL_INITIAL_MS;
+    let wait = POLL_INITIAL_MS;
     for (;;) {
-        await sleep(interval);
+        await sleep(wait);
 
         let response;
         try {
@@ -175,8 +176,15 @@ async function pollJob(statusUrl) {
             return null;
         }
         if (response.status === 429) {
-            interval = Math.max(retryAfterMs(response, interval), interval);
+            // Retry-After carries the limiter's own window, which is
+            // configurable and routinely larger than POLL_MAX_MS. It is
+            // honoured uncapped: the ceiling paces the polling this page
+            // chooses to do, it does not license ignoring a delay the API
+            // asked for — capping it would just earn another 429. The
+            // ordinary interval keeps advancing underneath, so one long
+            // wait does not become the cadence.
             interval = Math.min(interval * POLL_BACKOFF_FACTOR, POLL_MAX_MS);
+            wait = Math.max(retryAfterMs(response, interval), interval);
             continue;
         }
         if (!response.ok) {
@@ -195,6 +203,7 @@ async function pollJob(statusUrl) {
             setLoadingMessage('⏳ Vídeo na fila, aguardando um processador...');
         }
         interval = Math.min(interval * POLL_BACKOFF_FACTOR, POLL_MAX_MS);
+        wait = interval;
     }
 }
 

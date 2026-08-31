@@ -27,7 +27,9 @@ func TestCreateDirs_CreatesOnlyTemp(t *testing.T) {
 		}
 	})
 
-	createDirs()
+	if err := createDirs(); err != nil {
+		t.Fatalf("createDirs: %v", err)
+	}
 
 	if _, err := os.Stat(filepath.Join(dir, "temp")); err != nil {
 		t.Fatalf("expected temp/ to exist: %v", err)

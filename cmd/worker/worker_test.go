@@ -328,7 +328,9 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 		sources:  sources,
 	}
 
-	createDirs()
+	if err := createDirs(); err != nil {
+		t.Fatalf("createDirs: %v", err)
+	}
 
 	return &workerTestEnv{
 		deps:      deps,

@@ -158,6 +158,16 @@ func (s *fakeIdempotencyStore) hasReservation(key videodomain.IdempotencyKey) bo
 	return exists
 }
 
+// isFinalized reports whether key holds a finalized entry naming a real
+// job, as opposed to a bare reservation — the distinction ClearByJob acts
+// on, and therefore the one the finalize/enqueue ordering turns on.
+func (s *fakeIdempotencyStore) isFinalized(key videodomain.IdempotencyKey) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.entries[key.String()]
+	return exists && entry.final
+}
+
 // callCounts reports Finalize/Clear invocation counts, for asserting a
 // request that proceeded without a reservation never touches either.
 func (s *fakeIdempotencyStore) callCounts() (finalize, clear int) {
@@ -190,6 +200,10 @@ type inMemoryVideoJobRepository struct {
 	// takes when a job cannot be queued for the relay to dispatch.
 	enqueueErr   error
 	enqueueCalls int
+	// beforeEnqueue, when set, runs on entry to Enqueue and before its
+	// lock is taken — a seam for observing what the handler had already
+	// done to state outside this repository by the time it queued.
+	beforeEnqueue func()
 }
 
 func newInMemoryVideoJobRepository() *inMemoryVideoJobRepository {
@@ -232,6 +246,9 @@ func (r *inMemoryVideoJobRepository) Update(_ context.Context, job *videodomain.
 }
 
 func (r *inMemoryVideoJobRepository) Enqueue(_ context.Context, job *videodomain.VideoJob) error {
+	if r.beforeEnqueue != nil {
+		r.beforeEnqueue()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.enqueueCalls++
@@ -1754,5 +1771,81 @@ func TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything(t 
 	}
 	if store.hasReservation(idemKey) {
 		t.Fatal("the idempotency reservation survived an enqueue failure; a retry of the same content would be blocked")
+	}
+}
+
+// TestHandleVideoUpload_FinalizesTheIdempotencyKeyBeforeQueueingTheJob pins
+// an ordering the compiler cannot: the key has to name the job before the
+// enqueue commits, because the enqueue is what makes the job reachable by a
+// worker, and a worker that fails a job clears this key by job ID.
+//
+// Finalizing after the enqueue leaves a window in which that clear finds a
+// bare reservation and — correctly, by ClearByJob's own rule — does nothing,
+// after which this handler writes the finalized entry anyway. The key then
+// points at a failed job for its full 24-hour window and the user cannot
+// retry the same content at all. The window is small; the consequence is
+// not, and the only thing keeping it shut is the statement order.
+func TestHandleVideoUpload_FinalizesTheIdempotencyKeyBeforeQueueingTheJob(t *testing.T) {
+	module, store, repo, _ := newEnqueueTestVideoModule()
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("finalize before enqueue content")
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var finalizedAtEnqueue bool
+	repo.beforeEnqueue = func() { finalizedAtEnqueue = store.isFinalized(idemKey) }
+
+	videoPath := writeTestUploadContent(t, content)
+	uploadVideoAccepted(t, srv.URL, token, videoPath, "movie.mp4")
+
+	if repo.enqueueCalls != 1 {
+		t.Fatalf("enqueue calls = %d, want 1", repo.enqueueCalls)
+	}
+	if !finalizedAtEnqueue {
+		t.Fatal("the idempotency key was still a bare reservation when the job was queued; a worker failing it first would leave the key pinned to the failed job for its full TTL")
+	}
+}
+
+// TestHandleVideoUpload_EnqueueFailure_ClearsTheAlreadyFinalizedKey is the
+// other half of that ordering. Finalizing first means the enqueue failure
+// branch now has a finalized entry to undo rather than a reservation, and
+// Clear removes either — but only because it matches on the token, which is
+// exactly the property that would break silently if Clear were ever narrowed
+// to the reserved state.
+func TestHandleVideoUpload_EnqueueFailure_ClearsTheAlreadyFinalizedKey(t *testing.T) {
+	module, store, repo, _ := newEnqueueTestVideoModule()
+	repo.enqueueErr = errors.New("outbox write failed")
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	content := []byte("enqueue failure after finalize content")
+	idemKey, err := videodomain.NewIdempotencyKey(userID.String(), sha256Hex(content))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var finalizedAtEnqueue bool
+	repo.beforeEnqueue = func() { finalizedAtEnqueue = store.isFinalized(idemKey) }
+
+	videoPath := writeTestUploadContent(t, content)
+	resp, _ := uploadVideo(t, srv.URL, token, videoPath, "movie.mp4")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+	if !finalizedAtEnqueue {
+		t.Fatal("expected the key to be finalized before the failing enqueue")
+	}
+	if store.hasReservation(idemKey) {
+		t.Fatal("the finalized idempotency key survived an enqueue failure; a retry of the same content would be answered with a job that was never queued")
 	}
 }

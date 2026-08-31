@@ -64,7 +64,9 @@ const consumerTag = "video-worker"
 func main() {
 	ctx := context.Background()
 
-	createDirs()
+	if err := createDirs(); err != nil {
+		log.Fatal(err)
+	}
 
 	deps, err := setupWorker(ctx)
 	if err != nil {
@@ -126,12 +128,18 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 }
 
 // createDirs creates the scratch directory the pipeline downloads into and
-// extracts through. cmd/api creates the same one; both processes need it,
-// and neither can assume the other ran first.
-func createDirs() {
+// extracts through. This process is the only one that needs it — cmd/api
+// stopped touching the filesystem when extraction moved here.
+func createDirs() error {
+	// Fatal, not logged and shrugged off: every delivery downloads its
+	// source into temp/ and extracts there. A worker without it would
+	// still claim jobs and then fail each one for a reason that has
+	// nothing to do with the job — deleting its source on the way out.
+	// Being unavailable is the honest outcome.
 	if err := os.MkdirAll("temp", 0750); err != nil {
-		log.Printf("video: worker: create directory temp: %v", err)
+		return fmt.Errorf("video: worker: create directory temp: %w", err)
 	}
+	return nil
 }
 
 // workerDeps is the composition root's product: everything one delivery
