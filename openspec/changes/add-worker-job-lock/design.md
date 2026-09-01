@@ -38,6 +38,8 @@ The sweeper is a goroutine in `cmd/worker`, sibling to the consumer in the same 
 
 *Where it runs.* `cmd/worker`, not `cmd/api`: a deployment with no worker has nothing to recover, and the lease knowledge is the worker's. Multiple worker replicas each run one, which is safe by decision 2's conditional update.
 
+*What it reads through.* The scan and the takeover decision run against the **undecorated** PostgreSQL repository, following the precedent `GET /download/:filename` set: a decision that grants one process authority over another's job is a correctness decision, and a correctness decision does not read a cache. The status cache keys per job ID and caches no listings, so `FindProcessing` could not be served from it anyway — but the epoch the sweeper carries into `Requeue` must come from the same read the conditional update is predicated on, and stating that here keeps a later reader from wiring the decorator in for uniformity.
+
 ### 2. Recovery requeues (`processing → queued`); the claim predicate is not widened
 
 The requeue is one transaction: `status → queued`, `lease_epoch + 1`, and a `video_job.queued.v2` outbox row — the same row `Enqueue` writes, published by the same relay, consumed by the same worker path. It is conditional on `status = 'processing' AND lease_epoch = <the epoch the sweep observed>`, so two sweepers race on one statement and exactly one wins, exactly as `ClaimForProcessing` does.
