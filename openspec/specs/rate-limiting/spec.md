@@ -12,6 +12,10 @@ Define the Redis-backed, per-authenticated-user request rate limiter applied to 
 
 Neither static mount appears in that enumeration any more, because neither exists: `/outputs` went when results moved to object storage, `/uploads` when source videos followed. Every handler in the group returns JSON; none streams an artifact.
 
+**Status polling is now the dominant consumer of this budget, and the interval SHALL be chosen against it.** Since `POST /upload` became an acknowledgement rather than a result, a client learns an outcome by repeatedly calling `GET /api/video-jobs/:id`, and those polls share one budget with the submission and the eventual download issuance. A polling client SHALL therefore start at an interval no shorter than 2 seconds and SHALL back off to an interval of at least 10 seconds, so that a single tracked job settles well inside the default budget and a user with several jobs or tabs in flight is not rate-limited by ordinary use. A fixed short interval SHALL NOT be used: at the default 60 requests per 60 seconds it would consume half the budget for one job and exceed it for two.
+
+A `429` returned to a poller SHALL be treated as a back-off signal, not as a job failure. The client SHALL lengthen its interval, honour `Retry-After`, and continue polling; it SHALL NOT report the job as failed, and SHALL NOT retry sooner than the header directs. A job's outcome is what the status endpoint reports when it answers, and a throttled poll has reported nothing.
+
 The limit governs **requests to this API**, and after result downloads became presigned URLs that is narrower than it may read. `GET /download/:filename` issues a URL and is limited; the transfer that URL authorizes happens between the client and the storage service, which this middleware does not sit in front of. A caller held to `RATE_LIMIT_MAX_REQUESTS` issuances per window can still begin that many transfers, and each transfer's bandwidth is unbounded by anything specified here. Bounding artifact egress is an object-storage concern, and no requirement in this capability SHALL be read as constraining it.
 
 #### Scenario: Request within the limit succeeds
@@ -48,7 +52,7 @@ The limit governs **requests to this API**, and after result downloads became pr
 
 - **GIVEN** an authenticated user who has exhausted their window
 - **WHEN** they request `GET /download/:filename`
-- **THEN** the response is `429 Too Many Requests`, with no object stated in storage and no URL issued
+- **THEN** the response is `429 Too Many Requests`, with no object read from storage and no URL issued
 
 #### Scenario: The upload route remains rate limited after its static mount is removed
 
@@ -61,6 +65,18 @@ The limit governs **requests to this API**, and after result downloads became pr
 - **GIVEN** an authenticated user who has exhausted their window and holds a presigned URL issued earlier in that window
 - **WHEN** they request that URL
 - **THEN** the transfer proceeds, because the request goes to the storage service rather than to a route this middleware is mounted on
+
+#### Scenario: Polling a job to completion stays within the default budget
+
+- **GIVEN** an authenticated user with the default limit who submits one video and polls its status until it is `completed`
+- **WHEN** the job takes long enough for the polling interval to reach its ceiling
+- **THEN** the submission, every poll, and the download issuance together stay under `RATE_LIMIT_MAX_REQUESTS` for each window, and no `429` is returned
+
+#### Scenario: A throttled poll backs off instead of failing the job
+
+- **GIVEN** a polling client that receives `429` with a `Retry-After` header while a job is still `processing`
+- **WHEN** it handles that response
+- **THEN** it waits at least the indicated number of seconds, lengthens its interval, and resumes polling — it does not report the job as failed and does not retry sooner than `Retry-After` allows
 
 ### Requirement: Rate Limit Thresholds Are Configurable With Safe Defaults
 

@@ -1,46 +1,49 @@
 # FIAP X — Video Frame Processor
 
-A Go web service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Built as the code deliverable for a POSTECH/FIAP hackathon.
+A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous: an HTTP API (`cmd/api`) accepts and reports, and a worker (`cmd/worker`) does the extraction off a RabbitMQ queue. Built as the code deliverable for a POSTECH/FIAP hackathon.
 
 ## Prerequisites
 
 | Dependency | Version | Notes |
 |---|---|---|
 | Go | 1.27+ | Required; see `go.mod` |
-| ffmpeg | any recent | Must be on `PATH`; the app shells out to it |
+| ffmpeg | any recent | Must be on `PATH`; `cmd/worker` shells out to it |
 | Docker | any recent | Optional for local dev; required if Go/ffmpeg are not installed |
 
 ## Quickstart
 
-The server requires identity, video, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since the broker is reached by a background relay rather than by any request — see [docs/development.md](docs/development.md) for running it directly with `go run ./cmd/api`. The fastest path with no manual wiring is Docker:
+The API requires identity, video, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since neither process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` ones. Without it, uploads are accepted and never processed. See [docs/development.md](docs/development.md) for running both directly. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
 git clone https://github.com/kakadlec/video-processor.git
 cd video-processor
 
-# 2. Run the full stack (app + PostgreSQL + Redis, all already configured)
+# 2. Run the full stack (app + worker + PostgreSQL + Redis + MinIO +
+#    RabbitMQ, all already configured)
 docker compose up --build
 # Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
-# already wired in — /api/auth/register and /api/auth/login are live
+# already wired in — /api/auth/register and /api/auth/login are live.
+# The `worker` service runs from the same image with its command overridden.
 
 # 3. Open http://127.0.0.1:8080 in your browser
-# Register/log in, then upload a video file. When processing completes the
-# page shows a Download button: clicking it asks the API for a 5-minute
-# URL and the browser fetches the ZIP from MinIO directly.
+# Register/log in, then upload a video file. The upload returns immediately
+# and the page polls the job's status until it completes, then shows a
+# Download button: clicking it asks the API for a 5-minute URL and the
+# browser fetches the ZIP from MinIO directly.
 ```
 
 `docker-compose.yml` is the only supported way to run the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. (Container deployment is a different concern; see [docs/operations.md](docs/operations.md).) See [docs/development.md](docs/development.md) for running the test suite the same way.
 
 ## Current Limitations
 
-The application is a synchronous monolith at this stage:
+Processing is asynchronous as of Phase 6, but the system is not yet complete:
 
-- **No async processing** — `POST /upload` blocks until `ffmpeg` finishes. Large videos will hold the HTTP connection open for minutes.
-- **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so each request downloads its source into `temp/`, extracts frames there, and builds the zip there, removing all of it before responding. Nothing durable lives on local disk any more (Phase 5): uploaded source videos go to MinIO too, but only as **transient** objects each request deletes before it finishes — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
-- **Nothing consumes the job queue** — `POST /upload` does enqueue the job and an outbox relay publishes it to RabbitMQ (Phase 6), but no worker dequeues it, so concurrent uploads still each run their own `ffmpeg` process in-request with no concurrency limit.
-- **No notifications** — users must stay on the page or poll `GET /api/status` to find out when processing completes.
-- **In-flight work is lost on restart** — job records live in PostgreSQL and results in MinIO, both of which survive a restart, but a job being processed when the process dies is never resumed and stays stuck in `processing`.
+- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Scale by running more worker processes — each holds exactly one job at a time by design.
+- **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so the worker downloads each source into its own `temp/`, extracts frames there, and builds the zip there, removing all of it before the job finishes. Nothing durable lives on local disk (Phase 5): uploaded source videos go to MinIO too, as **transient** objects whose owner deletes them — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
+- **A source object can leak.** A job that is enqueued but never dispatched — the relay never published it, the message was dead-lettered before a claim, or a worker died between delivery and cleanup — leaves its source in the bucket with nothing to reclaim it. Configure the `uploads/`-prefix expiration lifecycle rule; it is the only guarantee. See [docs/operations.md](docs/operations.md).
+- **No notifications** — users must stay on the page (which polls the job's status URL) or poll `GET /api/status` to find out when processing completes. Phase 7.
+- **In-flight work is lost on restart** — a worker drains for up to five minutes on `SIGTERM`, but a job whose worker dies mid-extraction stays stuck in `processing` and is never resumed: the atomic claim admits only `queued` rows, so every redelivery is refused. Recovering those is `add-worker-job-lock` (Phase 6).
 
 These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
 
@@ -50,7 +53,7 @@ These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Current implementation, target DDD structure, roadmap summary |
 | [docs/domain-model.md](docs/domain-model.md) | Bounded contexts, `VideoJob` aggregate, state machine, domain events |
-| [docs/flows.md](docs/flows.md) | Current synchronous flow, target async flow, frontend interaction sequences |
+| [docs/flows.md](docs/flows.md) | The asynchronous upload/poll/download flow, the worker's own sequence, frontend interaction sequences |
 | [docs/development.md](docs/development.md) | Local setup, test execution, Docker workflow, contribution conventions |
 | [docs/operations.md](docs/operations.md) | Deployment, runtime directories, environment variables, planned infrastructure |
 | [docs/roadmap.md](docs/roadmap.md) | 8-phase evolution roadmap (summary) |
@@ -64,7 +67,8 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 | `GET` | `/` | Web upload UI (inline HTML/CSS/JS); always public |
 | `POST` | `/api/auth/register` | Create a user account |
 | `POST` | `/api/auth/login` | Authenticate and receive a bearer access token |
-| `POST` | `/upload` | Upload a video file (multipart `video` field); returns JSON with `zip_path` on success; requires `Authorization: Bearer <token>` |
+| `POST` | `/upload` | Upload a video file (multipart `video` field); returns `202 {"job_id", "status", "status_url"}` — the work is accepted, not done; requires `Authorization: Bearer <token>` |
+| `GET` | `/api/video-jobs/:id` | Poll a job's status (`queued` → `processing` → `completed`/`failed`); this is what `status_url` names. Owner-only |
 | `GET` | `/download/:filename` | Issue a 5-minute presigned URL for a processed ZIP: `200 {"url", "expires_at"}`, not the archive itself. Owner-only; follow the returned URL (no `Authorization` header) to fetch the bytes from MinIO |
 | `GET` | `/api/status` | List processed ZIPs with metadata; scoped to the caller's own uploads |
 
@@ -72,8 +76,11 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 
 - **Language:** Go 1.27
 - **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12
-- **Frame extraction:** `ffmpeg` (via `exec.Command`)
-- **Identity persistence:** PostgreSQL (via `pgx`)
+- **Frame extraction:** `ffmpeg` (via `exec.CommandContext`, in `cmd/worker`)
+- **Identity and job persistence:** PostgreSQL (via `pgx`), including a transactional outbox
+- **Job dispatch:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — outbox relay in `cmd/api`, consumer in `cmd/worker`
+- **Object storage:** MinIO / S3-compatible (via [`minio-go`](https://github.com/minio/minio-go)) for source videos and ZIP results
+- **Idempotency, rate limiting, status cache:** Redis (via [`go-redis`](https://github.com/redis/go-redis))
 - **Password hashing:** bcrypt
 - **Access tokens:** JWT ([`golang-jwt/jwt`](https://github.com/golang-jwt/jwt))
 - **CI:** GitHub Actions — `go vet`, `go test`, [gosec](https://github.com/securego/gosec), [govulncheck](https://go.dev/security/vuln)

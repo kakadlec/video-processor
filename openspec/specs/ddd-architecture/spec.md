@@ -196,7 +196,7 @@ Redis SHALL be used as a mandatory performance and reliability layer with three 
 
 ### Requirement: Monorepo Package Topology Is the Target Structure
 
-The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/worker` as separate entrypoints sharing `internal/` packages. This topology SHALL NOT require a big-bang rewrite; `main.go` MAY remain functional during incremental migration. Cross-cutting **infrastructure** plumbing that no single bounded context owns (e.g. a shared Redis connection used by more than one context) lives under `internal/platform/`, distinct from any bounded context's own `internal/<context>/infrastructure/`. This is infrastructure sharing only — it does NOT permit sharing `domain` or `application` logic between contexts, which remains forbidden by the "No direct cross-context domain imports" scenario above.
+The repository SHALL have a monorepo topology with `cmd/api` and `cmd/worker` as separate entrypoints sharing `internal/` packages. Both entrypoints now exist, so the scenarios below are live obligations rather than targets: each SHALL build independently, and each SHALL wire its own composition root requiring only the configuration it uses, rather than one binary switching behavior on a mode flag. Cross-cutting **infrastructure** plumbing that no single bounded context owns (e.g. a shared Redis connection used by more than one context) lives under `internal/platform/`, distinct from any bounded context's own `internal/<context>/infrastructure/`. This is infrastructure sharing only — it does NOT permit sharing `domain` or `application` logic between contexts, which remains forbidden by the "No direct cross-context domain imports" scenario above.
 
 #### Scenario: API and worker share domain and application packages
 
@@ -226,6 +226,8 @@ The repository SHALL evolve toward a monorepo topology with `cmd/api` and `cmd/w
 
 The web frontend (HTML/CSS/JavaScript in `cmd/api/web/index.html`, `cmd/api/web/styles.css`, and `cmd/api/web/app.js`, embedded into the binary via `go:embed` and served as `GET /`, `GET /styles.css`, and `GET /app.js` respectively) SHALL be treated as a presentation/delivery layer, not as a bounded context. It SHALL remain functional throughout all phases of the DDD migration, and any backend contract change that affects its consumed endpoints SHALL include an explicit task to update it.
 
+Where the frontend polls a backend endpoint, that polling SHALL be treated as a consumer of the same per-user request budget as its other calls, and SHALL back off rather than retry at a fixed rate when the backend signals that the budget is exhausted. A delivery layer that turns a rate-limit response into a reported failure, or into a tighter retry loop, is not remaining functional in the sense this requirement means.
+
 #### Scenario: Frontend is not a bounded context
 
 - **GIVEN** the system is organized into bounded contexts
@@ -238,11 +240,17 @@ The web frontend (HTML/CSS/JavaScript in `cmd/api/web/index.html`, `cmd/api/web/
 - **WHEN** a browser requests `GET /`
 - **THEN** the server returns HTTP 200 with the HTML page and the page renders without JavaScript errors
 
-#### Scenario: POST /upload remains available during async migration
+#### Scenario: POST /upload is itself the canonical async endpoint
 
-- **GIVEN** Phase 6 introduces `POST /jobs` as the canonical async job endpoint
+- **GIVEN** Phase 6's asynchronous migration is complete
 - **WHEN** an existing client sends a request to `POST /upload`
-- **THEN** the endpoint SHALL remain available and SHALL accept the same multipart form data; only the response schema changes (returns job ID + status URL instead of a direct download link)
+- **THEN** the endpoint SHALL remain available at the same path and SHALL accept the same multipart form data; only the response schema changes (returns job ID + status URL instead of a direct download link), and no separate submission endpoint is introduced alongside it
+
+#### Scenario: The pre-existing job endpoint is not the async submission path
+
+- **GIVEN** `POST /api/video-jobs` already exists from Phase 3, accepting a filename in JSON and carrying no uploaded bytes
+- **WHEN** the asynchronous migration chooses which endpoint submits work
+- **THEN** it is `POST /upload`, because that is the endpoint that receives the bytes; `POST /api/video-jobs` keeps having no processing trigger, and the frontend's submission path is unchanged apart from how it reads the response
 
 #### Scenario: Backend contract change must not silently break the frontend
 

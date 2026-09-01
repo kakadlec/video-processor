@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is a single Go binary (or `go run ./cmd/api`) behind a Docker container. There is no orchestration. External services are a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module, and (as of Phase 4's `add-upload-idempotency-keys`) a required Redis instance backing `POST /upload`'s idempotency keys, every authenticated route's per-user rate limiting (`add-rate-limiting-middleware`), and, as of `add-videojob-status-cache`, a non-authoritative `VideoJob` status cache — everything else still runs with no environment-specific configuration beyond the port.
+The application is **two** Go processes built from one image: `cmd/api` (the HTTP surface) and `cmd/worker` (the frame-extraction consumer). Neither is a prerequisite for the other to start, and neither switches behaviour on a mode flag — the image's default command runs the API, and the worker is started by overriding it (`/app/worker`). There is no orchestration. External services are a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module, and (as of Phase 4's `add-upload-idempotency-keys`) a required Redis instance backing `POST /upload`'s idempotency keys, every authenticated route's per-user rate limiting (`add-rate-limiting-middleware`), and, as of `add-videojob-status-cache`, a non-authoritative `VideoJob` status cache; a required MinIO (or S3-compatible) bucket holding both source videos and results; and a required RabbitMQ broker carrying the dispatch. Every one of those needs environment-specific configuration — the per-process surface is the table below, and no process runs on defaults beyond the port.
 
 ### Docker
 
@@ -10,8 +10,9 @@ The application is a single Go binary (or `go run ./cmd/api`) behind a Docker co
 # Build
 docker build -t video-processor .
 
-# Run (identity, video, Redis, and MinIO configuration are all required — see
-# Environment Variables below; the container exits at startup if any is missing)
+# Run the API (identity, video, Redis, MinIO, and RabbitMQ configuration are all
+# required — see Environment Variables below; the container exits at startup if
+# any is missing)
 docker run -p 8080:8080 \
   -e IDENTITY_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e IDENTITY_JWT_SIGNING_KEY="change-me" \
@@ -21,12 +22,43 @@ docker run -p 8080:8080 \
   -e VIDEO_MINIO_ACCESS_KEY="minio-access-key" \
   -e VIDEO_MINIO_SECRET_KEY="minio-secret-key" \
   -e VIDEO_MINIO_BUCKET="video-results" \
+  -e RABBITMQ_URL="amqp://user:pass@host:5672/" \
   video-processor
+
+# Run the worker — same image, different command, no port, and NO IDENTITY_*
+# variables: it makes no access-control decision, so requiring identity
+# configuration would misrepresent what the process does
+docker run \
+  -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
+  -e REDIS_ADDR="host:6379" \
+  -e VIDEO_MINIO_ENDPOINT="host:9000" \
+  -e VIDEO_MINIO_ACCESS_KEY="minio-access-key" \
+  -e VIDEO_MINIO_SECRET_KEY="minio-secret-key" \
+  -e VIDEO_MINIO_BUCKET="video-results" \
+  -e RABBITMQ_URL="amqp://user:pass@host:5672/" \
+  video-processor /app/worker
 ```
 
-The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.27-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships only that binary and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
+**Uploads are not processed unless at least one worker is running.** With the API alone, `POST /upload` still answers `202` and the job sits in `queued` forever — the submission succeeds because it was accepted, not because it was done. Run at least one worker in every environment where uploads are expected to complete. Scale by adding worker processes, not by raising a concurrency setting: prefetch is one by design, so a worker holds exactly one job at a time.
+
+The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.27-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships **both** binaries (`/app/app` and `/app/worker`) and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). `ffmpeg` is there for the worker now rather than for the API, and stays for that reason. See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
 
 ### Environment Variables
+
+The two processes have deliberately different configuration surfaces:
+
+| | `cmd/api` | `cmd/worker` |
+|---|---|---|
+| `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY` | **required** | **not read** — the worker makes no access-control decision |
+| `VIDEO_POSTGRES_DSN` | required | required |
+| `REDIS_ADDR` | required | required (status cache + clearing a failed job's idempotency key) |
+| `VIDEO_MINIO_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET` | required | required |
+| `VIDEO_MINIO_PUBLIC_ENDPOINT`, `VIDEO_MINIO_PUBLIC_USE_SSL` | optional | optional, and **read even though unused** — see below |
+| `RABBITMQ_URL` | required | required |
+| `RATE_LIMIT_*` | optional | not read |
+| `PORT` / `GIN_MODE` | as below | not read — the worker serves no HTTP and exposes no port |
+
+The one row that needs explaining is `VIDEO_MINIO_PUBLIC_*`. The worker never mints a presigned URL — issuing download grants belongs to the API — but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. So the variables *are* read on the worker, and a malformed value fails worker startup even though nothing signs with it. Leaving them unset is the normal case (each falls back to its internal counterpart), which is why `docker-compose.yml` sets them only on `app`.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -44,7 +76,7 @@ The Dockerfile is a multi-stage build. The default (final) stage — used by the
 | `VIDEO_MINIO_BUCKET` | unset | Bucket holding processed ZIP results, keyed `frames_<jobID>.zip`. Required at startup; created automatically if absent. |
 | `VIDEO_MINIO_USE_SSL` | `false` | Whether to connect over TLS. Optional, but a value that is *set* and not parseable as a boolean is a configuration error, never a silent `false` — a typo must not quietly downgrade an intended TLS connection to plaintext. |
 | `VIDEO_MINIO_PUBLIC_ENDPOINT` | `VIDEO_MINIO_ENDPOINT` | Address (`host:port`) clients reach MinIO at, used **only** to construct presigned download URLs. Optional as of Phase 5's `add-presigned-download-urls`; defaults to the internal endpoint, so a deployment where one address serves both the server and its clients needs nothing here. The server never dials this address. |
-| `RABBITMQ_URL` | unset | Full AMQP URI for the shared broker (e.g. `amqp://video:video@rabbitmq:5672/`) — a URI, not a `host:port` pair like `REDIS_ADDR`, because it carries the TLS scheme, the credentials, and the virtual host. **Required at startup** as of Phase 6's `add-videojob-source-key-and-outbox-relay`: an unset value stops `cmd/api` with a clear error. A *reachable* broker is not required — the outbox relay owns the connection, dials it in its own goroutine, and retries with backoff, so the server starts and serves every route with the broker down. |
+| `RABBITMQ_URL` | unset | Full AMQP URI for the shared broker (e.g. `amqp://video:video@rabbitmq:5672/`) — a URI, not a `host:port` pair like `REDIS_ADDR`, because it carries the TLS scheme, the credentials, and the virtual host. **Required at startup by both processes** (`cmd/api` as of Phase 6's `add-videojob-source-key-and-outbox-relay`, `cmd/worker` as of `migrate-upload-to-async-processing`): an unset value stops the process with a clear error. A *reachable* broker is not required by either — the relay and the consumer each own their connection, dial it in their own goroutine, and retry with backoff, so the API serves every route and the worker stays up with the broker down. |
 | `VIDEO_MINIO_PUBLIC_USE_SSL` | `VIDEO_MINIO_USE_SSL` | Scheme for the URLs issued against `VIDEO_MINIO_PUBLIC_ENDPOINT`. Optional; defaults to the *resolved* `VIDEO_MINIO_USE_SSL`, not to `false` — declaring TLS once must not silently produce `http://` links. Set it explicitly when TLS terminates in front of the public address but the server talks plaintext internally. A set-but-unparseable value is a configuration error, same as above. |
 
 The first four `VIDEO_MINIO_*` variables are **required**; `VIDEO_MINIO_USE_SSL`, `VIDEO_MINIO_PUBLIC_ENDPOINT`, and `VIDEO_MINIO_PUBLIC_USE_SSL` are optional. `setupVideo` loads the configuration, opens the client, pings it, ensures the bucket exists, and discovers the bucket's region for the presign-only client, and **any of those steps failing stops startup**. This is deliberately fail-closed, unlike the Redis-backed features above, which degrade to a slower but correct system when Redis is down: a result that cannot be stored cannot be delivered, so there is nothing to degrade to.
@@ -72,29 +104,34 @@ An issued URL also **cannot be revoked**: deleting the job, changing its owner, 
 
 Their `VIDEO_` prefix marks them as the Video Processing context's own configuration, matching `VIDEO_POSTGRES_DSN` and distinguishing them from `internal/platform/`'s unprefixed `REDIS_ADDR`.
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`). `RABBITMQ_URL` is in a category of its own: it is read by no startup path at all today, so setting it has no effect and leaving it unset costs nothing (see the RabbitMQ section below).
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`). `RABBITMQ_URL` is required to be set by both processes but is not connectivity-checked at startup by either (see the RabbitMQ section below).
+
+`cmd/worker` applies the same rules to the subset it reads: `RABBITMQ_URL` is loaded first, before any I/O, then `VIDEO_POSTGRES_DSN` (opened, pinged, migrated), `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables (opened, pinged, bucket ensured). It also creates `temp/` at startup and **exits if it cannot** — every delivery downloads its source there, so a worker without it would claim jobs and fail each one for a reason unrelated to the job, deleting the source on the way out. Being unavailable is the honest outcome.
 
 ## Runtime Directory Structure
 
-The application creates and uses **one** directory relative to its working directory:
+**`cmd/worker`** creates and uses **one** directory relative to its working directory. `cmd/api` creates none — it stopped touching the filesystem when extraction moved to the worker:
 
 ```
 ./
-  temp/       Per-request scratch: the downloaded source video, the extracted
-              PNG frames, and the ZIP built from them
+  temp/       Per-job scratch, on the WORKER's filesystem: the downloaded
+              source video, the extracted PNG frames, and the ZIP built
+              from them
 ```
 
 Neither uploaded source videos nor processed ZIP results are on local disk any more — both are objects in the MinIO bucket named by `VIDEO_MINIO_BUCKET`, separated by key prefix.
 
 | Location | Created by | Contents | Cleaned by |
 |---|---|---|---|
-| `temp/` | `createDirs()` at startup, plus per-request subpaths | Downloaded source copy, PNG frames, the built ZIP | Always, by `defer` on every path |
-| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | The same request, on success and failure alike — best effort, see below |
+| `temp/` (worker only) | `cmd/worker`'s `createDirs()` at startup, plus per-job subpaths | Downloaded source copy, PNG frames, the built ZIP | Always, by `defer` on every path |
+| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | Whichever component owns the job's outcome — the request if the job never reached `queued`, the worker once it has processed it. **Not guaranteed**, see below |
 | Bucket, flat keys | `ProcessVideoJob` on success | `frames_<jobID>.zip` results | Never (manual cleanup required) |
 
-**Source cleanup is best effort.** Each upload request deletes its own source object through a single deferred call — one `RemoveObject`, no retry. If MinIO is unreachable at exactly that moment the object survives, and nothing in the application will come back for it. The failure is logged with the leaked key, so the residual set is recoverable from logs rather than invisible.
+**Source cleanup is best effort, and since the async cutover it is also not exhaustive.** A source object has exactly one owner at a time: the `POST /upload` request until its job commits as `queued`, and the worker that processes it afterwards. Each deletes through a single call — one `RemoveObject`, no retry — so a MinIO hiccup at that instant leaves the object behind, logged with its key so the residue is enumerable.
 
-The recommended backstop is a bucket **expiration lifecycle rule scoped to the `uploads/` prefix** — for example, expire objects under `uploads/` after one day. It must be scoped to that prefix: result objects live in the same bucket under flat `frames_*.zip` keys and must never expire. This is operator policy, not an application dependency; no code path assumes the rule exists.
+**A job that is enqueued but never dispatched leaks its source permanently.** The request has given up ownership and no worker ever took it. That happens when the relay never publishes the row, when the message is dead-lettered before any claim, or when a worker dies between delivery and its own cleanup.
+
+The bucket **expiration lifecycle rule scoped to the `uploads/` prefix** is therefore no longer a recommended backstop — it is the **only** guarantee those objects are ever reclaimed. Configure it: expire objects under `uploads/` after one day (comfortably longer than any extraction). It must be scoped to that prefix, because result objects live in the same bucket under flat `frames_*.zip` keys and must never expire. No code path assumes the rule exists, which is exactly why its absence is silent.
 
 Results accumulate indefinitely. There is no expiry, no lifecycle rule, no cleanup job, and no size limit for them — growth must be monitored manually in the current deployment. Moving artifacts off local disk removed the container-disk pressure, not the retention gap.
 
@@ -109,6 +146,22 @@ Three required checks run on every push and pull request:
 | `Vulnerability Scan (govulncheck)` | [`govulncheck`](https://go.dev/security/vuln) | Fails only when a known vulnerability is reachable from code actually called by this project |
 
 Releases are automated via `release-please`. On every push to `main`, it maintains a "Release PR" showing the next version computed from Conventional Commits. Merging that PR creates the git tag, publishes a GitHub Release, and updates `CHANGELOG.md`.
+
+### Post-deploy step: retire the superseded dispatch generation
+
+The async cutover moved job dispatch to a new generation of the topology — `video.jobs.v2` / `video.jobs.queued.v2`, routing key and outbox `event_type` `video_job.queued.v2`. The previous generation's entities are **not** deleted by the application, and after every replica is running the new build they should be deleted by hand:
+
+```bash
+# from a shell that can reach the broker's management API / CLI
+rabbitmqctl delete_queue video.jobs.queued.v1
+rabbitmqctl delete_exchange video.jobs.v1
+```
+
+Nothing publishes to or consumes from them once the rollout completes, so this is housekeeping rather than a correctness step — an unretired generation is a bounded, idle queue, and the system is correct whether or not the deletion has happened.
+
+**It cannot be automated, and the reason is the rollout itself.** A deletion executed at startup would race a not-yet-redeployed replica that is still publishing into the old generation, destroying dispatches for jobs that are legitimately `queued`. The safe moment is *after* every replica is on the new build, which is a fact about the deployment that no process can observe from inside. `video.jobs.dlx` and `video.jobs.dead` carry no generation suffix and must **not** be deleted — both generations share that sink deliberately, so there is one place to look at dead-lettered messages.
+
+Those queues do not drain on their own either: the job queue carries no message TTL by design (see the RabbitMQ section below), so a superseded generation's backlog persists until it is deleted.
 
 ---
 
@@ -136,7 +189,7 @@ S3-compatible object storage. As of `migrate-result-storage-to-minio` it holds e
 `internal/video/infrastructure/storage` holds the connection plumbing (`Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `EnsureBucket`, plus `BucketRegion`/`OpenPresigner` for the presign-only client) and both adapters — `ResultStorage` and `SourceStorage` — implementing their domain ports over the same client and bucket. Properties worth knowing:
 
 - **Startup is fail-closed.** `setupVideo` loads, opens, pings, and ensures the bucket; any failure stops the process. See the environment table above, including the deployment-ordering note.
-- **Source objects are transient.** `POST /upload` streams the video straight into the bucket without touching local disk, and deletes its own object before the request finishes — on success and on failure alike. See the Runtime Directory Structure section above for the best-effort caveat and the recommended lifecycle-rule backstop.
+- **Source objects are transient, with one owner at a time.** `POST /upload` streams the video straight into the bucket without touching local disk. It deletes that object itself only if the job never reached `queued`; once the enqueue commits, the object is the worker's input and the request must leave it alone. See the Runtime Directory Structure section above for the best-effort caveat and for why the `uploads/`-prefix lifecycle rule is now the only guarantee rather than a backstop.
 - **`GET /download/:filename` is authorized from the `VideoJob` row**, not from anything stored beside the artifact, and every rejection returns a byte-identical `404` so the endpoint cannot be used to probe for other users' results. It issues a 5-minute presigned URL rather than the bytes, so that authorization is the *complete* decision — nothing re-checks ownership when the URL is redeemed. `GET /api/status` lists a caller's `completed` jobs and reads each object's size and timestamp directly, and never carries a signed URL.
 - **Startup makes one extra round trip.** After `Ping` and `EnsureBucket`, `setupVideo` calls `GetBucketLocation` and hands the region to the presign-only client. Without a configured region the signing library would try to discover it over the network on first use — against the *public* endpoint, which the server generally cannot reach. That call joins the fail-closed sequence: a failure stops startup.
 - **Result keys are flat** (`frames_<jobID>.zip`) and must stay that way: the key is handed to the browser and used verbatim as `GET /download/:filename`'s single path segment, so a `/` would percent-encode and break the match. That constraint survived the move to presigned URLs — the route did too, and `app.js` still calls it — so it has not lapsed. Giving *results* a bucket prefix requires a frontend change. **Source keys do carry a prefix** (`uploads/<uploadID>_<filename>`) for exactly the complementary reason: no route exposes them, so no key of theirs ever becomes a URL path segment. Anything that re-exposes source objects over HTTP has to drop that prefix in the same change.
@@ -150,13 +203,13 @@ Unlike Redis's, MinIO's contents are authoritative once results move there: `doc
 
 ---
 
-### RabbitMQ — Topology declared and published to by the outbox relay; nothing consumes (Phase 6)
+### RabbitMQ — Topology declared, published to by the outbox relay, consumed by `cmd/worker` (Phase 6)
 
 `internal/platform/rabbitmq` opens, health-checks, and closes an AMQP connection and declares a topology; `internal/video/infrastructure/messaging` defines the one this context uses. Both shipped with `add-rabbitmq-infrastructure`.
 
-**`cmd/api` now opens a connection**, as of `add-videojob-source-key-and-outbox-relay`: the outbox relay runs as a goroutine inside it, publishing `video_job.queued` events. **Nothing consumes the queue** — the worker is a separate Phase 6 change, so messages accumulate there by design. See "The outbox relay" below for what that means operationally.
+**Both processes open a connection.** `cmd/api` runs the outbox relay as a goroutine, publishing `video_job.queued.v2` events (`add-videojob-source-key-and-outbox-relay`); `cmd/worker` runs the consumer that reads them (`migrate-upload-to-async-processing`). Each declares the topology after every successful dial, so neither depends on the other having started first, and a broker recreated while one was disconnected gets its entities back. See "The outbox relay" and "The worker" below.
 
-- **`RABBITMQ_URL`** holds a full AMQP URI (`amqp://user:pass@host:5672/vhost`), not a `host:port` pair like `REDIS_ADDR`: the URI carries the scheme that selects TLS, the credentials, and the virtual host. `setupVideo` loads it through `LoadConfigFromEnv` as its **first** step, before any I/O, so a missing variable fails fast and clearly instead of after PostgreSQL and MinIO have already been opened.
+- **`RABBITMQ_URL`** holds a full AMQP URI (`amqp://user:pass@host:5672/vhost`), not a `host:port` pair like `REDIS_ADDR`: the URI carries the scheme that selects TLS, the credentials, and the virtual host. `cmd/api`'s `setupVideo` and `cmd/worker`'s `setupWorker` each load it through `LoadConfigFromEnv` as their **first** step, before any I/O, so a missing variable fails fast and clearly instead of after PostgreSQL and MinIO have already been opened.
 - **`Open` connects**, unlike the Redis and MinIO adapters, which construct a client without touching the network. AMQP has no lazy client, so an unreachable broker or wrong credentials surface immediately rather than on first use.
 - **The health check is a real round trip** — it opens a channel and closes it. The client's own `IsClosed()` predicate reports only what the process has already observed, which is stale for a broker that stopped answering without the connection being torn down.
 
@@ -164,15 +217,17 @@ The declared topology, and the two operational policies in it that are decisions
 
 | Entity | Name | Arguments |
 |---|---|---|
-| Job exchange | `video.jobs.v1` | `direct`, durable |
-| Routing key | `video_job.queued` | equal to the outbox `event_type` string |
-| Job queue | `video.jobs.queued.v1` | `x-max-length` 10 000, `x-overflow` `reject-publish`, dead-letters to `video.jobs.dlx` |
+| Job exchange | `video.jobs.v2` | `direct`, durable |
+| Routing key | `video_job.queued.v2` | equal to the outbox `event_type` string |
+| Job queue | `video.jobs.queued.v2` | `x-max-length` 10 000, `x-overflow` `reject-publish`, dead-letters to `video.jobs.dlx` |
 | Dead-letter exchange | `video.jobs.dlx` | `fanout`, durable |
 | Dead-letter queue | `video.jobs.dead` | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, forwards nowhere |
 
 - **A full job queue refuses new publishes; it does not drop old ones.** `reject-publish` means the broker nacks the publisher rather than evicting the oldest queued job, so a full queue becomes back-pressure: the publisher leaves its outbox row unstamped, retries, and the system resumes when the queue drains. Nothing is lost. Expect a stalled relay and a growing count of unpublished outbox rows as the symptom, not missing jobs.
 - **Job messages never expire**, and that takes two things, not one. The job queue deliberately carries no `x-message-ttl`; publishers must also leave the per-message `expiration` property unset, since RabbitMQ honours it independently of any queue setting. Either one would dead-letter a message without any update to its `video_jobs` row, and the state machine has no transition out of `queued` except to `processing` — so the job would report `queued` to its owner forever. A backlog therefore persists until it is consumed rather than aging out, which is the intended trade.
-- **The generation suffix is on the exchange**, and the queue name follows it. A `direct` exchange delivers each publish to every queue bound with the matching routing key, so a future generation gets a new exchange rather than only a new queue.
+- **The generation suffix is on the exchange, the queue, *and* the routing key** — which is also the outbox `event_type` string. Versioning the exchange alone was the original plan and it does not work: every `cmd/api` replica's relay claims from the one shared `video_job_outbox` table, filtered on `event_type`, so with a single shared string a redeployed replica's relay would claim a not-yet-redeployed replica's row and publish it into the new generation. The exchange bump is kept alongside it because the two close different holes — the event type stops a relay *claiming* the wrong generation's row, the exchange stops the broker *delivering* to the wrong generation's queue.
+- **What a generation bump protects is the rolling-deploy window, not stale messages.** Stale messages are already harmless: the claim is conditional on `status = 'queued'`, so a message naming a job that has moved on is refused and dead-lettered with no side effect. What that does not protect is a job that is *legitimately* `queued` while two processing models are live — during the cutover deploy, an old in-request replica and a new worker could both act on one job, and the loser's cleanup would delete the source out from under the winner's running extraction.
+- **The dead-letter sink carries no suffix.** `video.jobs.dlx`/`video.jobs.dead` are shared across generations deliberately: a dead-lettered message is for inspection, and one place to look beats one per generation.
 
 Like PostgreSQL's and MinIO's, this broker's contents are authoritative once the relay ships: an acknowledged, `published_at`-stamped message is the only record that a job is waiting. `docker-compose.yml` gives the local service a named `rabbitmq_data` volume and a pinned `hostname` for that reason — RabbitMQ keys its Mnesia directory by hostname, so the volume does nothing without it.
 
@@ -193,13 +248,13 @@ The volume is named `<project>_rabbitmq_data`, and Compose derives `<project>` f
 
 #### The outbox relay
 
-`cmd/api` starts one relay goroutine (`internal/video/infrastructure/messaging.Relay`) and stops it on `SIGINT`/`SIGTERM`. It exists because `POST /upload` must not depend on the broker: `Repository.Enqueue` commits the `pending → queued` update and a `video_job.queued` outbox row in one transaction, and the relay carries that row to RabbitMQ afterwards.
+`cmd/api` starts one relay goroutine (`internal/video/infrastructure/messaging.Relay`) and stops it on `SIGINT`/`SIGTERM`. It exists because `POST /upload` must not depend on the broker: `Repository.Enqueue` commits the `pending → queued` update and a `video_job.queued.v2` outbox row in one transaction, and the relay carries that row to RabbitMQ afterwards.
 
 Each cycle it opens a transaction, claims a bounded batch of unpublished rows with `SELECT … FOR UPDATE SKIP LOCKED` (so several `cmd/api` replicas can each run one without dispatching the same row twice), publishes them **mandatory** on a confirm-mode channel, stamps `published_at` only for the messages the broker both acknowledged and did not return, and commits. The poll interval (2 s), the batch size (100 rows), the confirmation timeout (15 s), and the dial backoff are compile-time constants — there is no environment variable to tune them, matching the status cache's fixed TTL.
 
 Operationally, three things are worth knowing before they surprise you:
 
-- **A full job queue stalls the relay, by design.** `reject-publish` nacks the publish instead of evicting a queued job, so the row stays unstamped and the next poll retries it. Nothing is lost and uploads are unaffected — they still complete in-request. Since nothing consumes `video.jobs.queued.v1` yet, this is the expected end state once the queue reaches its 10 000-message limit.
+- **A full job queue stalls the relay, by design.** `reject-publish` nacks the publish instead of evicting a queued job, so the row stays unstamped and the next poll retries it. Nothing is lost, and uploads keep being *accepted* — but they stop being *processed*, since the dispatch never reaches the queue. A queue at its 10 000-message limit now means workers are not keeping up (or are not running); add workers rather than raising the limit.
 - **Unpublished outbox rows are the symptom to look at**, not a missing-message count on the broker:
 
   ```sql
@@ -209,13 +264,46 @@ Operationally, three things are worth knowing before they surprise you:
    GROUP BY event_type;
   ```
 
-  A growing `video_job.queued` count with an ageing `min(occurred_at)` means the relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. A large and **steadily growing** `video_job.created` count is normal: one row is written per job created and none is ever marked published, so that number only ever goes up. Those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`) — which is exactly why an unbounded backlog there is harmless rather than a leak to chase.
+  A growing `video_job.queued.v2` count with an ageing `min(occurred_at)` means the relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. A large and **steadily growing** `video_job.created` count is normal: one row is written per job created and none is ever marked published, so that number only ever goes up. Those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`) — which is exactly why an unbounded backlog there is harmless rather than a leak to chase.
 - **Delivery is at-least-once.** The relay commits only after the broker acknowledges, so a crash in between republishes rather than loses. A consumer must tolerate a duplicate regardless, since a nack or a consumer crash produces one too.
 
 Its lifecycle transitions are logged — started, connection lost, reconnected, stopped — because a healthy relay is otherwise invisible. Repeated dial failures back off from 1 s to a 30 s ceiling, and the topology is redeclared after every successful dial, so a broker that was recreated while the relay was disconnected gets its exchange and queues back before the next publish.
 
+#### The worker
 
-A fourth Redis-backed responsibility — a **distributed lease** preventing a redelivered message from being processed alongside the job a live worker still holds — is planned for later in Phase 6, once `cmd/worker` exists to contend over job pickup.
+`cmd/worker` consumes `video.jobs.queued.v2` with a **prefetch of one**: one unacknowledged delivery at a time, because the unit of work is a full `ffmpeg` run and buffering a second delivery would hide it from every other consumer for the duration. Scale out by running more worker processes; there is no concurrency setting to raise.
+
+A delivery is acknowledged only after the transition that makes its job terminal has committed. Everything else is rejected without requeue, which sends it to `video.jobs.dlx`:
+
+| Situation | Disposition | Job left as | Source object |
+|---|---|---|---|
+| Body will not decode, or names no source key | Reject → DLQ | untouched | untouched |
+| Claim lost (job already `processing`/terminal — a duplicate delivery) | Reject → DLQ | untouched | **kept** — another consumer is probably reading it right now |
+| Dispatch names an unknown job | Reject → DLQ | n/a | untouched |
+| Run broke before any terminal state committed | Reject → DLQ | wherever it was | **kept** |
+| Extraction/storage failed (`ProcessVideoJob` committed `failed` itself) | **Ack** | `failed` with a reason | deleted, and the idempotency key cleared so a retry works |
+| Result stored but `CompleteJob` will not commit after 4 retries | Reject → DLQ | `processing` | **kept**, and the result `StorageKey` logged |
+| Success | **Ack** | `completed` | deleted |
+
+Requeue is never used except on one path — a delivery pulled off the channel *after* the shutdown signal, which nothing has been done to yet. Requeueing anything else would loop rather than recover, since a redelivery of a job past `queued` can only lose the claim again.
+
+**Operator symptom: jobs stuck in `processing`.** That state means a worker claimed the job and did not reach a terminal write. Two causes, distinguishable by the DLQ:
+
+```sql
+SELECT id, original_filename, created_at
+  FROM video_jobs
+ WHERE status = 'processing'
+   AND created_at < now() - interval '1 hour';
+```
+
+- If `video.jobs.dead` holds the matching dispatch, the worker gave up deliberately — most likely the terminal write failed after the result was already stored. The worker's log line names the job and the result `StorageKey`; the artifact is in the bucket and the row can be reconciled by hand.
+- If nothing is in the DLQ **yet**, the most likely explanation is a worker that died mid-extraction — but absence from the DLQ does not prove it, so do not read it as a diagnosis. The message was never acknowledged, so the broker requeues it when that connection drops; between the crash and another consumer picking it up it is simply queued or unacknowledged and appears nowhere. Once a consumer does take it, `ClaimForProcessing` admits only `queued` rows, so the redelivery is refused and dead-lettered as a lost claim — at which point the job matches the first bullet's DLQ shape without having its first bullet's cause. A dead-lettered message can also have aged out of `video.jobs.dead` by the time you look. Check `rabbitmqctl list_queues name messages messages_unacknowledged` alongside the DLQ before concluding anything.
+
+  Either way **the job stays stranded**, and that is a known gap rather than a surprise: no redelivery can re-claim a `processing` row, and recovering it is `add-worker-job-lock`'s subject (Phase 6). Until then, resolution is manual, and the source object is still in the bucket unless the lifecycle rule has already expired it.
+
+Shutdown is `SIGINT`/`SIGTERM`: the worker stops taking new deliveries immediately and then waits up to **5 minutes** for the job in hand to reach a terminal state and be acknowledged. The handler runs on a context detached from that signal, so a shutdown never kills a running `ffmpeg` or aborts the write that records its outcome. If the deadline expires, the abandoned job is logged by ID and the process exits with that delivery still unacknowledged, so the broker **does** requeue it — but the row is `processing` by then, so the next consumer loses the claim and dead-letters it rather than resuming the work. The job is stranded exactly as in the crash case above; the redelivery buys nothing until `add-worker-job-lock` lands. Give worker containers a stop timeout at least as long as the drain, or an impatient orchestrator will strand exactly the jobs the drain exists to save.
+
+A fourth Redis-backed responsibility — a **distributed lease** letting a redelivered message safely re-claim a job whose worker died — is still planned for later in Phase 6 (`add-worker-job-lock`). Concurrent pickup of the *same* job is already prevented by PostgreSQL, not Redis: `ClaimForProcessing`'s `WHERE id = $1 AND status = 'queued'` admits exactly one consumer. What the lease is for is the case that predicate cannot address, the stranded-`processing` job above.
 
 ---
 
