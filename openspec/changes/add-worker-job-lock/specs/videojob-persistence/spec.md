@@ -74,7 +74,7 @@ It SHALL be a distinct method rather than a mode of `Enqueue` or of `Update`. `E
 
 `domain.VideoJobRepository` SHALL expose a method returning a bounded batch of jobs currently in `processing` status, and `postgres.Repository` SHALL implement it with the status filter **in the query**, ordered deterministically, taking an explicit limit.
 
-Successive calls SHALL NOT be able to return the same bounded prefix forever. A fixed `ORDER BY id LIMIT n` starves recovery: if the first `n` `processing` rows belong to healthy long-running extractions whose leases keep being renewed, every cycle examines those same rows and an abandoned job outside that prefix is never reached, for as long as those extractions last. The scan SHALL therefore advance across cycles — a keyset cursor carried between sweeps, or an ordering that puts the least recently examined rows first — so that recovery latency is bounded by the number of `processing` rows and the sweep interval, not by when unrelated jobs happen to finish.
+Successive calls SHALL NOT be able to return the same bounded prefix forever. A fixed `ORDER BY id LIMIT n` starves recovery: if the first `n` `processing` rows belong to healthy long-running extractions whose leases keep being renewed, every cycle examines those same rows and an abandoned job outside that prefix is never reached, for as long as those extractions last. The scan SHALL therefore advance across cycles — a keyset cursor carried between sweeps, or an ordering that puts the least recently examined rows first — so that recovery latency is bounded by the number of `processing` rows and the sweep interval, not by when unrelated jobs happen to finish. Where a cursor is used, its zero value SHALL mean "start of scan" and SHALL omit the keyset predicate rather than being bound as a value: the first cycle and every wrap pass it, and the column it would compare against is a `uuid`.
 
 The filter SHALL NOT be applied in Go over a broader read. The result set this feeds is scanned on a timer for the life of the deployment, and a scan whose cost grows with total job history is the failure mode `videojob-outbox-relay`'s claim index exists to avoid. An index supporting the predicate SHALL exist for the same reason.
 
@@ -93,6 +93,12 @@ It SHALL NOT be exposed through any HTTP route: it is not owner-scoped and retur
 - **GIVEN** more `processing` jobs than the requested limit
 - **WHEN** the method is called with that limit
 - **THEN** at most that many jobs are returned
+
+#### Scenario: The first scan and a wrapped scan return rows
+
+- **GIVEN** `processing` jobs and a scan starting from the zero cursor, as the first cycle and every wrap do
+- **WHEN** the method is called
+- **THEN** it returns rows rather than failing, because the zero cursor selects the start of the scan instead of being compared against an identifier
 
 #### Scenario: An abandoned job outside the first batch is still reached
 
