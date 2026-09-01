@@ -38,6 +38,8 @@ A fenced outcome SHALL be logged distinctly from a lost claim, naming the job, t
 
 ### Requirement: The Worker Deletes the Source Object, and Only If It Won the Claim
 
+**This requirement's name is now shorthand for a wider rule and SHALL be read through this paragraph.** Winning the claim is the *consumer's* way of earning the right to delete a source object, and it is no longer the only one: the sweeper never claims anything, yet `videojob-lease-recovery` requires it to delete the source of a job it abandons. The governing condition is therefore **having applied this job's terminal write** — the consumer applies it by claiming, extracting, and committing; the sweeper applies it by winning the conditional abandonment write at the epoch its scan observed. Every "did not win the claim" clause below is an instance of that condition, not an independent one, and an actor that did not apply the terminal write deletes nothing whichever role it is in.
+
 The worker SHALL delete the source object named by the message once the job it claimed has **committed** a terminal state — `completed` or `failed` — on success and on failure alike. The deletion SHALL be attempted on every path that returns normally after such a commit. It is deliberately *not* a deferred cleanup: a panic unwinding between the commit and the delete leaves the object behind, which is the same leak this requirement already accepts below and strictly safer than the alternative a defer would invite.
 
 **It SHALL NOT delete the source object on any path where the job did not reach a committed terminal state**, and this is the condition that matters most, because getting it wrong is unrecoverable rather than merely untidy. A panic mid-extraction, a `CompleteJob` write that would not commit, a shutdown deadline that expired — each leaves the job in `processing`, and the source bytes are the only thing from which that job can ever be finished. Deleting them turns a job the sweeper's fenced takeover could have recovered into one that can only be failed. An unconditional deferred delete registered at claim time therefore SHALL NOT be used; the delete SHALL be guarded on the committed outcome.
@@ -46,7 +48,9 @@ The worker SHALL delete the source object named by the message once the job it c
 
 The bytes left behind in that case leak, and that is the deliberate trade: a leaked object is reclaimable by the storage lifecycle rule, while a deleted one is gone.
 
-It SHALL NOT delete the source object when it did not win the claim either. Another consumer is processing that job from those exact bytes, and deleting them would destroy a running extraction's input — the failure mode generation isolation exists to prevent, reintroduced from inside.
+A consumer SHALL NOT delete the source object when it did not win the claim either. Another consumer is processing that job from those exact bytes, and deleting them would destroy a running extraction's input — the failure mode generation isolation exists to prevent, reintroduced from inside.
+
+**The sweeper's abandonment is the other way to earn the deletion, and it is gated the same way.** It SHALL delete the source object only when its `failed` write was *applied by that call* — not when the row merely already carries the outcome it intended, which is what a second sweeper at the same bound observes (see `videojob-lease-recovery`). The one actor that may delete on an already-present outcome is a caller retrying a write it made itself and whose response it lost, because that work is its own.
 
 The deletion SHALL be best effort, as it was when the HTTP handler owned it: one attempt, no retry, a failure logged with the `StorageKey` and not escalated. A failed deletion SHALL NOT prevent the message from being acknowledged, because the job is already terminal and the dispatch must not be redelivered.
 
@@ -88,6 +92,18 @@ The deletion SHALL be best effort, as it was when the HTTP handler owned it: one
 - **WHEN** the worker is refused the claim and dead-letters the message
 - **THEN** the source object still exists, so the consumer that won the claim can still read it
 
+#### Scenario: The sweeper deletes the source of a job it abandoned
+
+- **GIVEN** a job the sweeper fails after the requeue bound, whose terminal write that call applied
+- **WHEN** the sweep finishes with it
+- **THEN** no object exists under that job's source key, and its idempotency key no longer maps that content to it
+
+#### Scenario: A second sweeper at the same bound deletes nothing
+
+- **GIVEN** two sweepers reaching the bound for one job, the first having applied the `failed` write
+- **WHEN** the second finds the row already carrying that outcome
+- **THEN** it deletes no source object and clears no idempotency key, because it applied nothing
+
 #### Scenario: A failed deletion does not redeliver the dispatch
 
 - **GIVEN** a job processed to a terminal state and object storage rejecting the delete
@@ -100,7 +116,7 @@ When a job reaches `failed` under this process — whether committed by the cons
 
 The worker SHALL reconstruct the key from the job's owner and its persisted content hash, and SHALL delete it through an operation that removes the key only when it still refers to this job — the finalized value names the job, so matching on the job identifier proves ownership exactly as the reservation token did, and a key already reclaimed by a newer request names neither.
 
-It SHALL NOT clear the key for a job whose `failed` write it did not itself commit. A worker whose terminal write was refused by the fence has not failed anything; clearing then would release a mapping that belongs to a job still running under another holder.
+It SHALL NOT clear the key for a job whose `failed` write it did not itself apply. A worker whose terminal write was refused by the fence has not failed anything, and a sweeper that found the row already carrying the outcome it intended did not fail it either; clearing in either case would release a mapping that belongs to a job another actor owns. The single exception is the one the source-object rule already carries: a caller retrying its own write whose response was lost.
 
 The reservation **token** SHALL NOT be persisted anywhere to enable this. It is a possession capability whose whole purpose is to be held only by the request that minted it; storing it in a table that outlives the key's window, and that every job read touches, would buy nothing the job identifier does not already prove.
 
