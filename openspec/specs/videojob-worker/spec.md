@@ -4,7 +4,7 @@
 
 Define `cmd/worker`, the process that turns a dispatched `video_job.queued` message into a finished `VideoJob`: what it consumes, how it claims a job so a duplicate delivery cannot double-process it, when it acknowledges, dead-letters, or leaves a message outstanding, which side effects it owns (the source object, the failed job's idempotency key) and under exactly which conditions, its own composition root and configuration surface, and how it shuts down.
 
-It is the consumer `videojob-messaging`'s topology and `videojob-outbox-relay`'s publishing were built for. The extraction sequence it runs is `videojob-execution`'s `ProcessVideoJob`; the transitions it drives are `videojob-lifecycle`'s; the conditional claim underneath them is `videojob-persistence`'s. This capability owns only what the worker process itself decides — it makes no access-control decision (`video-processing-access`) and serves no HTTP.
+It is the consumer that `videojob-messaging`'s topology and `videojob-outbox-relay`'s publishing were built for. The extraction sequence it runs is `videojob-execution`'s `ProcessVideoJob`; the transitions it drives are `videojob-lifecycle`'s; the conditional claim underneath them is `videojob-persistence`'s. This capability owns only what the worker process itself decides — it makes no access-control decision (`video-processing-access`) and serves no HTTP.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ The worker SHALL NOT serve HTTP, SHALL NOT be reachable from outside the deploym
 
 The worker SHALL set a consumer prefetch of exactly one unacknowledged message and SHALL acknowledge a message only after the transition that makes its job terminal has been committed.
 
-Prefetch above one SHALL NOT be configured. The unit of work is a full extraction — seconds to minutes of `ffmpeg`, not microseconds — so buffering buys no throughput, and a worker that dies holding buffered messages loses each of their deliveries while their jobs sit claimed in `processing`, which no mechanism in this capability's scope can recover.
+Prefetch above one SHALL NOT be configured. The unit of work is a full extraction — seconds to minutes of `ffmpeg`, not microseconds — so buffering buys no throughput. What it costs is availability of the buffered work: a prefetched message is held by this consumer and is not offered to any other, so it waits behind work of unbounded duration while an idle worker elsewhere has nothing to take. The messages themselves are not lost — a prefetched delivery has not been handled, its job is still `queued`, and the broker requeues it when this consumer's connection closes — so the reason for the bound is fairness and latency, not durability.
 
 Acknowledging before the terminal write SHALL NOT be done: a crash between the acknowledgement and the commit destroys the only remaining record that the job needs processing.
 
@@ -106,7 +106,7 @@ A rejected message SHALL NOT cause a transition. In particular a lost claim SHAL
 
 ### Requirement: The Worker Deletes the Source Object, and Only If It Won the Claim
 
-The worker SHALL delete the source object named by the message once the job it claimed has **committed** a terminal state — `completed` or `failed` — on success and on failure alike. The deletion SHALL be attempted on every exit path from that point, including a panic that unwinds afterwards.
+The worker SHALL delete the source object named by the message once the job it claimed has **committed** a terminal state — `completed` or `failed` — on success and on failure alike. The deletion SHALL be attempted on every path that returns normally after such a commit. It is deliberately *not* a deferred cleanup: a panic unwinding between the commit and the delete leaves the object behind, which is the same leak this requirement already accepts below and strictly safer than the alternative a defer would invite.
 
 **It SHALL NOT delete the source object on any path where the job did not reach a committed terminal state**, and this is the condition that matters most, because getting it wrong is unrecoverable rather than merely untidy. A panic mid-extraction, a `CompleteJob` write that would not commit, a shutdown deadline that expired — each leaves the job in `processing`, and the source bytes are the only thing from which that job can ever be finished. Deleting them turns a job a later fenced takeover could have recovered into one that can only be failed. An unconditional deferred delete registered at claim time therefore SHALL NOT be used; the delete SHALL be guarded on the committed outcome.
 
@@ -188,7 +188,7 @@ A failure to clear the key SHALL be logged and SHALL NOT fail the job or prevent
 
 It SHALL NOT run the outbox relay. The relay belongs to `cmd/api`, and running it in both would double the claim polling against the outbox table for no additional dispatch.
 
-Broker reachability SHALL be treated as the worker's own concern rather than a fatal startup gate, matching the relay: the worker SHALL dial, SHALL redial with bounded backoff when the connection or the consuming channel is lost, and SHALL redeclare the topology after every successful dial, since nothing else declares it against a fresh or recreated broker.
+Broker reachability SHALL be treated as the worker's own concern rather than a fatal startup gate, matching the relay: the worker SHALL dial, SHALL redial with bounded backoff when the connection or the consuming channel is lost, and SHALL redeclare the topology after every successful dial. The relay declares the same topology on its own dials (`videojob-outbox-relay`), and both declaring is the point: neither process's startup may depend on the other having run first, so against a fresh or recreated broker a worker started alone still has a queue to consume from.
 
 Unlike the API, the worker SHALL exit non-zero if it cannot reach object storage or the database at startup — it has no request path to degrade, and a worker that consumes messages it cannot possibly process would drain the queue into the dead-letter queue.
 
