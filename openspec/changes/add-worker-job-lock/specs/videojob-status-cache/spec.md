@@ -12,6 +12,8 @@ Neither `Enqueue`, `ClaimForProcessing`, nor the requeue method SHALL be passed 
 
 The cached record SHALL mirror the persisted column set exactly, source key, content hash, **and fence epoch** included. The entry serves the `FindByID` that every transition use case makes before it writes, so a field missing from the record is silently dropped on every cache hit — a dropped source key yields either a rejected `Enqueue` or a queued message naming an object no consumer can fetch, a dropped content hash leaves a failed job's idempotency key unclearable, and a dropped epoch would make a cache-served job report abandonment count zero, which the sweeper's bound reads.
 
+**Every write-through SHALL serialize the epoch the write actually committed at, not whatever epoch the caller's in-memory aggregate happens to carry.** The decorator writes the record from the aggregate it was handed, and that aggregate's epoch can be wrong in three distinct ways: a claim can report an epoch the caller never read, a requeue advances the stored epoch by one, and a `CompleteJob`/`FailJob` aggregate loaded from a previous release's cache record decodes at zero while its write commits at the caller-supplied epoch. In each case the authoritative value SHALL be used — the claim's reported epoch, the requeue's advanced epoch, and `Update`'s epoch argument respectively. The requeue SHALL make its advanced epoch available for this: the aggregate's own requeue transition advances the in-memory epoch, which the conditional statement's `lease_epoch = lease_epoch + 1` matches by construction.
+
 **A won claim's write-through SHALL serialize the epoch the claim reported, not the epoch on the aggregate the caller passed in.** Those differ in exactly the case that matters: a consumer can load a `queued` job at one epoch, lose a race to a sweep that requeues it, and then win the claim on the re-dispatched job at the advanced epoch. Caching the pre-claim aggregate would publish the superseded value, and the next `FindByID` served from that entry would report an abandonment count lower than the row's — which the sweeper's bound reads.
 
 A record written by a previous release carries no epoch at all. Such a record SHALL decode to epoch zero rather than failing the read, and SHALL NOT be treated as authoritative for any fenced write — the fence's own input is the epoch the claim reported, never a value read back from a job, cached or otherwise.
@@ -33,6 +35,18 @@ A record written by a previous release carries no epoch at all. Such a record SH
 - **GIVEN** a `VideoJob` cached in `queued` status
 - **WHEN** `CachedVideoJobRepository.ClaimForProcessing` succeeds and reports a row affected
 - **THEN** a subsequent `FindByID` served from cache returns `processing`
+
+#### Scenario: A successful Update caches the epoch it wrote at
+
+- **GIVEN** a `VideoJob` loaded from a record written by a previous release, so its in-memory epoch is zero, and a `CompleteJob` that commits at a non-zero held epoch
+- **WHEN** the decorator writes through
+- **THEN** the cached record carries the epoch the write committed at, not zero
+
+#### Scenario: A won requeue caches the advanced epoch
+
+- **GIVEN** a `processing` `VideoJob` at a known epoch
+- **WHEN** the requeue succeeds and the decorator writes through
+- **THEN** the cached record is `queued` at one epoch greater, matching the persisted row
 
 #### Scenario: A won claim caches the epoch the claim reported
 

@@ -94,6 +94,28 @@ A `pending` job SHALL NOT be reported as a lost claim. It was never dispatched, 
 
 **`StartProcessing` SHALL additionally report the fence epoch its claim won**, read by the claiming statement itself, and **`CompleteJob` and `FailJob` SHALL each require that epoch as an input and persist conditionally on it**, returning a distinct exported fence sentinel when the stored row no longer carries it. They SHALL NOT re-read the epoch from the job they loaded: by then the row may carry a successor's, and a fence checked against that value would pass in exactly the case it exists to reject. The lost-claim sentinel and the fence sentinel SHALL remain distinct — the first says another consumer took the job before this one started, the second says another consumer took it away while this one was working.
 
+**A takeover SHALL surface as the fence sentinel even when it is detected before the write.** Both use cases load the job and apply the aggregate transition first, so a job that has already been requeued reads as `queued` and one a successor has already finished reads as terminal; in both cases the aggregate refuses the transition and reports an invalid transition, and the caller never reaches the fenced statement. Reporting that raw error would defeat the fence at the only layer that acts on it — `videojob-worker`'s disposition table branches on the fence sentinel — so `CompleteJob` and `FailJob` SHALL map a refused transition to the fence sentinel when the loaded row's status is no longer `processing` **and** its epoch is at least the caller's held epoch, which together mean the caller did claim this job and no longer owns it.
+
+A `pending` job SHALL NOT be mapped to the fence, for the same reason `StartProcessing` does not map one to a lost claim: it was never dispatched, so a terminal write naming it is an anomaly worth surfacing as itself rather than hiding behind the routine case. This mirrors the pending-versus-lost-claim discrimination `StartProcessing` already makes, and SHALL be implemented as deliberately as that one.
+
+#### Scenario: A terminal write on a requeued job reports the fence, not an invalid transition
+
+- **GIVEN** a worker holding a job's epoch whose job was swept, requeued to `queued`, and re-dispatched while it was extracting
+- **WHEN** it calls `CompleteJob` with its held epoch
+- **THEN** the call reports the fence sentinel rather than an invalid-transition error, and the job is not modified
+
+#### Scenario: A terminal write on a job a successor already finished reports the fence
+
+- **GIVEN** a worker holding a job's epoch whose job has since been requeued, re-claimed, and completed by another worker
+- **WHEN** it calls `CompleteJob` or `FailJob` with its held epoch
+- **THEN** the call reports the fence sentinel and the persisted outcome is still the successor's
+
+#### Scenario: A terminal write naming a pending job is not disguised as a fence
+
+- **GIVEN** a `pending` job that was never enqueued or claimed
+- **WHEN** `CompleteJob` or `FailJob` is called for it
+- **THEN** the call reports the invalid transition rather than the fence sentinel
+
 The claim is what makes duplicate dispatch safe, and it is a *correctness* primitive rather than a *recovery* one. Dispatch is at-least-once by construction (`videojob-outbox-relay` can publish a message whose `published_at` never commits), and `Update` was historically a read-then-unconditional-write, so without the conditional persist two deliveries would both pass `queued → processing` and both run an extraction over the same source. With it, exactly one wins and the loser mutates nothing.
 
 Recovery of a job whose consumer died mid-extraction is a **separate** mechanism and SHALL remain so. `ClaimForProcessing`'s predicate SHALL keep naming `queued` alone: widening it to re-admit a `processing` row would make the claim depend on the lease that decides abandonment, and that lease fails open, so a lease-store outage would license two workers to claim one live job. `videojob-lease-recovery` instead returns an abandoned job to `queued` through the aggregate's `Requeue` edge, after which this claim applies unchanged. An implementer SHALL NOT relax the predicate here to make a stranded job recoverable.
