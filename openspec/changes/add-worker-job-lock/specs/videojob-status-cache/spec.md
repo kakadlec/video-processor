@@ -1,5 +1,29 @@
 ## MODIFIED Requirements
 
+### Requirement: Repeated Single-Job Status Reads Are Served From Cache
+
+`internal/video/infrastructure/cache.CachedVideoJobRepository` SHALL implement `domain.VideoJobRepository`'s `FindByID` as a cache-aside read against Redis, keyed per job (`"videojob:status:" + jobID.String()`). A cache hit SHALL be returned without querying PostgreSQL. This SHALL apply to `GetJobStatus` (backing `GET /api/video-jobs/:id`) and to the internal `FindByID` call `EnqueueVideoJob` and `StartProcessing` make before writing.
+
+**`CompleteJob` and `FailJob` SHALL be the exception: they SHALL read through the undecorated repository and write through the cached one.** Their read decides whether a fence applies, and a stale entry decides it wrongly in a way no later write can correct — a claim whose write-through and fallback delete both failed leaves a `queued` record at the holder's own epoch, and the aggregate refuses the terminal transition on it before any statement can run, so the rightful holder can never commit its result. The cache exists to absorb repeated polling reads, and these are once-per-job writes, so the exception costs nothing it was built to provide. This is the same judgement `videojob-result-storage` records for `GET /download/:filename`'s entitlement lookup and `videojob-lease-recovery` records for the sweeper's scan: a decision about who owns a job does not read a cache.
+
+#### Scenario: Repeated status poll for an unchanged job is served from cache
+
+- **GIVEN** a `VideoJob` whose current state was already cached by a prior lookup
+- **WHEN** `GetJobStatus` looks it up again before any state transition occurs
+- **THEN** the result is served from the Redis cache entry, with no PostgreSQL query
+
+#### Scenario: A deserialized cache hit reconstructs a fully valid aggregate
+
+- **GIVEN** a cache hit whose stored fields are read back
+- **WHEN** the cached value is deserialized into a `*domain.VideoJob`
+- **THEN** every field is re-validated through its domain constructor (matching `postgres.Repository`'s own reconstruction discipline), so a hit can never produce an aggregate that bypasses domain invariants
+
+#### Scenario: A terminal write is not decided from a cache entry
+
+- **GIVEN** a job whose cache entry says `queued` at the holder's own epoch, because its claim's write-through and fallback delete both failed
+- **WHEN** that holder calls `CompleteJob`
+- **THEN** the job is loaded from PostgreSQL, found `processing`, and completed — and the cache entry is corrected by the write-through
+
 ### Requirement: Cache Reflects The Latest State Transition Write
 
 `CachedVideoJobRepository`'s `Update`, `Enqueue`, **`ClaimForProcessing`, and the requeue method** SHALL each write to PostgreSQL first, and only once that write succeeds, write the job's new serialized state to its cache entry (write-through), overwriting rather than merely deleting any prior entry. This SHALL apply to every state transition: `Complete` and `Fail` reach it through `Update`, `Enqueue` through the dedicated method that commits the transition together with its outbox row, `StartProcessing` through the conditional claim, and an abandoned job's return to the queue through the requeue method that commits its own dispatch event (see `videojob-persistence`). A concurrent cache-miss repopulation (the "PostgreSQL Is Authoritative On Cache Miss" requirement below) SHALL NOT be able to overwrite a write-through entry with an older value it read before the transition committed.
