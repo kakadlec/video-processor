@@ -149,7 +149,7 @@ The sweeper SHALL requeue a given job at most a bounded number of times, counted
 
 **A `processing` job whose source key is empty SHALL be failed on sight rather than requeued.** Such rows exist only from before the source-key column was added, and they are exactly what a first sweep encounters. Requeueing one is a loop with no exit: the aggregate's requeue transition rejects an empty source key, so the epoch never advances, the bound is never reached, and the abandonment path never fires. Excluding them from the scan instead SHALL NOT be substituted — that leaves them stranded, which is the condition this capability exists to end.
 
-The cleanup that follows an abandonment — deleting the source object and clearing the idempotency key — SHALL be gated on **this** actor's own committed `failed` write, never on the observation that the job is terminal. Exclusivity for that write comes from the terminal statement's own predicate, which requires the row to still be `processing`; whichever actor gets there first leaves the row terminal and every other actor's write affects no row. Two sweepers reaching the bound together, or a sweeper racing a leaseless worker that is still running, therefore produce exactly one cleanup. An argument from the aggregate's transition check SHALL NOT be substituted for that predicate: every actor evaluates that check against a copy loaded before any of them wrote.
+The cleanup that follows an abandonment — deleting the source object and clearing the idempotency key — SHALL be gated on **this** actor's own committed `failed` write, never on the observation that the job is terminal and never on the terminal row merely matching what this actor intended to write. Two sweepers at the bound produce byte-identical intents — same epoch, same `failed`, same fixed reason — so the sweeper SHALL use the applied-versus-already-present outcome `videojob-lifecycle` requires, and SHALL clean up only on *applied*. Exclusivity for the write itself comes from the terminal statement's own predicate, which requires the row to still be `processing`; whichever actor gets there first leaves the row terminal and every other actor's write affects no row. Two sweepers reaching the bound together, or a sweeper racing a leaseless worker that is still running, therefore produce exactly one cleanup. An argument from the aggregate's transition check SHALL NOT be substituted for that predicate: every actor evaluates that check against a copy loaded before any of them wrote.
 
 An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process — an input that exhausts memory, say — would otherwise be re-dispatched forever and would take down each replica in turn.
 
@@ -167,9 +167,9 @@ An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process
 
 #### Scenario: Only the sweeper that committed the failure cleans up
 
-- **GIVEN** two sweepers that both reach the bound for the same job
-- **WHEN** the first commits `failed` and the second's transition is refused
-- **THEN** the second deletes no object and clears no idempotency key
+- **GIVEN** two sweepers that both reach the bound for the same job, writing the identical epoch, status, and fixed reason
+- **WHEN** the first commits `failed` and the second finds the job already carrying exactly that outcome
+- **THEN** the second's result reports the state as already present rather than applied, and it deletes no object and clears no idempotency key
 
 #### Scenario: The abandonment reason leaks no infrastructure detail
 
