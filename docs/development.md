@@ -26,7 +26,9 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity, Video Processing, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`:
+Identity, Video Processing, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
+
+**Running the API alone is not enough to process an upload.** Since the async cutover, `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`. Run both (see below); with the API alone, jobs stay `queued` forever and the status endpoint reports exactly that.
 
 ```bash
 # Download dependencies
@@ -53,21 +55,29 @@ export RABBITMQ_URL="amqp://video:video@localhost:5672/"
 # is not true inside Docker Compose, where the server uses minio:9000 and the
 # compose file sets VIDEO_MINIO_PUBLIC_ENDPOINT to the published port instead.
 
-# Start the server (listens on :8080)
+# Start the API (listens on :8080)
 go run ./cmd/api
 
-# Build a binary
+# In a second shell, with the same exports minus the IDENTITY_* ones,
+# start the worker. It serves no HTTP and exposes no port.
+go run ./cmd/worker
+
+# Build binaries
 go build -o app ./cmd/api
-./app
+go build -o worker ./cmd/worker
 ```
 
-The server creates `temp/` in the working directory on first run — the only directory it owns now. Neither uploaded source videos nor processed ZIP results are written to disk: both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which the server requires at startup and creates if absent. `temp/` holds per-request scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the request finishes.
+`cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` variables (it makes no access-control decision) and no `VIDEO_MINIO_PUBLIC_*` (it never presigns). Exporting the extra variables anyway is harmless — it just ignores them.
 
-To skip the manual wiring entirely, use `docker compose up --build`, which runs the whole application inside Docker with identity already configured — see "Docker Workflow" below.
+`cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **`cmd/api` creates no directory at all** any more: extraction moved to the worker, so the API never touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk: both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which both processes require at startup and the API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running both processes from the same working directory is fine — the API does not use it.
+
+To skip the manual wiring entirely, use `docker compose up --build`, which starts the API **and** a `worker` service inside Docker with everything already configured — see "Docker Workflow" below.
 
 ## Running Tests
 
 Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, the `VIDEO_MINIO_*` variables must point at a reachable MinIO, and `RABBITMQ_URL` must be **set** — `cmd/api`'s `TestMain` requires the variable because `setupVideo` does, but deliberately does not require a live broker, because `cmd/api` does not either.
+
+`cmd/worker`'s own suite is the one place a **reachable** broker changes whether real coverage runs rather than only how much: its end-to-end dispatch tests need `RABBITMQ_TEST_URL` alongside PostgreSQL, Redis, and MinIO, and skip cleanly without it, exactly like the messaging package's. Run it through Docker (below) or CI to exercise them.
 
 A *reachable* broker is a prerequisite for **full coverage**, not for a passing run: `internal/platform/rabbitmq`'s and `internal/video/infrastructure/messaging`'s tests skip with a clear message when `RABBITMQ_TEST_URL` is unset, the same way the Redis and MinIO adapter suites do. A local run without a broker passes while exercising none of those two packages — which between them cover the publisher, the relay, and its reconnect and shutdown paths — so exercise them through the Docker command below (or CI, which always provides one) before trusting a green result for a change that touches them.
 
@@ -133,12 +143,14 @@ A change whose diff includes a Go module input file (`.go` source, `go.mod`, or 
 ```bash
 docker compose up --build
 # Access the UI by opening http://127.0.0.1:8080 in a browser —
-# identity, video, and Redis are already configured (PostgreSQL, JWT signing key, REDIS_ADDR)
+# identity, video, Redis, MinIO, and RabbitMQ are already configured, and a
+# `worker` service is started alongside `app` from the same image, so uploads
+# are actually processed
 ```
 
 `docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.
 
-> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app` and deployment both use — ships only the compiled binary and `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000).
+> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app`, `worker`, and deployment all use — ships **both** compiled binaries (`/app/app` and `/app/worker`) plus `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000). `ffmpeg` is there for the worker now rather than for the API. The `worker` service is the same image with its command overridden to `/app/worker`.
 >
 > **Bind-mount permissions:** there is no longer a bind-mounted working directory to get wrong. `./uploads` and `./outputs` were both removed once their artifacts moved into MinIO, so the non-root user (UID 1000) writes only to `temp/` inside the container, which the image creates and owns. If you still have a root-owned `uploads/` or `outputs/` in your clone from an older checkout, it is inert — delete it.
 

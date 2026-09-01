@@ -1,7 +1,7 @@
 # video-frame-extraction Specification
 
 ## Purpose
-Define the video-processing HTTP surface as it behaves today: which uploads are accepted, how frames are extracted and packaged, which artifacts survive a request, and how processed results are listed and downloaded. Access control over those results is specified in `identity-authentication` and `video-processing-access`; this spec covers the processing behavior itself and references ownership only where it changes a response.
+Define the video-processing surface as it behaves today: which uploads are accepted, how frames are extracted and packaged, which artifacts survive a job, and how processed results are listed and downloaded. Extraction now happens in `cmd/worker` rather than inside the submitting request, so the cleanup obligations here are stated against a job's terminal state rather than against a response. Access control over those results is specified in `identity-authentication` and `video-processing-access`; this spec covers the processing behavior itself and references ownership only where it changes a response.
 ## Requirements
 
 ### Requirement: Video Upload Validation
@@ -44,12 +44,20 @@ The system SHALL package all extracted frames into a single downloadable `.zip` 
 
 On successful processing, the system SHALL delete the stored source object, leaving the zip object in the configured MinIO bucket as the only durable artifact.
 
-The source no longer lives on the local filesystem: it is an object under the `uploads/` key prefix of the same bucket (see `videojob-source-storage`), and the transient local copy `ProcessVideoJob` downloads for `ffmpeg` is removed under `temp/` as part of the same sequence.
+The source has not lived on the local filesystem since Phase 5: it is an object under the `uploads/` key prefix of the same bucket (see `videojob-source-storage`). Since the asynchronous cutover the cleanup no longer happens inside the submitting request at all — the object is deleted by `cmd/worker` once the job it processed reaches a terminal state, and the transient local copy it downloaded for `ffmpeg` is removed from **the worker's** `temp/` directory as part of the same sequence. The submitting API's filesystem is not involved in processing and holds no copy.
+
+"After successful processing" therefore means after the job reaches `completed`, which is observable through the job's status rather than through the upload response. An observer SHALL NOT expect the source object to be gone by the time the submission is acknowledged.
 
 #### Scenario: Uploaded file removed after success
 
 - **WHEN** a video upload is processed successfully
-- **THEN** no object exists under that request's source key, and the transient local copy under `temp/` no longer exists, after the request completes
+- **THEN** no object exists under that job's source key, and no local copy of it remains under any `temp/` directory, once the job's status is `completed`
+
+#### Scenario: The source object still exists while the job is queued
+
+- **GIVEN** a submitted video whose job is `queued` and not yet claimed
+- **WHEN** the bucket is inspected
+- **THEN** the source object is present, because the component that will delete it has not processed the job yet
 
 ### Requirement: Processed Files Listing
 
@@ -118,21 +126,27 @@ The system SHALL remove the per-request temporary frame-extraction directory und
 
 ### Requirement: Source Object Removed On Processing Failure
 
-When frame extraction or result storage fails, the system SHALL delete the stored source object rather than retaining it. With storage reachable, a failed request leaves behind neither a source object in the bucket nor a local copy under `temp/`.
+When frame extraction or result storage fails, the system SHALL delete the stored source object rather than retaining it. With storage reachable, a failed job leaves behind neither a source object in the bucket nor a local copy under any `temp/` directory.
 
-The deletion is an obligation to attempt, not a guarantee of absence — `videojob-source-storage`'s "Every Request Deletes Its Own Source Object" owns the full semantics, including what happens when the attempt itself fails. The point of this requirement is the reversal of intent: failure is no longer a reason to keep the source.
+The deletion is an obligation to attempt, not a guarantee of absence — `videojob-source-storage` owns the full semantics, including which component is obliged to attempt it and what happens when the attempt itself fails. The point of this requirement is the reversal of intent: failure is no longer a reason to keep the source.
 
 This inverts the behavior the removed "Uploaded File Retained On Processing Failure" requirement documented. Retention was a known leak, tolerable only because a local file is reclaimed when its container is replaced; the same leak in object storage would be durable and unbounded, with nothing in this system to reap it.
 
-A consequence, accepted deliberately: a failed job cannot be retried from the original bytes, because they are gone. A retry is a fresh upload. `upload-idempotency` already clears a failed job's key immediately so such a retry is not blocked.
+Two consequences, both accepted deliberately. A failed job cannot be retried from the original bytes, because they are gone; a retry is a fresh submission, which `upload-idempotency` keeps unblocked by clearing a failed job's key immediately. And a job that fails *before* any component claims it — one whose dispatch was never delivered — is not covered by this requirement at all: nothing processes it, so nothing deletes its source, and the object-storage lifecycle rule is what reclaims it.
 
 #### Scenario: Failed processing leaves no source object
 
-- **WHEN** a video upload with a valid extension but content `ffmpeg` cannot decode is processed
-- **THEN** the response reports `success: false`, and no object exists under that request's source key after the request completes
+- **WHEN** a submitted video with a valid extension but content `ffmpeg` cannot decode is processed
+- **THEN** the job's status is `failed` with a recorded reason, and no object exists under its source key
 
 #### Scenario: Failed result storage also removes the source
 
 - **GIVEN** frames were extracted successfully but the result zip cannot be stored
-- **WHEN** the request completes
-- **THEN** the job is `failed` and no object exists under that request's source key
+- **WHEN** the job reaches its terminal state
+- **THEN** the job is `failed` and no object exists under its source key
+
+#### Scenario: A job that was never claimed is not covered
+
+- **GIVEN** a job whose dispatch was never delivered to any consumer
+- **WHEN** the bucket is inspected
+- **THEN** its source object is still present, and only the storage lifecycle rule will reclaim it

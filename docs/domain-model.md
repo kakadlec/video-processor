@@ -22,7 +22,7 @@
 
 ### Video Processing
 
-**Responsibility:** Manage the full lifecycle of a video processing job — accepting an upload, tracking state transitions, coordinating the async worker, and making the result available. This is the core domain of FIAP X.
+**Responsibility:** Manage the full lifecycle of a video processing job — accepting an upload, tracking state transitions, running the async worker, and making the result available. This is the core domain of FIAP X. It spans two processes: `cmd/api` accepts and reports, `cmd/worker` executes.
 
 **Aggregate root:** `VideoJob` (see below).
 
@@ -63,6 +63,7 @@
 | `OriginalFilename` | string | Non-empty; extension must be in the allowed set |
 | `StorageKey` | string | Non-empty; opaque path within the configured storage backend. Held by the aggregate in **two distinct roles** — see `SourceKey` below — which must never be conflated |
 | `SourceKey` | `StorageKey` | The uploaded video's object key (`uploads/<uploadID>_<filename>`). Set at creation and never after; MAY be zero, because `POST /api/video-jobs` creates a job from a filename with no stored object. A job whose `SourceKey` is zero cannot be enqueued — the invariant lives on the `Enqueue` transition, deliberately not on reconstitution, so rows predating the column still load |
+| `ContentHash` | string | SHA-256 digest of the uploaded bytes, computed on the same pass that stored them. Set at creation and never after; MAY be empty (a job from `POST /api/video-jobs`, or a row predating the column). It exists so a process that never saw the submitting request can rebuild the job's idempotency key from `UserID` + hash — the reservation **token** is deliberately *not* persisted, being a possession capability of the request that minted it. Like `SourceKey`, it is not validated at reconstitution |
 | `FrameCount` | int | ≥ 0; set only on transition to `completed` |
 | `ErrorReason` | string | Non-empty only in `failed` state |
 | `JobStatus` | enum | Transitions only via defined commands (see state machine below) |
@@ -78,9 +79,9 @@ pending → queued → processing → completed
 |---|---|---|
 | `pending` | Job created, upload stored; not yet on the queue | `CreateVideoJob` use case |
 | `queued` | Dispatch recorded in the outbox and committed with the transition; the broker message follows, published out of band by the relay | `EnqueueVideoJob` use case |
-| `processing` | Worker has dequeued the job and started extracting frames | Worker `StartProcessing` command |
-| `completed` | Frames extracted and ZIP stored; `FrameCount` and `StorageKey` populated | Worker `CompleteJob` command |
-| `failed` | Processing failed; `ErrorReason` populated | Worker `FailJob` command |
+| `processing` | `cmd/worker` has dequeued the job and won the claim; frame extraction is under way | `cmd/worker`'s `StartProcessing` command — an **atomic conditional claim**, see below |
+| `completed` | Frames extracted and ZIP stored; `FrameCount` and `StorageKey` populated | `cmd/worker`'s `CompleteJob` command |
+| `failed` | Processing failed; `ErrorReason` populated | `ProcessVideoJob`'s own `FailJob` call, inside `cmd/worker` |
 
 **Invariants:**
 - A job may not transition backwards.
@@ -88,6 +89,8 @@ pending → queued → processing → completed
 - `ErrorReason` MUST be empty unless the job is `failed`.
 - `StorageKey` for the result MUST be set atomically with the `completed` transition.
 - `SourceKey` MUST be non-zero to enter `queued`, and is fixed at creation — it is never rewritten by a transition.
+- `ContentHash` is fixed at creation and never rewritten by a transition either.
+- **`queued → processing` is a claim, not merely a transition.** It is persisted through a single conditional statement (`… WHERE id = $1 AND status = 'queued'`), so of two consumers handed the same dispatch exactly one wins and the loser mutates nothing. Dispatch is at-least-once by construction, so without that predicate both would pass the transition check and both would extract. Losing the claim is a distinct, non-failing outcome: the loser returns a sentinel, does not call `FailJob`, and touches neither the job nor its source object.
 
 ### Use Cases
 
@@ -99,9 +102,10 @@ pending → queued → processing → completed
 | `EnqueueVideoJob` | API (post-upload) | Job in `pending` with a non-zero `SourceKey` | Job transitions to `queued` and a `VideoJobQueued` outbox row is committed in the **same transaction** — the dispatch is *recorded for relay*, not published. The broker message is the relay's separate step and may not arrive at all while the broker is down |
 | `GetJobStatus` | Authenticated user (via API) | Job exists; caller's `UserID` matches job's `UserID` | Returns current `JobStatus`, `FrameCount`, and result URL if `completed` |
 | `ListUserJobs` | Authenticated user (via API) | — | Returns paginated list of the caller's jobs with their statuses |
-| `StartProcessing` | Worker (internal) | Job in `queued` | Job transitions to `processing` |
-| `CompleteJob` | Worker (internal) | Job in `processing` | Job transitions to `completed`; `StorageKey` and `FrameCount` set; `VideoJobCompleted` event emitted |
-| `FailJob` | Worker (internal) | Job in `processing` | Job transitions to `failed`; `ErrorReason` set; `VideoJobFailed` event emitted |
+| `StartProcessing` | `cmd/worker` (internal) | Job in `queued` | Job transitions to `processing`, persisted as an atomic conditional claim. If the stored status is no longer `queued`, nothing is written and a lost-claim sentinel is returned — a `pending` job is reported differently, since a dispatch naming an un-enqueued job is an anomaly rather than a duplicate |
+| `CompleteJob` | `cmd/worker` (internal) | Job in `processing`, result already stored in the bucket | Job transitions to `completed`; `StorageKey` and `FrameCount` set; `VideoJobCompleted` event emitted (Phase 7). The worker retries this write with backoff before giving up — the artifact is already durable, so abandoning it would orphan finished work |
+| `FailJob` | `ProcessVideoJob`, inside `cmd/worker` | Job in `processing` | Job transitions to `failed`; `ErrorReason` set; `VideoJobFailed` event emitted (Phase 7). The worker never calls it directly — `ProcessVideoJob` fails the job itself, and a second failure write would be the overwrite the claim exists to prevent |
+| `ClearJobIdempotencyKey` | `cmd/worker` (internal) | Job reached `failed` | The job's idempotency key is deleted, but only if it still names that job — rebuilt from the job's `UserID` and persisted `ContentHash`, read from the undecorated PostgreSQL repository. An immediate resubmission of the same bytes is then treated as fresh instead of being deduplicated onto the failure for the rest of the 24-hour window |
 
 #### Identity Context (implemented, Phase 2)
 
@@ -128,19 +132,19 @@ All events are serialized as JSON. The `type` field is the canonical discriminat
 | Event | JSON fields | Crosses context boundary? | Status |
 |---|---|---|---|
 | `VideoJobCreated` | `type`, `job_id`, `user_id`, `original_filename`, `occurred_at` | No (internal) | **Recorded** (Phase 3): `internal/video/infrastructure/postgres.Repository.Create` writes this exact payload to the `video_job_outbox` table transactionally with the `video_jobs` row — not yet published anywhere, since nothing consumes it (marked "No" cross-context above) |
-| `VideoJobQueued` | `type`, `job_id`, `user_id`, `source_key`, `occurred_at` | No (internal) | **Recorded and published** (Phase 6): `postgres.Repository.Enqueue` writes this payload to `video_job_outbox` transactionally with the `pending → queued` update, and `messaging.Relay` publishes it verbatim to `video.jobs.v1`. `source_key` is what a consumer needs to fetch the video; nothing consumes it yet |
-| `VideoJobStarted` | `type`, `job_id`, `occurred_at` | No (internal) | Planned (Phase 6) |
+| `VideoJobQueued` | `type`, `job_id`, `user_id`, `source_key`, `content_hash`, `occurred_at` | No (internal) | **Recorded, published, and consumed** (Phase 6): `postgres.Repository.Enqueue` writes this payload to `video_job_outbox` transactionally with the `pending → queued` update, `messaging.Relay` publishes it verbatim to `video.jobs.v2`, and `cmd/worker` consumes it. `source_key` is what the worker needs to fetch the video; `content_hash` travels with it so a failed job's idempotency key is derivable without a second read. `type` and the routing key are both `video_job.queued.v2` — the generation suffix is carried by the event-type string as well as the exchange, because every replica's relay claims from one shared outbox table filtered on it |
+| `VideoJobStarted` | `type`, `job_id`, `occurred_at` | No (internal) | Planned. Not emitted: `StartProcessing` persists through the conditional claim, which writes no outbox row |
 | `VideoJobCompleted` | `type`, `job_id`, `user_id`, `frame_count`, `storage_key`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
 | `VideoJobFailed` | `type`, `job_id`, `user_id`, `error_reason`, `occurred_at` | Yes — Video Processing → Notification | Planned (Phase 6–7) |
 | `UserRegistered` | `type`, `user_id`, `email`, `occurred_at` | Yes (optionally) — Identity → Notification | Planned — deferred until Notification (Phase 7) needs it; Identity itself (Phase 2) is implemented |
 | `UserAuthenticated` | `type`, `user_id`, `occurred_at` | No (internal) | Planned; not emitted by the current `AuthenticateUser` use case |
 
-Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay. That relay now exists (`openspec/specs/videojob-outbox-relay/spec.md`) and its source table is `video_job_outbox` (Phase 3), but it dispatches **only** `VideoJobQueued`. `VideoJobCreated` rows are written and deliberately never published — an internal event, and the relay's claim filters on `event_type` precisely so that permanent backlog cannot starve the rows that are meant to go out. Neither of the two events that actually cross to Notification (`VideoJobCompleted`, `VideoJobFailed`) is written anywhere yet: `CompleteJob` and `FailJob` persist through `Repository.Update`, which is deliberately not an outbox writer, so Phase 7 decides their shape on its own terms. See `openspec/specs/videojob-persistence/spec.md` for what `video_job_outbox` currently records. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
+Integration events that cross context boundaries are published to RabbitMQ (Phase 6) via a transactional-outbox relay. That relay now exists (`openspec/specs/videojob-outbox-relay/spec.md`) and its source table is `video_job_outbox` (Phase 3), but it dispatches **only** `VideoJobQueued`, and `cmd/worker` is what consumes those dispatches. `VideoJobCreated` rows are written and deliberately never published — an internal event, and the relay's claim filters on `event_type` precisely so that permanent backlog cannot starve the rows that are meant to go out. Neither of the two events that actually cross to Notification (`VideoJobCompleted`, `VideoJobFailed`) is written anywhere yet: `CompleteJob` and `FailJob` persist through `Repository.Update`, which is deliberately not an outbox writer, so Phase 7 decides their shape on its own terms. See `openspec/specs/videojob-persistence/spec.md` for what `video_job_outbox` currently records. Internal domain events do not need to be published to the broker. Identity (Phase 2) is implemented but does not emit either event above yet — see the Identity Context use-case table.
 
 ---
 
 ## Cross-Context Contracts
 
-- **`UserID`** is the identifier that crosses bounded context boundaries, but not as a shared type: each context defines and owns its own local `UserID` value object (`internal/identity/domain/user_id.go` and, as of Phase 3's `add-videojob-domain-and-application`, `internal/video/domain/user_id.go`) — two distinct Go types, never a package shared between the two contexts' `domain` layers. Translation between a source context's identifier and a consuming context's local type happens only at the composition root or via consumed integration events. `cmd/api` is that composition root today: `cmd/api/video.go`'s HTTP handlers (wired by Phase 3's `wire-videojob-http-endpoints`) are the actual translation point, converting the bearer-auth middleware's already-verified `identity.UserID` string into `video.UserID` on every `/api/video-jobs` request; `cmd/worker` will play the same role once Phase 6 introduces it. No `pkg/` directory exists or is planned — a shared kernel was considered and rejected (see `add-videojob-domain-and-application`'s `design.md` in the archive) as tighter coupling than this architecture's context-independence goal justifies.
+- **`UserID`** is the identifier that crosses bounded context boundaries, but not as a shared type: each context defines and owns its own local `UserID` value object (`internal/identity/domain/user_id.go` and, as of Phase 3's `add-videojob-domain-and-application`, `internal/video/domain/user_id.go`) — two distinct Go types, never a package shared between the two contexts' `domain` layers. Translation between a source context's identifier and a consuming context's local type happens only at the composition root or via consumed integration events. `cmd/api` is where that translation happens: `cmd/api/video.go`'s HTTP handlers (wired by Phase 3's `wire-videojob-http-endpoints`) convert the bearer-auth middleware's already-verified `identity.UserID` string into `video.UserID` on every request. `cmd/worker` (Phase 6) is a second composition root but performs **no** such translation — it never sees a token and reads the `user_id` off the dispatch message, which the API already translated. It has no Identity configuration at all. No `pkg/` directory exists or is planned — a shared kernel was considered and rejected (see `add-videojob-domain-and-application`'s `design.md` in the archive) as tighter coupling than this architecture's context-independence goal justifies.
 - The Video Processing context's own `UserID` constructor enforces only non-emptiness, not any identifier format or existence check — the identifier itself is minted once, at user creation, by Identity's `UserIDGenerator`; the bearer-auth middleware only verifies the token and supplies that already-minted, already-verified value to the handler, which Video Processing's `UserID` then wraps.
 - The Notification context receives integration events over RabbitMQ and resolves delivery preferences by `UserID` alone, never by calling into Identity or Video Processing internals.
