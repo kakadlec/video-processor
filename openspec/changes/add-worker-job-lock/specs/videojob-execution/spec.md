@@ -12,6 +12,8 @@ The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID an
 
 **`ProcessVideoJob` SHALL hold the job's lease for the duration of its extraction.** It SHALL acquire the lease at the moment `StartProcessing` reports a won claim — it is the only component that observes that moment, since its caller does not regain control until the sequence returns — and SHALL renew it until the sequence ends. It SHALL NOT release it: the lease must survive until the caller's terminal write commits, so release belongs to that caller, and the conditional release makes performing it elsewhere safe. Acquire and renew failures SHALL be logged and SHALL NOT stop the extraction; a renewal that finds a superseded epoch SHALL stop renewing rather than overwrite it.
 
+**`ProcessVideoJob`'s result SHALL report whether its own `FailJob` write was applied by this call or found the outcome already present.** The caller performs `CompleteJob` itself and reads that distinction from its return value, but the failure write happens inside this use case, and the caller's obligations turn on it: `videojob-worker` gates deleting the source object and clearing the idempotency key on **having applied this job's terminal write**, and a run that merely found the row already `failed` — as a sweeper reaching the requeue bound at the same epoch leaves it — applied nothing and owns neither cleanup. Reporting the failure without that flag would make the caller's rule unimplementable and would let two actors clean up after one job.
+
 **A fenced write SHALL be reported, never retried and never worked around.** When `FailJob` is refused because the epoch has been superseded, `ProcessVideoJob` SHALL surface that sentinel to its caller rather than falling back to an unfenced write, re-loading the job, or reporting the job as failed. The job was taken over while this sequence was running, and its outcome belongs to whoever holds it now. The transient local copy SHALL still be removed, as on every other path.
 
 It SHALL NOT call `EnqueueVideoJob`. That transition belongs to the submitting handler, and calling it here would be a rejected `queued → queued` transition: `POST /upload` enqueues the job itself, immediately after creating it, so that the `pending → queued` update commits in the same transaction as the event describing it. `docs/domain-model.md`'s use-case table has always assigned `EnqueueVideoJob` the actor "API (post-upload)". An implementer SHALL NOT restore the call to keep the use case's sequence "complete". It SHALL NOT call the requeue transition either: returning an abandoned job to the queue is `videojob-lease-recovery`'s sweeper's, and a use case that requeued the job it was running would re-dispatch its own work.
@@ -52,11 +54,17 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 - **WHEN** `ProcessVideoJob.Execute` is called with its ID and source key
 - **THEN** it returns the lost-claim sentinel, no source object was downloaded, `ffmpeg` was not invoked, `FailJob` was not called, and the job's persisted state is unchanged
 
+#### Scenario: A failure the caller did not write is reported as already present
+
+- **GIVEN** an extraction whose failure write finds the row already `failed` at the same epoch, with the outcome another actor committed
+- **WHEN** `ProcessVideoJob.Execute` returns
+- **THEN** the result reports the failure as already present rather than applied by this call, so the caller deletes no source object and clears no idempotency key
+
 #### Scenario: Failed extraction fails the job
 
 - **GIVEN** a `VideoJob` in `queued` status and a stored source object `ffmpeg` cannot decode
 - **WHEN** `ProcessVideoJob.Execute` is called with that job's ID and the source key
-- **THEN** it calls `FailJob` with the epoch its claim won, the job's persisted status is `failed` with a non-empty `ErrorReason`, and the transient local copy no longer exists
+- **THEN** it calls `FailJob` with the epoch its claim won, the job's persisted status is `failed` with a non-empty `ErrorReason`, the result reports that write as applied by this call, and the transient local copy no longer exists
 
 #### Scenario: A failure write refused by the fence is reported, not retried
 
