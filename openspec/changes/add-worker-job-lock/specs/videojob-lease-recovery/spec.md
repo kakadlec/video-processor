@@ -2,7 +2,9 @@
 
 ### Requirement: A Lease Records That Some Worker Is Still Working on a Job
 
-The Video Processing context SHALL define a job-lease port in its domain layer, implemented by a Redis-backed adapter in its infrastructure layer, keyed by `VideoJobID` under this context's own key namespace. The port SHALL expose acquiring a lease for a job, renewing it, releasing it, and asking whether one is currently held.
+The Video Processing context SHALL define a job-lease port in its domain layer, implemented by a Redis-backed adapter in its infrastructure layer, keyed by `VideoJobID` under this context's own key namespace. The port SHALL expose acquiring a lease for a job, renewing it, releasing it, and asking whether one is held. **Every one of those operations SHALL carry the fence epoch, the query included.** The query SHALL answer "is this job leased at this epoch", not "does a key exist for this job": a stored value naming a different epoch SHALL be reported as not held.
+
+That distinction is not pedantry. Acquisition fails open, so the rightful holder may hold no lease at all; a superseded claimant's late acquire then finds the key absent and writes its own older epoch. A query keyed only on the job would report that row as protected, the sweeper would skip it forever, and the job would be unrecoverable while its only lease belongs to a worker the fence has already locked out.
 
 A lease SHALL carry an expiry, and its value SHALL be the fence epoch its holder claimed with (see below). Renewal and release SHALL be conditional on the stored value still naming that epoch, so a worker whose job has already been taken over can neither extend nor delete the lease its successor holds. The epoch identifies a holder unambiguously: only a requeue changes it, and only a requeue can produce a second holder.
 
@@ -18,6 +20,12 @@ It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` an
 
 - **WHEN** a worker wins a job's claim and begins extracting
 - **THEN** the lease store reports that job as held, and continues to report it as held for as long as the extraction runs
+
+#### Scenario: A lease naming an older epoch does not protect the current generation
+
+- **GIVEN** a job requeued and re-claimed at a newer epoch, whose current holder never acquired a lease, and whose stored lease names the previous epoch
+- **WHEN** the sweeper asks whether that job is held at the epoch its scan reported
+- **THEN** the answer is not-held, and the job is treated as abandoned like any other
 
 #### Scenario: A lease lapses when its holder stops renewing
 
