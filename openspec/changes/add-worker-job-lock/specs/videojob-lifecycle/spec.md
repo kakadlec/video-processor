@@ -94,15 +94,31 @@ A `pending` job SHALL NOT be reported as a lost claim. It was never dispatched, 
 
 **`StartProcessing` SHALL additionally report the fence epoch its claim won**, read by the claiming statement itself, and **`CompleteJob` and `FailJob` SHALL each require that epoch as an input and persist conditionally on it**, returning a distinct exported fence sentinel when the stored row no longer carries it. They SHALL NOT re-read the epoch from the job they loaded: by then the row may carry a successor's, and a fence checked against that value would pass in exactly the case it exists to reject. The lost-claim sentinel and the fence sentinel SHALL remain distinct — the first says another consumer took the job before this one started, the second says another consumer took it away while this one was working.
 
-**A takeover SHALL surface as the fence sentinel even when it is detected before the write.** Both use cases load the job and apply the aggregate transition first, so a job that has already been requeued reads as `queued` and one a successor has already finished reads as terminal; in both cases the aggregate refuses the transition and reports an invalid transition, and the caller never reaches the fenced statement. Reporting that raw error would defeat the fence at the only layer that acts on it — `videojob-worker`'s disposition table branches on the fence sentinel — so `CompleteJob` and `FailJob` SHALL map a refused transition to the fence sentinel when the loaded row's status is no longer `processing` **and** its epoch is at least the caller's held epoch, which together mean the caller did claim this job and no longer owns it.
+**A takeover SHALL surface as the fence sentinel even when it is detected before the write.** Both use cases load the job and apply the aggregate transition first, so a job that has already been requeued reads as `queued` and one a successor has already finished reads as terminal; in both cases the aggregate refuses the transition and reports an invalid transition, and the caller never reaches the fenced statement. Reporting that raw error would defeat the fence at the only layer that acts on it — `videojob-worker`'s disposition table branches on the fence sentinel — so `CompleteJob` and `FailJob` SHALL map a refused transition to the fence sentinel — but only where the loaded value actually proves a takeover, which is narrower than "no longer `processing`":
 
-A `pending` job SHALL NOT be mapped to the fence, for the same reason `StartProcessing` does not map one to a lost claim: it was never dispatched, so a terminal write naming it is an anomaly worth surfacing as itself rather than hiding behind the routine case. This mirrors the pending-versus-lost-claim discrimination `StartProcessing` already makes, and SHALL be implemented as deliberately as that one.
+- **A strictly greater epoch SHALL be reported as the fence**, whatever the status. Only a requeue advances the epoch, so a greater value is proof that this caller's job was taken from it.
+- **An equal epoch on a `queued` row SHALL NOT be reported as the fence on the strength of that read alone.** A genuine requeue always advances the epoch, so this combination cannot describe a takeover; what it does describe is a stale cache entry, reachable whenever a claim's write-through and its fallback delete both failed. The use case SHALL resolve it against the authoritative store — re-reading past the cache, or simply attempting the conditional write, whose predicate is the authority — and SHALL NOT fence the rightful holder on the strength of a cached value the claim already superseded.
+- **An equal epoch on a terminal row SHALL be reported as the fence only when the recorded outcome differs from the one this caller is writing.** When the recorded status, storage key, frame count, and failure reason are the ones this call would write, the row is this caller's *own* committed write whose response it did not receive — the retry `videojob-worker` requires produces exactly that — and the call SHALL report success. Fencing it would dead-letter a message whose work completed and skip the source-object cleanup that a committed outcome licenses.
+
+A `pending` job SHALL NOT be mapped to the fence at any epoch, for the same reason `StartProcessing` does not map one to a lost claim: it was never dispatched, so a terminal write naming it is an anomaly worth surfacing as itself rather than hiding behind the routine case. This mirrors the pending-versus-lost-claim discrimination `StartProcessing` already makes, and SHALL be implemented as deliberately as that one.
 
 #### Scenario: A terminal write on a requeued job reports the fence, not an invalid transition
 
 - **GIVEN** a worker holding a job's epoch whose job was swept, requeued to `queued`, and re-dispatched while it was extracting
 - **WHEN** it calls `CompleteJob` with its held epoch
 - **THEN** the call reports the fence sentinel rather than an invalid-transition error, and the job is not modified
+
+#### Scenario: A retried terminal write that already committed reports success
+
+- **GIVEN** a worker whose `CompleteJob` committed but whose database response was lost, so it retries with the same epoch, storage key, and frame count
+- **WHEN** the retry loads the job and finds it already `completed` at that epoch with exactly those values
+- **THEN** the call reports success rather than the fence, so the caller acknowledges the message and performs the cleanup its committed outcome licenses
+
+#### Scenario: A stale cached queued read does not fence the rightful holder
+
+- **GIVEN** a worker that won a claim whose cache write-through and fallback delete both failed, leaving a `queued` record at the same epoch it holds
+- **WHEN** it later calls `CompleteJob` and the load is served from that stale record
+- **THEN** the outcome is decided against the authoritative row rather than the cached one, and the write succeeds
 
 #### Scenario: A terminal write on a job a successor already finished reports the fence
 

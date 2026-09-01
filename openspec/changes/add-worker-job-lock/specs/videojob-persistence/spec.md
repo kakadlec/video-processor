@@ -122,7 +122,7 @@ This is safe precisely because `Update` performs only `processing → completed`
 
 The fence SHALL NOT be confused with the claim. `ClaimForProcessing` decides who *starts* a job; `Update` decides who may *finish* one. `StartProcessing` SHALL NOT be routed through `Update`.
 
-The two ways `Update` can affect no row SHALL be distinguishable to the caller's log, through the same follow-up lookup `ClaimForProcessing` already uses to separate a missing row from a lost claim: a superseded epoch means the job was taken over, while a matching epoch on a terminal row means another actor at the same epoch finished first. Both dispositions are identical — reject, keep the source object, clear no idempotency key, perform no cleanup — so a single sentinel MAY carry both, but a log that cannot tell them apart makes an abandonment race indistinguishable from a takeover.
+The two ways `Update` can affect no row SHALL be distinguishable to the caller's log, through the same follow-up lookup `ClaimForProcessing` already uses to separate a missing row from a lost claim: a strictly greater epoch means the job was taken over, while a matching epoch on a terminal row means either another actor at the same epoch finished first or — when the recorded outcome is the one this caller was writing — this caller's own earlier commit whose response was lost, which its use case reports as success rather than as a fence. Both dispositions are identical — reject, keep the source object, clear no idempotency key, perform no cleanup — so a single sentinel MAY carry both, but a log that cannot tell them apart makes an abandonment race indistinguishable from a takeover.
 
 #### Scenario: Update persists a transitioned job
 
