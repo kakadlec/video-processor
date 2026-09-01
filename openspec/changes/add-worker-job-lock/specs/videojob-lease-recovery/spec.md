@@ -1,0 +1,188 @@
+## ADDED Requirements
+
+### Requirement: A Lease Records That Some Worker Is Still Working on a Job
+
+The Video Processing context SHALL define a job-lease port in its domain layer, implemented by a Redis-backed adapter in its infrastructure layer, keyed by `VideoJobID` under this context's own key namespace. The port SHALL expose acquiring a lease for a job, renewing it, releasing it, and asking whether one is currently held.
+
+A lease SHALL carry an expiry, and its value SHALL be the fence epoch its holder claimed with (see below). Renewal and release SHALL be conditional on the stored value still naming that epoch, so a worker whose job has already been taken over can neither extend nor delete the lease its successor holds. The epoch identifies a holder unambiguously: only a requeue changes it, and only a requeue can produce a second holder.
+
+The lease SHALL be a **liveness** signal and nothing else. `ClaimForProcessing` SHALL NOT consult it, no HTTP route SHALL consult it, and it SHALL NOT be used to bound how many extractions run concurrently — prefetch and process count do that.
+
+It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` and encodes this context's fence semantics, and `ddd-architecture` confines `internal/platform/` to plumbing no bounded context owns.
+
+#### Scenario: A lease is held for the duration of an extraction
+
+- **WHEN** a worker wins a job's claim and begins extracting
+- **THEN** the lease store reports that job as held, and continues to report it as held for as long as the extraction runs
+
+#### Scenario: A lease lapses when its holder stops renewing
+
+- **GIVEN** a job whose holder has stopped renewing its lease
+- **WHEN** the lease's expiry passes
+- **THEN** the lease store reports that job as not held
+
+#### Scenario: A superseded holder cannot renew the lease it lost
+
+- **GIVEN** a job whose lease is held at a newer epoch than the one a resurrected worker claimed with
+- **WHEN** that worker attempts to renew or release the lease
+- **THEN** the stored lease is unchanged, and the current holder's lease keeps its own expiry
+
+#### Scenario: The lease is released when the outcome is committed
+
+- **GIVEN** a worker that has committed a job's terminal state
+- **WHEN** it finishes with that job
+- **THEN** the lease store reports the job as not held, without waiting for the expiry
+
+### Requirement: The Fence Epoch Is Won Atomically and Carried, Never Re-Read
+
+`video_jobs` SHALL carry a monotonically increasing fence epoch per job. `ClaimForProcessing` SHALL return the epoch of the row it claimed, read by the claiming statement itself rather than by a prior lookup, and that value SHALL be carried forward through the processing sequence into whichever terminal write ends it.
+
+Re-reading the epoch inside `CompleteJob` or `FailJob` SHALL NOT be substituted for carrying it. Those use cases load the aggregate before they write, and by then the row may carry a successor's epoch; a fence checked against that value fences nothing, and the check would pass in exactly the case it exists to reject.
+
+Reading it from a lookup that precedes the claim SHALL NOT be substituted either. Between such a read and the claim, a sweep can requeue the job and advance the epoch, and the worker would then run a job it legitimately owns while holding an epoch that fences its own terminal write.
+
+#### Scenario: A claimant learns its epoch from the claiming statement
+
+- **GIVEN** a job in `queued` status
+- **WHEN** a worker claims it
+- **THEN** the claim reports the row's current epoch, and that epoch is the one the worker carries for the rest of the job
+
+#### Scenario: A stale epoch read before the claim is not used
+
+- **GIVEN** a job that is requeued, and its epoch advanced, between a worker's initial lookup and its claim
+- **WHEN** the worker wins the claim and later commits a terminal state
+- **THEN** the write succeeds, because the epoch it carries is the one the claim reported and not the one the earlier lookup saw
+
+### Requirement: A Terminal Write Is Conditional on the Fence Epoch
+
+The persistence path behind `CompleteJob` and `FailJob` SHALL apply its write only if the stored row still carries the epoch the caller claimed with, and SHALL report a distinct, exported sentinel error when no row matches. That sentinel SHALL be distinguishable from a not-found error and from an invalid-transition error: the row exists and the transition was legal, but the caller no longer owns the job.
+
+The fence SHALL live in the same statement as the write it guards. A token held only in Redis SHALL NOT be substituted: consulting it is advisory, and a caller that got an error or a stale answer would write anyway.
+
+This is what makes recovery safe. Once a job can be requeued and re-claimed, a worker that was presumed dead can come back mid-run; without the fence it would commit `completed` or `failed` over the outcome of the worker that took the job from it.
+
+#### Scenario: A superseded worker cannot complete a job it no longer owns
+
+- **GIVEN** a job that was requeued and re-claimed after its original worker stopped renewing its lease
+- **WHEN** that original worker attempts to commit `completed`
+- **THEN** the write is refused with the fence sentinel, and the job's persisted status, `StorageKey`, `FrameCount`, and `ErrorReason` reflect only the current holder
+
+#### Scenario: A superseded worker cannot fail a job it no longer owns
+
+- **GIVEN** the same job, and an original worker whose extraction errored
+- **WHEN** it attempts to commit `failed`
+- **THEN** the write is refused with the fence sentinel and the job is not moved to `failed`
+
+#### Scenario: The current holder's terminal write succeeds
+
+- **GIVEN** a job whose current holder claimed it and whose epoch has not advanced since
+- **WHEN** that holder commits `completed` or `failed`
+- **THEN** the write succeeds and the job reaches that terminal state
+
+### Requirement: A Sweeper Returns Abandoned Jobs to the Queue
+
+`cmd/worker` SHALL run a periodic sweeper alongside its consumer. Each cycle it SHALL read a bounded batch of jobs in `processing` status, ask the lease store whether each is still held, and for those that are not, requeue them: a single transaction moving the job `processing → queued`, advancing its fence epoch, and writing the job-dispatch generation's queued outbox row — the same row `Enqueue` writes, published by the same relay and consumed by the same worker path.
+
+The requeue SHALL be conditional on the job still being `processing` **and** still carrying the epoch the sweep observed, so that two sweepers in two worker replicas race on one statement and exactly one wins.
+
+Recovery SHALL NOT be built on broker redelivery. When a worker process dies its unacknowledged delivery is requeued by the broker immediately, so the redelivery arrives while the lease is still live and is dead-lettered; by the time the lease could be observed as lapsed there is no message left. A delayed-retry queue SHALL NOT be substituted either: its delay would have to exceed every possible extraction to be correct.
+
+The claim predicate SHALL NOT be widened to admit a `processing` row instead. Doing so would make `ClaimForProcessing` read the lease, and the lease is Redis-backed and fails open — a Redis outage would then license two workers to claim one live job, which is the exact hazard the conditional claim exists to close.
+
+#### Scenario: A job abandoned by a dead worker is processed again
+
+- **GIVEN** a job left in `processing` by a worker that died mid-extraction, whose lease has since lapsed
+- **WHEN** the sweeper next runs and a worker is consuming
+- **THEN** the job is returned to `queued`, dispatched again, claimed, and driven to a terminal state without operator action
+
+#### Scenario: A job whose lease is still held is left alone
+
+- **GIVEN** a job in `processing` whose holder is renewing its lease
+- **WHEN** the sweeper runs
+- **THEN** the job is not requeued, its status is still `processing`, and its epoch is unchanged
+
+#### Scenario: Two sweepers cannot requeue the same job twice
+
+- **GIVEN** a job in `processing` with a lapsed lease and two worker replicas sweeping concurrently
+- **WHEN** both attempt to requeue it
+- **THEN** exactly one succeeds, the epoch advances by exactly one, and exactly one queued outbox row is written
+
+#### Scenario: The requeue and its dispatch event commit together
+
+- **GIVEN** a requeue whose outbox insert fails
+- **WHEN** the call returns an error
+- **THEN** the job is still `processing` with its original epoch — no job is left `queued` with nothing to dispatch it
+
+#### Scenario: A job stranded before this change is recovered by the first sweep
+
+- **GIVEN** a `video_jobs` row in `processing` written before the fence column existed, holding the column's default epoch and having no lease
+- **WHEN** the sweeper runs
+- **THEN** it is requeued like any other abandoned job
+
+#### Scenario: Jobs stranded in queued are not the sweeper's concern
+
+- **GIVEN** a job in `queued` status whose dispatch was never published or was dead-lettered
+- **WHEN** the sweeper runs
+- **THEN** it is not touched — the sweeper scans `processing` rows only
+
+### Requirement: Repeated Abandonment Ends in a Terminal State, Not a Loop
+
+The sweeper SHALL requeue a given job at most a bounded number of times, counted by its fence epoch. Beyond that bound it SHALL NOT requeue the job again; it SHALL fail the job through the same fenced terminal write, with a fixed reason naming no infrastructure detail, and SHALL then delete the job's source object and clear its idempotency key — the worker's own terminal-failure disposition, performed here because there is no delivery in hand to carry it.
+
+**A `processing` job whose source key is empty SHALL be failed on sight rather than requeued.** Such rows exist only from before the source-key column was added, and they are exactly what a first sweep encounters. Requeueing one is a loop with no exit: the aggregate's requeue transition rejects an empty source key, so the epoch never advances, the bound is never reached, and the abandonment path never fires. Excluding them from the scan instead SHALL NOT be substituted — that leaves them stranded, which is the condition this capability exists to end.
+
+The cleanup that follows an abandonment — deleting the source object and clearing the idempotency key — SHALL be gated on **this** actor's own committed `failed` write, never on the observation that the job is terminal. Two sweepers can both reach the bound; the loser's transition is refused as invalid rather than as fenced, and cleaning up on that path would act on behalf of a write it did not make.
+
+An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process — an input that exhausts memory, say — would otherwise be re-dispatched forever and would take down each replica in turn.
+
+#### Scenario: A job that keeps killing its worker eventually fails
+
+- **GIVEN** a job that has already been requeued the maximum number of times and is again in `processing` with a lapsed lease
+- **WHEN** the sweeper runs
+- **THEN** the job is `failed` with a non-empty reason, no further queued outbox row is written for it, its source object is gone, and its idempotency key no longer maps that content to it
+
+#### Scenario: A job with no recorded source is failed rather than requeued
+
+- **GIVEN** a `processing` job whose `source_key` is empty, as a row predating that column carries
+- **WHEN** the sweeper finds it unleased
+- **THEN** it is `failed` on that sweep, no outbox row is written for it, and it is not seen again by a later sweep
+
+#### Scenario: Only the sweeper that committed the failure cleans up
+
+- **GIVEN** two sweepers that both reach the bound for the same job
+- **WHEN** the first commits `failed` and the second's transition is refused
+- **THEN** the second deletes no object and clears no idempotency key
+
+#### Scenario: The abandonment reason leaks no infrastructure detail
+
+- **GIVEN** a job failed by the sweeper for repeated abandonment
+- **WHEN** its `ErrorReason` is read back through the job-status API
+- **THEN** it names neither the storage endpoint, nor the bucket, nor the broker, nor Redis
+
+### Requirement: Acquiring a Lease Fails Open, Deciding One Has Lapsed Fails Closed
+
+The two lease interactions SHALL have opposite failure postures.
+
+Acquiring or renewing a lease SHALL fail **open**: a lease-store error SHALL be logged and processing SHALL continue. The job is protected by the unconditional claim, so an extraction running without a lease is correct — it is merely invisible to the sweeper, and the worst case is one duplicated extraction the fence resolves.
+
+Deciding that a lease has lapsed SHALL fail **closed**: a lease-store error SHALL NOT be read as evidence of expiry, and the sweeper SHALL NOT requeue a job it could not get an answer for. Declining preserves the pre-existing behaviour — the job stays stranded until the lease store is reachable — whereas assuming expiry would turn a Redis outage into a licence to take over every running job at once.
+
+This asymmetry SHALL be stated in the implementation rather than left to be inferred, because it is the one place in this system where "fail open" is the wrong default.
+
+#### Scenario: An extraction proceeds when the lease cannot be acquired
+
+- **GIVEN** a worker that won a job's claim and a lease store that errors on acquire
+- **WHEN** the worker continues
+- **THEN** the extraction runs to a terminal state, and the failure to acquire is logged
+
+#### Scenario: The sweeper requeues nothing while the lease store is unreachable
+
+- **GIVEN** jobs in `processing` and a lease store that errors on every query
+- **WHEN** the sweeper runs
+- **THEN** no job is requeued, no epoch advances, no outbox row is written, and the condition is logged
+
+#### Scenario: A lease lost to an outage costs work, not correctness
+
+- **GIVEN** a running extraction whose lease was lost because the lease store dropped its keys
+- **WHEN** the sweeper requeues that job and another worker claims and completes it
+- **THEN** the original worker's terminal write is refused by the fence, it does not delete the source object, and the job carries exactly one outcome

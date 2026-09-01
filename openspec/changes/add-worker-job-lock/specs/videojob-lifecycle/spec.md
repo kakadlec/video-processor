@@ -1,0 +1,185 @@
+## MODIFIED Requirements
+
+### Requirement: JobStatus Transition Validity Is an Independently Testable Pure Function
+
+`JobStatus` SHALL provide a pure function that reports whether a transition from one status to another is valid, independent of any `VideoJob` instance, implementing the state machine `pending → queued → processing → completed`, `processing → failed`, and `processing → queued`. The `VideoJob` aggregate SHALL expose one method per edge in that state machine — `Enqueue` (`pending → queued`), `StartProcessing` (`queued → processing`), `Complete` (`processing → completed`), `Fail` (`processing → failed`), `Requeue` (`processing → queued`) — each of which SHALL reject the call with an error, and leave the aggregate's state unchanged, when the current status cannot legally make that transition.
+
+**`processing → queued` is the state machine's only backwards edge, and it exists for exactly one purpose: returning a job whose worker died to the queue** (see `videojob-lease-recovery`). It SHALL NOT be used to retry a job that reached a terminal state, to re-dispatch a job on request, or to undo a claim a worker still holds. No further backwards edge SHALL be added on the strength of this one; `completed` and `failed` remain terminal, with no outgoing edges at all.
+
+`Requeue` SHALL be a distinct aggregate method rather than a second caller of `Enqueue`. The two transitions differ in origin status, in what may be assumed about the job's fields, and in who is allowed to perform them, and collapsing them would let a `pending` job be requeued or an abandoned one be treated as a first dispatch.
+
+`Enqueue` SHALL additionally reject a job whose source key is empty, with a distinct exported sentinel error. That is a precondition on the aggregate rather than an edge in the state machine — the pure transition function still reports `pending → queued` valid, because it is given two statuses and knows nothing about a job — so the aggregate method is the only place the invariant can live. Its rationale, and why it is deliberately absent from `RestoreVideoJob`, belong to the requirement below. `Requeue` SHALL reject an empty source key for the same reason and with the same sentinel: a job re-dispatched without a source is a message no worker can act on.
+
+#### Scenario: Valid forward transition is accepted
+
+- **GIVEN** the current status is `pending`
+- **WHEN** validity of a transition to `queued` is checked
+- **THEN** it reports the transition as valid
+
+#### Scenario: Backwards transition is rejected
+
+- **GIVEN** the current status is `completed` or `failed`
+- **WHEN** validity of a transition to any other status is checked
+- **THEN** it reports the transition as invalid
+
+#### Scenario: The requeue edge is the only permitted backwards transition
+
+- **GIVEN** the current status is `processing`
+- **WHEN** validity of a transition to `queued` is checked, and separately validity of `queued → pending` and `completed → queued`
+- **THEN** `processing → queued` is reported valid and both of the others are reported invalid
+
+#### Scenario: Undefined transition is rejected
+
+- **GIVEN** the current status is `pending`
+- **WHEN** validity of a transition directly to `completed` (skipping `queued` and `processing`) is checked
+- **THEN** it reports the transition as invalid
+
+#### Scenario: Enqueue moves a pending job to queued
+
+- **GIVEN** a `VideoJob` in `pending` status with a non-empty source key
+- **WHEN** `Enqueue` is called
+- **THEN** the job's status is `queued`
+
+#### Scenario: Enqueue rejects a pending job with no source key
+
+- **GIVEN** a `VideoJob` in `pending` status whose source key is empty
+- **WHEN** `Enqueue` is called
+- **THEN** it returns the source-key sentinel error and the job's status remains `pending`
+
+#### Scenario: StartProcessing moves a queued job to processing
+
+- **GIVEN** a `VideoJob` in `queued` status
+- **WHEN** `StartProcessing` is called
+- **THEN** the job's status is `processing`
+
+#### Scenario: Requeue moves a processing job back to queued
+
+- **GIVEN** a `VideoJob` in `processing` status with a non-empty source key
+- **WHEN** `Requeue` is called
+- **THEN** the job's status is `queued`
+
+#### Scenario: Requeue is rejected for a job that is not processing
+
+- **GIVEN** a `VideoJob` in `pending`, `queued`, `completed`, or `failed` status
+- **WHEN** `Requeue` is called
+- **THEN** it returns an error and the job's status is unchanged
+
+#### Scenario: Complete moves a processing job to completed with a result
+
+- **GIVEN** a `VideoJob` in `processing` status
+- **WHEN** `Complete` is called with a non-zero `StorageKey` and a non-negative `FrameCount`
+- **THEN** the job's status is `completed`, and its `StorageKey`/`FrameCount` match the supplied values
+
+#### Scenario: Fail moves a processing job to failed with a reason
+
+- **GIVEN** a `VideoJob` in `processing` status
+- **WHEN** `Fail` is called with a non-empty reason
+- **THEN** the job's status is `failed`, and its `ErrorReason` matches the supplied reason
+
+#### Scenario: An out-of-order transition call is rejected without mutating the aggregate
+
+- **GIVEN** a `VideoJob` in `pending` status
+- **WHEN** `StartProcessing`, `Complete`, `Fail`, or `Requeue` is called on it directly
+- **THEN** it returns an error, and the job's status remains `pending`
+
+### Requirement: EnqueueVideoJob, StartProcessing, CompleteJob, and FailJob Persist One State Transition Each
+
+Four application-layer use cases — `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` — SHALL each load a `VideoJob` by ID via `VideoJobRepository.FindByID`, apply exactly the one aggregate transition method matching their name, and persist the result. `CompleteJob` and `FailJob` persist via `VideoJobRepository.Update`; **`EnqueueVideoJob` persists via `VideoJobRepository.Enqueue`**, which commits the transition together with the event describing it; **`StartProcessing` persists via `VideoJobRepository.ClaimForProcessing`**, which applies the transition only if the stored status is still `queued` (see `videojob-persistence`). `CompleteJob` additionally accepts a `StorageKey` and `FrameCount`; `FailJob` additionally accepts a non-empty failure reason. None of the four SHALL be reachable from any HTTP route defined by `videojob-http-api`.
+
+**`StartProcessing` SHALL be an atomic claim, and losing that claim SHALL be a distinct, non-failing outcome.** It SHALL return a distinct exported sentinel error, SHALL NOT retry, and SHALL NOT call `FailJob` or otherwise mutate the job — another consumer owns it, and writing anything would corrupt that consumer's work.
+
+**That sentinel SHALL be reported for both ways of losing the claim, which are reached at different points in the use case.** The common one is decided before any write: `StartProcessing` loads the job first, and a job already in `processing`, `completed`, or `failed` is rejected by the aggregate's own transition method, which does not know a claim is being attempted and reports an invalid transition. The rarer one is the race after the read, where the conditional persist affects no row. Both mean the same thing — some other consumer holds or held this job — and both SHALL surface as the lost-claim sentinel, so a caller does not have to distinguish an ordinary duplicate delivery from a narrow race to decide what to do about it.
+
+A `pending` job SHALL NOT be reported as a lost claim. It was never dispatched, so a message naming it is an anomaly rather than a duplicate, and collapsing the two would hide the case worth investigating behind the case that is routine.
+
+**`StartProcessing` SHALL additionally report the fence epoch its claim won**, read by the claiming statement itself, and **`CompleteJob` and `FailJob` SHALL each require that epoch as an input and persist conditionally on it**, returning a distinct exported fence sentinel when the stored row no longer carries it. They SHALL NOT re-read the epoch from the job they loaded: by then the row may carry a successor's, and a fence checked against that value would pass in exactly the case it exists to reject. The lost-claim sentinel and the fence sentinel SHALL remain distinct — the first says another consumer took the job before this one started, the second says another consumer took it away while this one was working.
+
+The claim is what makes duplicate dispatch safe, and it is a *correctness* primitive rather than a *recovery* one. Dispatch is at-least-once by construction (`videojob-outbox-relay` can publish a message whose `published_at` never commits), and `Update` was historically a read-then-unconditional-write, so without the conditional persist two deliveries would both pass `queued → processing` and both run an extraction over the same source. With it, exactly one wins and the loser mutates nothing.
+
+Recovery of a job whose consumer died mid-extraction is a **separate** mechanism and SHALL remain so. `ClaimForProcessing`'s predicate SHALL keep naming `queued` alone: widening it to re-admit a `processing` row would make the claim depend on the lease that decides abandonment, and that lease fails open, so a lease-store outage would license two workers to claim one live job. `videojob-lease-recovery` instead returns an abandoned job to `queued` through the aggregate's `Requeue` edge, after which this claim applies unchanged. An implementer SHALL NOT relax the predicate here to make a stranded job recoverable.
+
+`VideoJob.Enqueue` SHALL reject a job whose source key is empty. A job with no stored source cannot be processed, so queueing it would produce a dispatch no worker can act on. This invariant lives on the transition and **SHALL NOT** be added to `RestoreVideoJob`: pairing the field at reconstitution, the way `StorageKey` is paired with `completed` and `ErrorReason` with `failed`, would make every pre-existing `queued` or `processing` row unloadable once the column is added with an empty default — and such rows exist, because a crash or a client disconnect can strand one between the enqueue and the dispatch.
+
+#### Scenario: EnqueueVideoJob transitions and persists
+
+- **GIVEN** a persisted `VideoJob` in `pending` status with a non-empty source key
+- **WHEN** `EnqueueVideoJob.Execute` is called with its ID
+- **THEN** a subsequent `FindByID` for that job returns it in `queued` status
+
+#### Scenario: A job with no source key cannot be enqueued
+
+- **GIVEN** a persisted `VideoJob` in `pending` status with an empty source key
+- **WHEN** `EnqueueVideoJob.Execute` is called with its ID
+- **THEN** it returns an error, and a subsequent `FindByID` still returns the job in `pending` status
+
+#### Scenario: A pre-existing queued job with no source key still loads
+
+- **GIVEN** a `video_jobs` row in `queued` status whose `source_key` is empty, as an add-column migration leaves it
+- **WHEN** `FindByID` is called for it
+- **THEN** it returns the job rather than a domain error, because the source-key invariant is enforced on the transition and not at reconstitution
+
+#### Scenario: StartProcessing transitions and persists
+
+- **GIVEN** a persisted `VideoJob` in `queued` status
+- **WHEN** `StartProcessing.Execute` is called with its ID
+- **THEN** a subsequent `FindByID` for that job returns it in `processing` status
+
+#### Scenario: StartProcessing reports the epoch its claim won
+
+- **GIVEN** a persisted `VideoJob` in `queued` status
+- **WHEN** `StartProcessing.Execute` succeeds
+- **THEN** it returns the fence epoch stored on the claimed row, and `CompleteJob` called with that epoch succeeds
+
+#### Scenario: Only one of two concurrent claims on the same job succeeds
+
+- **GIVEN** a persisted `VideoJob` in `queued` status
+- **WHEN** two `StartProcessing.Execute` calls for that ID run concurrently
+- **THEN** exactly one returns successfully and the other returns the lost-claim sentinel, and the job is `processing` with no intermediate state observable to a third reader
+
+#### Scenario: A lost claim mutates nothing and does not fail the job
+
+- **GIVEN** a persisted `VideoJob` already in `processing` status
+- **WHEN** `StartProcessing.Execute` is called with its ID
+- **THEN** it returns the lost-claim sentinel — not a generic invalid-transition error — the job is still `processing`, its `ErrorReason` is unchanged, and no `FailJob` transition was attempted
+
+#### Scenario: A job that was never enqueued is not reported as a lost claim
+
+- **GIVEN** a persisted `VideoJob` in `pending` status
+- **WHEN** `StartProcessing.Execute` is called with its ID
+- **THEN** it returns an error that is **not** the lost-claim sentinel, so a dispatch naming an un-enqueued job is distinguishable from a duplicate delivery
+
+#### Scenario: A completed job cannot be re-claimed
+
+- **GIVEN** a persisted `VideoJob` in `completed` status, as a redelivered stale dispatch would name
+- **WHEN** `StartProcessing.Execute` is called with its ID
+- **THEN** it returns the lost-claim sentinel — decided before any write is attempted — and the job's status, `StorageKey`, and `FrameCount` are unchanged
+
+#### Scenario: CompleteJob transitions and persists a result
+
+- **GIVEN** a persisted `VideoJob` in `processing` status
+- **WHEN** `CompleteJob.Execute` is called with its ID, the epoch it was claimed at, a `StorageKey`, and a `FrameCount`
+- **THEN** a subsequent `FindByID` for that job returns it in `completed` status with the given `StorageKey` and `FrameCount`
+
+#### Scenario: FailJob transitions and persists a reason
+
+- **GIVEN** a persisted `VideoJob` in `processing` status
+- **WHEN** `FailJob.Execute` is called with its ID, the epoch it was claimed at, and a failure reason
+- **THEN** a subsequent `FindByID` for that job returns it in `failed` status with that `ErrorReason`
+
+#### Scenario: A terminal write carrying a superseded epoch is refused
+
+- **GIVEN** a persisted `VideoJob` whose fence epoch has advanced since a caller claimed it
+- **WHEN** that caller calls `CompleteJob.Execute` or `FailJob.Execute` with the epoch it claimed at
+- **THEN** it returns the fence sentinel — distinct from the lost-claim sentinel and from `ErrVideoJobNotFound` — and the job's persisted state is unchanged
+
+#### Scenario: An invalid transition is propagated as an error, not silently ignored
+
+- **GIVEN** a persisted `VideoJob` in `pending` status
+- **WHEN** `CompleteJob.Execute` is called with its ID
+- **THEN** it returns an error, and a subsequent `FindByID` for that job still returns it in `pending` status
+
+#### Scenario: A nonexistent job ID is rejected as not found
+
+- **GIVEN** no `VideoJob` exists for a given ID
+- **WHEN** any of the four use cases is called with that ID
+- **THEN** it returns `ErrVideoJobNotFound` and does not persist anything
