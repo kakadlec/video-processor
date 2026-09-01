@@ -12,6 +12,8 @@ Neither `Enqueue`, `ClaimForProcessing`, nor the requeue method SHALL be passed 
 
 The cached record SHALL mirror the persisted column set exactly, source key, content hash, **and fence epoch** included. The entry serves the `FindByID` that every transition use case makes before it writes, so a field missing from the record is silently dropped on every cache hit — a dropped source key yields either a rejected `Enqueue` or a queued message naming an object no consumer can fetch, a dropped content hash leaves a failed job's idempotency key unclearable, and a dropped epoch would make a cache-served job report abandonment count zero, which the sweeper's bound reads.
 
+**A won claim's write-through SHALL serialize the epoch the claim reported, not the epoch on the aggregate the caller passed in.** Those differ in exactly the case that matters: a consumer can load a `queued` job at one epoch, lose a race to a sweep that requeues it, and then win the claim on the re-dispatched job at the advanced epoch. Caching the pre-claim aggregate would publish the superseded value, and the next `FindByID` served from that entry would report an abandonment count lower than the row's — which the sweeper's bound reads.
+
 A record written by a previous release carries no epoch at all. Such a record SHALL decode to epoch zero rather than failing the read, and SHALL NOT be treated as authoritative for any fenced write — the fence's own input is the epoch the claim reported, never a value read back from a job, cached or otherwise.
 
 #### Scenario: A concurrent stale read cannot overwrite a newer write-through value
@@ -31,6 +33,12 @@ A record written by a previous release carries no epoch at all. Such a record SH
 - **GIVEN** a `VideoJob` cached in `queued` status
 - **WHEN** `CachedVideoJobRepository.ClaimForProcessing` succeeds and reports a row affected
 - **THEN** a subsequent `FindByID` served from cache returns `processing`
+
+#### Scenario: A won claim caches the epoch the claim reported
+
+- **GIVEN** a `VideoJob` read as `queued` at one epoch, requeued by a concurrent sweep, and then successfully claimed at the advanced epoch
+- **WHEN** the decorator writes through
+- **THEN** the cached record carries the epoch the claim reported, matching the persisted row rather than the caller's pre-claim aggregate
 
 #### Scenario: A lost claim writes nothing to the cache
 

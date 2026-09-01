@@ -78,7 +78,7 @@ That split follows from Redis failing open everywhere in this system. A lease co
 
 #### Scenario: Status cache absorbs repeated polling reads
 
-- **GIVEN** a client polls `GET /jobs/{id}/status` repeatedly
+- **GIVEN** a client polls `GET /api/video-jobs/:id` repeatedly
 - **WHEN** the job state has not changed since the last DB write
 - **THEN** the response is served from the Redis status cache without a PostgreSQL query
 

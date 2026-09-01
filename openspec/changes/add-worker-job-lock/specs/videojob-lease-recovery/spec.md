@@ -6,6 +6,10 @@ The Video Processing context SHALL define a job-lease port in its domain layer, 
 
 A lease SHALL carry an expiry, and its value SHALL be the fence epoch its holder claimed with (see below). Renewal and release SHALL be conditional on the stored value still naming that epoch, so a worker whose job has already been taken over can neither extend nor delete the lease its successor holds. The epoch identifies a holder unambiguously: only a requeue changes it, and only a requeue can produce a second holder.
 
+**Acquisition SHALL be conditional too**, though on a weaker predicate than renewal: it SHALL replace an absent lease or one naming an *older* epoch, and SHALL refuse to replace one naming a *newer* one. An unconditional write is unsafe because winning the claim and setting the lease are two steps: a claimant that stalls between them can be swept, requeued, and superseded, and its late write would then replace the rightful holder's lease with a stale epoch — after which the holder's own renewals are refused, its live job looks abandoned once that stale entry expires, and it is requeued a second time under a worker that is still running. Refusing on a newer stored value SHALL NOT be reported as an error to the caller: it is the successor's lease, correctly left alone.
+
+A `SET NX` SHALL NOT be substituted for that conditional write. `NX` also refuses to replace an *older* lease, so a claimant that legitimately took over a job would run leaseless until the dead holder's entry expired — invisible to the sweeper for exactly the window recovery depends on.
+
 The lease SHALL be a **liveness** signal and nothing else. `ClaimForProcessing` SHALL NOT consult it, no HTTP route SHALL consult it, and it SHALL NOT be used to bound how many extractions run concurrently — prefetch and process count do that.
 
 It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` and encodes this context's fence semantics, and `ddd-architecture` confines `internal/platform/` to plumbing no bounded context owns.
@@ -26,6 +30,18 @@ It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` an
 - **GIVEN** a job whose lease is held at a newer epoch than the one a resurrected worker claimed with
 - **WHEN** that worker attempts to renew or release the lease
 - **THEN** the stored lease is unchanged, and the current holder's lease keeps its own expiry
+
+#### Scenario: A stalled claimant cannot overwrite its successor's lease
+
+- **GIVEN** a worker that won a claim at one epoch but had not yet acquired the lease, and a job that has since been requeued and re-claimed at a newer epoch by another worker
+- **WHEN** the first worker finally attempts to acquire the lease
+- **THEN** the stored lease still names the newer epoch, the current holder's renewals keep succeeding, and the attempt is not reported as an error
+
+#### Scenario: A new holder replaces a dead holder's stale lease
+
+- **GIVEN** a job whose previous holder's lease entry still exists at an older epoch
+- **WHEN** a worker that claimed the job at a newer epoch acquires the lease
+- **THEN** the acquisition succeeds and the lease store reports the job as held at the newer epoch
 
 #### Scenario: The lease is released when the outcome is committed
 
@@ -55,7 +71,9 @@ Reading it from a lookup that precedes the claim SHALL NOT be substituted either
 
 ### Requirement: A Terminal Write Is Conditional on the Fence Epoch
 
-The persistence path behind `CompleteJob` and `FailJob` SHALL apply its write only if the stored row still carries the epoch the caller claimed with, and SHALL report a distinct, exported sentinel error when no row matches. That sentinel SHALL be distinguishable from a not-found error and from an invalid-transition error: the row exists and the transition was legal, but the caller no longer owns the job.
+The persistence path behind `CompleteJob` and `FailJob` SHALL apply its write only if the stored row still carries the epoch the caller claimed with **and is still in `processing` status**, and SHALL report a distinct, exported sentinel error when no row matches. That sentinel SHALL be distinguishable from a not-found error and from an invalid-transition error: the row exists and the transition was legal, but the caller may no longer commit it.
+
+Both conjuncts are load-bearing and neither subsumes the other. The epoch rejects a worker whose job was taken from it. The status makes the write *exclusive*, which the epoch alone cannot: the epoch advances only on a requeue, so a live leaseless worker and the sweeper abandoning it can hold the same epoch, and an epoch-only predicate would let both commit, the second overwriting the first. With the status conjunct exactly one terminal write per job can ever affect a row, and the cleanup that follows a terminal state has exactly one owner.
 
 The fence SHALL live in the same statement as the write it guards. A token held only in Redis SHALL NOT be substituted: consulting it is advisory, and a caller that got an error or a stale answer would write anyway.
 
@@ -131,7 +149,7 @@ The sweeper SHALL requeue a given job at most a bounded number of times, counted
 
 **A `processing` job whose source key is empty SHALL be failed on sight rather than requeued.** Such rows exist only from before the source-key column was added, and they are exactly what a first sweep encounters. Requeueing one is a loop with no exit: the aggregate's requeue transition rejects an empty source key, so the epoch never advances, the bound is never reached, and the abandonment path never fires. Excluding them from the scan instead SHALL NOT be substituted — that leaves them stranded, which is the condition this capability exists to end.
 
-The cleanup that follows an abandonment — deleting the source object and clearing the idempotency key — SHALL be gated on **this** actor's own committed `failed` write, never on the observation that the job is terminal. Two sweepers can both reach the bound; the loser's transition is refused as invalid rather than as fenced, and cleaning up on that path would act on behalf of a write it did not make.
+The cleanup that follows an abandonment — deleting the source object and clearing the idempotency key — SHALL be gated on **this** actor's own committed `failed` write, never on the observation that the job is terminal. Exclusivity for that write comes from the terminal statement's own predicate, which requires the row to still be `processing`; whichever actor gets there first leaves the row terminal and every other actor's write affects no row. Two sweepers reaching the bound together, or a sweeper racing a leaseless worker that is still running, therefore produce exactly one cleanup. An argument from the aggregate's transition check SHALL NOT be substituted for that predicate: every actor evaluates that check against a copy loaded before any of them wrote.
 
 An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process — an input that exhausts memory, say — would otherwise be re-dispatched forever and would take down each replica in turn.
 
@@ -158,6 +176,21 @@ An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process
 - **GIVEN** a job failed by the sweeper for repeated abandonment
 - **WHEN** its `ErrorReason` is read back through the job-status API
 - **THEN** it names neither the storage endpoint, nor the bucket, nor the broker, nor Redis
+
+### Requirement: The Result Object Is Not Fenced, and Its Interchangeability Is What Makes That Safe
+
+The fence guards the `video_jobs` row, not the stored result object. A superseded worker's extraction can finish after its successor's and write `frames_<jobID>.zip` a second time before its terminal write is refused, so the bytes under that key are whichever run finished last while the row's `frame_count` is the holder's. This SHALL be treated as an accepted, stated property rather than an unnoticed one, and it is safe only because two conditions hold:
+
+- **The source object is immutable for the life of the job.** `POST /upload` writes it once and never rewrites it, and it is deleted only once a terminal state is committed. Every run of a given job therefore reads identical input bytes.
+- **Every worker that can be running a given job runs the same `ffmpeg` build.** Extraction is deterministic in its input, so two runs of one job produce equivalent frames and an equal frame count. This is what makes draining old workers before starting new ones a **precondition** of the deploy rather than an optimisation.
+
+Any change that breaks either condition — a mutable source, a per-worker extraction parameter, a toolchain that varies across replicas — SHALL either re-key results per epoch or fence publication of the object, and SHALL NOT rely on this requirement's argument.
+
+#### Scenario: A late run rewrites the result object without changing the recorded outcome
+
+- **GIVEN** a superseded worker whose extraction finishes after its successor has completed the job
+- **WHEN** it stores its result under the job's result key and then attempts its terminal write
+- **THEN** the terminal write is refused, the job's `frame_count` and `status` are the successor's, and the object under that key decodes to the same frames the successor produced
 
 ### Requirement: Acquiring a Lease Fails Open, Deciding One Has Lapsed Fails Closed
 

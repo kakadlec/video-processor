@@ -74,6 +74,8 @@ It SHALL be a distinct method rather than a mode of `Enqueue` or of `Update`. `E
 
 `domain.VideoJobRepository` SHALL expose a method returning a bounded batch of jobs currently in `processing` status, and `postgres.Repository` SHALL implement it with the status filter **in the query**, ordered deterministically, taking an explicit limit.
 
+Successive calls SHALL NOT be able to return the same bounded prefix forever. A fixed `ORDER BY id LIMIT n` starves recovery: if the first `n` `processing` rows belong to healthy long-running extractions whose leases keep being renewed, every cycle examines those same rows and an abandoned job outside that prefix is never reached, for as long as those extractions last. The scan SHALL therefore advance across cycles — a keyset cursor carried between sweeps, or an ordering that puts the least recently examined rows first — so that recovery latency is bounded by the number of `processing` rows and the sweep interval, not by when unrelated jobs happen to finish.
+
 The filter SHALL NOT be applied in Go over a broader read. The result set this feeds is scanned on a timer for the life of the deployment, and a scan whose cost grows with total job history is the failure mode `videojob-outbox-relay`'s claim index exists to avoid. An index supporting the predicate SHALL exist for the same reason.
 
 It SHALL NOT be exposed through any HTTP route: it is not owner-scoped and returns other users' jobs by construction.
@@ -92,6 +94,12 @@ It SHALL NOT be exposed through any HTTP route: it is not owner-scoped and retur
 - **WHEN** the method is called with that limit
 - **THEN** at most that many jobs are returned
 
+#### Scenario: An abandoned job outside the first batch is still reached
+
+- **GIVEN** more `processing` jobs than the batch limit, where every job within one batch's worth is healthy and leased, and an abandoned one sorts after them
+- **WHEN** the sweeper runs repeatedly while those healthy jobs keep running
+- **THEN** the abandoned job is eventually returned by a scan and recovered, rather than waiting for the healthy jobs to finish
+
 #### Scenario: Jobs of every owner are returned
 
 - **GIVEN** `processing` jobs belonging to two different users
@@ -102,13 +110,19 @@ It SHALL NOT be exposed through any HTTP route: it is not owner-scoped and retur
 
 ### Requirement: Update Persists a VideoJob's Transitioned State
 
-`Repository.Update` SHALL persist an already-loaded `VideoJob`'s current `status`, `frame_count`, `error_reason`, and `storage_key` to its existing `video_jobs` row, identified by its unchanging `id` **and by the fence epoch its caller claimed with**. It SHALL NOT write a `video_job_outbox` row.
+`Repository.Update` SHALL persist an already-loaded `VideoJob`'s current `status`, `frame_count`, `error_reason`, and `storage_key` to its existing `video_jobs` row, identified by its unchanging `id`, **by the fence epoch its caller claimed with, and by the row still being `processing`**. It SHALL NOT write a `video_job_outbox` row.
 
 That exclusion is now load-bearing rather than incidental. Two repository methods write outbox rows — `Create` for `video_job.created` and `Enqueue` for the job-dispatch generation's queued event, with the requeue path above as the third — and `Update` is deliberately not among them. It is the path `CompleteJob` and `FailJob` both take, so emitting an event from it would make event production a status-dependent side effect of a general-purpose write, and would settle the shape of `VideoJobCompleted`/`VideoJobFailed` as a by-product rather than as Phase 7's own decision. `Update` SHALL NOT be given an outbox write to avoid adding a dedicated method.
 
 `Update` SHALL be **fenced**: its predicate SHALL include the caller-supplied epoch, and affecting no row SHALL be reported as a distinct exported sentinel — the row exists and the transition was legal, but the caller no longer owns the job. This is a deliberate reversal of this requirement's previous "`Update` SHALL remain unconditional" clause, and the reason it reversed is that recovery now exists: a worker presumed dead can return mid-run, and the only thing that can stop it committing over its successor is a predicate in the same statement as the write.
 
-The fence SHALL NOT be confused with the claim. `ClaimForProcessing` decides who *starts* a job and predicates on status; `Update`'s fence decides who may *finish* one and predicates on the epoch. `StartProcessing` SHALL NOT be routed through `Update`, and `Update`'s predicate SHALL NOT be widened to include status.
+**The predicate SHALL also require the stored status to be `processing`**, and that conjunct SHALL NOT be dropped as redundant with the epoch. It is what makes a terminal write *exclusive* rather than merely *ordered*: the epoch advances only on a requeue, so two actors can legitimately hold the same epoch for one job — a live but leaseless worker and the sweeper that decided to abandon it both act at the epoch they observed. Both would pass an epoch-only predicate, both would commit, and the second would overwrite the first. With the status conjunct the first write leaves the row terminal, the second matches no row, and exactly one actor may then perform the cleanup that follows a terminal state. An argument that the aggregate's own transition check prevents this SHALL NOT be substituted: both actors evaluate that check against copies loaded before either write.
+
+This is safe precisely because `Update` performs only `processing → completed` and `processing → failed`. `Enqueue` owns `pending → queued`, `ClaimForProcessing` owns `queued → processing`, and the requeue method above owns `processing → queued`; no caller of `Update` writes from any other status.
+
+The fence SHALL NOT be confused with the claim. `ClaimForProcessing` decides who *starts* a job; `Update` decides who may *finish* one. `StartProcessing` SHALL NOT be routed through `Update`.
+
+The two ways `Update` can affect no row SHALL be distinguishable to the caller's log, through the same follow-up lookup `ClaimForProcessing` already uses to separate a missing row from a lost claim: a superseded epoch means the job was taken over, while a matching epoch on a terminal row means another actor at the same epoch finished first. Both dispositions are identical — reject, keep the source object, clear no idempotency key, perform no cleanup — so a single sentinel MAY carry both, but a log that cannot tell them apart makes an abandonment race indistinguishable from a takeover.
 
 #### Scenario: Update persists a transitioned job
 
@@ -121,6 +135,12 @@ The fence SHALL NOT be confused with the claim. `ClaimForProcessing` decides who
 - **GIVEN** a persisted `VideoJob` whose `lease_epoch` has advanced since a caller read it
 - **WHEN** `Repository.Update` is called with that caller's epoch
 - **THEN** it returns the fence sentinel and every column of the row is unchanged
+
+#### Scenario: Two actors at the same epoch cannot both commit a terminal state
+
+- **GIVEN** a persisted `processing` `VideoJob` and two actors that both observed it at the same epoch — a leaseless worker still running and a sweeper that has reached the abandonment bound
+- **WHEN** both call `Repository.Update` with that epoch, one writing `completed` and the other `failed`
+- **THEN** exactly one affects a row, the other is refused, and the persisted job carries only the winner's outcome
 
 #### Scenario: Update does not write an outbox row
 
