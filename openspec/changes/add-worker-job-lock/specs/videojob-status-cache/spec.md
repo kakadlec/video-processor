@@ -36,6 +36,8 @@ Neither `Enqueue`, `ClaimForProcessing`, nor the requeue method SHALL be passed 
 
 The cached record SHALL mirror the persisted column set exactly, source key, content hash, **and fence epoch** included. The entry serves the `FindByID` that every transition use case makes before it writes, so a field missing from the record is silently dropped on every cache hit — a dropped source key yields either a rejected `Enqueue` or a queued message naming an object no consumer can fetch, and a dropped content hash leaves a failed job's idempotency key unclearable. The epoch is there for fidelity rather than for any decision: a cache-served aggregate that silently differs from its row is the class of bug the source key and content hash were added to close, and a record carrying no epoch would hand every reader a zero that looks exactly like a real one. No consumer SHALL derive a fence or a requeue bound from the cached value — the fence's input is the epoch the claim reported, and the sweeper's bound comes from its authoritative scan — so the requirement is that the record not lie, not that something downstream depends on it.
 
+**Every write-through SHALL be a compare-and-set that refuses to replace a record already carrying a strictly newer `(fence epoch, status rank)` pair**, where the rank orders `pending < queued < processing < completed|failed`. A plain overwrite is not correctly ordered once recovery exists: the requeue commits its outbox row before its cache write, so the relay can publish and a worker can claim and write `processing` while that cache call is still in flight, after which the older `queued` write lands last — and a polling client is told a job is queued for the whole of a live extraction. The epoch alone cannot order those two writes, because claiming does not advance it. The pair can, and it is monotonic for exactly the reason the fence works: the only backwards status edge is the requeue, and the requeue advances the epoch. A write-through SHALL NOT write at all when its own write was not applied.
+
 **Every write-through SHALL serialize the epoch the write actually committed at, not whatever epoch the caller's in-memory aggregate happens to carry.** The decorator writes the record from the aggregate it was handed, and that aggregate's epoch can be wrong in three distinct ways: a claim can report an epoch the caller never read, a requeue advances the stored epoch by one, and a `CompleteJob`/`FailJob` aggregate loaded from a previous release's cache record decodes at zero while its write commits at the caller-supplied epoch. In each case the authoritative value SHALL be used — the claim's reported epoch, the requeue's advanced epoch, and `Update`'s epoch argument respectively. The requeue SHALL make its advanced epoch available for this: the aggregate's own requeue transition advances the in-memory epoch, which the conditional statement's `lease_epoch = lease_epoch + 1` matches by construction.
 
 **A won claim's write-through SHALL serialize the epoch the claim reported, not the epoch on the aggregate the caller passed in.** Those differ in exactly the case that matters: a consumer can load a `queued` job at one epoch, lose a race to a sweep that requeues it, and then win the claim on the re-dispatched job at the advanced epoch. Caching the pre-claim aggregate would publish a superseded value, so the next `FindByID` served from that entry would hand its caller an aggregate whose epoch disagrees with the row it claims to describe.
@@ -59,6 +61,12 @@ A record written by a previous release carries no epoch at all. Such a record SH
 - **GIVEN** a `VideoJob` cached in `queued` status
 - **WHEN** `CachedVideoJobRepository.ClaimForProcessing` succeeds and reports a row affected
 - **THEN** a subsequent `FindByID` served from cache returns `processing`
+
+#### Scenario: A delayed requeue write-through does not overwrite a newer claim
+
+- **GIVEN** a requeue that committed and whose cache write is delayed, and a worker that has since claimed the re-dispatched job and written `processing` at the same epoch
+- **WHEN** the requeue's cache write finally runs
+- **THEN** the cached record still reports `processing`, so a polling client is not told the job is queued while its extraction runs
 
 #### Scenario: A successful Update caches the epoch it wrote at
 
