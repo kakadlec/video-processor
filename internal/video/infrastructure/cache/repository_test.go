@@ -324,7 +324,18 @@ func TestCachedVideoJobRepository_Update_WritesThroughForImmediateCacheHit(t *te
 	}
 }
 
-func TestCachedVideoJobRepository_Update_InnerFailureLeavesCacheUntouched(t *testing.T) {
+// TestCachedVideoJobRepository_Update_InnerFailureInvalidatesTheEntry pins
+// the treatment of an ambiguous write. An error from the inner repository
+// does not say whether the row changed — a connection lost after PostgreSQL
+// committed reports exactly like one lost before it — so the entry standing
+// in Redis can no longer be vouched for and is dropped rather than left.
+//
+// Leaving it was this decorator's original behaviour, and the fence is what
+// made it unsafe: the entry a terminal write finds in front of it is the
+// claim's, reading processing, and a retry after an ambiguous commit now
+// short-circuits on finding its own committed outcome instead of writing
+// again — so nothing downstream would ever refresh it.
+func TestCachedVideoJobRepository_Update_InnerFailureInvalidatesTheEntry(t *testing.T) {
 	client := newTestClient(t)
 	fake := newFakeRepository()
 	job := newTestJob(t)
@@ -350,20 +361,114 @@ func TestCachedVideoJobRepository_Update_InnerFailureLeavesCacheUntouched(t *tes
 		t.Fatal("Update succeeded despite inner repository failure, want an error")
 	}
 
-	// The cache must still hold the pre-transition value. Force a
-	// non-cache FindByID to fail so a successful read here proves it came
-	// from the (untouched) cache entry.
+	if _, err := client.Get(ctx, "videojob:status:"+job.ID().String()).Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("expected the entry to be invalidated, got err = %v", err)
+	}
+}
+
+// TestCachedVideoJobRepository_AnErroredWriteInvalidatesTheEntry extends the
+// same treatment to the decorator's other three writers: each one's error is
+// ambiguous in exactly the way Update's is, and each leaves behind an entry
+// that contradicts the row it may have written.
+func TestCachedVideoJobRepository_AnErroredWriteInvalidatesTheEntry(t *testing.T) {
+	cases := []struct {
+		name  string
+		fail  func(*fakeRepository)
+		write func(context.Context, *cache.CachedVideoJobRepository, *domain.VideoJob) error
+	}{
+		{
+			name: "enqueue",
+			fail: func(f *fakeRepository) { f.enqueueErr = errors.New("simulated postgres failure") },
+			write: func(ctx context.Context, repo *cache.CachedVideoJobRepository, job *domain.VideoJob) error {
+				return repo.Enqueue(ctx, job)
+			},
+		},
+		{
+			name: "claim",
+			fail: func(f *fakeRepository) { f.claimErr = errors.New("simulated postgres failure") },
+			write: func(ctx context.Context, repo *cache.CachedVideoJobRepository, job *domain.VideoJob) error {
+				_, _, err := repo.ClaimForProcessing(ctx, job)
+				return err
+			},
+		},
+		{
+			name: "requeue",
+			fail: func(f *fakeRepository) { f.requeueErr = errors.New("simulated postgres failure") },
+			write: func(ctx context.Context, repo *cache.CachedVideoJobRepository, job *domain.VideoJob) error {
+				_, err := repo.Requeue(ctx, job, 0)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newTestClient(t)
+			fake := newFakeRepository()
+			job := newTestJob(t)
+			if err := fake.Create(context.Background(), job); err != nil {
+				t.Fatalf("fake.Create: %v", err)
+			}
+			repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+			ctx := context.Background()
+
+			if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+				t.Fatalf("FindByID (populate cache): %v", err)
+			}
+
+			fake.mu.Lock()
+			tc.fail(fake)
+			fake.mu.Unlock()
+
+			if err := tc.write(ctx, repo, job); err == nil {
+				t.Fatal("write succeeded despite inner repository failure, want an error")
+			}
+			if _, err := client.Get(ctx, "videojob:status:"+job.ID().String()).Result(); !errors.Is(err, redis.Nil) {
+				t.Fatalf("expected the entry to be invalidated, got err = %v", err)
+			}
+		})
+	}
+}
+
+// TestCachedVideoJobRepository_Update_AFenceLeavesTheEntryStanding is the
+// counterpart to the invalidation above: ErrJobFenced is a decided outcome,
+// not an ambiguous one. The statement ran and matched nothing, so the entry
+// in Redis belongs to the write that won and must survive this one's refusal.
+func TestCachedVideoJobRepository_Update_AFenceLeavesTheEntryStanding(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	if err := fake.Create(context.Background(), job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	ctx := context.Background()
+
+	if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+		t.Fatalf("FindByID (populate cache): %v", err)
+	}
+
 	fake.mu.Lock()
-	fake.updateErr = nil
-	fake.findByIDErr = errors.New("inner repository should not be called")
+	fake.updateErr = domain.ErrJobFenced
+	fake.mu.Unlock()
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	if _, err := repo.Update(ctx, job, 0); !errors.Is(err, domain.ErrJobFenced) {
+		t.Fatalf("Update error = %v, want ErrJobFenced", err)
+	}
+
+	fake.mu.Lock()
+	fake.findByIDErr = errors.New("must be served from cache")
 	fake.mu.Unlock()
 
 	got, err := repo.FindByID(ctx, job.ID())
 	if err != nil {
-		t.Fatalf("FindByID after failed Update (expected cache hit): %v", err)
+		t.Fatalf("FindByID after a fenced Update (expected cache hit): %v", err)
 	}
 	if got.Status() != domain.JobStatusPending {
-		t.Fatalf("status = %q, want pending (cache must not reflect the failed write)", got.Status())
+		t.Fatalf("status = %q, want pending (a fence must not disturb the winner's entry)", got.Status())
 	}
 }
 

@@ -310,11 +310,42 @@ func (r *CachedVideoJobRepository) writeCacheIfAbsent(ctx context.Context, job *
 // publish that view over the row's.
 func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
 	applied, err := r.inner.Update(ctx, job, epoch)
-	if err != nil || !applied {
+	if err != nil {
+		// A fence is a decided outcome, not an ambiguous one: the statement
+		// ran and matched nothing, so the entry standing in Redis is the
+		// winner's and must be left alone.
+		if !errors.Is(err, domain.ErrJobFenced) {
+			r.invalidateAfterAmbiguousWrite(job.ID())
+		}
 		return applied, err
+	}
+	if !applied {
+		return false, nil
 	}
 	r.writeThrough(newCachedJobRecord(job))
 	return true, nil
+}
+
+// invalidateAfterAmbiguousWrite best-effort drops job's cache entry after an
+// inner write returned an error. The error does not say whether the row
+// changed — a connection lost after PostgreSQL committed reports exactly like
+// one lost before it — so the entry can no longer be vouched for, and
+// deleting degrades it to a miss the next read repopulates from the
+// authority.
+//
+// Leaving it is not the harmless option it looks like. The entry a terminal
+// write finds in front of it is the claim's, reading processing, and the
+// retry that follows an ambiguous commit now short-circuits on finding its
+// own committed outcome (see application.classifyRefusedTransition) rather
+// than writing again — so no later write-through would refresh it, and
+// GET /api/video-jobs/:id would report processing for a finished job until
+// the entry expired on its own.
+func (r *CachedVideoJobRepository) invalidateAfterAmbiguousWrite(id domain.VideoJobID) {
+	cleanupCtx, cancel := detachedCleanupContext()
+	defer cancel()
+	if err := r.client.Del(cleanupCtx, cacheKey(id)).Err(); err != nil {
+		log.Printf("video: cache: invalidate %s: %v", id.String(), err)
+	}
 }
 
 // Enqueue implements domain.VideoJobRepository as write-through, exactly
@@ -328,6 +359,7 @@ func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.Video
 // would report pending for a job PostgreSQL already has as queued.
 func (r *CachedVideoJobRepository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	if err := r.inner.Enqueue(ctx, job); err != nil {
+		r.invalidateAfterAmbiguousWrite(job.ID())
 		return err
 	}
 	r.writeThrough(newCachedJobRecord(job))
@@ -355,8 +387,12 @@ func (r *CachedVideoJobRepository) Enqueue(ctx context.Context, job *domain.Vide
 // next reader an epoch that fences its own writes.
 func (r *CachedVideoJobRepository) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, int64, error) {
 	claimed, epoch, err := r.inner.ClaimForProcessing(ctx, job)
-	if err != nil || !claimed {
+	if err != nil {
+		r.invalidateAfterAmbiguousWrite(job.ID())
 		return claimed, epoch, err
+	}
+	if !claimed {
+		return false, epoch, nil
 	}
 	record := newCachedJobRecord(job)
 	record.LeaseEpoch = epoch
@@ -374,8 +410,12 @@ func (r *CachedVideoJobRepository) ClaimForProcessing(ctx context.Context, job *
 // re-dispatched.
 func (r *CachedVideoJobRepository) Requeue(ctx context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
 	requeued, err := r.inner.Requeue(ctx, job, observedEpoch)
-	if err != nil || !requeued {
+	if err != nil {
+		r.invalidateAfterAmbiguousWrite(job.ID())
 		return requeued, err
+	}
+	if !requeued {
+		return false, nil
 	}
 	r.writeThrough(newCachedJobRecord(job))
 	return true, nil

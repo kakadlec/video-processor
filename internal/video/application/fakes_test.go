@@ -279,7 +279,6 @@ type fakeJobLeaseStore struct {
 	acquireErr error
 	renewErr   error
 	heldErr    error
-	renewLoses bool
 	acquires   int
 	renews     int
 	releases   int
@@ -312,9 +311,6 @@ func (s *fakeJobLeaseStore) Renew(_ context.Context, id domain.VideoJobID, epoch
 	if s.renewErr != nil {
 		return false, s.renewErr
 	}
-	if s.renewLoses {
-		return false, nil
-	}
 	current, ok := s.held[id.String()]
 	if !ok || current != epoch {
 		return false, nil
@@ -342,6 +338,33 @@ func (s *fakeJobLeaseStore) Held(_ context.Context, id domain.VideoJobID, epoch 
 	}
 	current, ok := s.held[id.String()]
 	return ok && current == epoch, nil
+}
+
+// drop removes the lease without touching the call counters, standing in for
+// the two ways a run loses one without being superseded: an initial acquire
+// that failed open, and a key that expired while Redis was unreachable.
+func (s *fakeJobLeaseStore) drop(id domain.VideoJobID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.held, id.String())
+}
+
+// takeOver stores a lease at epoch, standing in for the successor a requeue
+// produced.
+func (s *fakeJobLeaseStore) takeOver(id domain.VideoJobID, epoch int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.held[id.String()] = epoch
+}
+
+func (s *fakeJobLeaseStore) epochHeld(id domain.VideoJobID) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	epoch, ok := s.held[id.String()]
+	return epoch, ok
 }
 
 func (s *fakeJobLeaseStore) counts() (acquires, renews, releases int) {

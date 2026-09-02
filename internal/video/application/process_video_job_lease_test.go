@@ -132,6 +132,104 @@ func TestProcessVideoJob_RenewsTheLeaseForTheWholeRun(t *testing.T) {
 	}
 }
 
+// TestProcessVideoJob_ReacquiresALeaseThatLapsedMidRun covers the half of a
+// refused renewal that is not a takeover. The store answers false for an
+// absent key just as it does for a superseded one, and an absent key is what
+// a failed initial acquire or a lapse during a Redis outage leaves behind.
+// Treating both as a takeover would end the heartbeat on the one path where
+// the run is still the rightful holder, leaving a live extraction invisible
+// to the sweep for the rest of its life — and then requeued underneath
+// itself (caught during review, Copilot PR #201).
+func TestProcessVideoJob_ReacquiresALeaseThatLapsedMidRun(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	job := newQueuedRepoJob(t, repo, "job-1", "user-1")
+
+	leases := newFakeJobLeaseStore()
+	extractor := newBlockingFrameExtractor(t)
+	ticker := newManualTicker()
+
+	uc := newProcessVideoJobUseCaseWithLeases(
+		repo, extractor, seededSources(t), newFakeResultStorage(), leases,
+		application.WithLeaseTicker(func(time.Duration) application.LeaseTicker { return ticker }),
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+		done <- err
+	}()
+
+	<-extractor.started
+	leases.drop(job.ID())
+
+	ticker.tick()
+	waitForCondition(t, "the lapsed lease to be re-acquired", func() bool {
+		acquires, _, _ := leases.counts()
+		epoch, held := leases.epochHeld(job.ID())
+		return acquires == 2 && held && epoch == 0
+	})
+
+	// The heartbeat has to still be running: a re-acquire that ended the
+	// loop would leave the lease to expire again with nothing renewing it.
+	ticker.tick()
+	waitForCondition(t, "renewal to continue after the re-acquire", func() bool {
+		_, renews, _ := leases.counts()
+		return renews >= 2
+	})
+
+	close(extractor.release)
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestProcessVideoJob_StopsRenewingOnceTakenOverAtANewerEpoch is the other
+// half: a lease naming a newer epoch is a real successor, the re-acquire is
+// refused, and this run must stop rather than keep the successor's lease
+// alive on its behalf.
+func TestProcessVideoJob_StopsRenewingOnceTakenOverAtANewerEpoch(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	job := newQueuedRepoJob(t, repo, "job-1", "user-1")
+
+	leases := newFakeJobLeaseStore()
+	extractor := newBlockingFrameExtractor(t)
+	ticker := newManualTicker()
+
+	uc := newProcessVideoJobUseCaseWithLeases(
+		repo, extractor, seededSources(t), newFakeResultStorage(), leases,
+		application.WithLeaseTicker(func(time.Duration) application.LeaseTicker { return ticker }),
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+		done <- err
+	}()
+
+	<-extractor.started
+	leases.takeOver(job.ID(), 1)
+
+	ticker.tick()
+	waitForCondition(t, "the refused re-acquire", func() bool {
+		acquires, renews, _ := leases.counts()
+		return acquires == 2 && renews == 1
+	})
+
+	// One more tick with nothing consuming it: the buffered channel takes
+	// it, and a heartbeat that had kept running would renew again.
+	ticker.tick()
+	time.Sleep(20 * time.Millisecond)
+	if _, renews, _ := leases.counts(); renews != 1 {
+		t.Fatalf("renews = %d, want 1 — the heartbeat kept running after being taken over", renews)
+	}
+	if epoch, held := leases.epochHeld(job.ID()); !held || epoch != 1 {
+		t.Fatalf("stored lease = (%d, %v), want the successor's epoch 1 left intact", epoch, held)
+	}
+
+	close(extractor.release)
+	<-done
+}
+
 // TestProcessVideoJob_RenewalPeriodStaysUnderTheLeaseTTL pins the pair that
 // makes the heartbeat a margin rather than a coin flip. The TTL lives in the
 // adapter and the period in this layer, so nothing but a test connects them.

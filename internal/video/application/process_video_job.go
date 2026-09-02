@@ -200,9 +200,14 @@ func NewProcessVideoJob(start *StartProcessing, fail *FailJob, extractor domain.
 // resolves. That is the fail-open half of the posture — deciding a lease has
 // lapsed is the half that fails closed, and it lives in the sweep.
 //
-// A renewal that finds a different epoch stops renewing rather than
-// retrying: this run has been taken over, its terminal write is going to be
-// fenced anyway, and continuing would extend the successor's lease.
+// A renewal the store refuses is not by itself evidence of a takeover: the
+// same false answer covers an absent key, which is what a failed initial
+// acquire or a lapse during a Redis outage leaves behind. Acquire is the
+// discriminator — it recreates an absent or older lease and refuses only a
+// newer holder — so a refused renewal re-acquires, and only a refused
+// re-acquire stops the loop. Without that, one unreachable moment would
+// leave a live extraction unleased for the rest of its run and the sweep
+// would requeue it.
 //
 // It does not release the lease. Release happens after the outcome is
 // committed, which is the caller's moment, not this one's.
@@ -229,8 +234,16 @@ func (uc *ProcessVideoJob) holdLease(ctx context.Context, id domain.VideoJobID, 
 					log.Printf("renew lease for job %s at epoch %d: %v", id.String(), epoch, err)
 					continue
 				}
-				if !renewed {
-					log.Printf("lease for job %s no longer held at epoch %d, stopping renewal", id.String(), epoch)
+				if renewed {
+					continue
+				}
+				reacquired, err := uc.leases.Acquire(renewCtx, id, epoch)
+				if err != nil {
+					log.Printf("reacquire lease for job %s at epoch %d: %v", id.String(), epoch, err)
+					continue
+				}
+				if !reacquired {
+					log.Printf("lease for job %s taken over at an epoch newer than %d, stopping renewal", id.String(), epoch)
 					return
 				}
 			}
