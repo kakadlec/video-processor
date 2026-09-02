@@ -167,6 +167,35 @@ func TestRedisStore_AcquireReplacesAnOlderEpochAndYieldsToANewerOne(t *testing.T
 		}
 	})
 
+	// The equal case is the boundary the recovery path stands on: a run whose
+	// lease lapsed re-acquires at the epoch it already holds rather than at a
+	// new one, so a predicate tightened from "not newer" to "strictly older"
+	// would leave it leaseless and let the sweep requeue it mid-extraction.
+	t.Run("re-acquiring at the stored epoch is idempotent", func(t *testing.T) {
+		store, client := newStore(t)
+		ctx := context.Background()
+		jobID := newTestJobID(t)
+		t.Cleanup(func() { _ = client.Del(ctx, "videojob:lease:"+jobID.String()).Err() })
+
+		if _, err := store.Acquire(ctx, jobID, 3); err != nil {
+			t.Fatalf("Acquire at epoch 3: %v", err)
+		}
+		acquired, err := store.Acquire(ctx, jobID, 3)
+		if err != nil {
+			t.Fatalf("re-Acquire at epoch 3: %v", err)
+		}
+		if !acquired {
+			t.Fatal("acquired = false at the stored epoch, want true")
+		}
+		held, err := store.Held(ctx, jobID, 3)
+		if err != nil {
+			t.Fatalf("Held: %v", err)
+		}
+		if !held {
+			t.Fatal("held = false at epoch 3, want true")
+		}
+	})
+
 	t.Run("yields to a newer epoch without erroring", func(t *testing.T) {
 		store, client := newStore(t)
 		ctx := context.Background()
