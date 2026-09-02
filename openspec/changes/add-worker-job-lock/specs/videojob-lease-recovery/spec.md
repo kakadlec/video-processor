@@ -111,6 +111,10 @@ This is what makes recovery safe. Once a job can be requeued and re-claimed, a w
 
 The requeue SHALL be conditional on the job still being `processing` **and** still carrying the epoch the sweep observed, so that two sweepers in two worker replicas race on one statement and exactly one wins.
 
+**A single unleased observation SHALL NOT be enough to act on a job.** A sweeper SHALL act only on a job it has observed unleased at the *same epoch* on two consecutive cycles, and SHALL discard that mark as soon as a cycle finds the job leased, no longer `processing`, or carrying a different epoch. A claim commits in PostgreSQL and its lease is acquired in Redis — two stores, two round trips — so every healthy run is briefly `processing` with no lease. Acting on one observation requeues a live extraction, and at the requeue bound below it *fails* that extraction and deletes its source, which no fence can undo. Two cycles a full sweep interval apart cannot both land inside one process's claim-to-acquire gap. The cost is that worst-case recovery latency is two sweep intervals rather than one, which is the right trade against terminating a healthy job.
+
+The confirmation state SHALL be worker-local and in-memory, never persisted or shared between replicas: each replica confirms its own observations, and what makes concurrent sweepers safe remains the conditional requeue and the fenced terminal write. A restarted replica simply re-observes, at a cost of one cycle.
+
 Recovery SHALL NOT be built on broker redelivery. When a worker process dies its unacknowledged delivery is requeued by the broker immediately, so the redelivery arrives while the lease is still live and is dead-lettered; by the time the lease could be observed as lapsed there is no message left. A delayed-retry queue SHALL NOT be substituted either: its delay would have to exceed every possible extraction to be correct.
 
 The claim predicate SHALL NOT be widened to admit a `processing` row instead. Doing so would make `ClaimForProcessing` read the lease, and the lease is Redis-backed and fails open — a Redis outage would then license two workers to claim one live job, which is the exact hazard the conditional claim exists to close.
@@ -118,8 +122,20 @@ The claim predicate SHALL NOT be widened to admit a `processing` row instead. Do
 #### Scenario: A job abandoned by a dead worker is processed again
 
 - **GIVEN** a job left in `processing` by a worker that died mid-extraction, whose lease has since lapsed
-- **WHEN** the sweeper next runs and a worker is consuming
+- **WHEN** two consecutive sweep cycles both observe it unleased at the same epoch, and a worker is consuming
 - **THEN** the job is returned to `queued`, dispatched again, claimed, and driven to a terminal state without operator action
+
+#### Scenario: A job claimed moments before a sweep is not requeued
+
+- **GIVEN** a job whose claim has committed but whose holder has not yet acquired its lease
+- **WHEN** a sweep cycle observes it unleased and the holder acquires and renews before the next cycle
+- **THEN** nothing is written on either cycle, the epoch is unchanged, and the extraction runs to completion
+
+#### Scenario: A mark is discarded when the epoch moves under it
+
+- **GIVEN** a job marked unleased at one epoch that another replica then requeues and a worker re-claims
+- **WHEN** the next cycle observes it at the advanced epoch
+- **THEN** that observation counts as a first one and nothing is written for it on that cycle
 
 #### Scenario: A job whose lease is still held is left alone
 
@@ -153,7 +169,7 @@ The claim predicate SHALL NOT be widened to admit a `processing` row instead. Do
 
 ### Requirement: Repeated Abandonment Ends in a Terminal State, Not a Loop
 
-The sweeper SHALL requeue a given job at most a bounded number of times, counted by its fence epoch. Beyond that bound it SHALL NOT requeue the job again; it SHALL fail the job through the same fenced terminal write, with a fixed reason naming no infrastructure detail, and SHALL then delete the job's source object and clear its idempotency key — the worker's own terminal-failure disposition, performed here because there is no delivery in hand to carry it.
+The sweeper SHALL requeue a given job at most a bounded number of times, counted by its fence epoch. Beyond that bound it SHALL NOT requeue the job again; it SHALL fail the job through the same fenced terminal write, subject to the same two-cycle confirmation as a requeue — the abandonment is the one sweeper action a fence cannot undo, so it is the action that most needs it, with a fixed reason naming no infrastructure detail, and SHALL then delete the job's source object and clear its idempotency key — the worker's own terminal-failure disposition, performed here because there is no delivery in hand to carry it.
 
 **A `processing` job whose source key is empty SHALL be failed on sight rather than requeued.** Such rows exist only from before the source-key column was added, and they are exactly what a first sweep encounters. Requeueing one is a loop with no exit: the aggregate's requeue transition rejects an empty source key, so the epoch never advances, the bound is never reached, and the abandonment path never fires. Excluding them from the scan instead SHALL NOT be substituted — that leaves them stranded, which is the condition this capability exists to end.
 
@@ -171,7 +187,7 @@ An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process
 
 - **GIVEN** a `processing` job whose `source_key` is empty, as a row predating that column carries
 - **WHEN** the sweeper finds it unleased
-- **THEN** it is `failed` on that sweep, no outbox row is written for it, and it is not seen again by a later sweep
+- **THEN** it is `failed` on the cycle that confirms it, no outbox row is written for it, and it is not seen again by a later sweep
 
 #### Scenario: Only the sweeper that committed the failure cleans up
 
