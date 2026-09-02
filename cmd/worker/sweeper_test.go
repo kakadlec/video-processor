@@ -51,6 +51,59 @@ func takeLease(t *testing.T, env *workerTestEnv, job *videodomain.VideoJob, epoc
 	}
 }
 
+// ownJobsOnly hides every processing row but the ones a test seeded.
+//
+// The worker package's test database is deliberately never truncated — a
+// drain-deadline test parks a goroutine inside an extraction, and a truncate
+// would race it — so the video_jobs table accumulates processing rows across
+// runs. A sweep over all of them would both bury the job under test behind
+// earlier batches and act on rows belonging to other tests.
+//
+// The real FindProcessing still does the work: this pages through it with
+// its own cursor and limit, so the keyset query, its index, and the
+// sweeper's own cursor arithmetic are all still exercised.
+type ownJobsOnly struct {
+	videodomain.VideoJobRepository
+	mine map[string]bool
+}
+
+func (r *ownJobsOnly) FindProcessing(ctx context.Context, after videodomain.VideoJobID, limit int) ([]*videodomain.VideoJob, error) {
+	var out []*videodomain.VideoJob
+	cursor := after
+	for len(out) < limit {
+		batch, err := r.VideoJobRepository.FindProcessing(ctx, cursor, limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, job := range batch {
+			if r.mine[job.ID().String()] && len(out) < limit {
+				out = append(out, job)
+			}
+		}
+		cursor = batch[len(batch)-1].ID()
+		if len(batch) < limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// sweeperFor builds a sweeper that sees only the given jobs.
+func sweeperFor(t *testing.T, env *workerTestEnv, jobs ...*videodomain.VideoJob) *sweeper {
+	t.Helper()
+
+	mine := make(map[string]bool, len(jobs))
+	for _, job := range jobs {
+		mine[job.ID().String()] = true
+	}
+	scoped := *env.deps
+	scoped.jobReader = &ownJobsOnly{VideoJobRepository: env.deps.jobReader, mine: mine}
+	return newSweeper(&scoped)
+}
+
 // sweepTwice runs the confirmation the sweep requires before acting. One
 // observation is never enough: a claim commits in PostgreSQL and its lease
 // is set in Redis immediately afterwards, so every healthy run is briefly
@@ -86,7 +139,7 @@ func TestSweep_RequeuesAnAbandonedJobAndDispatchesItAgain(t *testing.T) {
 	dropLease(t, env, job)
 	before := queuedOutboxRows(t, env, job)
 
-	sweepTwice(ctx, newSweeper(env.deps))
+	sweepTwice(ctx, sweeperFor(t, env, job))
 
 	stored, err := env.repo.FindByID(ctx, job.ID())
 	if err != nil {
@@ -118,7 +171,7 @@ func TestSweep_LeavesALiveJobAlone(t *testing.T) {
 	epoch := claimSeededJob(t, env, job)
 	takeLease(t, env, job, epoch)
 
-	sweepTwice(ctx, newSweeper(env.deps))
+	sweepTwice(ctx, sweeperFor(t, env, job))
 
 	stored, err := env.repo.FindByID(ctx, job.ID())
 	if err != nil {
@@ -144,7 +197,7 @@ func TestSweep_ActsOnlyOnASecondConfirmation(t *testing.T) {
 	epoch := claimSeededJob(t, env, job)
 	dropLease(t, env, job)
 
-	s := newSweeper(env.deps)
+	s := sweeperFor(t, env, job)
 	s.sweep(ctx)
 
 	stored, err := env.repo.FindByID(ctx, job.ID())
@@ -178,7 +231,7 @@ func TestSweep_FailsAJobAtTheRequeueBound(t *testing.T) {
 	for i := 0; i < maxRequeues; i++ {
 		epoch := claimSeededJob(t, env, job)
 		dropLease(t, env, job)
-		sweepTwice(ctx, newSweeper(env.deps))
+		sweepTwice(ctx, sweeperFor(t, env, job))
 
 		stored, err := env.repo.FindByID(ctx, job.ID())
 		if err != nil {
@@ -209,7 +262,7 @@ func TestSweep_FailsAJobAtTheRequeueBound(t *testing.T) {
 		t.Fatalf("finalize idempotency key: finalized=%v err=%v", finalized, err)
 	}
 
-	sweepTwice(ctx, newSweeper(env.deps))
+	sweepTwice(ctx, sweeperFor(t, env, job))
 
 	stored, err := env.repo.FindByID(ctx, job.ID())
 	if err != nil {
@@ -251,7 +304,12 @@ func TestSweep_FailsAProcessingJobWithNoSourceOnTheFirstRecovery(t *testing.T) {
 		t.Fatalf("insert a pre-migration processing row: %v", err)
 	}
 
-	sweepTwice(ctx, newSweeper(env.deps))
+	legacy, err := env.repo.FindByID(ctx, id)
+	if err != nil {
+		t.Fatalf("reload the pre-migration row: %v", err)
+	}
+
+	sweepTwice(ctx, sweeperFor(t, env, legacy))
 
 	stored, err := env.repo.FindByID(ctx, id)
 	if err != nil {
@@ -259,6 +317,9 @@ func TestSweep_FailsAProcessingJobWithNoSourceOnTheFirstRecovery(t *testing.T) {
 	}
 	if stored.Status() != videodomain.JobStatusFailed {
 		t.Fatalf("status = %q, want %q — a job with no source can never be re-dispatched", stored.Status(), videodomain.JobStatusFailed)
+	}
+	if stored.LeaseEpoch() != 0 {
+		t.Fatalf("lease epoch = %d, want 0 — the job was failed, never requeued", stored.LeaseEpoch())
 	}
 }
 
@@ -278,7 +339,7 @@ func TestSweep_TakesOverNothingWhenTheLeaseStoreIsUnreachable(t *testing.T) {
 		t.Fatalf("close redis: %v", err)
 	}
 
-	sweepTwice(ctx, newSweeper(env.deps))
+	sweepTwice(ctx, sweeperFor(t, env, job))
 
 	stored, err := env.repo.FindByID(ctx, job.ID())
 	if err != nil {
@@ -332,7 +393,7 @@ func TestSweep_ReachesAJobBehindAFullBatchOfLeasedOnes(t *testing.T) {
 
 	// Enough cycles to wrap the scan and confirm the mark: the first
 	// rotation is two full batches, and the second is what confirms.
-	s := newSweeper(env.deps)
+	s := sweeperFor(t, env, jobs...)
 	for i := 0; i < 6; i++ {
 		s.sweep(ctx)
 	}
@@ -359,7 +420,7 @@ func TestRecovery_FencesTheOriginalClaimantAfterASweep(t *testing.T) {
 	originalEpoch := claimSeededJob(t, env, job)
 	dropLease(t, env, job)
 
-	sweepTwice(ctx, newSweeper(env.deps))
+	sweepTwice(ctx, sweeperFor(t, env, job))
 
 	requeued, err := env.repo.FindByID(ctx, job.ID())
 	if err != nil {
