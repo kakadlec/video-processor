@@ -359,19 +359,21 @@ func TestUpload_ValidVideo_QueuesTheJobAndAnswers202(t *testing.T) {
 		t.Fatalf("job status = %q, want %q — POST /upload must not process", job.Status, videodomain.JobStatusQueued)
 	}
 
-	// No ffmpeg ran in this process, so temp/ has nothing in it: no
-	// downloaded source copy, no per-job frame directory, no zip.
-	for _, pattern := range []string{"*_source", "*.zip", "*"} {
-		strays, err := filepath.Glob(filepath.Join("temp", pattern))
-		if err != nil {
-			t.Fatalf("failed to glob temp dir: %v", err)
-		}
-		for _, stray := range strays {
-			if filepath.Base(stray) == ".gitkeep" {
-				continue
-			}
-			t.Fatalf("POST /upload left %q under temp/ — the API extracts nothing", stray)
-		}
+	// Nothing was extracted for this job: no downloaded source copy
+	// (temp/<jobID>_source), no per-job frame directory (temp/<jobID>),
+	// no zip (temp/<jobID>.zip) — one glob covers all three.
+	//
+	// Scoped to this job's id rather than to the whole directory. temp/ is
+	// resolved relative to the repository root, which cmd/worker's TestMain
+	// chdirs to as well, and `go test ./...` runs the two packages'
+	// binaries in parallel — so an unscoped glob reports that package's
+	// in-flight scratch as this handler's leftovers.
+	strays, err := filepath.Glob(filepath.Join("temp", accepted.JobID+"*"))
+	if err != nil {
+		t.Fatalf("failed to glob temp dir: %v", err)
+	}
+	if len(strays) > 0 {
+		t.Fatalf("POST /upload left %v under temp/ — the API extracts nothing", strays)
 	}
 }
 
