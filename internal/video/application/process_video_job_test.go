@@ -40,14 +40,20 @@ func writeTestZip(t *testing.T) string {
 }
 
 func newProcessVideoJobUseCase(repo *fakeVideoJobRepository, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage) *application.ProcessVideoJob {
+	return newProcessVideoJobUseCaseWithLeases(repo, extractor, sources, results, newFakeJobLeaseStore())
+}
+
+func newProcessVideoJobUseCaseWithLeases(repo *fakeVideoJobRepository, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, opts ...application.ProcessVideoJobOption) *application.ProcessVideoJob {
 	parser := fakeVideoJobIDParser{}
 	return application.NewProcessVideoJob(
-		application.NewStartProcessing(repo, parser),
-		application.NewFailJob(repo, parser),
+		application.NewStartProcessing(repo, repo, parser),
+		application.NewFailJob(repo, repo, parser),
 		extractor,
 		sources,
 		results,
+		leases,
 		parser,
+		opts...,
 	)
 }
 
@@ -378,9 +384,7 @@ func TestProcessVideoJob_LostClaim_AbandonsWithoutTouchingTheJob(t *testing.T) {
 				if err := job.StartProcessing(); err != nil {
 					t.Fatalf("unexpected error starting processing: %v", err)
 				}
-				if err := repo.Update(context.Background(), job); err != nil {
-					t.Fatalf("unexpected error persisting job: %v", err)
-				}
+				repo.seed(job)
 			},
 		},
 	}

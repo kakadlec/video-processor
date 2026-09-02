@@ -295,7 +295,7 @@ func TestRepository_Create_DuplicateID_LeavesNoOutboxRow(t *testing.T) {
 	}
 
 	// Reuse the same ID to force a primary-key violation on the second Create.
-	dup, err := domain.RestoreVideoJob(first.ID(), first.UserID(), first.OriginalFilename(), first.SourceKey(), first.ContentHash(), first.StorageKey(), 0, "", domain.JobStatusPending, time.Now().UTC())
+	dup, err := domain.RestoreVideoJob(first.ID(), first.UserID(), first.OriginalFilename(), first.SourceKey(), first.ContentHash(), first.StorageKey(), 0, "", domain.JobStatusPending, time.Now().UTC(), 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -360,12 +360,7 @@ func TestRepository_Update_PersistsTransitionedState(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if err := job.Enqueue(); err != nil {
-		t.Fatalf("unexpected error enqueuing: %v", err)
-	}
-	if err := job.StartProcessing(); err != nil {
-		t.Fatalf("unexpected error starting processing: %v", err)
-	}
+	epoch := driveCreatedJobToProcessing(t, repo, job)
 	storageKey, err := domain.NewStorageKey("outputs/frames_" + job.ID().String() + ".zip")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -374,8 +369,12 @@ func TestRepository_Update_PersistsTransitionedState(t *testing.T) {
 		t.Fatalf("unexpected error completing: %v", err)
 	}
 
-	if err := repo.Update(ctx, job); err != nil {
+	applied, err := repo.Update(ctx, job, epoch)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
 	}
 
 	found, err := repo.FindByID(ctx, job.ID())
@@ -404,15 +403,20 @@ func TestRepository_Update_DoesNotWriteOutboxRow(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// Counted after the job has reached processing, so the outbox row
+	// Enqueue legitimately writes is part of the baseline and only Update's
+	// own effect is under test.
+	epoch := driveCreatedJobToProcessing(t, repo, job)
+
 	var before int
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&before); err != nil {
 		t.Fatalf("unexpected error counting outbox rows: %v", err)
 	}
 
-	if err := job.Enqueue(); err != nil {
-		t.Fatalf("unexpected error enqueuing: %v", err)
+	if err := job.Fail("boom"); err != nil {
+		t.Fatalf("unexpected error failing: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, epoch); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -441,26 +445,31 @@ func TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds(t *testi
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if err := job.Enqueue(); err != nil {
-		t.Fatalf("unexpected error enqueuing: %v", err)
+	epoch := driveCreatedJobToProcessing(t, repo, job)
+	if err := job.Fail("boom"); err != nil {
+		t.Fatalf("unexpected error failing: %v", err)
 	}
 
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := repo.Update(canceledCtx, job); err == nil {
+	if _, err := repo.Update(canceledCtx, job, epoch); err == nil {
 		t.Fatalf("expected an error updating with an already-canceled context, got nil")
 	}
 
-	if err := repo.Update(context.Background(), job); err != nil {
+	applied, err := repo.Update(context.Background(), job, epoch)
+	if err != nil {
 		t.Fatalf("unexpected error updating with a fresh context: %v", err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
 	}
 
 	found, err := repo.FindByID(context.Background(), job.ID())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if found.Status() != domain.JobStatusQueued {
-		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusQueued)
+	if found.Status() != domain.JobStatusFailed {
+		t.Fatalf("Status = %v, want %v", found.Status(), domain.JobStatusFailed)
 	}
 }
 
@@ -475,16 +484,11 @@ func completeTestJob(t *testing.T, repo *postgres.Repository, ids domain.VideoJo
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := job.Enqueue(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if err := job.StartProcessing(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	epoch := driveCreatedJobToProcessing(t, repo, job)
 	if err := job.Complete(domain.ResultStorageKey(job.ID()), 3); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, epoch); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return job
@@ -630,16 +634,11 @@ func TestRepository_SourceKeyRoundTripsThroughEveryReadMethod(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resultKey := domain.ResultStorageKey(job.ID())
-	if err := job.Enqueue(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if err := job.StartProcessing(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	epoch := driveCreatedJobToProcessing(t, repo, job)
 	if err := job.Complete(resultKey, 3); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, epoch); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -714,9 +713,22 @@ func TestRepository_FindByID_PreMigrationRowLoadsWithAnEmptySourceKey(t *testing
 }
 
 // seedJobInStatus persists a job already driven to status, returning it.
-// Every state is reached through the aggregate's own transitions, so the row
-// is one the application could actually have written.
 func seedJobInStatus(t *testing.T, repo *postgres.Repository, ids domain.VideoJobIDGenerator, status domain.JobStatus) *domain.VideoJob {
+	t.Helper()
+	job, _ := seedJobInStatusAtEpoch(t, repo, ids, status)
+	return job
+}
+
+// seedJobInStatusAtEpoch is seedJobInStatus plus the epoch the claim won,
+// which a terminal write has to carry.
+//
+// Every state is reached through the aggregate's own transitions and through
+// the repository method that owns that edge — Enqueue for queued,
+// ClaimForProcessing for processing — rather than by writing the end state
+// straight over the created row. That is not ceremony: Update is conditional
+// on the row already being processing at the caller's epoch, so the short
+// cut no longer persists anything.
+func seedJobInStatusAtEpoch(t *testing.T, repo *postgres.Repository, ids domain.VideoJobIDGenerator, status domain.JobStatus) (*domain.VideoJob, int64) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -725,17 +737,25 @@ func seedJobInStatus(t *testing.T, repo *postgres.Repository, ids domain.VideoJo
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if status == domain.JobStatusPending {
-		return job
+		return job, 0
 	}
 
 	if err := job.Enqueue(); err != nil {
 		t.Fatalf("unexpected error enqueuing: %v", err)
 	}
-	if status != domain.JobStatusQueued {
-		if err := job.StartProcessing(); err != nil {
-			t.Fatalf("unexpected error starting processing: %v", err)
-		}
+	if err := repo.Enqueue(ctx, job); err != nil {
+		t.Fatalf("unexpected error persisting the enqueue: %v", err)
 	}
+	if status == domain.JobStatusQueued {
+		return job, 0
+	}
+
+	epoch := claimSeededJob(t, repo, job)
+
+	if status == domain.JobStatusProcessing {
+		return job, epoch
+	}
+
 	switch status {
 	case domain.JobStatusCompleted:
 		storageKey, err := domain.NewStorageKey("frames_" + job.ID().String() + ".zip")
@@ -751,10 +771,49 @@ func seedJobInStatus(t *testing.T, repo *postgres.Repository, ids domain.VideoJo
 		}
 	}
 
-	if err := repo.Update(ctx, job); err != nil {
+	applied, err := repo.Update(ctx, job, epoch)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	return job
+	if !applied {
+		t.Fatal("Update reported applied = false while seeding a terminal job")
+	}
+	return job, epoch
+}
+
+// driveCreatedJobToProcessing takes a job whose row exists in pending
+// through the two persisted edges that reach processing, returning the epoch
+// the claim won. Every terminal write in these tests goes through it,
+// because Update refuses anything else.
+func driveCreatedJobToProcessing(t *testing.T, repo *postgres.Repository, job *domain.VideoJob) int64 {
+	t.Helper()
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if err := repo.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error persisting the enqueue: %v", err)
+	}
+	return claimSeededJob(t, repo, job)
+}
+
+// claimSeededJob takes a queued job through the conditional claim, leaving
+// both the aggregate and the row in processing, and returns the epoch the
+// claim won.
+func claimSeededJob(t *testing.T, repo *postgres.Repository, job *domain.VideoJob) int64 {
+	t.Helper()
+
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error starting processing: %v", err)
+	}
+	claimed, epoch, err := repo.ClaimForProcessing(context.Background(), job)
+	if err != nil {
+		t.Fatalf("unexpected error claiming: %v", err)
+	}
+	if !claimed {
+		t.Fatal("ClaimForProcessing reported claimed = false while seeding a processing job")
+	}
+	return epoch
 }
 
 // TestRepository_ClaimForProcessing_ClaimsAQueuedRow is the happy path of the
@@ -770,12 +829,15 @@ func TestRepository_ClaimForProcessing_ClaimsAQueuedRow(t *testing.T) {
 
 	job := seedJobInStatus(t, repo, ids, domain.JobStatusQueued)
 
-	claimed, err := repo.ClaimForProcessing(ctx, job)
+	claimed, epoch, err := repo.ClaimForProcessing(ctx, job)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !claimed {
 		t.Fatal("claimed = false, want true for a queued row")
+	}
+	if epoch != 0 {
+		t.Fatalf("epoch = %d, want 0 for a job that has never been requeued", epoch)
 	}
 
 	found, err := repo.FindByID(ctx, job.ID())
@@ -810,7 +872,7 @@ func TestRepository_ClaimForProcessing_RefusesEveryOtherStatus(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			claimed, err := repo.ClaimForProcessing(ctx, job)
+			claimed, _, err := repo.ClaimForProcessing(ctx, job)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -862,7 +924,7 @@ func TestRepository_ClaimForProcessing_ConcurrentClaimsProduceExactlyOneWinner(t
 		go func() {
 			defer wg.Done()
 			<-start
-			claimed, err := repo.ClaimForProcessing(ctx, job)
+			claimed, _, err := repo.ClaimForProcessing(ctx, job)
 			if err != nil {
 				errs <- err
 				return
@@ -901,7 +963,7 @@ func TestRepository_ClaimForProcessing_UnknownIDIsDistinctFromALostClaim(t *test
 	ctx := context.Background()
 
 	unknown := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
-	claimed, err := repo.ClaimForProcessing(ctx, unknown)
+	claimed, _, err := repo.ClaimForProcessing(ctx, unknown)
 	if !errors.Is(err, domain.ErrVideoJobNotFound) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobNotFound)
 	}
@@ -912,7 +974,7 @@ func TestRepository_ClaimForProcessing_UnknownIDIsDistinctFromALostClaim(t *test
 	// The contrast: a row that exists but is no longer queued reports the
 	// same claimed=false with no error at all.
 	taken := seedJobInStatus(t, repo, ids, domain.JobStatusProcessing)
-	claimed, err = repo.ClaimForProcessing(ctx, taken)
+	claimed, _, err = repo.ClaimForProcessing(ctx, taken)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

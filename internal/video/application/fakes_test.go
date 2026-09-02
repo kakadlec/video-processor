@@ -34,6 +34,13 @@ type fakeVideoJobRepository struct {
 	// caller's read and its own write.
 	claimLoses bool
 	claimErr   error
+	// lastUpdateEpoch records the epoch the most recent Update was fenced
+	// against, so a test can assert the use case passed the claim's epoch
+	// rather than reading one off the job it loaded.
+	lastUpdateEpoch int64
+	updateErr       error
+	requeueCalls    int
+	requeueErr      error
 }
 
 func newFakeVideoJobRepository() *fakeVideoJobRepository {
@@ -41,7 +48,7 @@ func newFakeVideoJobRepository() *fakeVideoJobRepository {
 }
 
 func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
-	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt(), job.LeaseEpoch())
 	if err != nil {
 		panic("fakeVideoJobRepository: failed to clone video job: " + err.Error())
 	}
@@ -115,12 +122,95 @@ func (r *fakeVideoJobRepository) FindCompletedByUserID(_ context.Context, userID
 	return matches, nil
 }
 
-func (r *fakeVideoJobRepository) Update(_ context.Context, job *domain.VideoJob) error {
+// Update mirrors the real adapter's conditional statement: it writes only
+// when the stored row is still processing at the caller's epoch, and reports
+// whether it did. Every other outcome goes through the same three-way
+// classification the PostgreSQL adapter performs, so a use case cannot pass
+// here by treating a fenced write as an applied one.
+func (r *fakeVideoJobRepository) Update(_ context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.updateCalls++
-	return r.persistLocked(job)
+	r.lastUpdateEpoch = epoch
+	if r.updateErr != nil {
+		return false, r.updateErr
+	}
+	stored, ok := r.byID[job.ID().String()]
+	if !ok {
+		return false, domain.ErrVideoJobNotFound
+	}
+	if stored.LeaseEpoch() != epoch || stored.Status() != domain.JobStatusProcessing {
+		return false, classifyRefusedFakeUpdate(stored, job, epoch)
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, nil
+}
+
+// Requeue mirrors the recovery edge: conditional on the stored row still
+// being processing at the observed epoch, and advancing the epoch when it
+// writes.
+func (r *fakeVideoJobRepository) Requeue(_ context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.requeueCalls++
+	if r.requeueErr != nil {
+		return false, r.requeueErr
+	}
+	stored, ok := r.byID[job.ID().String()]
+	if !ok {
+		return false, domain.ErrVideoJobNotFound
+	}
+	if stored.Status() != domain.JobStatusProcessing || stored.LeaseEpoch() != observedEpoch {
+		return false, nil
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, nil
+}
+
+func (r *fakeVideoJobRepository) FindProcessing(_ context.Context, after domain.VideoJobID, limit int) ([]*domain.VideoJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var matches []*domain.VideoJob
+	for _, job := range r.byID {
+		if job.Status() != domain.JobStatusProcessing {
+			continue
+		}
+		if !after.IsZero() && job.ID().String() <= after.String() {
+			continue
+		}
+		matches = append(matches, cloneVideoJob(job))
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].ID().String() < matches[j].ID().String()
+	})
+	if limit > 0 && len(matches) > limit {
+		matches = matches[:limit]
+	}
+	return matches, nil
+}
+
+// classifyRefusedFakeUpdate reproduces the PostgreSQL adapter's reading of a
+// refused conditional write, so that an in-memory test sees the same errors a
+// real one would.
+func classifyRefusedFakeUpdate(stored, want *domain.VideoJob, epoch int64) error {
+	if stored.LeaseEpoch() != epoch {
+		return domain.ErrJobFenced
+	}
+	terminal := stored.Status() == domain.JobStatusCompleted || stored.Status() == domain.JobStatusFailed
+	if !terminal {
+		return domain.ErrJobFenced
+	}
+	sameOutcome := stored.Status() == want.Status() &&
+		stored.StorageKey().String() == want.StorageKey().String() &&
+		stored.FrameCount() == want.FrameCount() &&
+		stored.ErrorReason() == want.ErrorReason()
+	if sameOutcome {
+		return nil
+	}
+	return domain.ErrJobFenced
 }
 
 // Enqueue records that it, rather than Update, was the path taken — the
@@ -137,23 +227,115 @@ func (r *fakeVideoJobRepository) Enqueue(_ context.Context, job *domain.VideoJob
 
 // ClaimForProcessing mirrors the real adapter: it persists only when the
 // stored row is still queued, and reports whether it did.
-func (r *fakeVideoJobRepository) ClaimForProcessing(_ context.Context, job *domain.VideoJob) (bool, error) {
+func (r *fakeVideoJobRepository) ClaimForProcessing(_ context.Context, job *domain.VideoJob) (bool, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.claimCalls++
 	if r.claimErr != nil {
-		return false, r.claimErr
+		return false, 0, r.claimErr
 	}
 	stored, ok := r.byID[job.ID().String()]
 	if !ok {
-		return false, domain.ErrVideoJobNotFound
+		return false, 0, domain.ErrVideoJobNotFound
 	}
 	if r.claimLoses || stored.Status() != domain.JobStatusQueued {
-		return false, nil
+		return false, 0, nil
 	}
 	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, stored.LeaseEpoch(), nil
+}
+
+// seed stores a job in whatever state a test has built it, bypassing the
+// conditional writes the port exposes. Test setup arrives at a state; it
+// does not exercise the paths that reach it, and Update in particular will
+// refuse anything that is not a terminal write at the held epoch.
+func (r *fakeVideoJobRepository) seed(job *domain.VideoJob) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+}
+
+// fakeJobLeaseStore is an in-memory domain.JobLeaseStore recording every
+// call, with injectable failures so both halves of the lease posture — the
+// fail-open acquire/renew and the fail-closed liveness read — are testable.
+type fakeJobLeaseStore struct {
+	mu         sync.Mutex
+	held       map[string]int64
+	acquireErr error
+	renewErr   error
+	heldErr    error
+	renewLoses bool
+	acquires   int
+	renews     int
+	releases   int
+}
+
+func newFakeJobLeaseStore() *fakeJobLeaseStore {
+	return &fakeJobLeaseStore{held: make(map[string]int64)}
+}
+
+func (s *fakeJobLeaseStore) Acquire(_ context.Context, id domain.VideoJobID, epoch int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.acquires++
+	if s.acquireErr != nil {
+		return false, s.acquireErr
+	}
+	if current, ok := s.held[id.String()]; ok && current > epoch {
+		return false, nil
+	}
+	s.held[id.String()] = epoch
 	return true, nil
+}
+
+func (s *fakeJobLeaseStore) Renew(_ context.Context, id domain.VideoJobID, epoch int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.renews++
+	if s.renewErr != nil {
+		return false, s.renewErr
+	}
+	if s.renewLoses {
+		return false, nil
+	}
+	current, ok := s.held[id.String()]
+	if !ok || current != epoch {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *fakeJobLeaseStore) Release(_ context.Context, id domain.VideoJobID, epoch int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.releases++
+	if current, ok := s.held[id.String()]; ok && current == epoch {
+		delete(s.held, id.String())
+	}
+	return nil
+}
+
+func (s *fakeJobLeaseStore) Held(_ context.Context, id domain.VideoJobID, epoch int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.heldErr != nil {
+		return false, s.heldErr
+	}
+	current, ok := s.held[id.String()]
+	return ok && current == epoch, nil
+}
+
+func (s *fakeJobLeaseStore) counts() (acquires, renews, releases int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.acquires, s.renews, s.releases
 }
 
 func (r *fakeVideoJobRepository) persistLocked(job *domain.VideoJob) error {

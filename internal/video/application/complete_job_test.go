@@ -15,9 +15,7 @@ func newProcessingRepoJob(t *testing.T, repo *fakeVideoJobRepository, jobID, use
 	if err := job.StartProcessing(); err != nil {
 		t.Fatalf("unexpected error starting processing: %v", err)
 	}
-	if err := repo.Update(context.Background(), job); err != nil {
-		t.Fatalf("unexpected error persisting job: %v", err)
-	}
+	repo.seed(job)
 	return job
 }
 
@@ -25,7 +23,7 @@ func TestCompleteJob_TransitionsAndPersistsResult(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newProcessingRepoJob(t, repo, "job-1", "user-1")
 
-	uc := application.NewCompleteJob(repo, fakeVideoJobIDParser{})
+	uc := application.NewCompleteJob(repo, repo, fakeVideoJobIDParser{})
 	result, err := uc.Execute(context.Background(), application.CompleteJobInput{
 		JobID:      "job-1",
 		StorageKey: "outputs/frames_job-1.zip",
@@ -55,7 +53,7 @@ func TestCompleteJob_TransitionsAndPersistsResult(t *testing.T) {
 
 func TestCompleteJob_NonexistentJob_ReturnsNotFound(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	uc := application.NewCompleteJob(repo, fakeVideoJobIDParser{})
+	uc := application.NewCompleteJob(repo, repo, fakeVideoJobIDParser{})
 
 	_, err := uc.Execute(context.Background(), application.CompleteJobInput{
 		JobID:      "missing-job",
@@ -71,7 +69,7 @@ func TestCompleteJob_InvalidTransition_ReturnsError(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newPendingRepoJob(t, repo, "job-1", "user-1")
 
-	uc := application.NewCompleteJob(repo, fakeVideoJobIDParser{})
+	uc := application.NewCompleteJob(repo, repo, fakeVideoJobIDParser{})
 	_, err := uc.Execute(context.Background(), application.CompleteJobInput{
 		JobID:      "job-1",
 		StorageKey: "outputs/frames_job-1.zip",

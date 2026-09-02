@@ -64,13 +64,26 @@ type fakeRepository struct {
 	claimErr                 error
 	findByIDErr              error
 	updateErr                error
+	updateApplied            bool
+	lastUpdateEpoch          int64
+	claimEpoch               int64
+	requeueCalls             int
+	requeueResult            bool
+	requeueErr               error
+	lastRequeueEpoch         int64
+	findProcessing           []*domain.VideoJob
+	findProcessingCalls      int
+	findProcessingErr        error
 	enqueueErr               error
 	findByUserIDErr          error
 	findCompletedByUserIDErr error
 }
 
+// newFakeRepository defaults updateApplied to true: almost every test wants
+// the ordinary write-through, and only the ones about a refused write set it
+// false.
 func newFakeRepository() *fakeRepository {
-	return &fakeRepository{byID: make(map[string]*domain.VideoJob)}
+	return &fakeRepository{byID: make(map[string]*domain.VideoJob), updateApplied: true}
 }
 
 // cloneVideoJob returns an independent copy of job, mirroring
@@ -82,7 +95,7 @@ func newFakeRepository() *fakeRepository {
 // test like TestCachedVideoJobRepository_MissRepopulation_* pass whether or
 // not the production code actually handles the race correctly.
 func cloneVideoJob(job *domain.VideoJob) *domain.VideoJob {
-	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt(), job.LeaseEpoch())
 	if err != nil {
 		panic("fakeRepository: failed to clone video job: " + err.Error())
 	}
@@ -131,15 +144,52 @@ func (r *fakeRepository) FindCompletedByUserID(_ context.Context, _ domain.UserI
 	return nil, nil
 }
 
-func (r *fakeRepository) Update(_ context.Context, job *domain.VideoJob) error {
+// Update reports whatever the test set up, for the same reason
+// ClaimForProcessing does: the decorator's only interesting behaviour is
+// whether it writes through, and that has to be observable independently of
+// the fence semantics the real adapter enforces.
+func (r *fakeRepository) Update(_ context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.updateCalls++
+	r.lastUpdateEpoch = epoch
 	if r.updateErr != nil {
-		return r.updateErr
+		return false, r.updateErr
+	}
+	if !r.updateApplied {
+		return false, nil
 	}
 	r.byID[job.ID().String()] = cloneVideoJob(job)
-	return nil
+	return true, nil
+}
+
+func (r *fakeRepository) Requeue(_ context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requeueCalls++
+	r.lastRequeueEpoch = observedEpoch
+	if r.requeueErr != nil {
+		return false, r.requeueErr
+	}
+	if !r.requeueResult {
+		return false, nil
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, nil
+}
+
+func (r *fakeRepository) FindProcessing(_ context.Context, _ domain.VideoJobID, _ int) ([]*domain.VideoJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.findProcessingCalls++
+	if r.findProcessingErr != nil {
+		return nil, r.findProcessingErr
+	}
+	var jobs []*domain.VideoJob
+	for _, job := range r.findProcessing {
+		jobs = append(jobs, cloneVideoJob(job))
+	}
+	return jobs, nil
 }
 
 func (r *fakeRepository) Enqueue(_ context.Context, job *domain.VideoJob) error {
@@ -156,18 +206,18 @@ func (r *fakeRepository) Enqueue(_ context.Context, job *domain.VideoJob) error 
 // ClaimForProcessing reports whatever the test set up, so the decorator's
 // only interesting behaviour — whether it writes through — can be observed
 // independently of any real conditional-update semantics.
-func (r *fakeRepository) ClaimForProcessing(_ context.Context, job *domain.VideoJob) (bool, error) {
+func (r *fakeRepository) ClaimForProcessing(_ context.Context, job *domain.VideoJob) (bool, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.claimCalls++
 	if r.claimErr != nil {
-		return false, r.claimErr
+		return false, 0, r.claimErr
 	}
 	if !r.claimResult {
-		return false, nil
+		return false, 0, nil
 	}
 	r.byID[job.ID().String()] = cloneVideoJob(job)
-	return true, nil
+	return true, r.claimEpoch, nil
 }
 
 var jobIDCounter int
@@ -196,7 +246,7 @@ func newTestJob(t *testing.T) *domain.VideoJob {
 	if err != nil {
 		t.Fatalf("NewStorageKey: %v", err)
 	}
-	job, err := domain.RestoreVideoJob(id, userID, filename, sourceKey, "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now())
+	job, err := domain.RestoreVideoJob(id, userID, filename, sourceKey, "", domain.StorageKey{}, 0, "", domain.JobStatusPending, time.Now(), 0)
 	if err != nil {
 		t.Fatalf("RestoreVideoJob: %v", err)
 	}
@@ -255,7 +305,7 @@ func TestCachedVideoJobRepository_Update_WritesThroughForImmediateCacheHit(t *te
 	if err := job.Enqueue(); err != nil {
 		t.Fatalf("job.Enqueue: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, 0); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
@@ -296,7 +346,7 @@ func TestCachedVideoJobRepository_Update_InnerFailureLeavesCacheUntouched(t *tes
 	fake.updateErr = errors.New("simulated postgres failure")
 	fake.mu.Unlock()
 
-	if err := repo.Update(ctx, job); err == nil {
+	if _, err := repo.Update(ctx, job, 0); err == nil {
 		t.Fatal("Update succeeded despite inner repository failure, want an error")
 	}
 
@@ -362,15 +412,23 @@ func (b *blockingFindByID) FindCompletedByUserID(ctx context.Context, userID dom
 	return b.fake.FindCompletedByUserID(ctx, userID)
 }
 
-func (b *blockingFindByID) Update(ctx context.Context, job *domain.VideoJob) error {
-	return b.fake.Update(ctx, job)
+func (b *blockingFindByID) Update(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
+	return b.fake.Update(ctx, job, epoch)
+}
+
+func (b *blockingFindByID) Requeue(ctx context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
+	return b.fake.Requeue(ctx, job, observedEpoch)
+}
+
+func (b *blockingFindByID) FindProcessing(ctx context.Context, after domain.VideoJobID, limit int) ([]*domain.VideoJob, error) {
+	return b.fake.FindProcessing(ctx, after, limit)
 }
 
 func (b *blockingFindByID) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	return b.fake.Enqueue(ctx, job)
 }
 
-func (b *blockingFindByID) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, error) {
+func (b *blockingFindByID) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, int64, error) {
 	return b.fake.ClaimForProcessing(ctx, job)
 }
 
@@ -409,7 +467,7 @@ func TestCachedVideoJobRepository_MissRepopulation_DoesNotClobberConcurrentWrite
 	if err := job.Enqueue(); err != nil {
 		t.Fatalf("job.Enqueue: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, 0); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
@@ -555,7 +613,7 @@ func TestCachedVideoJobRepository_Update_WriteThroughSurvivesACanceledCallerCont
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := repo.Update(canceledCtx, job); err != nil {
+	if _, err := repo.Update(canceledCtx, job, 0); err != nil {
 		t.Fatalf("Update with a canceled caller context: %v", err)
 	}
 
@@ -627,7 +685,7 @@ func TestCachedVideoJobRepository_CacheWriteFailure_DoesNotSurface(t *testing.T)
 	if err := job.Enqueue(); err != nil {
 		t.Fatalf("job.Enqueue: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, 0); err != nil {
 		t.Fatalf("Update with an unreachable cache: %v", err)
 	}
 }
@@ -662,7 +720,7 @@ func TestCachedVideoJobRepository_CacheWrites_CarryTheFixedTTL(t *testing.T) {
 	if err := job.Enqueue(); err != nil {
 		t.Fatalf("job.Enqueue: %v", err)
 	}
-	if err := repo.Update(ctx, job); err != nil {
+	if _, err := repo.Update(ctx, job, 0); err != nil {
 		t.Fatalf("Update (write-through): %v", err)
 	}
 	assertBoundedTTL(t, "after write-through")
@@ -792,7 +850,7 @@ func TestCachedVideoJobRepository_ClaimForProcessing_WritesThroughOnlyOnAWin(t *
 			t.Fatalf("job.StartProcessing: %v", err)
 		}
 
-		claimed, err := repo.ClaimForProcessing(ctx, job)
+		claimed, _, err := repo.ClaimForProcessing(ctx, job)
 		if err != nil {
 			t.Fatalf("ClaimForProcessing: %v", err)
 		}
@@ -823,7 +881,7 @@ func TestCachedVideoJobRepository_ClaimForProcessing_WritesThroughOnlyOnAWin(t *
 		// holds a completed entry. That is the state a write-through on
 		// the loss path would destroy.
 		job := newTestJob(t)
-		completed, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), resultKeyFor(t, job), 7, "", domain.JobStatusCompleted, job.CreatedAt())
+		completed, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), resultKeyFor(t, job), 7, "", domain.JobStatusCompleted, job.CreatedAt(), job.LeaseEpoch())
 		if err != nil {
 			t.Fatalf("RestoreVideoJob: %v", err)
 		}
@@ -843,12 +901,12 @@ func TestCachedVideoJobRepository_ClaimForProcessing_WritesThroughOnlyOnAWin(t *
 
 		// This consumer read the row while it was still queued and moved
 		// its own copy of the aggregate to processing before losing.
-		loser, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), domain.StorageKey{}, 0, "", domain.JobStatusProcessing, job.CreatedAt())
+		loser, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), domain.StorageKey{}, 0, "", domain.JobStatusProcessing, job.CreatedAt(), job.LeaseEpoch())
 		if err != nil {
 			t.Fatalf("RestoreVideoJob: %v", err)
 		}
 
-		claimed, err := repo.ClaimForProcessing(ctx, loser)
+		claimed, _, err := repo.ClaimForProcessing(ctx, loser)
 		if err != nil {
 			t.Fatalf("ClaimForProcessing: %v", err)
 		}

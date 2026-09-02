@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     storage_key TEXT NOT NULL DEFAULT '',
     source_key TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL DEFAULT '',
+    lease_epoch BIGINT NOT NULL DEFAULT 0,
     -- PostgreSQL's TIMESTAMPTZ has microsecond resolution, one order of
     -- magnitude coarser than Go's time.Time (nanosecond). A CreatedAt with a
     -- non-zero sub-microsecond component will not round-trip exactly through
@@ -41,8 +42,31 @@ ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS source_key TEXT NOT NULL DEFAULT
 -- IdempotencyKey the submitting request derived, having only the job.
 ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT '';
 
+-- lease_epoch follows the same two-path pattern: declared inline above for a
+-- fresh database, added here for one that already exists, purely additive.
+--
+-- 0 is the correct value for a pre-existing row rather than a placeholder
+-- standing in for an unknown one. The epoch counts how many times a job has
+-- been requeued after being abandoned, and a row written before recovery
+-- existed has been abandoned exactly zero times. Every such row therefore
+-- enters the fence at the same epoch the first claim of a fresh job holds,
+-- which is what lets the first sweep recover the jobs stranded in processing
+-- by earlier builds.
+ALTER TABLE video_jobs ADD COLUMN IF NOT EXISTS lease_epoch BIGINT NOT NULL DEFAULT 0;
+
 CREATE INDEX IF NOT EXISTS video_jobs_user_id_created_at_id_idx
     ON video_jobs (user_id, created_at DESC, id ASC);
+
+-- The recovery sweep's scan: every processing job, ordered by id, resumed
+-- from a keyset cursor. Partial for the same reason the outbox's index is
+-- partial, and the stake is the same one. The sweep runs on a timer for the
+-- life of the deployment, so an unindexed scan would re-read the entire job
+-- history — which only ever grows — every interval, to find the handful of
+-- rows that are currently processing. Ordering by id alone matches the
+-- cursor, so the index answers the filter, the order, and the resume point.
+CREATE INDEX IF NOT EXISTS video_jobs_processing_id_idx
+    ON video_jobs (id)
+    WHERE status = 'processing';
 
 -- Transactional outbox: Repository.Create and Repository.Enqueue each write
 -- a row here in the same transaction as their video_jobs write, so a reader

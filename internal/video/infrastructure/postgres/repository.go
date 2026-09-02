@@ -102,8 +102,8 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 	defer func() { _ = tx.Rollback() }()
 
 	const insertJob = `
-		INSERT INTO video_jobs (id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO video_jobs (id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`
 	if _, err := tx.ExecContext(ctx, insertJob,
 		job.ID().String(),
@@ -116,6 +116,7 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 		job.ContentHash(),
 		job.StorageKey().String(),
 		job.CreatedAt(),
+		job.LeaseEpoch(),
 	); err != nil {
 		return fmt.Errorf("video: create video job: %w", err)
 	}
@@ -142,7 +143,7 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 // FindByID looks up a job by ID, returning domain.ErrVideoJobNotFound if none exists.
 func (r *Repository) FindByID(ctx context.Context, id domain.VideoJobID) (*domain.VideoJob, error) {
 	const query = `
-		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch
 		FROM video_jobs WHERE id = $1
 	`
 	return r.scanJob(r.db.QueryRowContext(ctx, query, id.String()))
@@ -152,7 +153,7 @@ func (r *Repository) FindByID(ctx context.Context, id domain.VideoJobID) (*domai
 // VideoJobID ascending as a tie-breaker, bounded by offset and limit.
 func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, offset, limit int) ([]*domain.VideoJob, error) {
 	const query = `
-		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch
 		FROM video_jobs
 		WHERE user_id = $1
 		ORDER BY created_at DESC, id ASC
@@ -184,7 +185,7 @@ func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, off
 // recent pending/failed jobs hide a user's completed results entirely.
 func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.UserID) ([]*domain.VideoJob, error) {
 	const query = `
-		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch
 		FROM video_jobs
 		WHERE user_id = $1 AND status = $2
 		ORDER BY created_at DESC, id ASC
@@ -209,35 +210,141 @@ func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.Us
 	return jobs, nil
 }
 
-// updateJobStatement is shared by Update and Enqueue, which persist exactly
-// the same columns — the only difference between them is the outbox row
-// Enqueue writes alongside. source_key is absent because it is written once,
-// by Create, and never changes afterwards.
+// enqueueJobStatement is Enqueue's write. Its predicate is the id alone:
+// the pending -> queued transition is guarded by the aggregate, which
+// refuses it from any other status, and by the transaction the outbox insert
+// commits with.
+//
+// It was once shared verbatim with Update. The split is load-bearing rather
+// than cosmetic: Update's predicate now names lease_epoch and a processing
+// status, and an enqueue running through that statement would affect zero
+// rows while still inserting and committing its outbox row — leaving a job
+// stuck at pending with a live dispatch naming it.
 //
 // Enqueue writing frame_count, error_reason, and storage_key is a stated
 // precondition rather than an accident: it only ever runs on a job the
 // aggregate has just moved from pending to queued, where all three are still
 // their zero values. It must not be called on a job carrying a result.
-const updateJobStatement = `
+// source_key is absent from both statements because it is written once, by
+// Create, and never changes afterwards.
+const enqueueJobStatement = `
 	UPDATE video_jobs
 	SET status = $1, frame_count = $2, error_reason = $3, storage_key = $4
 	WHERE id = $5
 `
 
-// Update persists job's current status, frame count, error reason, and
-// storage key to its existing row, identified by its unchanging id. Unlike
-// Create and Enqueue, it writes no video_job_outbox row.
-func (r *Repository) Update(ctx context.Context, job *domain.VideoJob) error {
-	if _, err := r.db.ExecContext(ctx, updateJobStatement,
+// updateTerminalJobStatement is Update's write, and it is fenced. It used to
+// be unconditional, on the reasoning that only the one consumer holding the
+// claim could ever reach it. Recovery makes that false: a job whose worker
+// died is requeued and claimed again, so two actors can hold the same job's
+// aggregate in memory at once.
+//
+// Both added conjuncts are required and neither is redundant. lease_epoch
+// rejects a worker superseded by a requeue — its epoch is behind the row's,
+// so its terminal write for a run that has already been re-dispatched cannot
+// land. status = processing makes the write exclusive between two actors
+// legitimately holding the *same* epoch: a leaseless worker still running and
+// the sweep abandoning it. Whoever writes first leaves the row terminal, and
+// every other write affects no row.
+//
+// The aggregate's own transition check does not substitute for the status
+// conjunct. That check runs against the copy in this process's memory, which
+// was loaded before the other actor wrote; the predicate is the only thing
+// that reads the row as it stands at the moment of the write.
+//
+// Fencing here is safe because Update writes only processing -> completed and
+// processing -> failed. Enqueue, ClaimForProcessing, and Requeue own the
+// other three edges, and none of them goes through this statement.
+const updateTerminalJobStatement = `
+	UPDATE video_jobs
+	SET status = $1, frame_count = $2, error_reason = $3, storage_key = $4
+	WHERE id = $5 AND lease_epoch = $6 AND status = $7
+`
+
+// Update persists job's terminal outcome to its existing row, conditional on
+// epoch — the lease epoch the caller holds — and on the row still being
+// processing. Unlike Create and Enqueue, it writes no video_job_outbox row.
+//
+// Zero rows affected has three readings, told apart by a follow-up lookup the
+// way ClaimForProcessing already tells a lost claim from an unknown job.
+func (r *Repository) Update(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
+	result, err := r.db.ExecContext(ctx, updateTerminalJobStatement,
 		string(job.Status()),
 		job.FrameCount(),
 		job.ErrorReason(),
 		job.StorageKey().String(),
 		job.ID().String(),
-	); err != nil {
+		epoch,
+		string(domain.JobStatusProcessing),
+	)
+	if err != nil {
+		return false, fmt.Errorf("video: update video job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("video: update video job: %w", err)
+	}
+	if affected > 0 {
+		return true, nil
+	}
+	return false, r.classifyRefusedUpdate(ctx, job, epoch)
+}
+
+// classifyRefusedUpdate reads the row Update could not write and decides what
+// its refusal meant.
+//
+// It classifies from the stored row alone, so every refusal that is not this
+// caller's own recorded outcome is reported as a fence — including a row that
+// is no longer processing at the caller's epoch. The finer reading of that
+// case (an equal-epoch queued row is a stale cache entry, and a pending job
+// is a defect rather than a fence) needs the aggregate and belongs to
+// application.classifyRefusedTransition, which loads authoritatively and
+// therefore intercepts both before any statement runs. The two are not in
+// conflict; they answer at different levels of information.
+func (r *Repository) classifyRefusedUpdate(ctx context.Context, job *domain.VideoJob, epoch int64) error {
+	const lookup = `
+		SELECT status, frame_count, error_reason, storage_key, lease_epoch
+		FROM video_jobs WHERE id = $1
+	`
+	var (
+		statusValue   string
+		frameCount    int
+		errorReason   string
+		storageKeyVal string
+		storedEpoch   int64
+	)
+	if err := r.db.QueryRowContext(ctx, lookup, job.ID().String()).Scan(&statusValue, &frameCount, &errorReason, &storageKeyVal, &storedEpoch); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ErrVideoJobNotFound
+		}
 		return fmt.Errorf("video: update video job: %w", err)
 	}
-	return nil
+
+	if storedEpoch == epoch && isTerminalStatus(domain.JobStatus(statusValue)) {
+		// This caller's own earlier commit, re-attempted after a lost
+		// response. All four outcome fields are compared because the
+		// sweep's abandonment and a genuine failure differ only in the
+		// reason.
+		if statusValue == string(job.Status()) &&
+			frameCount == job.FrameCount() &&
+			errorReason == job.ErrorReason() &&
+			storageKeyVal == job.StorageKey().String() {
+			return nil
+		}
+		// Another actor holding the same epoch finished first. Wrapped
+		// distinctly from a takeover: an abandonment race is not a
+		// supersession, and a log that conflates them hides which one
+		// is happening.
+		return fmt.Errorf("video: update video job: another actor recorded %s at epoch %d: %w", statusValue, epoch, domain.ErrJobFenced)
+	}
+	// A strictly greater stored epoch is a takeover; anything else that
+	// refused the predicate means the caller does not hold a processing row
+	// at its epoch, which is the same loss by a different route.
+	return fmt.Errorf("video: update video job: job is at epoch %d, caller holds %d: %w", storedEpoch, epoch, domain.ErrJobFenced)
+}
+
+func isTerminalStatus(status domain.JobStatus) bool {
+	return status == domain.JobStatusCompleted || status == domain.JobStatusFailed
 }
 
 // Enqueue persists job's queued state and, in the same transaction, the
@@ -250,16 +357,9 @@ func (r *Repository) Update(ctx context.Context, job *domain.VideoJob) error {
 // enqueued long after it was created behind rows that were queued first.
 func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	occurredAt := time.Now().UTC()
-	payload, err := json.Marshal(videoJobQueuedPayload{
-		Type:        videoJobQueuedEventType,
-		JobID:       job.ID().String(),
-		UserID:      job.UserID().String(),
-		SourceKey:   job.SourceKey().String(),
-		ContentHash: job.ContentHash(),
-		OccurredAt:  occurredAt,
-	})
+	payload, err := marshalQueuedOutboxPayload(job, occurredAt)
 	if err != nil {
-		return fmt.Errorf("video: marshal outbox payload: %w", err)
+		return err
 	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -268,7 +368,7 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, updateJobStatement,
+	if _, err := tx.ExecContext(ctx, enqueueJobStatement,
 		string(job.Status()),
 		job.FrameCount(),
 		job.ErrorReason(),
@@ -278,6 +378,37 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 		return fmt.Errorf("video: enqueue video job: %w", err)
 	}
 
+	if err := insertQueuedOutboxEvent(ctx, tx, payload, occurredAt); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("video: commit enqueue transaction: %w", err)
+	}
+	return nil
+}
+
+// marshalQueuedOutboxPayload and insertQueuedOutboxEvent are shared by
+// Enqueue and Requeue rather than copied into each. The consumer cannot tell
+// a first dispatch from a re-dispatch and must not have to, so the two write
+// the same event type and the same payload; a drifted second copy would be a
+// message the consumer decodes to zero values.
+func marshalQueuedOutboxPayload(job *domain.VideoJob, occurredAt time.Time) ([]byte, error) {
+	payload, err := json.Marshal(videoJobQueuedPayload{
+		Type:        videoJobQueuedEventType,
+		JobID:       job.ID().String(),
+		UserID:      job.UserID().String(),
+		SourceKey:   job.SourceKey().String(),
+		ContentHash: job.ContentHash(),
+		OccurredAt:  occurredAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("video: marshal outbox payload: %w", err)
+	}
+	return payload, nil
+}
+
+func insertQueuedOutboxEvent(ctx context.Context, tx *sql.Tx, payload []byte, occurredAt time.Time) error {
 	const insertOutbox = `
 		INSERT INTO video_job_outbox (id, event_type, payload, occurred_at)
 		VALUES ($1, $2, $3, $4)
@@ -290,11 +421,65 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	); err != nil {
 		return fmt.Errorf("video: record outbox event: %w", err)
 	}
+	return nil
+}
+
+// Requeue returns an abandoned job from processing to queued and, in the same
+// transaction, writes the outbox row re-dispatching it. The two commit
+// together for the same reason Enqueue's do: a job back in queued with no
+// dispatch naming it is stranded exactly as badly as it was before.
+//
+// The UPDATE is conditional on observedEpoch and on the row still being
+// processing, and it advances the epoch by one. That advance is the fence:
+// the previous holder's terminal write names the old epoch and can no longer
+// apply.
+func (r *Repository) Requeue(ctx context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
+	occurredAt := time.Now().UTC()
+	payload, err := marshalQueuedOutboxPayload(job, occurredAt)
+	if err != nil {
+		return false, err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("video: begin requeue transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const requeueStatement = `
+		UPDATE video_jobs
+		SET status = $1, lease_epoch = lease_epoch + 1
+		WHERE id = $2 AND status = $3 AND lease_epoch = $4
+	`
+	result, err := tx.ExecContext(ctx, requeueStatement,
+		string(domain.JobStatusQueued),
+		job.ID().String(),
+		string(domain.JobStatusProcessing),
+		observedEpoch,
+	)
+	if err != nil {
+		return false, fmt.Errorf("video: requeue video job: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("video: requeue video job: %w", err)
+	}
+	if affected == 0 {
+		// Another sweep won, or the job left processing between the scan
+		// and this write. Rolling back rather than committing is what
+		// keeps the outbox row from announcing a dispatch that did not
+		// happen.
+		return false, nil
+	}
+
+	if err := insertQueuedOutboxEvent(ctx, tx, payload, occurredAt); err != nil {
+		return false, err
+	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("video: commit enqueue transaction: %w", err)
+		return false, fmt.Errorf("video: commit requeue transaction: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // ClaimForProcessing moves the job from queued to processing with a single
@@ -314,35 +499,98 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 // On zero rows affected it distinguishes a job that exists but is no longer
 // queued from an id that names no row at all, so a consumer can tell a lost
 // claim from an unknown job when classifying a message for dead-lettering.
-func (r *Repository) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, error) {
+//
+// The winner is handed the row's lease_epoch by the claiming statement
+// itself, through RETURNING. Not a second query: one read before the claim
+// can be stale by the time the claim lands — a sweep can requeue in between,
+// and the winner would then carry an epoch that fences its own terminal
+// write — and one read after is a statement another writer can interleave
+// with. The claim does not advance the epoch; only a requeue does.
+func (r *Repository) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, int64, error) {
 	const claim = `
 		UPDATE video_jobs SET status = $1 WHERE id = $2 AND status = $3
+		RETURNING lease_epoch
 	`
-	result, err := r.db.ExecContext(ctx, claim,
+	var epoch int64
+	err := r.db.QueryRowContext(ctx, claim,
 		string(domain.JobStatusProcessing),
 		job.ID().String(),
 		string(domain.JobStatusQueued),
-	)
-	if err != nil {
-		return false, fmt.Errorf("video: claim video job for processing: %w", err)
+	).Scan(&epoch)
+	if err == nil {
+		return true, epoch, nil
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("video: claim video job for processing: %w", err)
-	}
-	if affected > 0 {
-		return true, nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, 0, fmt.Errorf("video: claim video job for processing: %w", err)
 	}
 
 	const exists = `SELECT 1 FROM video_jobs WHERE id = $1`
 	var one int
 	if err := r.db.QueryRowContext(ctx, exists, job.ID().String()).Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, domain.ErrVideoJobNotFound
+			return false, 0, domain.ErrVideoJobNotFound
 		}
-		return false, fmt.Errorf("video: claim video job for processing: %w", err)
+		return false, 0, fmt.Errorf("video: claim video job for processing: %w", err)
 	}
-	return false, nil
+	return false, 0, nil
+}
+
+// FindProcessing returns up to limit processing jobs ordered by id, resuming
+// strictly after the cursor. The recovery sweep carries that cursor between
+// cycles and wraps on a short read.
+//
+// The keyset is not a refinement of ORDER BY id LIMIT n; it is what keeps the
+// sweep from starving. One batch's worth of healthy long-running extractions
+// sorts first every cycle, and an abandoned job behind them would never be
+// examined until they finished.
+//
+// A zero cursor means the start of the scan and selects the statement with no
+// keyset predicate at all. It cannot be bound instead: it serializes to the
+// empty string, and id is a uuid, so id > ” errors before a row is examined.
+// Two constant statements rather than one assembled from fragments, so no
+// query in this package is ever built by concatenation.
+func (r *Repository) FindProcessing(ctx context.Context, after domain.VideoJobID, limit int) ([]*domain.VideoJob, error) {
+	const fromStart = `
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch
+		FROM video_jobs
+		WHERE status = $1
+		ORDER BY id ASC
+		LIMIT $2
+	`
+	const afterCursor = `
+		SELECT id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch
+		FROM video_jobs
+		WHERE status = $1 AND id > $2
+		ORDER BY id ASC
+		LIMIT $3
+	`
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if after.IsZero() {
+		rows, err = r.db.QueryContext(ctx, fromStart, string(domain.JobStatusProcessing), limit)
+	} else {
+		rows, err = r.db.QueryContext(ctx, afterCursor, string(domain.JobStatusProcessing), after.String(), limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("video: list processing video jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []*domain.VideoJob
+	for rows.Next() {
+		job, err := r.scanJobRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("video: list processing video jobs: %w", err)
+	}
+	return jobs, nil
 }
 
 type rowScanner interface {
@@ -369,6 +617,7 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 		contentHash   string
 		storageKeyVal string
 		createdAt     time.Time
+		leaseEpoch    int64
 	)
 	// Scan order follows the SELECT column list above: source_key, then
 	// content_hash, then storage_key, in both. All three are strings on the
@@ -380,7 +629,7 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 	// RestoreVideoJob call below in one order. content_hash sitting between
 	// the two keys is deliberate: it makes that particular transposition the
 	// less likely one to write.
-	if err := row.Scan(&idValue, &userIDValue, &filenameValue, &statusValue, &frameCount, &errorReason, &sourceKeyVal, &contentHash, &storageKeyVal, &createdAt); err != nil {
+	if err := row.Scan(&idValue, &userIDValue, &filenameValue, &statusValue, &frameCount, &errorReason, &sourceKeyVal, &contentHash, &storageKeyVal, &createdAt, &leaseEpoch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
@@ -419,5 +668,5 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 		}
 	}
 
-	return domain.RestoreVideoJob(id, userID, filename, sourceKey, contentHash, storageKey, frameCount, errorReason, domain.JobStatus(statusValue), createdAt)
+	return domain.RestoreVideoJob(id, userID, filename, sourceKey, contentHash, storageKey, frameCount, errorReason, domain.JobStatus(statusValue), createdAt, leaseEpoch)
 }
