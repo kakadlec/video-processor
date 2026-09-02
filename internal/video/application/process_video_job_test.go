@@ -43,7 +43,7 @@ func newProcessVideoJobUseCase(repo *fakeVideoJobRepository, extractor domain.Fr
 	return newProcessVideoJobUseCaseWithLeases(repo, extractor, sources, results, newFakeJobLeaseStore())
 }
 
-func newProcessVideoJobUseCaseWithLeases(repo *fakeVideoJobRepository, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, opts ...application.ProcessVideoJobOption) *application.ProcessVideoJob {
+func newProcessVideoJobUseCaseWithLeases(repo domain.VideoJobRepository, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, opts ...application.ProcessVideoJobOption) *application.ProcessVideoJob {
 	parser := fakeVideoJobIDParser{}
 	return application.NewProcessVideoJob(
 		application.NewStartProcessing(repo, repo, parser),

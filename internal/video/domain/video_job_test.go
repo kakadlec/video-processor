@@ -382,3 +382,94 @@ func TestVideoJob_OutOfOrderTransition_RejectedWithoutMutation(t *testing.T) {
 		t.Fatalf("job.Status() = %v, want unchanged %v", job.Status(), domain.JobStatusPending)
 	}
 }
+
+// newProcessingVideoJob returns a job the recovery sweep could legitimately
+// find: claimed, with a source key still naming its input.
+func newProcessingVideoJob(t *testing.T) *domain.VideoJob {
+	t.Helper()
+	job := newPendingVideoJob(t)
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("unexpected error starting processing: %v", err)
+	}
+	return job
+}
+
+func TestVideoJob_Requeue_ProcessingToQueuedAdvancesTheEpoch(t *testing.T) {
+	job := newProcessingVideoJob(t)
+	before := job.LeaseEpoch()
+
+	if err := job.Requeue(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusQueued {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusQueued)
+	}
+	if job.LeaseEpoch() != before+1 {
+		t.Fatalf("job.LeaseEpoch() = %d, want %d", job.LeaseEpoch(), before+1)
+	}
+}
+
+// TestVideoJob_Requeue_RejectsEveryNonProcessingStatus is the half of the
+// recovery edge that keeps it from being a general-purpose reset. The epoch
+// assertion matters as much as the status one: an implementation that
+// advanced the epoch before consulting the transition table would leave a
+// rejected job fencing out its own rightful holder.
+func TestVideoJob_Requeue_RejectsEveryNonProcessingStatus(t *testing.T) {
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	sourceKey, err := domain.NewStorageKey("uploads/upload-1_input.mp4")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cases := []struct {
+		status      domain.JobStatus
+		storageKey  domain.StorageKey
+		frameCount  int
+		errorReason string
+	}{
+		{status: domain.JobStatusPending},
+		{status: domain.JobStatusQueued},
+		{status: domain.JobStatusCompleted, storageKey: domain.ResultStorageKey(id), frameCount: 7},
+		{status: domain.JobStatusFailed, errorReason: "boom"},
+	}
+
+	for _, tc := range cases {
+		t.Run(string(tc.status), func(t *testing.T) {
+			job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), sourceKey, "", tc.storageKey, tc.frameCount, tc.errorReason, tc.status, time.Now(), 3)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if err := job.Requeue(); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+				t.Fatalf("error = %v, want %v", err, domain.ErrInvalidStatusTransition)
+			}
+			if job.Status() != tc.status {
+				t.Fatalf("job.Status() = %v, want the job left in %v", job.Status(), tc.status)
+			}
+			if job.LeaseEpoch() != 3 {
+				t.Fatalf("job.LeaseEpoch() = %d, want the epoch left at 3", job.LeaseEpoch())
+			}
+		})
+	}
+}
+
+func TestVideoJob_Requeue_RejectsAJobWithNoSourceKey(t *testing.T) {
+	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	job, err := domain.RestoreVideoJob(id, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, "", domain.StorageKey{}, 0, "", domain.JobStatusProcessing, time.Now(), 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := job.Requeue(); !errors.Is(err, domain.ErrSourceKeyRequiredToEnqueue) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrSourceKeyRequiredToEnqueue)
+	}
+	if job.Status() != domain.JobStatusProcessing {
+		t.Fatalf("job.Status() = %v, want the job left in %v", job.Status(), domain.JobStatusProcessing)
+	}
+	if job.LeaseEpoch() != 1 {
+		t.Fatalf("job.LeaseEpoch() = %d, want the epoch left at 1", job.LeaseEpoch())
+	}
+}

@@ -246,7 +246,15 @@ func (j *VideoJob) StartProcessing() error {
 // It deliberately does not route through Enqueue. The two edges differ in
 // origin status and in who may walk them — a submitter queues a pending job,
 // only the recovery sweep requeues a processing one.
+//
+// The origin status is checked here rather than left to the transition
+// table, which cannot express it: the table's queued row is reachable from
+// both pending and processing, so a table-only Requeue would accept a
+// pending job and advance its epoch for an abandonment that never happened.
 func (j *VideoJob) Requeue() error {
+	if j.status != JobStatusProcessing {
+		return ErrInvalidStatusTransition
+	}
 	if j.sourceKey.IsZero() {
 		return ErrSourceKeyRequiredToEnqueue
 	}

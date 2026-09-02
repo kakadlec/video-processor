@@ -257,6 +257,19 @@ func (r *fakeVideoJobRepository) seed(job *domain.VideoJob) {
 	r.byID[job.ID().String()] = cloneVideoJob(job)
 }
 
+// staleReader wraps a repository so that FindByID answers from a fixed
+// record while every write still goes to the wrapped store. It is the shape
+// of the caching decorator when a write-through has been delayed past a
+// later one: the cached record is stale, the row underneath is not.
+type staleReader struct {
+	*fakeVideoJobRepository
+	stale *domain.VideoJob
+}
+
+func (r staleReader) FindByID(context.Context, domain.VideoJobID) (*domain.VideoJob, error) {
+	return cloneVideoJob(r.stale), nil
+}
+
 // fakeJobLeaseStore is an in-memory domain.JobLeaseStore recording every
 // call, with injectable failures so both halves of the lease posture — the
 // fail-open acquire/renew and the fail-closed liveness read — are testable.

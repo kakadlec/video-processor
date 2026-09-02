@@ -933,3 +933,202 @@ func resultKeyFor(t *testing.T, job *domain.VideoJob) domain.StorageKey {
 	t.Helper()
 	return domain.ResultStorageKey(job.ID())
 }
+
+// TestCachedVideoJobRepository_Update_FencedWriteLeavesTheCacheAlone is the
+// write-through's conditional half for the fence. A refused write means
+// another actor owns the job; publishing this caller's view of it would put
+// the loser's outcome in front of every reader for the entry's whole TTL.
+func TestCachedVideoJobRepository_Update_FencedWriteLeavesTheCacheAlone(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	if err := fake.Create(context.Background(), job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	ctx := context.Background()
+
+	// Populate the entry with the pre-write state.
+	if _, err := repo.FindByID(ctx, job.ID()); err != nil {
+		t.Fatalf("FindByID: %v", err)
+	}
+
+	fake.mu.Lock()
+	fake.updateApplied = false
+	fake.mu.Unlock()
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	applied, err := repo.Update(ctx, job, 0)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if applied {
+		t.Fatal("applied = true, want false")
+	}
+
+	fake.mu.Lock()
+	fake.findByIDErr = errors.New("must be served from cache")
+	fake.mu.Unlock()
+
+	got, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("FindByID after a refused Update (expected cache hit): %v", err)
+	}
+	if got.Status() != domain.JobStatusPending {
+		t.Fatalf("status = %q, want pending (a refused write must not be published)", got.Status())
+	}
+}
+
+// TestCachedVideoJobRepository_ClaimForProcessing_CachesTheEpochTheClaimWon
+// pins the one place the cached record's epoch does not come off the
+// aggregate. A claim on a requeued job reads an epoch the caller's in-memory
+// job has never seen, and caching the aggregate's would advertise a
+// superseded fence to every reader — including a worker deciding whether its
+// own write can still apply.
+func TestCachedVideoJobRepository_ClaimForProcessing_CachesTheEpochTheClaimWon(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	if err := fake.Create(context.Background(), job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.claimResult = true
+	fake.claimEpoch = 3
+	fake.mu.Unlock()
+
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("job.StartProcessing: %v", err)
+	}
+	if job.LeaseEpoch() != 0 {
+		t.Fatalf("test setup: the aggregate's epoch is %d, want 0 so the claim's differs from it", job.LeaseEpoch())
+	}
+
+	claimed, epoch, err := repo.ClaimForProcessing(ctx, job)
+	if err != nil {
+		t.Fatalf("ClaimForProcessing: %v", err)
+	}
+	if !claimed || epoch != 3 {
+		t.Fatalf("claimed = %v, epoch = %d, want true and 3", claimed, epoch)
+	}
+
+	fake.mu.Lock()
+	fake.findByIDErr = errors.New("must be served from cache")
+	fake.mu.Unlock()
+
+	got, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("FindByID after the claim (expected cache hit): %v", err)
+	}
+	if got.LeaseEpoch() != 3 {
+		t.Fatalf("cached LeaseEpoch = %d, want 3 (the epoch the claim reported, not the aggregate's)", got.LeaseEpoch())
+	}
+}
+
+// TestCachedVideoJobRepository_Requeue_WritesThroughOnlyWhenItWon covers the
+// recovery edge's conditional write-through. A lost requeue is the ordinary
+// outcome of two sweeps racing, and the loser publishing queued would hide a
+// job the winner has already handed to a new consumer.
+func TestCachedVideoJobRepository_Requeue_WritesThroughOnlyWhenItWon(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		won        bool
+		wantStatus domain.JobStatus
+	}{
+		{name: "won", won: true, wantStatus: domain.JobStatusQueued},
+		{name: "lost", won: false, wantStatus: domain.JobStatusProcessing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newTestClient(t)
+			fake := newFakeRepository()
+			job := newTestJob(t)
+			if err := fake.Create(context.Background(), job); err != nil {
+				t.Fatalf("fake.Create: %v", err)
+			}
+			repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+			ctx := context.Background()
+
+			if err := job.Enqueue(); err != nil {
+				t.Fatalf("job.Enqueue: %v", err)
+			}
+			if err := job.StartProcessing(); err != nil {
+				t.Fatalf("job.StartProcessing: %v", err)
+			}
+			fake.mu.Lock()
+			fake.claimResult = true
+			fake.mu.Unlock()
+			if _, _, err := repo.ClaimForProcessing(ctx, job); err != nil {
+				t.Fatalf("ClaimForProcessing: %v", err)
+			}
+
+			fake.mu.Lock()
+			fake.requeueResult = tc.won
+			fake.mu.Unlock()
+
+			if err := job.Requeue(); err != nil {
+				t.Fatalf("job.Requeue: %v", err)
+			}
+			requeued, err := repo.Requeue(ctx, job, 0)
+			if err != nil {
+				t.Fatalf("Requeue: %v", err)
+			}
+			if requeued != tc.won {
+				t.Fatalf("requeued = %v, want %v", requeued, tc.won)
+			}
+
+			fake.mu.Lock()
+			fake.findByIDErr = errors.New("must be served from cache")
+			fake.mu.Unlock()
+
+			got, err := repo.FindByID(ctx, job.ID())
+			if err != nil {
+				t.Fatalf("FindByID after Requeue (expected cache hit): %v", err)
+			}
+			if got.Status() != tc.wantStatus {
+				t.Fatalf("cached status = %q, want %q", got.Status(), tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestCachedVideoJobRepository_FindProcessing_PassesStraightThrough pins the
+// one read that must never be answered from the cache: the sweep decides
+// whether to take a job away from its holder, and it may only decide that on
+// the authoritative row.
+func TestCachedVideoJobRepository_FindProcessing_PassesStraightThrough(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	if err := fake.Create(context.Background(), job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+	repo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.findProcessing = []*domain.VideoJob{job}
+	fake.mu.Unlock()
+
+	jobs, err := repo.FindProcessing(ctx, domain.VideoJobID{}, 10)
+	if err != nil {
+		t.Fatalf("FindProcessing: %v", err)
+	}
+	if len(jobs) != 1 || !jobs[0].ID().Equal(job.ID()) {
+		t.Fatalf("jobs = %v, want the one row the inner repository returned", jobs)
+	}
+	if fake.findProcessingCalls != 1 {
+		t.Fatalf("findProcessingCalls = %d, want 1", fake.findProcessingCalls)
+	}
+
+	if _, err := client.Get(ctx, "videojob:status:"+job.ID().String()).Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("cache entry after FindProcessing: err = %v, want redis.Nil (the scan must cache nothing)", err)
+	}
+}
