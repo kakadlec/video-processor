@@ -355,7 +355,24 @@ func TestRepository_Requeue_ConcurrentSweepsProduceOneWinnerAndOneDispatch(t *te
 	job, epoch := seedJobInStatusAtEpoch(t, repo, ids, domain.JobStatusProcessing)
 	before := countQueuedOutboxRows(t, db, job)
 
+	// Each sweep's own copy of the aggregate, loaded and transitioned before
+	// any of them writes — the state two worker processes are in when their
+	// scans overlap. Built serially on purpose: a copy loaded after another
+	// sweep had already committed would read queued and never reach the
+	// write this test is about.
 	const sweeps = 4
+	copies := make([]*domain.VideoJob, sweeps)
+	for i := range copies {
+		mine, err := repo.FindByID(ctx, job.ID())
+		if err != nil {
+			t.Fatalf("FindByID: %v", err)
+		}
+		if err := mine.Requeue(); err != nil {
+			t.Fatalf("job.Requeue: %v", err)
+		}
+		copies[i] = mine
+	}
+
 	start := make(chan struct{})
 	results := make(chan bool, sweeps)
 	errs := make(chan error, sweeps)
@@ -365,19 +382,8 @@ func TestRepository_Requeue_ConcurrentSweepsProduceOneWinnerAndOneDispatch(t *te
 		go func() {
 			defer wg.Done()
 
-			// Each sweep loads and transitions its own copy, exactly as
-			// two worker processes would.
-			mine, err := repo.FindByID(ctx, job.ID())
-			if err != nil {
-				errs <- err
-				return
-			}
-			if err := mine.Requeue(); err != nil {
-				errs <- err
-				return
-			}
 			<-start
-			requeued, err := repo.Requeue(ctx, mine, epoch)
+			requeued, err := repo.Requeue(ctx, copies[i], epoch)
 			if err != nil {
 				errs <- err
 				return
