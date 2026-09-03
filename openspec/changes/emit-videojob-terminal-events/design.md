@@ -2,19 +2,21 @@
 
 Every producer of a terminal `VideoJob` outcome already funnels through one statement. `CompleteJob` and `FailJob` are `Repository.Update`'s only two callers, and the sweeper's abandonment write goes through `FailJob` as well — so the worker's success, the worker's extraction failure, and the sweeper's abandonment are three paths into a single conditional `UPDATE ... WHERE id = $1 AND lease_epoch = $2 AND status = 'processing'`.
 
-That statement is also where the system's fence lives. `applied == true` means this actor won the terminal outcome; `applied == false` with no error means the row already carried exactly this outcome (a retry finding its own earlier commit); `ErrJobFenced` means another actor won. Phase 7's correctness hinges entirely on the event being tied to the first of those three and to nothing else — the whole point of the lease-recovery design is that a superseded worker and its successor can both finish the same job, and a user must not be notified twice for it.
+That statement is also where the system's fence lives. `applied == true` means this actor won the terminal outcome; `applied == false` with no error means the row already carried exactly this outcome (a retry finding its own earlier commit); `ErrJobFenced` means another actor won. Phase 7's correctness hinges entirely on the event being tied to the first of those three and to nothing else — the whole point of the lease-recovery design is that a superseded worker and its successor can both finish the same job, and one job must not leave two records of how it ended.
+
+That is a claim about the durable record, not about delivery. The relay is at-least-once by construction (`videojob-outbox-relay`: an acknowledged publish followed by a lost transaction republishes the row), so a consumer must deduplicate regardless. What the fence removes is the duplicate a consumer *could not* deduplicate — a completion and an abandonment failure for the same job, two records of different outcomes, both true from their author's point of view. Deduplicating repeated deliveries of one record is the later consumer change's job and is named as such in the spec.
 
 The existing relay is single-purpose in three places at once: `Relay` holds one `eventType`, `OutboxRepository.Claim` filters on one `event_type`, and `Publisher` is constructed with one fixed routing key. The routing key equals the `event_type` string by an invariant that `TestRoutingKeyMatchesTheOutboxEventType` pins across two packages that do not import each other.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- A durable, transactionally-consistent record of `VideoJobCompleted` and `VideoJobFailed`, written exactly once per job outcome.
+- A durable, transactionally-consistent record of `VideoJobCompleted` and `VideoJobFailed`, written exactly once per job outcome. Delivery of that record stays at-least-once, unchanged.
 - Those records reach the broker and wait durably on a queue for a consumer that does not exist yet.
 - No change to the worker's acknowledgement decision table, to `applied` semantics, or to any HTTP response.
 
 **Non-Goals:**
-- Any consumer, delivery channel, retry policy, or `NotificationPreference` — those are later Phase 7 changes.
+- Any consumer, delivery channel, retry policy, or `NotificationPreference` — those are later Phase 7 changes. Delivery deduplication belongs to the consumer and is stated as its obligation here, not solved here.
 - `UserRegistered` and anything in the Identity context.
 - Publishing the accumulated `video_job.created` backlog, which stays deliberately unpublished.
 
@@ -71,7 +73,7 @@ The claim predicate becomes `event_type = ANY($1)`. The partial index `video_job
 
 ### 5. One topology for both terminal events, one queue
 
-A new exchange, one durable queue bound to both routing keys, and the existing dead-letter sink (which deliberately carries no generation suffix, so every generation's dead letters land in one place).
+A new exchange `video.jobs.terminal.v1`, one durable queue `video.jobs.terminal.events.v1` bound to both routing keys, and the existing dead-letter sink `video.jobs.dlx`/`video.jobs.dead` (which deliberately carries no generation suffix, so every generation's and every stream's dead letters land in one place). Bounds match the job queue's: `x-max-length` 10 000 with `reject-publish`. The exact table is pinned in the spec, as the dispatch topology's is — the queue names the class of event rather than a single state, because it carries two.
 
 The queue is declared now, two changes before anything consumes it. That is the point: the relay publishes **mandatory** and stamps `published_at` only for messages the broker both acknowledged and routed, so publishing into an exchange with no binding would return every message unroutable and leave the rows to be re-attempted every two seconds, forever. A declared, unconsumed queue holds them durably instead, bounded by the same `x-max-length` + `reject-publish` back-pressure the job queue uses — a full queue nacks, the row waits, nothing is lost.
 

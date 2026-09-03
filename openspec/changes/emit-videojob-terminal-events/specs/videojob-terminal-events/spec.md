@@ -33,7 +33,11 @@ An event SHALL be recorded **only** when the fenced conditional statement affect
 - A write refused by the fence (`ErrJobFenced`) — another actor won the outcome, and that actor's own write already recorded the event.
 - A write that finds the stored row already carrying exactly this caller's outcome (`applied == false`) — this caller's earlier commit already recorded it.
 
-This is the whole correctness argument for the capability, and it rests on `videojob-lease-recovery` rather than on caution. A worker presumed dead can return mid-run while a sweeper has already abandoned its job, and both may hold the same epoch; the terminal statement's `status = 'processing'` conjunct is what makes exactly one of them apply. Binding event emission to that same statement's row count — rather than to a second predicate evaluated separately — means the actor who wins the outcome and the actor who announces it cannot diverge. A user SHALL NOT receive two notifications for one job, and a job that reached a terminal state SHALL NOT go unannounced.
+This is the whole correctness argument for the capability, and it rests on `videojob-lease-recovery` rather than on caution. A worker presumed dead can return mid-run while a sweeper has already abandoned its job, and both may hold the same epoch; the terminal statement's `status = 'processing'` conjunct is what makes exactly one of them apply. Binding event emission to that same statement's row count — rather than to a second predicate evaluated separately — means the actor who wins the outcome and the actor who announces it cannot diverge. A job that reached a terminal state SHALL NOT go unannounced, and two actors racing to finish it SHALL NOT produce two records of that outcome.
+
+**This guarantee is scoped to the durable record, not to delivery, and the distinction SHALL NOT be blurred.** `videojob-outbox-relay` is deliberately at-least-once: a publish the broker acknowledged, followed by a lost transaction, leaves the row unstamped and a later poll republishes it. One outbox row can therefore become more than one message, and a consumer's own crash or nack produces the same duplicate independently of the relay. What this requirement removes is the duplicate the *lease-recovery design itself* would otherwise create — a second, differently-worded outcome for one job, which no consumer could deduplicate because the two records describe genuinely different outcomes. Collapsing the two duplicates into one problem would leave that one unsolved and promise an exactly-once delivery no part of this system provides.
+
+**Deduplicating deliveries is therefore the consumer's obligation, and it SHALL be carried by whatever consumes this queue** — the later Phase 7 change owns that, keyed on the `job_id` and event type each message carries. Nothing in this capability may be read as relieving it of that.
 
 The completion retry that `videojob-worker` performs is covered by the second bullet: a retry after a lost response finds its own outcome recorded, records no second event, and still reports success.
 
@@ -48,6 +52,12 @@ The completion retry that `videojob-worker` performs is covered by the second bu
 - **GIVEN** a `processing` `VideoJob` observed at the same epoch by a still-running leaseless worker and by a sweeper that has reached the abandonment bound
 - **WHEN** both commit a terminal outcome, one `completed` and one `failed`
 - **THEN** exactly one write applies and exactly one terminal outbox row exists for that job
+
+#### Scenario: One record may still be delivered more than once
+
+- **GIVEN** exactly one terminal outbox row for a job
+- **WHEN** the relay publishes it, the broker acknowledges, and the relay's transaction is lost before it commits
+- **THEN** a later poll publishes that same row again, and the duplicate is the consumer's to discard rather than a violation of this requirement
 
 #### Scenario: A retried completion records no second event
 
@@ -92,6 +102,22 @@ The generation suffix SHALL be part of the **event type string**, not only of an
 ### Requirement: The Context Owns a Terminal-Event Topology With a Queue Declared Ahead of Its Consumer
 
 `internal/video/infrastructure/messaging` SHALL define a second topology for the terminal events: its own exchange, one durable work queue bound to **both** terminal routing keys, and the existing dead-letter sink. The names SHALL live in the context rather than in `internal/platform/rabbitmq`, which `ddd-architecture` confines to connection and lifecycle plumbing.
+
+`TerminalEventsTopology` SHALL return exactly:
+
+| Entity | Name | Type | Arguments |
+|---|---|---|---|
+| Terminal exchange | `video.jobs.terminal.v1` | `direct`, durable | — |
+| Routing keys | `video_job.completed.v1`, `video_job.failed.v1` | — | — |
+| Terminal queue | `video.jobs.terminal.events.v1` | durable | `x-max-length` 10 000, `x-overflow` `reject-publish`, `x-dead-letter-exchange` `video.jobs.dlx` |
+| Dead-letter exchange | `video.jobs.dlx` | `fanout`, durable | — |
+| Dead-letter queue | `video.jobs.dead` | durable | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, **no** `x-dead-letter-exchange` |
+
+These values SHALL be pinned here for the same reason `videojob-messaging` pins the dispatch topology's: unpinned names cannot drift detectably, and a generation that is only a convention is not an isolation mechanism.
+
+The queue name does not name a single job state, because it carries two; it names the class of event instead. The generation suffix on the exchange and the queue SHALL match the one on the event types, and the three SHALL be bumped together for the reason the dispatch generation records — the `event_type` is what a relay claims on, the exchange is what a broker routes on, and versioning either alone leaves the other's crossing open.
+
+The dead-letter exchange and queue SHALL be the dispatch topology's existing ones and SHALL carry no generation suffix. The sink is fanout, so one place to look at holds every generation's and every stream's dead letters; a second sink would fragment that with nothing gained.
 
 The work queue SHALL be declared even though no consumer exists yet, and this SHALL NOT be treated as premature. The relay publishes **mandatory** and stamps `published_at` only for messages the broker both acknowledged and routed (`videojob-outbox-relay`); publishing into an exchange with no binding would return every message unroutable, leaving its row unpublished and re-attempted on every poll indefinitely. A declared queue holds the events durably until Phase 7's consumer reads them.
 

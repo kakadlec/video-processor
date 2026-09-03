@@ -27,9 +27,10 @@ Implementation order follows the dependency chain: the payload contract and the 
 ## 4. Terminal-event topology
 
 - [ ] 4.1 Replace `rabbitmq.Topology.RoutingKey` with `RoutingKeys []string` and bind each in `DeclareTopology`, per design decision 5. Reject an empty slice with an error. No name from this context enters `internal/platform/rabbitmq`.
-- [ ] 4.1a Update the existing dispatch topology to pass a one-element `RoutingKeys`, and add the terminal exchange, queue, and both routing-key bindings to `topology.go`, reusing the existing dead-letter exchange and queue.
+- [ ] 4.1a Update the existing dispatch topology to pass a one-element `RoutingKeys`, and add `TerminalEventsTopology` to `topology.go` with the exact names and bounds the spec pins (`video.jobs.terminal.v1`, `video.jobs.terminal.events.v1`, both routing keys), reusing the existing dead-letter exchange and queue.
 - [ ] 4.2 Give the terminal queue the same `x-max-length` + `reject-publish` bound as the job queue and no message TTL, and comment why the TTL is absent — the reason differs from the job queue's and is worth stating: an expired terminal event is an outcome that is never announced.
 - [ ] 4.3 Extend `TestRoutingKeyMatchesTheOutboxEventType` to assert the equality for every published event type, over a table rather than one pair.
+- [ ] 4.4 Assert `TerminalEventsTopology`'s returned descriptor field-by-field against the pinned table, the way the dispatch topology's values are pinned — names, both routing keys, and every argument.
 
 ## 5. `cmd/worker` wiring
 
