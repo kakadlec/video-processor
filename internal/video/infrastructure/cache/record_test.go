@@ -40,7 +40,7 @@ func mustVideoJob(t *testing.T, status domain.JobStatus, storageKey string, fram
 			t.Fatalf("NewStorageKey: %v", err)
 		}
 	}
-	job, err := domain.RestoreVideoJob(id, userID, filename, domain.StorageKey{}, "", key, frameCount, errorReason, status, time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	job, err := domain.RestoreVideoJob(id, userID, filename, domain.StorageKey{}, "", key, frameCount, errorReason, status, time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), 0)
 	if err != nil {
 		t.Fatalf("RestoreVideoJob: %v", err)
 	}
@@ -149,4 +149,63 @@ func TestCachedJobRecord_ToVideoJob_RejectsInvalidJobID(t *testing.T) {
 	if _, err := rec.toVideoJob(stubIDParser{}); err == nil {
 		t.Fatal("toVideoJob succeeded with an empty job id, want an error")
 	}
+}
+
+// TestCachedJobRecord_MissingEpochDecodesToZero pins the compatibility half
+// of adding the field. Entries written by the previous build are still in
+// Redis for the whole of their TTL after a deploy, and a decode that failed
+// on them would turn every one into a cache miss — or worse, an error on a
+// path whose whole job is to be transparent.
+func TestCachedJobRecord_MissingEpochDecodesToZero(t *testing.T) {
+	const withoutEpoch = `{"id":"11111111-1111-4111-8111-111111111111","user_id":"user-1","original_filename":"video.mp4","status":"processing","created_at":"2026-01-01T12:00:00Z"}`
+
+	var record cachedJobRecord
+	if err := json.Unmarshal([]byte(withoutEpoch), &record); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if record.LeaseEpoch != 0 {
+		t.Fatalf("record.LeaseEpoch = %d, want 0", record.LeaseEpoch)
+	}
+
+	job, err := record.toVideoJob(stubIDParser{})
+	if err != nil {
+		t.Fatalf("toVideoJob: %v", err)
+	}
+	if job.LeaseEpoch() != 0 {
+		t.Fatalf("job.LeaseEpoch() = %d, want 0", job.LeaseEpoch())
+	}
+}
+
+// TestCachedJobRecord_RoundTripsTheLeaseEpoch is the other half: a non-zero
+// epoch has to survive the round trip, or a reader would see a fence the row
+// has already moved past.
+func TestCachedJobRecord_RoundTripsTheLeaseEpoch(t *testing.T) {
+	job := mustVideoJobAtEpoch(t, domain.JobStatusProcessing, 4)
+
+	data, err := json.Marshal(newCachedJobRecord(job))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var record cachedJobRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	restored, err := record.toVideoJob(stubIDParser{})
+	if err != nil {
+		t.Fatalf("toVideoJob: %v", err)
+	}
+	if restored.LeaseEpoch() != 4 {
+		t.Fatalf("restored.LeaseEpoch() = %d, want 4", restored.LeaseEpoch())
+	}
+}
+
+func mustVideoJobAtEpoch(t *testing.T, status domain.JobStatus, epoch int64) *domain.VideoJob {
+	t.Helper()
+
+	base := mustVideoJob(t, status, "", 0, "")
+	job, err := domain.RestoreVideoJob(base.ID(), base.UserID(), base.OriginalFilename(), base.SourceKey(), base.ContentHash(), base.StorageKey(), base.FrameCount(), base.ErrorReason(), base.Status(), base.CreatedAt(), epoch)
+	if err != nil {
+		t.Fatalf("RestoreVideoJob: %v", err)
+	}
+	return job
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"video-processor/internal/video/domain"
 )
@@ -23,7 +24,23 @@ const fallbackFailureReason = "video processing failed"
 const (
 	storeFailureReason = "failed to store the extracted result"
 	fetchFailureReason = "failed to retrieve the uploaded video"
+	// abandonedFailureReason is what the recovery sweep records for a job it
+	// has given up on: one that has exhausted its requeues, or that carries
+	// no source key to re-dispatch. Like the two above it is persisted and
+	// echoed to the uploader, so it names no broker, store, or endpoint.
+	abandonedFailureReason = "video processing was interrupted and could not be recovered"
 )
+
+// leaseRenewInterval is how often a running extraction renews its job lease.
+// It must stay comfortably below the adapter's lease TTL
+// (internal/video/infrastructure/lease.TTL, 90s): the margin is what absorbs
+// a slow Redis round trip or a scheduling delay without a live job appearing
+// abandoned. A constant rather than configuration, for the same reason the
+// TTL is one — the pair is a correctness margin, not a deployment preference.
+//
+// The constant is duplicated in spirit rather than imported: the application
+// layer does not depend on an infrastructure adapter.
+const leaseRenewInterval = 30 * time.Second
 
 // tempDirName is where the source video is downloaded for ffmpeg, matching
 // the directory the extractor writes its own frames and zip into.
@@ -46,6 +63,16 @@ type ProcessVideoJobResult struct {
 	ImageNames    []string
 	StorageKey    string
 	FailureReason string
+	// LeaseEpoch is the fence epoch the claim won and this run held
+	// throughout. The caller carries it into its own terminal write.
+	LeaseEpoch int64
+	// Applied reports whether the failure write this use case made is the
+	// one that landed, as opposed to matching a terminal row another actor
+	// had already committed. It is meaningful only when Success is false —
+	// the caller's cleanup of the source object and the idempotency key is
+	// one-shot and rides on it. A successful run makes no terminal write at
+	// all; its caller reads CompleteJob's own outcome instead.
+	Applied bool
 	// ExtractionError is the error that caused Success to be false —
 	// from domain.FrameExtractor, from retrieving the source, or from
 	// storing the result — unwrapped so a caller can classify it (e.g. via
@@ -112,12 +139,121 @@ type ProcessVideoJob struct {
 	extractor domain.FrameExtractor
 	sources   domain.SourceStorage
 	results   domain.ResultStorage
+	leases    domain.JobLeaseStore
 	idsFor    domain.VideoJobIDParser
+	newTicker LeaseTickerFunc
+}
+
+// LeaseTicker is the seam the lease heartbeat ticks on. It exists so a test
+// can drive renewal without waiting out a renewal period in wall-clock time;
+// the default is time.Ticker.
+type LeaseTicker interface {
+	Ticks() <-chan time.Time
+	Stop()
+}
+
+// LeaseTickerFunc builds a LeaseTicker for a period.
+type LeaseTickerFunc func(time.Duration) LeaseTicker
+
+// ProcessVideoJobOption customizes the use case at construction.
+type ProcessVideoJobOption func(*ProcessVideoJob)
+
+// WithLeaseTicker replaces the heartbeat's ticker source.
+func WithLeaseTicker(newTicker LeaseTickerFunc) ProcessVideoJobOption {
+	return func(uc *ProcessVideoJob) { uc.newTicker = newTicker }
+}
+
+type realLeaseTicker struct{ ticker *time.Ticker }
+
+func (t realLeaseTicker) Ticks() <-chan time.Time { return t.ticker.C }
+func (t realLeaseTicker) Stop()                   { t.ticker.Stop() }
+
+func newRealLeaseTicker(d time.Duration) LeaseTicker {
+	return realLeaseTicker{ticker: time.NewTicker(d)}
 }
 
 // NewProcessVideoJob wires the ProcessVideoJob use case to its dependencies.
-func NewProcessVideoJob(start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, idsFor domain.VideoJobIDParser) *ProcessVideoJob {
-	return &ProcessVideoJob{start: start, fail: fail, extractor: extractor, sources: sources, results: results, idsFor: idsFor}
+func NewProcessVideoJob(start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, idsFor domain.VideoJobIDParser, opts ...ProcessVideoJobOption) *ProcessVideoJob {
+	uc := &ProcessVideoJob{
+		start:     start,
+		fail:      fail,
+		extractor: extractor,
+		sources:   sources,
+		results:   results,
+		leases:    leases,
+		idsFor:    idsFor,
+		newTicker: newRealLeaseTicker,
+	}
+	for _, opt := range opts {
+		opt(uc)
+	}
+	return uc
+}
+
+// holdLease takes the job's lease at the epoch the claim won and keeps
+// renewing it until the returned stop function is called, which also joins
+// the renewing goroutine.
+//
+// Acquisition and renewal failures are logged and the run continues. The job
+// is already protected by the unconditional claim; being invisible to the
+// recovery sweep costs at most one duplicated extraction, which the fence
+// resolves. That is the fail-open half of the posture — deciding a lease has
+// lapsed is the half that fails closed, and it lives in the sweep.
+//
+// A renewal the store refuses is not by itself evidence of a takeover: the
+// same false answer covers an absent key, which is what a failed initial
+// acquire or a lapse during a Redis outage leaves behind. Acquire is the
+// discriminator — it recreates an absent or older lease and refuses only a
+// newer holder — so a refused renewal re-acquires, and only a refused
+// re-acquire stops the loop. Without that, one unreachable moment would
+// leave a live extraction unleased for the rest of its run and the sweep
+// would requeue it.
+//
+// It does not release the lease. Release happens after the outcome is
+// committed, which is the caller's moment, not this one's.
+func (uc *ProcessVideoJob) holdLease(ctx context.Context, id domain.VideoJobID, epoch int64) func() {
+	if acquired, err := uc.leases.Acquire(ctx, id, epoch); err != nil {
+		log.Printf("acquire lease for job %s at epoch %d: %v", id.String(), epoch, err)
+	} else if !acquired {
+		log.Printf("lease for job %s already held at a newer epoch than %d", id.String(), epoch)
+	}
+
+	renewCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := uc.newTicker(leaseRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.Ticks():
+				renewed, err := uc.leases.Renew(renewCtx, id, epoch)
+				if err != nil {
+					log.Printf("renew lease for job %s at epoch %d: %v", id.String(), epoch, err)
+					continue
+				}
+				if renewed {
+					continue
+				}
+				reacquired, err := uc.leases.Acquire(renewCtx, id, epoch)
+				if err != nil {
+					log.Printf("reacquire lease for job %s at epoch %d: %v", id.String(), epoch, err)
+					continue
+				}
+				if !reacquired {
+					log.Printf("lease for job %s taken over at an epoch newer than %d, stopping renewal", id.String(), epoch)
+					return
+				}
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // Execute runs jobID's start-processing/fetch/extract/store sequence against
@@ -128,18 +264,25 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 		return ProcessVideoJobResult{}, err
 	}
 
-	if _, err := uc.start.Execute(ctx, jobID); err != nil {
+	claim, err := uc.start.Execute(ctx, jobID)
+	if err != nil {
 		return ProcessVideoJobResult{}, err
 	}
+	epoch := claim.LeaseEpoch
+
+	// The lease starts the moment the claim is won and stops before this
+	// function returns, so no goroutine outlives the run it belongs to.
+	stopLease := uc.holdLease(ctx, id, epoch)
+	defer stopLease()
 
 	videoPath, err := localSourcePath(id)
 	if err != nil {
 		log.Printf("build local source path for job %s: %v", jobID, err)
-		return uc.failWith(jobID, err, fetchFailureReason)
+		return uc.failWith(jobID, epoch, err, fetchFailureReason)
 	}
 	if err := uc.sources.Get(ctx, sourceKey, videoPath); err != nil {
 		log.Printf("fetch source %s for job %s: %v", sourceKey.String(), jobID, err)
-		return uc.failWith(jobID, err, fetchFailureReason)
+		return uc.failWith(jobID, epoch, err, fetchFailureReason)
 	}
 	// Registered before extraction, not after: the extraction-error path
 	// below returns, so a defer set up afterwards would never run and the
@@ -152,7 +295,7 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 
 	zipPath, frameCount, imageNames, extractErr := uc.extractor.ExtractFrames(ctx, id, videoPath)
 	if extractErr != nil {
-		return uc.failWith(jobID, extractErr, extractErr.Error())
+		return uc.failWith(jobID, epoch, extractErr, extractErr.Error())
 	}
 	// Same ordering rule as the source copy above, for the same reason: the
 	// Put-error path returns.
@@ -165,7 +308,7 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 	storageKey := domain.ResultStorageKey(id)
 	if err := uc.results.Put(ctx, storageKey, zipPath); err != nil {
 		log.Printf("store result %s for job %s: %v", storageKey.String(), jobID, err)
-		return uc.failWith(jobID, err, storeFailureReason)
+		return uc.failWith(jobID, epoch, err, storeFailureReason)
 	}
 
 	return ProcessVideoJobResult{
@@ -174,6 +317,7 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 		FrameCount: frameCount,
 		ImageNames: imageNames,
 		StorageKey: storageKey.String(),
+		LeaseEpoch: epoch,
 	}, nil
 }
 
@@ -202,7 +346,14 @@ func localSourcePath(jobID domain.VideoJobID) (string, error) {
 // differ in what may be persisted — extraction echoes ffmpeg's own message,
 // as it always has, while the storage paths must not leak endpoint or
 // bucket.
-func (uc *ProcessVideoJob) failWith(jobID string, cause error, reason string) (ProcessVideoJobResult, error) {
+//
+// The write carries the caller's epoch and can be refused by the fence. That
+// refusal is returned as domain.ErrJobFenced and nothing else is attempted:
+// not a retry without the fence, not a reload, and emphatically not a report
+// of a failed job — this run no longer owns the job, and the actor that does
+// will record its own outcome. The deferred cleanup of the local copy still
+// runs, because it is registered above this call.
+func (uc *ProcessVideoJob) failWith(jobID string, epoch int64, cause error, reason string) (ProcessVideoJobResult, error) {
 	if reason == "" {
 		reason = fallbackFailureReason
 	}
@@ -212,8 +363,16 @@ func (uc *ProcessVideoJob) failWith(jobID string, cause error, reason string) (P
 	// reaches "failed" rather than being stuck wherever it was.
 	finalizeCtx, cancel := NewFinalizationContext()
 	defer cancel()
-	if _, err := uc.fail.Execute(finalizeCtx, FailJobInput{JobID: jobID, Reason: reason}); err != nil {
-		return ProcessVideoJobResult{}, err
+	failed, err := uc.fail.Execute(finalizeCtx, FailJobInput{JobID: jobID, Reason: reason, LeaseEpoch: epoch})
+	if err != nil {
+		return ProcessVideoJobResult{JobID: jobID, LeaseEpoch: epoch}, err
 	}
-	return ProcessVideoJobResult{JobID: jobID, Success: false, FailureReason: reason, ExtractionError: cause}, nil
+	return ProcessVideoJobResult{
+		JobID:           jobID,
+		Success:         false,
+		FailureReason:   reason,
+		ExtractionError: cause,
+		LeaseEpoch:      epoch,
+		Applied:         failed.Applied,
+	}, nil
 }

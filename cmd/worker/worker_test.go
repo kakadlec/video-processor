@@ -33,6 +33,7 @@ import (
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
+	videolease "video-processor/internal/video/infrastructure/lease"
 	videomessaging "video-processor/internal/video/infrastructure/messaging"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 	videostorage "video-processor/internal/video/infrastructure/storage"
@@ -309,6 +310,8 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 	keys := videoidempotency.NewRedisStore(redisClient)
 	extractor := newGatedExtractor(opts.release)
 
+	leases := videolease.NewRedisStore(redisClient)
+
 	deps := &workerDeps{
 		// Empty when RABBITMQ_TEST_URL is unset, which is fine: the tests
 		// that dial call testBrokerURL themselves and skip without it.
@@ -316,16 +319,22 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 		db:     db,
 		redis:  redisClient,
 		process: videoapplication.NewProcessVideoJob(
-			videoapplication.NewStartProcessing(repo, ids),
-			videoapplication.NewFailJob(repo, ids),
+			videoapplication.NewStartProcessing(plain, repo, ids),
+			videoapplication.NewFailJob(plain, repo, ids),
 			extractor,
 			sources,
 			results,
+			leases,
 			ids,
 		),
-		complete: videoapplication.NewCompleteJob(repo, ids),
-		clearKey: videoapplication.NewClearJobIdempotencyKey(plain, keys, ids),
-		sources:  sources,
+		complete:  videoapplication.NewCompleteJob(plain, repo, ids),
+		fail:      videoapplication.NewFailJob(plain, repo, ids),
+		clearKey:  videoapplication.NewClearJobIdempotencyKey(plain, keys, ids),
+		sources:   sources,
+		leases:    leases,
+		ids:       ids,
+		jobReader: plain,
+		jobWriter: repo,
 	}
 
 	if err := createDirs(); err != nil {
@@ -549,14 +558,23 @@ func queueDepth(t *testing.T, conn *amqp.Connection, queue string) int {
 }
 
 // startWorker runs the process's own run() in the background and hands back
-// the cancellation that stands in for SIGTERM.
+// the cancellation that stands in for SIGTERM. The sweep interval is set far
+// beyond any test's lifetime, so the recovery sweep never fires here: these
+// tests are about the consumer, and a sweep racing them would requeue jobs
+// out from under their assertions. The tests that are about the sweep use
+// startWorkerSweeping.
 func startWorker(t *testing.T, env *workerTestEnv, topo platformrabbitmq.Topology, drain time.Duration) (context.CancelFunc, <-chan struct{}) {
+	t.Helper()
+	return startWorkerSweeping(t, env, topo, drain, time.Hour)
+}
+
+func startWorkerSweeping(t *testing.T, env *workerTestEnv, topo platformrabbitmq.Topology, drain, sweep time.Duration) (context.CancelFunc, <-chan struct{}) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		run(ctx, env.deps, topo, drain)
+		run(ctx, env.deps, topo, drain, sweep)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -688,7 +706,7 @@ func TestHandle_DuplicateDispatchIsDeadLetteredWithoutASecondExtraction(t *testi
 	if err := winner.StartProcessing(); err != nil {
 		t.Fatalf("claim job for the winner: %v", err)
 	}
-	claimed, err := env.repo.ClaimForProcessing(ctx, winner)
+	claimed, _, err := env.repo.ClaimForProcessing(ctx, winner)
 	if err != nil {
 		t.Fatalf("persist the winner's claim: %v", err)
 	}
@@ -846,11 +864,11 @@ type failCompletionRepository struct {
 	err error
 }
 
-func (r failCompletionRepository) Update(ctx context.Context, job *videodomain.VideoJob) error {
+func (r failCompletionRepository) Update(ctx context.Context, job *videodomain.VideoJob, epoch int64) (bool, error) {
 	if job.Status() == videodomain.JobStatusCompleted {
-		return r.err
+		return false, r.err
 	}
-	return r.VideoJobRepository.Update(ctx, job)
+	return r.VideoJobRepository.Update(ctx, job, epoch)
 }
 
 // deleteQueue removes a queue out from under a running consumer, which is

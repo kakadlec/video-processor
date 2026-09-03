@@ -13,7 +13,7 @@ func TestFailJob_TransitionsAndPersistsReason(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newProcessingRepoJob(t, repo, "job-1", "user-1")
 
-	uc := application.NewFailJob(repo, fakeVideoJobIDParser{})
+	uc := application.NewFailJob(repo, repo, fakeVideoJobIDParser{})
 	result, err := uc.Execute(context.Background(), application.FailJobInput{
 		JobID:  "job-1",
 		Reason: "ffmpeg exploded",
@@ -39,7 +39,7 @@ func TestFailJob_TransitionsAndPersistsReason(t *testing.T) {
 
 func TestFailJob_NonexistentJob_ReturnsNotFound(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	uc := application.NewFailJob(repo, fakeVideoJobIDParser{})
+	uc := application.NewFailJob(repo, repo, fakeVideoJobIDParser{})
 
 	_, err := uc.Execute(context.Background(), application.FailJobInput{JobID: "missing-job", Reason: "boom"})
 	if !errors.Is(err, domain.ErrVideoJobNotFound) {
@@ -51,7 +51,7 @@ func TestFailJob_EmptyReason_ReturnsError(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newProcessingRepoJob(t, repo, "job-1", "user-1")
 
-	uc := application.NewFailJob(repo, fakeVideoJobIDParser{})
+	uc := application.NewFailJob(repo, repo, fakeVideoJobIDParser{})
 	_, err := uc.Execute(context.Background(), application.FailJobInput{JobID: "job-1", Reason: ""})
 	if !errors.Is(err, domain.ErrFailureReasonRequired) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrFailureReasonRequired)

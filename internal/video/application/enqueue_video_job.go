@@ -12,6 +12,17 @@ import (
 type TransitionResult struct {
 	JobID  string
 	Status string
+	// LeaseEpoch is the fence epoch the transition ran under. StartProcessing
+	// reports the epoch its claim returned, and the winner must carry that
+	// value through to its terminal write rather than re-reading it: a later
+	// read can only pick up a successor's.
+	LeaseEpoch int64
+	// Applied distinguishes "this call wrote the row" from "the row already
+	// carried exactly this outcome". Only the terminal writes can report
+	// false, and only for a caller finding its own earlier commit after a
+	// lost response — which is a success, but not one that licenses the
+	// one-shot cleanup of a job's source object and idempotency key.
+	Applied bool
 }
 
 // EnqueueVideoJob loads a VideoJob by ID, transitions it from pending to
@@ -50,5 +61,5 @@ func (uc *EnqueueVideoJob) Execute(ctx context.Context, jobID string) (Transitio
 		return TransitionResult{}, err
 	}
 
-	return TransitionResult{JobID: job.ID().String(), Status: string(job.Status())}, nil
+	return TransitionResult{JobID: job.ID().String(), Status: string(job.Status()), LeaseEpoch: job.LeaseEpoch(), Applied: true}, nil
 }

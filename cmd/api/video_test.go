@@ -211,7 +211,7 @@ func newInMemoryVideoJobRepository() *inMemoryVideoJobRepository {
 }
 
 func cloneVideoJob(job *videodomain.VideoJob) *videodomain.VideoJob {
-	clone, err := videodomain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt())
+	clone, err := videodomain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt(), job.LeaseEpoch())
 	if err != nil {
 		panic("inMemoryVideoJobRepository: failed to clone video job: " + err.Error())
 	}
@@ -235,14 +235,59 @@ func (r *inMemoryVideoJobRepository) FindByID(_ context.Context, id videodomain.
 	return cloneVideoJob(job), nil
 }
 
-func (r *inMemoryVideoJobRepository) Update(_ context.Context, job *videodomain.VideoJob) error {
+// Update mirrors the real adapter's fence: it writes only when the stored
+// row is still processing at the caller's epoch, and reports whether it did.
+func (r *inMemoryVideoJobRepository) Update(_ context.Context, job *videodomain.VideoJob, epoch int64) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.byID[job.ID().String()]; !ok {
-		return videodomain.ErrVideoJobNotFound
+	stored, ok := r.byID[job.ID().String()]
+	if !ok {
+		return false, videodomain.ErrVideoJobNotFound
+	}
+	if stored.Status() != videodomain.JobStatusProcessing || stored.LeaseEpoch() != epoch {
+		return false, videodomain.ErrJobFenced
 	}
 	r.byID[job.ID().String()] = cloneVideoJob(job)
-	return nil
+	return true, nil
+}
+
+// Requeue mirrors the recovery edge: conditional on the stored row still
+// being processing at the observed epoch.
+func (r *inMemoryVideoJobRepository) Requeue(_ context.Context, job *videodomain.VideoJob, observedEpoch int64) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stored, ok := r.byID[job.ID().String()]
+	if !ok {
+		return false, videodomain.ErrVideoJobNotFound
+	}
+	if stored.Status() != videodomain.JobStatusProcessing || stored.LeaseEpoch() != observedEpoch {
+		return false, nil
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(job)
+	return true, nil
+}
+
+func (r *inMemoryVideoJobRepository) FindProcessing(_ context.Context, after videodomain.VideoJobID, limit int) ([]*videodomain.VideoJob, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var matches []*videodomain.VideoJob
+	for _, job := range r.byID {
+		if job.Status() != videodomain.JobStatusProcessing {
+			continue
+		}
+		if !after.IsZero() && job.ID().String() <= after.String() {
+			continue
+		}
+		matches = append(matches, cloneVideoJob(job))
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].ID().String() < matches[j].ID().String()
+	})
+	if limit > 0 && len(matches) > limit {
+		matches = matches[:limit]
+	}
+	return matches, nil
 }
 
 func (r *inMemoryVideoJobRepository) Enqueue(_ context.Context, job *videodomain.VideoJob) error {
@@ -264,18 +309,18 @@ func (r *inMemoryVideoJobRepository) Enqueue(_ context.Context, job *videodomain
 
 // ClaimForProcessing mirrors the real adapter: it writes only when the
 // stored row is still queued, and reports whether it did.
-func (r *inMemoryVideoJobRepository) ClaimForProcessing(_ context.Context, job *videodomain.VideoJob) (bool, error) {
+func (r *inMemoryVideoJobRepository) ClaimForProcessing(_ context.Context, job *videodomain.VideoJob) (bool, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	stored, ok := r.byID[job.ID().String()]
 	if !ok {
-		return false, videodomain.ErrVideoJobNotFound
+		return false, 0, videodomain.ErrVideoJobNotFound
 	}
 	if stored.Status() != videodomain.JobStatusQueued {
-		return false, nil
+		return false, 0, nil
 	}
 	r.byID[job.ID().String()] = cloneVideoJob(job)
-	return true, nil
+	return true, stored.LeaseEpoch(), nil
 }
 
 func (r *inMemoryVideoJobRepository) FindByUserID(_ context.Context, userID videodomain.UserID, offset, limit int) ([]*videodomain.VideoJob, error) {
@@ -989,13 +1034,15 @@ func writeTestUploadContent(t *testing.T, content []byte) string {
 func driveJobToCompleted(t *testing.T, m *videoModule, jobID string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := videoapplication.NewStartProcessing(m.jobs, m.idsFor).Execute(ctx, jobID); err != nil {
+	claim, err := videoapplication.NewStartProcessing(m.jobs, m.jobs, m.idsFor).Execute(ctx, jobID)
+	if err != nil {
 		t.Fatalf("start processing %s: %v", jobID, err)
 	}
-	if _, err := videoapplication.NewCompleteJob(m.jobs, m.idsFor).Execute(ctx, videoapplication.CompleteJobInput{
+	if _, err := videoapplication.NewCompleteJob(m.jobs, m.jobs, m.idsFor).Execute(ctx, videoapplication.CompleteJobInput{
 		JobID:      jobID,
 		StorageKey: "frames_" + jobID + ".zip",
 		FrameCount: 3,
+		LeaseEpoch: claim.LeaseEpoch,
 	}); err != nil {
 		t.Fatalf("complete %s: %v", jobID, err)
 	}
@@ -1004,12 +1051,14 @@ func driveJobToCompleted(t *testing.T, m *videoModule, jobID string) {
 func driveJobToFailed(t *testing.T, m *videoModule, jobID, reason string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := videoapplication.NewStartProcessing(m.jobs, m.idsFor).Execute(ctx, jobID); err != nil {
+	claim, err := videoapplication.NewStartProcessing(m.jobs, m.jobs, m.idsFor).Execute(ctx, jobID)
+	if err != nil {
 		t.Fatalf("start processing %s: %v", jobID, err)
 	}
-	if _, err := videoapplication.NewFailJob(m.jobs, m.idsFor).Execute(ctx, videoapplication.FailJobInput{
-		JobID:  jobID,
-		Reason: reason,
+	if _, err := videoapplication.NewFailJob(m.jobs, m.jobs, m.idsFor).Execute(ctx, videoapplication.FailJobInput{
+		JobID:      jobID,
+		Reason:     reason,
+		LeaseEpoch: claim.LeaseEpoch,
 	}); err != nil {
 		t.Fatalf("fail %s: %v", jobID, err)
 	}

@@ -87,6 +87,14 @@ type VideoJob struct {
 	errorReason string
 	status      JobStatus
 	createdAt   time.Time
+	// leaseEpoch counts how many times this job has been requeued after
+	// being abandoned, and doubles as the fence identifying the holder of
+	// the current run: a terminal write carrying a superseded epoch is
+	// refused. It is deliberately not paired with any status — every status
+	// is reachable at every epoch, and the column ships with a default that
+	// must keep pre-existing rows loadable, exactly as sourceKey and
+	// contentHash do.
+	leaseEpoch int64
 }
 
 // NewVideoJob creates a brand-new VideoJob, minting its VideoJobID through
@@ -96,7 +104,7 @@ func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename Original
 	if generator == nil {
 		return nil, ErrVideoJobIDGeneratorRequired
 	}
-	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, contentHash, StorageKey{}, 0, "", JobStatusPending, createdAt)
+	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, contentHash, StorageKey{}, 0, "", JobStatusPending, createdAt, 0)
 }
 
 // RestoreVideoJob reconstructs a VideoJob from already-known, already-validated values, e.g. from storage.
@@ -109,7 +117,9 @@ func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename Original
 // time with no obvious cause. The invariant lives on Enqueue instead.
 // contentHash is unpaired for the same reason: its column also ships with an
 // empty default, so every row written before it existed must stay loadable.
-func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, sourceKey StorageKey, contentHash string, storageKey StorageKey, frameCount int, errorReason string, status JobStatus, createdAt time.Time) (*VideoJob, error) {
+// leaseEpoch is int64 rather than int so that transposing it with frameCount
+// — the only other numeric parameter — is a compile error.
+func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, sourceKey StorageKey, contentHash string, storageKey StorageKey, frameCount int, errorReason string, status JobStatus, createdAt time.Time, leaseEpoch int64) (*VideoJob, error) {
 	if id.IsZero() {
 		return nil, ErrVideoJobIDRequired
 	}
@@ -146,6 +156,7 @@ func RestoreVideoJob(id VideoJobID, userID UserID, filename OriginalFilename, so
 		errorReason:      errorReason,
 		status:           status,
 		createdAt:        createdAt,
+		leaseEpoch:       leaseEpoch,
 	}, nil
 }
 
@@ -201,6 +212,13 @@ func (j *VideoJob) CreatedAt() time.Time {
 	return j.createdAt
 }
 
+// LeaseEpoch returns the job's current fence epoch — the number of times it
+// has been requeued after abandonment. Zero for a job that has never been
+// recovered.
+func (j *VideoJob) LeaseEpoch() int64 {
+	return j.leaseEpoch
+}
+
 // Enqueue transitions the job from pending to queued. A job with no source
 // key is rejected: there is nothing for a worker to fetch, so queueing it
 // would produce a dispatch that can only fail.
@@ -214,6 +232,37 @@ func (j *VideoJob) Enqueue() error {
 // StartProcessing transitions the job from queued to processing.
 func (j *VideoJob) StartProcessing() error {
 	return j.transitionTo(JobStatusProcessing)
+}
+
+// Requeue transitions an abandoned job from processing back to queued so it
+// can be dispatched again, advancing the lease epoch by one. That advance is
+// the fence: it is what makes the previous holder's terminal write refuse to
+// apply, and it mirrors the lease_epoch = lease_epoch + 1 the conditional
+// statement applies, so a caller has the advanced value without a second read.
+//
+// A job with no source key is rejected with the same sentinel Enqueue uses:
+// a re-dispatch naming no stored object is a message no worker can act on.
+//
+// It deliberately does not route through Enqueue. The two edges differ in
+// origin status and in who may walk them — a submitter queues a pending job,
+// only the recovery sweep requeues a processing one.
+//
+// The origin status is checked here rather than left to the transition
+// table, which cannot express it: the table's queued row is reachable from
+// both pending and processing, so a table-only Requeue would accept a
+// pending job and advance its epoch for an abandonment that never happened.
+func (j *VideoJob) Requeue() error {
+	if j.status != JobStatusProcessing {
+		return ErrInvalidStatusTransition
+	}
+	if j.sourceKey.IsZero() {
+		return ErrSourceKeyRequiredToEnqueue
+	}
+	if err := j.transitionTo(JobStatusQueued); err != nil {
+		return err
+	}
+	j.leaseEpoch++
+	return nil
 }
 
 // Complete transitions the job from processing to completed, recording its

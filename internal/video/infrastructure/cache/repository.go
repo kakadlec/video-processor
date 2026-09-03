@@ -83,6 +83,7 @@ type cachedJobRecord struct {
 	ErrorReason      string    `json:"error_reason,omitempty"`
 	Status           string    `json:"status"`
 	CreatedAt        time.Time `json:"created_at"`
+	LeaseEpoch       int64     `json:"lease_epoch,omitempty"`
 }
 
 func newCachedJobRecord(job *domain.VideoJob) cachedJobRecord {
@@ -97,6 +98,7 @@ func newCachedJobRecord(job *domain.VideoJob) cachedJobRecord {
 		ErrorReason:      job.ErrorReason(),
 		Status:           string(job.Status()),
 		CreatedAt:        job.CreatedAt(),
+		LeaseEpoch:       job.LeaseEpoch(),
 	}
 }
 
@@ -139,7 +141,10 @@ func (rec cachedJobRecord) toVideoJob(idParser domain.VideoJobIDParser) (*domain
 			return nil, fmt.Errorf("cache: stored storage key is invalid: %w", err)
 		}
 	}
-	return domain.RestoreVideoJob(id, userID, filename, sourceKey, rec.ContentHash, storageKey, rec.FrameCount, rec.ErrorReason, domain.JobStatus(rec.Status), rec.CreatedAt)
+	// LeaseEpoch is omitempty, so a record written by a previous release
+	// carries no field at all and decodes to zero — the same value a job
+	// that has never been requeued holds.
+	return domain.RestoreVideoJob(id, userID, filename, sourceKey, rec.ContentHash, storageKey, rec.FrameCount, rec.ErrorReason, domain.JobStatus(rec.Status), rec.CreatedAt, rec.LeaseEpoch)
 }
 
 func cacheKey(id domain.VideoJobID) string {
@@ -297,12 +302,50 @@ func (r *CachedVideoJobRepository) writeCacheIfAbsent(ctx context.Context, job *
 // (falls back to PostgreSQL next time) rather than staying stale; either
 // failure is logged, and Update still reports success, since the
 // PostgreSQL write it's responsible for already committed.
-func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.VideoJob) error {
-	if err := r.inner.Update(ctx, job); err != nil {
-		return err
+//
+// The write-through is conditional on the inner write having been *applied*.
+// A fenced Update returns the sentinel and wrote nothing; an already-present
+// one matched a row another call committed. In both cases the caller's
+// in-memory job describes a state it does not own, and caching it would
+// publish that view over the row's.
+func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
+	applied, err := r.inner.Update(ctx, job, epoch)
+	if err != nil {
+		// A fence is a decided outcome, not an ambiguous one: the statement
+		// ran and matched nothing, so the entry standing in Redis is the
+		// winner's and must be left alone.
+		if !errors.Is(err, domain.ErrJobFenced) {
+			r.invalidateAfterAmbiguousWrite(job.ID())
+		}
+		return applied, err
 	}
-	r.writeThrough(job)
-	return nil
+	if !applied {
+		return false, nil
+	}
+	r.writeThrough(newCachedJobRecord(job))
+	return true, nil
+}
+
+// invalidateAfterAmbiguousWrite best-effort drops job's cache entry after an
+// inner write returned an error. The error does not say whether the row
+// changed — a connection lost after PostgreSQL committed reports exactly like
+// one lost before it — so the entry can no longer be vouched for, and
+// deleting degrades it to a miss the next read repopulates from the
+// authority.
+//
+// Leaving it is not the harmless option it looks like. The entry a terminal
+// write finds in front of it is the claim's, reading processing, and the
+// retry that follows an ambiguous commit now short-circuits on finding its
+// own committed outcome (see application.classifyRefusedTransition) rather
+// than writing again — so no later write-through would refresh it, and
+// GET /api/video-jobs/:id would report processing for a finished job until
+// the entry expired on its own.
+func (r *CachedVideoJobRepository) invalidateAfterAmbiguousWrite(id domain.VideoJobID) {
+	cleanupCtx, cancel := detachedCleanupContext()
+	defer cancel()
+	if err := r.client.Del(cleanupCtx, cacheKey(id)).Err(); err != nil {
+		log.Printf("video: cache: invalidate %s: %v", id.String(), err)
+	}
 }
 
 // Enqueue implements domain.VideoJobRepository as write-through, exactly
@@ -316,9 +359,10 @@ func (r *CachedVideoJobRepository) Update(ctx context.Context, job *domain.Video
 // would report pending for a job PostgreSQL already has as queued.
 func (r *CachedVideoJobRepository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	if err := r.inner.Enqueue(ctx, job); err != nil {
+		r.invalidateAfterAmbiguousWrite(job.ID())
 		return err
 	}
-	r.writeThrough(job)
+	r.writeThrough(newCachedJobRecord(job))
 	return nil
 }
 
@@ -336,30 +380,144 @@ func (r *CachedVideoJobRepository) Enqueue(ctx context.Context, job *domain.Vide
 // It deliberately does not pass through uncached the way Create does — a
 // won claim is a real state transition, and leaving a queued entry behind
 // would contradict the row for up to entryTTL.
-func (r *CachedVideoJobRepository) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, error) {
-	claimed, err := r.inner.ClaimForProcessing(ctx, job)
-	if err != nil || !claimed {
-		return claimed, err
+//
+// The entry carries the epoch the claim itself reported, not the one on the
+// aggregate passed in — those differ whenever the caller loaded the job
+// before a requeue advanced it, and caching the aggregate's would hand the
+// next reader an epoch that fences its own writes.
+func (r *CachedVideoJobRepository) ClaimForProcessing(ctx context.Context, job *domain.VideoJob) (bool, int64, error) {
+	claimed, epoch, err := r.inner.ClaimForProcessing(ctx, job)
+	if err != nil {
+		r.invalidateAfterAmbiguousWrite(job.ID())
+		return claimed, epoch, err
 	}
-	r.writeThrough(job)
+	if !claimed {
+		return false, epoch, nil
+	}
+	record := newCachedJobRecord(job)
+	record.LeaseEpoch = epoch
+	r.writeThrough(record)
+	return true, epoch, nil
+}
+
+// Requeue implements domain.VideoJobRepository as a conditional
+// write-through, on the same reasoning as ClaimForProcessing: only a sweep
+// that actually moved the row may publish its view.
+//
+// It deliberately does not pass through uncached. A requeue written past the
+// decorator would leave a processing entry standing for its full TTL, and
+// GET /api/video-jobs/:id would keep reporting processing for a job already
+// re-dispatched.
+func (r *CachedVideoJobRepository) Requeue(ctx context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
+	requeued, err := r.inner.Requeue(ctx, job, observedEpoch)
+	if err != nil {
+		r.invalidateAfterAmbiguousWrite(job.ID())
+		return requeued, err
+	}
+	if !requeued {
+		return false, nil
+	}
+	r.writeThrough(newCachedJobRecord(job))
 	return true, nil
 }
 
-// writeThrough overwrites job's cache entry after its authoritative write
-// has already committed. Shared by Update and Enqueue, which differ only in
-// what they persist, never in how the cache follows.
-func (r *CachedVideoJobRepository) writeThrough(job *domain.VideoJob) {
-	data, err := json.Marshal(newCachedJobRecord(job))
+// FindProcessing passes straight through, uncached. It is a multi-row scan,
+// which this per-job cache has nothing to offer — and its only caller is the
+// recovery sweep, whose whole decision rests on reading the authoritative
+// row.
+func (r *CachedVideoJobRepository) FindProcessing(ctx context.Context, after domain.VideoJobID, limit int) ([]*domain.VideoJob, error) {
+	return r.inner.FindProcessing(ctx, after, limit)
+}
+
+// writeThroughIfCurrentScript publishes a committed transition only when it
+// is not older than the cache entry already present. PostgreSQL transitions
+// can commit in order while their following Redis calls arrive out of order:
+// for example, a requeue can pause here while its successor claims and
+// completes, then resume and otherwise replace completed with queued.
+//
+// Epoch orders recovery generations. Within one epoch, the status rank orders
+// the forward state machine. Two different terminal outcomes have the same
+// rank and are never allowed to replace one another; PostgreSQL's processing
+// predicate chose exactly one winner, so whichever terminal record reached
+// Redis first is the only one this cache may retain. An identical record is
+// accepted to refresh its TTL. Missing epochs decode to zero for compatibility
+// with entries written before lease fencing existed.
+var writeThroughIfCurrentScript = redis.NewScript(`
+local incomingRaw = ARGV[1]
+local incoming = cjson.decode(incomingRaw)
+local currentRaw = redis.call("GET", KEYS[1])
+
+local function publish()
+	redis.call("SET", KEYS[1], incomingRaw, "PX", ARGV[2])
+	return 1
+end
+
+if not currentRaw then
+	return publish()
+end
+
+local decoded, current = pcall(cjson.decode, currentRaw)
+if not decoded or current.id ~= incoming.id then
+	return publish()
+end
+
+local currentEpoch = tonumber(current.lease_epoch) or 0
+local incomingEpoch = tonumber(incoming.lease_epoch) or 0
+if currentEpoch > incomingEpoch then
+	return 0
+end
+if currentEpoch < incomingEpoch then
+	return publish()
+end
+
+local ranks = {
+	pending = 0,
+	queued = 1,
+	processing = 2,
+	completed = 3,
+	failed = 3
+}
+local currentRank = ranks[current.status]
+local incomingRank = ranks[incoming.status]
+if not currentRank then
+	return publish()
+end
+if currentRank > incomingRank then
+	return 0
+end
+if currentRank < incomingRank then
+	return publish()
+end
+
+if currentRaw == incomingRaw then
+	return publish()
+end
+return 0
+`)
+
+// writeThrough follows an authoritative write with an epoch/status-aware
+// Redis compare-and-set. Shared by every write-through path, it takes the
+// record rather than the aggregate because ClaimForProcessing caches an epoch
+// the aggregate does not carry. If Redis cannot compare the records, the
+// fallback removes the entry: a miss is preferable to retaining a value whose
+// ordering cannot be established.
+func (r *CachedVideoJobRepository) writeThrough(record cachedJobRecord) {
+	data, err := json.Marshal(record)
 	if err != nil {
-		log.Printf("video: cache: marshal %s: %v", job.ID().String(), err)
+		log.Printf("video: cache: marshal %s: %v", record.ID, err)
+		return
+	}
+	id, err := r.idParser.ParseVideoJobID(record.ID)
+	if err != nil {
+		log.Printf("video: cache: write-through id %s: %v", record.ID, err)
 		return
 	}
 	cleanupCtx, cancel := detachedCleanupContext()
 	defer cancel()
-	if err := r.client.Set(cleanupCtx, cacheKey(job.ID()), data, entryTTL).Err(); err != nil {
-		log.Printf("video: cache: write-through set %s: %v", job.ID().String(), err)
-		if delErr := r.client.Del(cleanupCtx, cacheKey(job.ID())).Err(); delErr != nil {
-			log.Printf("video: cache: write-through fallback delete %s: %v", job.ID().String(), delErr)
+	if err := writeThroughIfCurrentScript.Run(cleanupCtx, r.client, []string{cacheKey(id)}, data, entryTTL.Milliseconds()).Err(); err != nil {
+		log.Printf("video: cache: write-through set %s: %v", record.ID, err)
+		if delErr := r.client.Del(cleanupCtx, cacheKey(id)).Err(); delErr != nil {
+			log.Printf("video: cache: write-through fallback delete %s: %v", record.ID, delErr)
 		}
 	}
 }

@@ -272,7 +272,8 @@ func seedCompletedJob(t *testing.T, m *videoModule, userID string) string {
 	if _, err := m.enqueueVideoJob.Execute(ctx, created.JobID); err != nil {
 		t.Fatalf("seed: enqueue job: %v", err)
 	}
-	if _, err := videoapplication.NewStartProcessing(m.jobs, m.idsFor).Execute(ctx, created.JobID); err != nil {
+	claim, err := videoapplication.NewStartProcessing(m.jobs, m.jobs, m.idsFor).Execute(ctx, created.JobID)
+	if err != nil {
 		t.Fatalf("seed: start processing: %v", err)
 	}
 
@@ -284,10 +285,11 @@ func seedCompletedJob(t *testing.T, m *videoModule, userID string) string {
 	if err := m.results.Put(ctx, storageKey, writeSeedZip(t)); err != nil {
 		t.Fatalf("seed: store result: %v", err)
 	}
-	if _, err := videoapplication.NewCompleteJob(m.jobs, m.idsFor).Execute(ctx, videoapplication.CompleteJobInput{
+	if _, err := videoapplication.NewCompleteJob(m.jobs, m.jobs, m.idsFor).Execute(ctx, videoapplication.CompleteJobInput{
 		JobID:      created.JobID,
 		StorageKey: key,
 		FrameCount: seedFrameCount,
+		LeaseEpoch: claim.LeaseEpoch,
 	}); err != nil {
 		t.Fatalf("seed: complete job: %v", err)
 	}

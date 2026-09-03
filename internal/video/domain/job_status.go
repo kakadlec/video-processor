@@ -12,12 +12,22 @@ const (
 )
 
 // validTransitions encodes the state machine's only allowed edges:
-// pending -> queued -> processing -> completed, and processing -> failed.
-// No backwards transitions, no skipping states.
+// pending -> queued -> processing -> completed, and processing -> failed,
+// plus one backwards edge, processing -> queued.
+//
+// That edge is the recovery path and it is the table's only exception. A job
+// whose worker died mid-run is otherwise unreachable: the claim predicate
+// names queued alone so it refuses the processing row, and the broker's
+// redelivery arrives long before any lease can lapse, so nothing else can
+// ever move it. Re-dispatching it is the only way back, and Requeue is the
+// only transition that walks this edge.
+//
+// No other backwards transition exists and no state may be skipped.
+// completed and failed remain terminal: nothing leaves them.
 var validTransitions = map[JobStatus]map[JobStatus]bool{
 	JobStatusPending:    {JobStatusQueued: true},
 	JobStatusQueued:     {JobStatusProcessing: true},
-	JobStatusProcessing: {JobStatusCompleted: true, JobStatusFailed: true},
+	JobStatusProcessing: {JobStatusCompleted: true, JobStatusFailed: true, JobStatusQueued: true},
 	JobStatusCompleted:  {},
 	JobStatusFailed:     {},
 }

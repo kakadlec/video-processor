@@ -33,6 +33,7 @@ import (
 	videoffmpeg "video-processor/internal/video/infrastructure/ffmpeg"
 	videoidempotency "video-processor/internal/video/infrastructure/idempotency"
 	videoidgen "video-processor/internal/video/infrastructure/idgen"
+	videolease "video-processor/internal/video/infrastructure/lease"
 	videomessaging "video-processor/internal/video/infrastructure/messaging"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 	videostorage "video-processor/internal/video/infrastructure/storage"
@@ -44,8 +45,10 @@ import (
 // Generous, because abandoning a running job is strictly worse than waiting
 // for it. Its row is already `processing`, and a redelivery cannot re-claim a
 // `processing` row — ClaimForProcessing takes only `queued` — so a job
-// dropped here is stranded until an operator or a later recovery mechanism
-// intervenes. The deadline exists only so a wedged extraction cannot keep the
+// dropped here is recovered only by the sweeper below, on the interval it
+// runs at, after its lease has lapsed. That is a delay measured in minutes,
+// not a permanent stranding, but it is still slower than letting the run
+// finish. The deadline exists only so a wedged extraction cannot keep the
 // process alive forever.
 const drainTimeout = 5 * time.Minute
 
@@ -76,7 +79,7 @@ func main() {
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 
-	run(signalCtx, deps, videomessaging.JobDispatchTopology(), drainTimeout)
+	run(signalCtx, deps, videomessaging.JobDispatchTopology(), drainTimeout, sweepInterval)
 
 	// Closed only after run has returned: the handler borrows both of these
 	// for the whole of a job, and closing either underneath a running
@@ -92,10 +95,11 @@ func main() {
 // run consumes until ctx is cancelled, then waits up to drain for the job in
 // flight to reach a terminal state and be acknowledged.
 //
-// Split out of main so the shutdown behaviour can be exercised: the topology
-// and the drain deadline are parameters because a test needs its own queue
-// names and cannot wait five minutes to observe an expiry.
-func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topology, drain time.Duration) {
+// Split out of main so the shutdown behaviour can be exercised: the topology,
+// the drain deadline, and the sweep interval are parameters because a test
+// needs its own queue names and cannot wait five minutes to observe an expiry
+// or a minute to observe a sweep.
+func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topology, drain, sweep time.Duration) {
 	// inFlight names the job currently being processed, so a drain that
 	// times out can say which one it abandoned. Read from the shutdown path
 	// while the handler goroutine writes it, hence atomic.
@@ -113,8 +117,24 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 		}
 	}()
 
+	// The sweeper runs on ctx itself, not on a detached one: unlike the
+	// handler — which is deliberately detached because killing a running
+	// ffmpeg is worse than waiting for it — a sweep has nothing invested and
+	// should stop promptly.
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		newSweeper(deps).run(ctx, sweep)
+	}()
+
 	<-ctx.Done()
 	log.Print("video: worker: shutdown signal received")
+
+	// Joined before returning, and therefore before main closes PostgreSQL
+	// and Redis — the same reasoning as cmd/api's join of its outbox relay.
+	// A sweep holds a transaction while it runs, so tearing the pool down
+	// underneath one would abort a claim instead of resolving it.
+	<-sweeperDone
 
 	select {
 	case <-consumerDone:
@@ -151,8 +171,19 @@ type workerDeps struct {
 
 	process  *videoapplication.ProcessVideoJob
 	complete *videoapplication.CompleteJob
+	fail     *videoapplication.FailJob
 	clearKey *videoapplication.ClearJobIdempotencyKey
 	sources  videodomain.SourceStorage
+	leases   videodomain.JobLeaseStore
+	ids      videodomain.VideoJobIDParser
+
+	// jobReader is the undecorated PostgreSQL repository and jobWriter the
+	// caching decorator over it. The sweeper's scan is a decision about who
+	// owns a job, so it reads the authoritative rows; its requeue and its
+	// abandonment go through the cache, or GET /api/video-jobs/:id would keep
+	// reporting `processing` for a job already re-dispatched.
+	jobReader videodomain.VideoJobRepository
+	jobWriter videodomain.VideoJobRepository
 }
 
 // setupWorker builds the Video Processing dependencies this process needs.
@@ -235,20 +266,31 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 	plainRepo := videopostgres.NewRepository(db, ids)
 	repo := videocache.NewCachedVideoJobRepository(plainRepo, redisClient, ids)
 	idempotencyStore := videoidempotency.NewRedisStore(redisClient)
+	// The lease store shares the one Redis client already wired for the
+	// idempotency store and the status cache. No new configuration surface:
+	// the TTL and the renewal period are constants.
+	leaseStore := videolease.NewRedisStore(redisClient)
+
+	failJob := videoapplication.NewFailJob(plainRepo, repo, ids)
 
 	return &workerDeps{
 		rabbit: rabbitConfig,
 		db:     db,
 		redis:  redisClient,
 		process: videoapplication.NewProcessVideoJob(
-			videoapplication.NewStartProcessing(repo, ids),
-			videoapplication.NewFailJob(repo, ids),
+			// Reader undecorated, writer cached, for all three ownership
+			// use cases: a decision about who owns a job does not read a
+			// cache.
+			videoapplication.NewStartProcessing(plainRepo, repo, ids),
+			failJob,
 			videoffmpeg.New(),
 			sourceStorage,
 			resultStorage,
+			leaseStore,
 			ids,
 		),
-		complete: videoapplication.NewCompleteJob(repo, ids),
+		complete: videoapplication.NewCompleteJob(plainRepo, repo, ids),
+		fail:     failJob,
 		// Undecorated, for the same reason GET /download/:filename's
 		// entitlement lookup is: this use case reads a field, not a status,
 		// and a cache record written by a replica of the previous release
@@ -256,8 +298,12 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 		// the key would be unbuildable and a failed job's 24-hour mapping
 		// would silently outlive it. PostgreSQL is where the hash is
 		// persisted; read it from there.
-		clearKey: videoapplication.NewClearJobIdempotencyKey(plainRepo, idempotencyStore, ids),
-		sources:  sourceStorage,
+		clearKey:  videoapplication.NewClearJobIdempotencyKey(plainRepo, idempotencyStore, ids),
+		sources:   sourceStorage,
+		leases:    leaseStore,
+		ids:       ids,
+		jobReader: plainRepo,
+		jobWriter: repo,
 	}, nil
 }
 
@@ -297,11 +343,24 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	case errors.Is(err, videodomain.ErrVideoJobNotFound):
 		log.Printf("video: worker: dispatch names unknown job %s, dead-lettering", msg.JobID)
 		return videomessaging.Reject
+	case errors.Is(err, videodomain.ErrJobFenced):
+		// This run was taken over while it was working: the sweep decided
+		// the job was abandoned, requeued it, and another consumer claimed
+		// it. Distinct from a lost claim, which means nothing was ever
+		// started — here an extraction ran and its outcome is being thrown
+		// away. Nothing is cleaned up: the source object is the successor's
+		// input, and the idempotency key names a job that is running again.
+		// The lease is not released either; a conditional release at a
+		// superseded epoch is a no-op whose only effect is a confusing log
+		// line.
+		log.Printf("video: worker: job %s was taken over while this worker held epoch %d, dead-lettering and keeping its source: %v", msg.JobID, result.LeaseEpoch, err)
+		return videomessaging.Reject
 	case err != nil:
 		// The run broke before any terminal state was committed. The job
 		// stays wherever it was and the source object stays put: leaking it
 		// is recoverable through the bucket's lifecycle rule, deleting an
-		// input that no terminal state accounts for is not.
+		// input that no terminal state accounts for is not. The row is left
+		// `processing`, which the sweeper recovers once the lease lapses.
 		log.Printf("video: worker: job %s did not reach a terminal state, dead-lettering: %v", msg.JobID, err)
 		return videomessaging.Reject
 	}
@@ -311,12 +370,22 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	// is exactly the overwrite the claim exists to prevent.
 	if !result.Success {
 		log.Printf("video: worker: job %s failed: %s", msg.JobID, result.FailureReason)
-		d.deleteSource(ctx, msg.JobID, sourceKey)
-		d.clearIdempotencyKey(ctx, msg.JobID)
+		// Cleanup is one-shot and rides on this actor's own committed
+		// write. A result that merely matched a terminal row another actor
+		// had already written cleans up nothing: that actor did it.
+		if result.Applied {
+			d.releaseLease(ctx, msg.JobID, result.LeaseEpoch)
+			d.deleteSource(ctx, msg.JobID, sourceKey)
+			d.clearIdempotencyKey(ctx, msg.JobID)
+		}
 		return videomessaging.Ack
 	}
 
 	if err := d.completeWithRetry(ctx, result); err != nil {
+		if errors.Is(err, videodomain.ErrJobFenced) {
+			log.Printf("video: worker: job %s produced result %s but was taken over at epoch %d, dead-lettering and keeping its source: %v", msg.JobID, result.StorageKey, result.LeaseEpoch, err)
+			return videomessaging.Reject
+		}
 		// The artifact is stored and the row still says `processing`. Both
 		// are deliberately left alone: the source stays so the job can be
 		// re-run by hand, and the message is dead-lettered rather than
@@ -331,9 +400,31 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	// purpose. Gating on the commit rather than on having won the claim is
 	// the point — a deferred delete registered at claim time would fire on
 	// every failure path above too.
+	d.releaseLease(ctx, msg.JobID, result.LeaseEpoch)
 	d.deleteSource(ctx, msg.JobID, sourceKey)
 	log.Printf("video: worker: job %s completed with %d frames", msg.JobID, result.FrameCount)
 	return videomessaging.Ack
+}
+
+// releaseLease drops the job's lease now that its outcome is committed, so a
+// successor is never made to wait out a TTL for a run that has finished.
+//
+// Acquisition and renewal belong to ProcessVideoJob, which is the only place
+// that knows the moment the claim was won. Release belongs here, where the
+// outcome is decided; it is conditional on the epoch, so doing it from
+// outside that use case is safe. Best effort: a failed release only costs
+// the lease's remaining TTL.
+func (d *workerDeps) releaseLease(ctx context.Context, jobID string, epoch int64) {
+	id, err := d.ids.ParseVideoJobID(jobID)
+	if err != nil {
+		log.Printf("video: worker: release lease for job %s: %v", jobID, err)
+		return
+	}
+	releaseCtx, cancel := videoapplication.NewFinalizationContext()
+	defer cancel()
+	if err := d.leases.Release(releaseCtx, id, epoch); err != nil {
+		log.Printf("video: worker: release lease for job %s at epoch %d: %v", jobID, epoch, err)
+	}
 }
 
 // completeWithRetry commits the completion, retrying a bounded number of
@@ -348,6 +439,7 @@ func (d *workerDeps) completeWithRetry(ctx context.Context, result videoapplicat
 		JobID:      result.JobID,
 		StorageKey: result.StorageKey,
 		FrameCount: result.FrameCount,
+		LeaseEpoch: result.LeaseEpoch,
 	}
 
 	var err error
@@ -357,6 +449,12 @@ func (d *workerDeps) completeWithRetry(ctx context.Context, result videoapplicat
 		cancel()
 		if err == nil {
 			return nil
+		}
+		// A fenced write is not a transient failure. This worker no longer
+		// owns the job, and every remaining attempt would burn its backoff
+		// to fail identically.
+		if errors.Is(err, videodomain.ErrJobFenced) {
+			return err
 		}
 		log.Printf("video: worker: mark job %s completed (attempt %d/%d): %v", result.JobID, attempt, terminalWriteAttempts, err)
 		if attempt < terminalWriteAttempts {
