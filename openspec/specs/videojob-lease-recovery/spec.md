@@ -205,7 +205,7 @@ An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process
 
 - **GIVEN** a job that has already been requeued the maximum number of times and is again in `processing` with a lapsed lease
 - **WHEN** the sweeper runs
-- **THEN** the job is `failed` with a non-empty reason, no further queued outbox row is written for it, its source object is gone, and its idempotency key no longer maps that content to it
+- **THEN** the job is `failed` with a non-empty reason, no further queued outbox row is written for it, and the sweeper makes one best-effort attempt to delete its source object and clear its idempotency key
 
 #### Scenario: A job with no recorded source is failed rather than requeued
 

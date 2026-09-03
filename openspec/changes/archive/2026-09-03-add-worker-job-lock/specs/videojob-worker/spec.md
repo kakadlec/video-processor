@@ -4,7 +4,7 @@
 
 When the worker cannot act on a message, it SHALL reject the message **without requeue**, so the topology's dead-letter route takes it. This SHALL apply to a message whose payload cannot be parsed, one naming a job that does not exist, one whose job the worker could not claim, and one whose job was **taken away from the worker while it ran** — a terminal write refused by the fence (see `videojob-lease-recovery`).
 
-It SHALL NOT requeue such a message: none of these conditions is transient, so requeueing produces an unbounded redelivery loop against a message that will never succeed. A fenced job is the sharpest case — it has already been re-dispatched by the sweeper, so a requeue here would add a second live delivery for a job that now has a rightful holder.
+It SHALL NOT requeue such a message: none of these conditions is transient, so requeueing produces an unbounded redelivery loop against a message that will never succeed. A fenced result means either a newer epoch was re-dispatched and may have a live successor, or another actor committed a different terminal outcome at the same epoch. Requeueing is wrong in both cases: it would add a competing delivery in the first and can never claim the already-terminal row in the second.
 
 It SHALL NOT acknowledge such a message either. An acknowledged message is gone from the broker, which would leave nothing to enumerate afterwards — the dead-letter queue is the only place these anomalies remain visible, and `videojob-messaging` keeps it unversioned so there is one place to look.
 
@@ -40,7 +40,7 @@ A fenced outcome SHALL be logged distinctly from a lost claim, naming the job, t
 
 The governing rule is **having applied this job's terminal write**, not claim ownership by itself. The consumer applies it by claiming, extracting, and committing; the sweeper applies it by winning the conditional abandonment write at the epoch its scan observed. An actor that did not apply the terminal write deletes nothing, except that a bounded completion retry may finish cleanup when it finds the identical outcome from its own possibly lost-response attempt.
 
-The consumer SHALL delete the source object named by the message when its terminal write was **applied**. A completion retry that finds its identical outcome already present MAY also delete because that bounded retry is completing cleanup for its own possibly lost-response write; a failure path that merely finds an identical outcome already present SHALL acknowledge but SHALL NOT clean up. The sweeper earns the same right only by applying its conditional abandonment write. Deletion SHALL be attempted on every normal return that satisfies one of those conditions. It is deliberately *not* deferred: a panic between commit and delete leaves the object behind, which is safer than deleting before ownership is established.
+The consumer SHALL attempt to delete the source object named by the message when its terminal write was **applied**. A completion retry that finds its identical outcome already present SHALL also attempt deletion because that bounded retry is completing cleanup for its own possibly lost-response write; a failure path that merely finds an identical outcome already present SHALL acknowledge but SHALL NOT clean up. The sweeper earns the same right only by applying its conditional abandonment write. Deletion SHALL be attempted on every normal return that satisfies one of those conditions. It is deliberately *not* deferred: a panic between commit and delete leaves the object behind, which is safer than deleting before ownership is established.
 
 **It SHALL NOT delete the source object on any path where the job did not reach a committed terminal state**, and this is the condition that matters most, because getting it wrong is unrecoverable rather than merely untidy. A panic mid-extraction, a `CompleteJob` write that would not commit, a shutdown deadline that expired — each leaves the job in `processing`, and the source bytes are the only thing from which that job can ever be finished. Deleting them turns a job the sweeper's fenced takeover could have recovered into one that can only be failed. An unconditional deferred delete registered at claim time therefore SHALL NOT be used; the delete SHALL be guarded on the committed outcome.
 
@@ -48,21 +48,21 @@ The consumer SHALL delete the source object named by the message when its termin
 
 A consumer SHALL NOT delete the source object when it did not win the claim either. Another consumer is processing that job from those exact bytes, and deleting them would destroy a running extraction's input — the failure mode generation isolation exists to prevent, reintroduced from inside.
 
-**The sweeper's abandonment is the other way to earn the deletion, and it is gated the same way.** It SHALL delete the source object only when its `failed` write was *applied by that call* — not when the row merely already carries the outcome it intended, which is what a second sweeper at the same bound observes (see `videojob-lease-recovery`). The one actor that may delete on an already-present outcome is a caller retrying a write it made itself and whose response it lost, because that work is its own.
+**The sweeper's abandonment is the other way to earn the deletion, and it is gated the same way.** It SHALL attempt to delete the source object only when its `failed` write was *applied by that call* — not when the row merely already carries the outcome it intended, which is what a second sweeper at the same bound observes (see `videojob-lease-recovery`). The one actor that may delete on an already-present outcome is a caller retrying a write it made itself and whose response it lost, because that work is its own.
 
 The deletion SHALL be best effort, as it was when the HTTP handler owned it: one attempt, no retry, a failure logged with the `StorageKey` and not escalated. A failed deletion SHALL NOT prevent the message from being acknowledged, because the job is already terminal and the dispatch must not be redelivered.
 
 **A job that is never dispatched leaks its source object permanently**, and this capability SHALL NOT claim otherwise. Once ownership moves here, no component deletes the source of a job whose message was never published, never delivered, or dead-lettered before the claim. The object-storage lifecycle rule on the source key prefix is the only remaining guarantee, and `docs/operations.md` SHALL describe it as such rather than as a backstop.
 
-#### Scenario: A completed job's source object is gone
+#### Scenario: Successful cleanup removes a completed job's source
 
-- **GIVEN** a dispatched job the worker processes to `completed`
+- **GIVEN** a dispatched job the worker processes to `completed` and whose source deletion succeeds
 - **WHEN** the message has been acknowledged
 - **THEN** no object exists under that job's source key
 
-#### Scenario: A failed job's source object is gone
+#### Scenario: Successful cleanup removes a failed job's source
 
-- **GIVEN** a dispatched job whose extraction fails and whose failure write this run applies
+- **GIVEN** a dispatched job whose extraction fails, whose failure write this run applies, and whose source deletion succeeds
 - **WHEN** the message has been acknowledged
 - **THEN** the job is `failed` and no object exists under its source key
 
@@ -94,7 +94,7 @@ The deletion SHALL be best effort, as it was when the HTTP handler owned it: one
 
 - **GIVEN** a job the sweeper fails after the requeue bound, whose terminal write that call applied
 - **WHEN** the sweep finishes with it
-- **THEN** no object exists under that job's source key, and its idempotency key no longer maps that content to it
+- **THEN** the sweeper makes one best-effort attempt to delete the source object and clear the idempotency key; either resource may remain if its cleanup call fails
 
 #### Scenario: A second sweeper at the same bound deletes nothing
 
@@ -110,25 +110,25 @@ The deletion SHALL be best effort, as it was when the HTTP handler owned it: one
 
 ### Requirement: The Worker Clears a Failed Job's Idempotency Key
 
-When a job reaches `failed` under this process — whether committed by the consumer handling its dispatch or by the sweeper abandoning it after repeated recovery (see `videojob-lease-recovery`) — the worker SHALL delete that job's idempotency key immediately, so an identical-content resubmission is treated as a fresh attempt rather than being deduplicated for the remainder of the fixed window.
+When a job reaches `failed` under this process — whether committed by the consumer handling its dispatch or by the sweeper abandoning it after repeated recovery (see `videojob-lease-recovery`) — the worker SHALL immediately attempt to delete that job's idempotency key, so an identical-content resubmission is treated as a fresh attempt rather than being deduplicated for the remainder of the fixed window.
 
-The worker SHALL reconstruct the key from the job's owner and its persisted content hash, and SHALL delete it through an operation that removes the key only when it still refers to this job — the finalized value names the job, so matching on the job identifier proves ownership exactly as the reservation token did, and a key already reclaimed by a newer request names neither.
+The worker SHALL reconstruct the key from the job's owner and its persisted content hash, and SHALL attempt deletion through an operation that removes the key only when it still refers to this job — the finalized value names the job, so matching on the job identifier proves ownership exactly as the reservation token did, and a key already reclaimed by a newer request names neither.
 
-It SHALL NOT clear the key for a job whose `failed` write it did not itself apply. A worker whose terminal write was refused by the fence has not failed anything, and a sweeper that found the row already carrying the outcome it intended did not fail it either; clearing in either case would release a mapping that belongs to a job another actor owns. The single exception is the one the source-object rule already carries: a caller retrying its own write whose response was lost.
+It SHALL NOT clear the key for a job whose `failed` write it did not itself apply. A worker whose terminal write was refused by the fence has not failed anything, and a sweeper that found the row already carrying the outcome it intended did not fail it either; clearing in either case would release a mapping that belongs to a job another actor owns. The completion retry exception in the source-object rule does not apply here: completed jobs deliberately retain their idempotency mapping, while an already-present failure is acknowledged without cleanup.
 
 The reservation **token** SHALL NOT be persisted anywhere to enable this. It is a possession capability whose whole purpose is to be held only by the request that minted it; storing it in a table that outlives the key's window, and that every job read touches, would buy nothing the job identifier does not already prove.
 
-A failure to clear the key SHALL be logged and SHALL NOT fail the job or prevent acknowledgement. The key expires on its own window regardless; the guarantee this requirement adds is promptness, not eventual removal.
+A failure to clear the key SHALL be logged and SHALL NOT fail the job or prevent acknowledgement. The key expires on its own window regardless; the obligation this requirement adds is one prompt attempt, not guaranteed immediate removal.
 
 #### Scenario: Retry after an asynchronous failure is not blocked
 
-- **GIVEN** a submitted video whose processing failed in the worker
+- **GIVEN** a submitted video whose processing failed in the worker and whose conditional idempotency clear succeeded
 - **WHEN** the same user resubmits identical content immediately afterwards
 - **THEN** the submission is treated as fresh and creates a new `VideoJob`, rather than returning the failed one
 
 #### Scenario: Retry after repeated abandonment is not blocked either
 
-- **GIVEN** a submitted video whose job the sweeper failed after exhausting its recovery attempts
+- **GIVEN** a submitted video whose job the sweeper failed after exhausting its recovery attempts and whose conditional idempotency clear succeeded
 - **WHEN** the same user resubmits identical content immediately afterwards
 - **THEN** the submission is treated as fresh and creates a new `VideoJob`
 

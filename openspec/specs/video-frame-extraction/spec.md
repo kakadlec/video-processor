@@ -51,7 +51,7 @@ The source has not lived on the local filesystem since Phase 5: it is an object 
 #### Scenario: Successful cleanup removes the uploaded object
 
 - **GIVEN** a video upload that is processed successfully and whose source deletion succeeds
-- **WHEN** its job reaches `completed`
+- **WHEN** the worker's post-commit cleanup finishes
 - **THEN** no object exists under that job's source key, and no transient local copy remains in the worker's `temp/` directory
 
 #### Scenario: Cleanup failure leaves lifecycle-managed residue
@@ -121,35 +121,36 @@ The endpoint has no unauthenticated behavior: it is reachable only behind bearer
 - **THEN** the bytes travel from the storage service to the client, and no response from this API carries them
 
 ### Requirement: Temporary Frame Directory Cleanup
-The system SHALL remove the per-request temporary frame-extraction directory under `temp/` after a request completes, whether frame extraction succeeds or fails.
+The worker SHALL remove each job's temporary frame-extraction directory under `temp/` after its processing sequence completes, whether frame extraction succeeds or fails.
 
 #### Scenario: Temp directory removed after failed extraction
-- **WHEN** a video upload with a valid extension but content `ffmpeg` cannot decode is processed
-- **THEN** no leftover per-request directory remains under `temp/` after the request completes
+- **WHEN** a video upload with valid extension but content `ffmpeg` cannot decode is processed
+- **THEN** no leftover directory for that job remains under the worker's `temp/` after the processing sequence completes
 
 #### Scenario: Temp directory removed after successful extraction
 - **WHEN** a video upload is processed successfully
-- **THEN** no leftover per-request directory remains under `temp/` after the request completes
+- **THEN** no leftover directory for that job remains under the worker's `temp/` after the processing sequence completes
 
-### Requirement: Source Object Removed On Processing Failure
+### Requirement: Source Object Deletion Is Attempted On Processing Failure
 
-When frame extraction or result storage fails, the system SHALL delete the stored source object rather than retaining it. With storage reachable, a failed job leaves behind neither a source object in the bucket nor a local copy under any `temp/` directory.
+When frame extraction or result storage fails and this run applies the job's `failed` outcome, the worker SHALL make one best-effort attempt to delete the stored source object rather than intentionally retaining it. The local copy SHALL still be removed, while a source deletion error MAY leave bucket residue for the `uploads/` lifecycle rule.
 
 The deletion is an obligation to attempt, not a guarantee of absence — `videojob-source-storage` owns the full semantics, including which component is obliged to attempt it and what happens when the attempt itself fails. The point of this requirement is the reversal of intent: failure is no longer a reason to keep the source.
 
 This inverts the behavior the removed "Uploaded File Retained On Processing Failure" requirement documented. Retention was a known leak, tolerable only because a local file is reclaimed when its container is replaced; the same leak in object storage would be durable and unbounded, with nothing in this system to reap it.
 
-Two consequences, both accepted deliberately. A failed job cannot be retried from the original bytes, because they are gone; a retry is a fresh submission, which `upload-idempotency` keeps unblocked by clearing a failed job's key immediately. And a job that fails *before* any component claims it — one whose dispatch was never delivered — is not covered by this requirement at all: nothing processes it, so nothing deletes its source, and the object-storage lifecycle rule is what reclaims it.
+Two consequences, both accepted deliberately. The system does not retry a failed job from the original bytes; a retry is a fresh submission, which the worker attempts to unblock promptly by clearing the failed job's idempotency key. And a job that fails *before* any component claims it — one whose dispatch was never delivered — is not covered by this requirement at all: nothing processes it, so nothing deletes its source, and the object-storage lifecycle rule is what reclaims it.
 
-#### Scenario: Failed processing leaves no source object
+#### Scenario: Successful cleanup removes the source after extraction failure
 
-- **WHEN** a submitted video with a valid extension but content `ffmpeg` cannot decode is processed
+- **GIVEN** source deletion succeeds
+- **WHEN** a submitted video with a valid extension but content `ffmpeg` cannot decode is processed and its failure write applies
 - **THEN** the job's status is `failed` with a recorded reason, and no object exists under its source key
 
-#### Scenario: Failed result storage also removes the source
+#### Scenario: Successful cleanup removes the source after result-storage failure
 
-- **GIVEN** frames were extracted successfully but the result zip cannot be stored
-- **WHEN** the job reaches its terminal state
+- **GIVEN** frames were extracted successfully, the result zip cannot be stored, and source deletion succeeds
+- **WHEN** the failure write applies and post-commit cleanup finishes
 - **THEN** the job is `failed` and no object exists under its source key
 
 #### Scenario: A job that was never claimed is not covered
