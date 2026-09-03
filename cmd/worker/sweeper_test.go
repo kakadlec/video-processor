@@ -356,6 +356,48 @@ func TestSweep_TakesOverNothingWhenTheLeaseStoreIsUnreachable(t *testing.T) {
 	}
 }
 
+type leaseStoreFailingSecondHeld struct {
+	videodomain.JobLeaseStore
+	calls int
+}
+
+func (s *leaseStoreFailingSecondHeld) Held(context.Context, videodomain.VideoJobID, int64) (bool, error) {
+	s.calls++
+	if s.calls == 2 {
+		return false, errors.New("simulated lease-store outage")
+	}
+	return false, nil
+}
+
+// TestSweep_DiscardsPreOutageConfirmation requires two fresh successful
+// not-held observations after the lease store recovers. A mark retained from
+// before an outage could otherwise combine with the first post-recovery read
+// and requeue a live worker before its heartbeat recreates the expired key.
+func TestSweep_DiscardsPreOutageConfirmation(t *testing.T) {
+	env := newWorkerTestEnv(t, envOptions{})
+	job, _ := seedQueuedJob(t, env, generateTestVideo(t, 1))
+	ctx := context.Background()
+
+	claimSeededJob(t, env, job)
+	dropLease(t, env, job)
+
+	s := sweeperFor(t, env, job)
+	s.deps.leases = &leaseStoreFailingSecondHeld{JobLeaseStore: env.deps.leases}
+
+	s.sweep(ctx) // First successful not-held observation marks the job.
+	s.sweep(ctx) // The outage must discard that mark.
+	s.sweep(ctx) // First post-recovery observation only marks it again.
+
+	if status := statusOf(t, env, job); status != videodomain.JobStatusProcessing {
+		t.Fatalf("status = %q, want %q — a pre-outage mark confirmed a post-outage observation", status, videodomain.JobStatusProcessing)
+	}
+
+	s.sweep(ctx) // The second fresh observation may now recover it.
+	if status := statusOf(t, env, job); status != videodomain.JobStatusQueued {
+		t.Fatalf("status = %q, want %q after two fresh post-outage observations", status, videodomain.JobStatusQueued)
+	}
+}
+
 // TestSweep_ReachesAJobBehindAFullBatchOfLeasedOnes is the keyset cursor's
 // reason for existing. A fixed ORDER BY id LIMIT n passes every other test
 // here and fails this one: a batch's worth of healthy long-running

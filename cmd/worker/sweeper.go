@@ -48,10 +48,12 @@ type sweeper struct {
 	// lease is set in Redis immediately afterwards, so every healthy run is
 	// briefly unleased; acting on that single observation would requeue a
 	// live job, and at the bound it would fail one and delete its source. A
-	// mark is dropped only on a contrary observation — the job is leased, or
-	// it is at a different epoch — never on mere absence from a batch, which
-	// would mean no job is ever confirmed once the table holds more
-	// processing rows than one batch.
+	// mark is dropped on a contrary observation — the job is leased or at a
+	// different epoch — and whenever the lease store cannot answer, because
+	// an observation made before an outage is not safe confirmation after
+	// recovery. Mere absence from a batch does not drop it, since that would
+	// mean no job is ever confirmed once the table holds more processing rows
+	// than one batch.
 	//
 	// Kept worker-local. Sharing or persisting it would add a coordination
 	// problem the conditional writes already solve.
@@ -106,9 +108,11 @@ func (s *sweeper) sweep(ctx context.Context) {
 		if err != nil {
 			// The fail-closed half of the posture. "Cannot reach Redis" is
 			// not evidence that a lease expired, and treating it as such
-			// would take over every running job at once. The mark is left
-			// standing: this is not a contrary observation, it is no
-			// observation at all.
+			// would take over every running job at once. It also breaks the
+			// confirmation sequence: after connectivity returns, the first
+			// successful not-held reading must start a fresh pair rather than
+			// confirm a mark made before the outage.
+			delete(s.marks, job.ID())
 			unreachable++
 			continue
 		}

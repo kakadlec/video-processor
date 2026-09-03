@@ -263,11 +263,16 @@ func TestProcessVideoJob_RenewalPeriodStaysUnderTheLeaseTTL(t *testing.T) {
 // process whatever the row says.
 func TestProcessVideoJob_PropagatesAFenceFromItsOwnFailure(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	newQueuedRepoJob(t, repo, "job-1", "user-1")
+	job := newQueuedRepoJob(t, repo, "job-1", "user-1")
+	recovered, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), job.CreatedAt(), 2)
+	if err != nil {
+		t.Fatalf("restore recovered job: %v", err)
+	}
+	repo.seed(recovered)
 
 	// The successor: by the time this run fails, the row has been requeued
 	// and re-claimed at a newer epoch.
-	fenceAfterClaim := &fencingRepository{fakeVideoJobRepository: repo, atEpoch: 1}
+	fenceAfterClaim := &fencingRepository{fakeVideoJobRepository: repo, atEpoch: 3}
 
 	sources := seededSources(t)
 	uc := newProcessVideoJobUseCaseWithLeases(
@@ -278,9 +283,12 @@ func TestProcessVideoJob_PropagatesAFenceFromItsOwnFailure(t *testing.T) {
 		newFakeJobLeaseStore(),
 	)
 
-	_, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+	result, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
 	if !errors.Is(err, domain.ErrJobFenced) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrJobFenced)
+	}
+	if result.JobID != "job-1" || result.LeaseEpoch != 2 {
+		t.Fatalf("fenced result = {JobID: %q, LeaseEpoch: %d}, want job-1 at the held epoch 2", result.JobID, result.LeaseEpoch)
 	}
 
 	localCopy := filepath.Join("temp", "job-1_source")

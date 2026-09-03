@@ -494,6 +494,110 @@ func TestCachedVideoJobRepository_FindByUserID_PassesThroughUncached(t *testing.
 	}
 }
 
+type blockingRequeue struct {
+	*fakeRepository
+	committed chan struct{}
+	release   chan struct{}
+}
+
+func (r *blockingRequeue) Requeue(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
+	requeued, err := r.fakeRepository.Requeue(ctx, job, epoch)
+	close(r.committed)
+	<-r.release
+	return requeued, err
+}
+
+// TestCachedVideoJobRepository_DelayedRequeueCannotClobberCompletion pins the
+// ordering between PostgreSQL and Redis. The requeue commits first but pauses
+// before cache maintenance; its successor then claims and completes. When the
+// delayed requeue resumes, its older queued record must not replace completed.
+func TestCachedVideoJobRepository_DelayedRequeueCannotClobberCompletion(t *testing.T) {
+	client := newTestClient(t)
+	fake := newFakeRepository()
+	job := newTestJob(t)
+	ctx := context.Background()
+	if err := fake.Create(ctx, job); err != nil {
+		t.Fatalf("fake.Create: %v", err)
+	}
+
+	fastRepo := cache.NewCachedVideoJobRepository(fake, client, idParser{})
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	if err := fastRepo.Enqueue(ctx, job); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("job.StartProcessing: %v", err)
+	}
+	fake.mu.Lock()
+	fake.claimResult = true
+	fake.mu.Unlock()
+	if claimed, _, err := fastRepo.ClaimForProcessing(ctx, job); err != nil || !claimed {
+		t.Fatalf("ClaimForProcessing: claimed=%v err=%v", claimed, err)
+	}
+
+	if err := job.Requeue(); err != nil {
+		t.Fatalf("job.Requeue: %v", err)
+	}
+	delayed := &blockingRequeue{
+		fakeRepository: fake,
+		committed:      make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+	delayedRepo := cache.NewCachedVideoJobRepository(delayed, client, idParser{})
+	fake.mu.Lock()
+	fake.requeueResult = true
+	fake.mu.Unlock()
+	type requeueResult struct {
+		requeued bool
+		err      error
+	}
+	done := make(chan requeueResult, 1)
+	go func() {
+		requeued, err := delayedRepo.Requeue(ctx, job, 0)
+		done <- requeueResult{requeued: requeued, err: err}
+	}()
+	<-delayed.committed
+
+	successor, err := fake.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("FindByID after requeue commit: %v", err)
+	}
+	if err := successor.StartProcessing(); err != nil {
+		t.Fatalf("successor.StartProcessing: %v", err)
+	}
+	fake.mu.Lock()
+	fake.claimEpoch = 1
+	fake.mu.Unlock()
+	if claimed, epoch, err := fastRepo.ClaimForProcessing(ctx, successor); err != nil || !claimed || epoch != 1 {
+		t.Fatalf("successor claim: claimed=%v epoch=%d err=%v", claimed, epoch, err)
+	}
+	if err := successor.Complete(resultKeyFor(t, successor), 7); err != nil {
+		t.Fatalf("successor.Complete: %v", err)
+	}
+	if applied, err := fastRepo.Update(ctx, successor, 1); err != nil || !applied {
+		t.Fatalf("successor Update: applied=%v err=%v", applied, err)
+	}
+
+	close(delayed.release)
+	result := <-done
+	if result.err != nil || !result.requeued {
+		t.Fatalf("delayed Requeue: requeued=%v err=%v", result.requeued, result.err)
+	}
+
+	fake.mu.Lock()
+	fake.findByIDErr = errors.New("must be served from cache")
+	fake.mu.Unlock()
+	got, err := fastRepo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("FindByID after delayed cache write: %v", err)
+	}
+	if got.Status() != domain.JobStatusCompleted || got.LeaseEpoch() != 1 {
+		t.Fatalf("cached job = %q at epoch %d, want completed at epoch 1", got.Status(), got.LeaseEpoch())
+	}
+}
+
 // blockingFindByID wraps a fakeRepository so its FindByID pauses, after
 // actually reading the underlying value, until the test signals it to
 // continue — modeling a slow miss-repopulation caller that has already

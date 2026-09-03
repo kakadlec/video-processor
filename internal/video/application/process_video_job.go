@@ -365,7 +365,7 @@ func (uc *ProcessVideoJob) failWith(jobID string, epoch int64, cause error, reas
 	defer cancel()
 	failed, err := uc.fail.Execute(finalizeCtx, FailJobInput{JobID: jobID, Reason: reason, LeaseEpoch: epoch})
 	if err != nil {
-		return ProcessVideoJobResult{}, err
+		return ProcessVideoJobResult{JobID: jobID, LeaseEpoch: epoch}, err
 	}
 	return ProcessVideoJobResult{
 		JobID:           jobID,

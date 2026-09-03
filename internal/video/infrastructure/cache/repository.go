@@ -429,11 +429,78 @@ func (r *CachedVideoJobRepository) FindProcessing(ctx context.Context, after dom
 	return r.inner.FindProcessing(ctx, after, limit)
 }
 
-// writeThrough overwrites a job's cache entry after its authoritative write
-// has already committed. Shared by every write-through path, which differ in
-// what they persist and in what makes the write conditional, never in how the
-// cache follows. It takes the record rather than the aggregate because
-// ClaimForProcessing caches an epoch the aggregate does not carry.
+// writeThroughIfCurrentScript publishes a committed transition only when it
+// is not older than the cache entry already present. PostgreSQL transitions
+// can commit in order while their following Redis calls arrive out of order:
+// for example, a requeue can pause here while its successor claims and
+// completes, then resume and otherwise replace completed with queued.
+//
+// Epoch orders recovery generations. Within one epoch, the status rank orders
+// the forward state machine. Two different terminal outcomes have the same
+// rank and are never allowed to replace one another; PostgreSQL's processing
+// predicate chose exactly one winner, so whichever terminal record reached
+// Redis first is the only one this cache may retain. An identical record is
+// accepted to refresh its TTL. Missing epochs decode to zero for compatibility
+// with entries written before lease fencing existed.
+var writeThroughIfCurrentScript = redis.NewScript(`
+local incomingRaw = ARGV[1]
+local incoming = cjson.decode(incomingRaw)
+local currentRaw = redis.call("GET", KEYS[1])
+
+local function publish()
+	redis.call("SET", KEYS[1], incomingRaw, "PX", ARGV[2])
+	return 1
+end
+
+if not currentRaw then
+	return publish()
+end
+
+local decoded, current = pcall(cjson.decode, currentRaw)
+if not decoded or current.id ~= incoming.id then
+	return publish()
+end
+
+local currentEpoch = tonumber(current.lease_epoch) or 0
+local incomingEpoch = tonumber(incoming.lease_epoch) or 0
+if currentEpoch > incomingEpoch then
+	return 0
+end
+if currentEpoch < incomingEpoch then
+	return publish()
+end
+
+local ranks = {
+	pending = 0,
+	queued = 1,
+	processing = 2,
+	completed = 3,
+	failed = 3
+}
+local currentRank = ranks[current.status]
+local incomingRank = ranks[incoming.status]
+if not currentRank then
+	return publish()
+end
+if currentRank > incomingRank then
+	return 0
+end
+if currentRank < incomingRank then
+	return publish()
+end
+
+if currentRaw == incomingRaw then
+	return publish()
+end
+return 0
+`)
+
+// writeThrough follows an authoritative write with an epoch/status-aware
+// Redis compare-and-set. Shared by every write-through path, it takes the
+// record rather than the aggregate because ClaimForProcessing caches an epoch
+// the aggregate does not carry. If Redis cannot compare the records, the
+// fallback removes the entry: a miss is preferable to retaining a value whose
+// ordering cannot be established.
 func (r *CachedVideoJobRepository) writeThrough(record cachedJobRecord) {
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -447,7 +514,7 @@ func (r *CachedVideoJobRepository) writeThrough(record cachedJobRecord) {
 	}
 	cleanupCtx, cancel := detachedCleanupContext()
 	defer cancel()
-	if err := r.client.Set(cleanupCtx, cacheKey(id), data, entryTTL).Err(); err != nil {
+	if err := writeThroughIfCurrentScript.Run(cleanupCtx, r.client, []string{cacheKey(id)}, data, entryTTL.Milliseconds()).Err(); err != nil {
 		log.Printf("video: cache: write-through set %s: %v", record.ID, err)
 		if delErr := r.client.Del(cleanupCtx, cacheKey(id)).Err(); delErr != nil {
 			log.Printf("video: cache: write-through fallback delete %s: %v", record.ID, delErr)
