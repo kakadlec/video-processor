@@ -126,7 +126,7 @@ Neither uploaded source videos nor processed ZIP results are on local disk any m
 | Location | Created by | Contents | Cleaned by |
 |---|---|---|---|
 | `temp/` (worker only) | `cmd/worker`'s `createDirs()` at startup, plus per-job subpaths | Downloaded source copy, PNG frames, the built ZIP | Always, by `defer` on every path |
-| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | The request before enqueue; the worker after an applied terminal result; or the sweeper after an applied abandonment failure. **Not guaranteed**, see below |
+| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | The request before enqueue; the worker after an applied terminal result or its own completion retry finds that result already present; or the sweeper after an applied abandonment failure. **Not guaranteed**, see below |
 | Bucket, flat keys | `ProcessVideoJob` on success | `frames_<jobID>.zip` results | Never (manual cleanup required) |
 
 **Source cleanup is best effort, and since the async cutover it is also not exhaustive.** A source object is owned by the `POST /upload` request until its job commits as `queued`; afterwards only a worker that applied a terminal outcome, or the sweeper that applied terminal abandonment, may delete it. Fenced and already-present outcomes delete nothing. Each cleanup uses one `RemoveObject` call with no retry, so a MinIO hiccup can leave residue logged by key.
@@ -293,7 +293,7 @@ A delivery is acknowledged only after a terminal outcome is confirmed. Cleanup d
 
 The AMQP consumer requeues only a delivery pulled off the channel after shutdown, before handling began. Crash recovery does not broker-requeue a `processing` delivery: the sweeper first commits a new `queued` row state and outbox event, and the ordinary relay publishes a fresh dispatch.
 
-**Operator symptom: a job remains `processing`.** A claimed job holds Redis key `videojob:lease:<jobID>` with its PostgreSQL `lease_epoch` as the value and a 90-second TTL. The worker renews every 30 seconds. The sweeper runs every 60 seconds, scans at most 50 rows with a rotating keyset cursor, and acts only after two consecutive successful "not held at this epoch" observations. A Redis query error clears the first observation and takes over nothing.
+**Operator symptom: a job remains `processing`.** After successful acquisition, a claimed job holds Redis key `videojob:lease:<jobID>` with its PostgreSQL `lease_epoch` as the value and a 90-second TTL. Acquisition errors fail open, so a running job may temporarily have no key. The worker renews every 30 seconds. The sweeper runs every 60 seconds, scans at most 50 rows with a rotating keyset cursor, and acts only after two consecutive successful "not held at this epoch" observations. A Redis query error clears the first observation and takes over nothing.
 
 ```sql
 SELECT id, user_id, status, source_key, lease_epoch, created_at
@@ -311,7 +311,7 @@ Correlate each candidate with worker logs and, from an authorized Redis shell, `
 - `requeued job ... at epoch N` means the row advanced and a new outbox dispatch committed;
 - `failed after abandonment` means the row exhausted three requeues, or had no source key, and the sweep applied the terminal write.
 
-Normal recovery latency includes the remaining lease TTL plus up to two sweep intervals. A backlog may add cycles because one cycle examines 50 rows. Restarting a worker also discards its in-memory first-observation marks, deliberately requiring two fresh observations.
+Normal recovery latency includes the remaining lease TTL plus up to two sweep intervals. A backlog may add cycles because one cycle examines 50 rows. Restarting a worker also discards its in-memory first-observation marks, deliberately requiring two fresh observations. Confirmation mitigates the ordinary claim-to-acquire race but is not a proof against a process paused across multiple scans: such a run may be treated as abandoned and fenced when it resumes; at the requeue bound, recovery may instead commit `failed` and remove the source.
 
 Do **not** manually change `status` or `lease_epoch`, publish a dispatch, or delete a lease. The requeue and outbox insert must commit together, and the epoch increment is what fences a prior worker. If recovery does not happen, preserve the row and artifacts, inspect the logs above, verify `source_key` still exists, and check for `frames_<jobID>.zip` from a fenced run. Escalate rather than bypassing repository predicates.
 
