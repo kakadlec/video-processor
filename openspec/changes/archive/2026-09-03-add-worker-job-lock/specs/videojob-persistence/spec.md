@@ -6,7 +6,7 @@ The `video_jobs` table SHALL carry a `lease_epoch` column holding a non-negative
 
 The default SHALL be the correct value for every pre-existing row rather than a placeholder: the epoch counts how many times a job has been returned to the queue after abandonment, and a row written before this column existed has been returned zero times. A `processing` row carrying the default is therefore an ordinary abandonment candidate, which is precisely the backlog this change is meant to recover.
 
-`Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID` SHALL round-trip the value, and `domain.RestoreVideoJob` SHALL accept it. It SHALL NOT be paired with any status at reconstitution: every status is reachable at every epoch.
+`Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID` SHALL round-trip the value, and `domain.RestoreVideoJob` SHALL accept it. Reconstitution SHALL NOT reject a stored row solely because of a status/epoch pairing. Normal transitions create `pending` only at epoch zero and may reach `queued`, `processing`, or a terminal status at epoch zero or later, but the restoration boundary validates the persisted fields independently rather than inventing a cross-field invariant.
 
 Only the requeue path SHALL advance it. `Create`, `Enqueue`, `Update`, and `ClaimForProcessing` SHALL leave it as they found it, so the stored value reads unambiguously as the job's abandonment count and can be used as the bound `videojob-lease-recovery` requires.
 

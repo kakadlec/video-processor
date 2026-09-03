@@ -287,11 +287,11 @@ A delivery is acknowledged only after a terminal outcome is confirmed. Cleanup d
 | Body will not decode, names no source key, or names an unknown job | Reject → DLQ | untouched / n/a | untouched |
 | Claim lost (duplicate or stale dispatch) | Reject → DLQ | untouched | kept; this run acquired no lease |
 | Run broke before any terminal state committed | Reject → DLQ | usually `processing` | kept; lease left to expire so recovery can act |
-| This run applied `failed` | **Ack** | `failed` | source deleted, idempotency key cleared conditionally, held lease released |
+| This run applied `failed` | **Ack** | `failed` | one best-effort attempt each to delete the source, conditionally clear the idempotency key, and release the held lease; failures are logged without changing the Ack |
 | An identical `failed` outcome was already present | **Ack** | `failed` | no cleanup; this actor did not apply the write |
 | Result stored but completion still errors after 4 retries | Reject → DLQ | usually `processing` | source and lease kept; result key logged |
 | Terminal write returns `ErrJobFenced` | Reject → DLQ | authoritative winner's state | source/idempotency untouched and no lease released; held epoch and result key logged. The current log says `taken over` for both a newer epoch and a same-epoch terminal winner |
-| Completion succeeds, including a retry that finds its identical outcome already present | **Ack** | `completed` | source deleted and held lease released |
+| Completion succeeds, including a retry that finds its identical outcome already present | **Ack** | `completed` | one best-effort attempt each to delete the source and release the held lease; failures are logged without changing the Ack |
 
 The AMQP consumer requeues only a delivery pulled off the channel after shutdown, before handling began. Crash recovery does not broker-requeue a `processing` delivery: the sweeper first commits a new `queued` row state and outbox event, and the ordinary relay publishes a fresh dispatch.
 
