@@ -1,5 +1,8 @@
-## ADDED Requirements
+# videojob-lease-recovery Specification
 
+## Purpose
+Define crash-safe worker recovery through Redis liveness leases, PostgreSQL fence epochs, conditional requeue with transactional re-dispatch, and bounded terminal abandonment.
+## Requirements
 ### Requirement: A Lease Records That Some Worker Is Still Working on a Job
 
 The Video Processing context SHALL define a job-lease port in its domain layer, implemented by a Redis-backed adapter in its infrastructure layer, keyed by `VideoJobID` under this context's own key namespace. The port SHALL expose acquiring a lease for a job, renewing it, releasing it, and asking whether one is held. **Every one of those operations SHALL carry the fence epoch, the query included.** The query SHALL answer "is this job leased at this epoch", not "does a key exist for this job": a stored value naming a different epoch SHALL be reported as not held.
@@ -8,9 +11,11 @@ That distinction is not pedantry. Acquisition fails open, so the rightful holder
 
 A lease SHALL carry an expiry, and its value SHALL be the fence epoch its holder claimed with (see below). Renewal and release SHALL be conditional on the stored value still naming that epoch, so a worker whose job has already been taken over can neither extend nor delete the lease its successor holds. The epoch identifies a holder unambiguously: only a requeue changes it, and only a requeue can produce a second holder.
 
-**Acquisition SHALL be conditional too**, though on a weaker predicate than renewal: it SHALL replace an absent lease or one naming an *older* epoch, and SHALL refuse to replace one naming a *newer* one. An unconditional write is unsafe because winning the claim and setting the lease are two steps: a claimant that stalls between them can be swept, requeued, and superseded, and its late write would then replace the rightful holder's lease with a stale epoch — after which the holder's own renewals are refused, its live job looks abandoned once that stale entry expires, and it is requeued a second time under a worker that is still running. Refusing on a newer stored value SHALL NOT be reported as an error to the caller: it is the successor's lease, correctly left alone.
+**Acquisition SHALL be conditional too**, though on a weaker predicate than renewal: it SHALL replace an absent lease or one naming an *older or equal* epoch, and SHALL refuse to replace one naming a *newer* one. An unconditional write is unsafe because winning the claim and setting the lease are two steps: a claimant that stalls between them can be swept, requeued, and superseded, and its late write would then replace the rightful holder's lease with a stale epoch — after which the holder's own renewals are refused, its live job looks abandoned once that stale entry expires, and it is requeued a second time under a worker that is still running. Refusing on a newer stored value SHALL NOT be reported as an error to the caller: it is the successor's lease, correctly left alone.
 
 A `SET NX` SHALL NOT be substituted for that conditional write. `NX` also refuses to replace an *older* lease, so a claimant that legitimately took over a job would run leaseless until the dead holder's entry expired — invisible to the sweeper for exactly the window recovery depends on.
+
+A refused renewal SHALL NOT by itself be treated as a takeover. The same outcome also means the key is absent, as happens when the initial acquire failed or the lease expired during a Redis outage. The holder SHALL attempt the conditional acquire again: an absent, equal, or older epoch restores its lease and keeps the heartbeat running, while a newer epoch proves a successor exists and stops renewal. This distinction prevents one transient outage from leaving a live extraction permanently invisible to recovery.
 
 The lease SHALL be a **liveness** signal and nothing else. `ClaimForProcessing` SHALL NOT consult it, no HTTP route SHALL consult it, and it SHALL NOT be used to bound how many extractions run concurrently — prefetch and process count do that.
 
@@ -50,6 +55,12 @@ It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` an
 - **GIVEN** a job whose previous holder's lease entry still exists at an older epoch
 - **WHEN** a worker that claimed the job at a newer epoch acquires the lease
 - **THEN** the acquisition succeeds and the lease store reports the job as held at the newer epoch
+
+#### Scenario: A live holder reacquires a lease that lapsed during an outage
+
+- **GIVEN** a running extraction whose lease key disappeared while Redis was unavailable
+- **WHEN** renewal reports the key absent and the holder conditionally reacquires at its epoch
+- **THEN** the lease is restored and renewal continues; but if the stored epoch is newer, reacquisition is refused and the old holder stops renewing
 
 #### Scenario: The lease is released when the outcome is committed
 
@@ -111,7 +122,7 @@ This is what makes recovery safe. Once a job can be requeued and re-claimed, a w
 
 The requeue SHALL be conditional on the job still being `processing` **and** still carrying the epoch the sweep observed, so that two sweepers in two worker replicas race on one statement and exactly one wins.
 
-**A single unleased observation SHALL NOT be enough to act on a job.** A sweeper SHALL act only on a job it has observed unleased at the *same epoch* on two consecutive cycles, and SHALL discard that mark as soon as a cycle finds the job leased, no longer `processing`, or carrying a different epoch. A claim commits in PostgreSQL and its lease is acquired in Redis — two stores, two round trips — so every healthy run is briefly `processing` with no lease. Acting on one observation requeues a live extraction, and at the requeue bound below it *fails* that extraction and deletes its source, which no fence can undo. Two cycles a full sweep interval apart cannot both land inside one process's claim-to-acquire gap. The cost is that worst-case recovery latency is two sweep intervals rather than one, which is the right trade against terminating a healthy job.
+**A single unleased observation SHALL NOT be enough to act on a job.** A sweeper SHALL act only on a job it has observed unleased at the *same epoch* on two consecutive successful lease queries, and SHALL discard that mark as soon as a cycle finds the job leased, no longer `processing`, carrying a different epoch, **or cannot query the lease store**. A mark made before an outage cannot confirm the first not-held observation after recovery: the lease may have expired during the outage and the live worker may not yet have renewed it. Two fresh successful observations are required. A claim commits in PostgreSQL and its lease is acquired in Redis — two stores, two round trips — so every healthy run is briefly `processing` with no lease. Acting on one observation requeues a live extraction, and at the requeue bound below it *fails* that extraction and deletes its source, which no fence can undo. Two cycles a full sweep interval apart cannot both land inside one process's claim-to-acquire gap. The cost is that worst-case recovery latency is two sweep intervals rather than one, which is the right trade against terminating a healthy job.
 
 The confirmation state SHALL be worker-local and in-memory, never persisted or shared between replicas: each replica confirms its own observations, and what makes concurrent sweepers safe remains the conditional requeue and the fenced terminal write. A restarted replica simply re-observes, at a cost of one cycle.
 
@@ -143,6 +154,12 @@ The claim predicate SHALL NOT be widened to admit a `processing` row instead. Do
 - **WHEN** the sweeper runs
 - **THEN** the job is not requeued, its status is still `processing`, and its epoch is unchanged
 
+#### Scenario: An outage resets an earlier unleased confirmation
+
+- **GIVEN** a job marked by one successful not-held observation, followed by a lease-store error
+- **WHEN** connectivity returns and the next cycle again observes the job not held
+- **THEN** that observation starts a fresh confirmation pair and does not requeue the job; only a second successful not-held observation may act
+
 #### Scenario: Two sweepers cannot requeue the same job twice
 
 - **GIVEN** a job in `processing` with a lapsed lease and two worker replicas sweeping concurrently
@@ -155,10 +172,10 @@ The claim predicate SHALL NOT be widened to admit a `processing` row instead. Do
 - **WHEN** the call returns an error
 - **THEN** the job is still `processing` with its original epoch — no job is left `queued` with nothing to dispatch it
 
-#### Scenario: A job stranded before this change is recovered by the first sweep
+#### Scenario: A job stranded before this change is recovered without operator action
 
 - **GIVEN** a `video_jobs` row in `processing` written before the fence column existed, holding the column's default epoch and having no lease
-- **WHEN** the sweeper runs
+- **WHEN** two successful sweep cycles confirm that it is not leased at that epoch
 - **THEN** it is requeued like any other abandoned job
 
 #### Scenario: Jobs stranded in queued are not the sweeper's concern
@@ -171,7 +188,7 @@ The claim predicate SHALL NOT be widened to admit a `processing` row instead. Do
 
 The sweeper SHALL requeue a given job at most a bounded number of times, counted by its fence epoch. Beyond that bound it SHALL NOT requeue the job again; it SHALL fail the job through the same fenced terminal write, subject to the same two-cycle confirmation as a requeue — the abandonment is the one sweeper action a fence cannot undo, so it is the action that most needs it, with a fixed reason naming no infrastructure detail, and SHALL then delete the job's source object and clear its idempotency key — the worker's own terminal-failure disposition, performed here because there is no delivery in hand to carry it.
 
-**A `processing` job whose source key is empty SHALL be failed on sight rather than requeued.** Such rows exist only from before the source-key column was added, and they are exactly what a first sweep encounters. Requeueing one is a loop with no exit: the aggregate's requeue transition rejects an empty source key, so the epoch never advances, the bound is never reached, and the abandonment path never fires. Excluding them from the scan instead SHALL NOT be substituted — that leaves them stranded, which is the condition this capability exists to end.
+**A `processing` job whose source key is empty SHALL be failed after the same two-observation confirmation rather than requeued.** Such rows exist only from before the source-key column was added, and they are exactly what a first sweep encounters. Requeueing one is a loop with no exit: the aggregate's requeue transition rejects an empty source key, so the epoch never advances, the bound is never reached, and the abandonment path never fires. Excluding them from the scan instead SHALL NOT be substituted — that leaves them stranded, which is the condition this capability exists to end.
 
 The cleanup that follows an abandonment — deleting the source object and clearing the idempotency key — SHALL be gated on **this** actor's own committed `failed` write, never on the observation that the job is terminal and never on the terminal row merely matching what this actor intended to write. Two sweepers at the bound produce byte-identical intents — same epoch, same `failed`, same fixed reason — so the sweeper SHALL use the applied-versus-already-present outcome `videojob-lifecycle` requires, and SHALL clean up only on *applied*. Exclusivity for the write itself comes from the terminal statement's own predicate, which requires the row to still be `processing`; whichever actor gets there first leaves the row terminal and every other actor's write affects no row. Two sweepers reaching the bound together, or a sweeper racing a leaseless worker that is still running, therefore produce exactly one cleanup. An argument from the aggregate's transition check SHALL NOT be substituted for that predicate: every actor evaluates that check against a copy loaded before any of them wrote.
 
@@ -220,9 +237,9 @@ Any change that breaks either condition — a mutable source, a per-worker extra
 
 The two lease interactions SHALL have opposite failure postures.
 
-Acquiring or renewing a lease SHALL fail **open**: a lease-store error SHALL be logged and processing SHALL continue. The job is protected by the unconditional claim, so an extraction running without a lease is correct — it is merely invisible to the sweeper, and the worst case is one duplicated extraction the fence resolves.
+Acquiring or renewing a lease SHALL fail **open**: a lease-store error SHALL be logged and processing SHALL continue. The job is protected by the conditional PostgreSQL claim, so an extraction running without a lease is correct — it is merely invisible to the sweeper, and the worst case is one duplicated extraction the fence resolves.
 
-Deciding that a lease has lapsed SHALL fail **closed**: a lease-store error SHALL NOT be read as evidence of expiry, and the sweeper SHALL NOT requeue a job it could not get an answer for. Declining preserves the pre-existing behaviour — the job stays stranded until the lease store is reachable — whereas assuming expiry would turn a Redis outage into a licence to take over every running job at once.
+Deciding that a lease has lapsed SHALL fail **closed**: a lease-store error SHALL NOT be read as evidence of expiry, and the sweeper SHALL NOT requeue a job it could not get an answer for. It SHALL also discard any earlier unleased mark for that job, so recovery requires two fresh successful observations after connectivity returns. Declining preserves the pre-existing behaviour — the job stays stranded until the lease store is reachable — whereas assuming expiry, or combining a pre-outage mark with one post-outage observation, would turn a Redis outage into a licence to take over live jobs.
 
 This asymmetry SHALL be stated in the implementation rather than left to be inferred, because it is the one place in this system where "fail open" is the wrong default.
 

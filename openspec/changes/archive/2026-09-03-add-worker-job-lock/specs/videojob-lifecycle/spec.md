@@ -121,7 +121,7 @@ A `pending` job SHALL NOT be mapped to the fence at any epoch, for the same reas
 #### Scenario: A stale cached queued read does not fence the rightful holder
 
 - **GIVEN** a worker that won a claim whose cache write-through and fallback delete both failed, leaving a `queued` record at the same epoch it holds
-- **WHEN** it later calls `CompleteJob` and the load is served from that stale record
+- **WHEN** it later calls `CompleteJob` while that stale record remains in Redis
 - **THEN** the outcome is decided against the authoritative row rather than the cached one, and the write succeeds
 
 #### Scenario: A terminal write on a job a successor already finished reports the fence
