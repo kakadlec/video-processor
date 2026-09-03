@@ -152,17 +152,17 @@ A failure to clear the key SHALL be logged and SHALL NOT fail the job or prevent
 
 ### Requirement: The Worker Stops With Its Process and Finishes the Message in Hand
 
-On `SIGINT` or `SIGTERM` the worker SHALL stop accepting new deliveries, SHALL finish the job it is currently processing and acknowledge it, SHALL stop its sweeper and its lease renewal, and SHALL then close the broker connection and its database, Redis, and storage handles in an order that keeps the in-flight work valid.
+On `SIGINT` or `SIGTERM` the worker SHALL stop accepting new deliveries, SHALL let the current handler finish and apply its normal Ack/Reject decision when it completes before the deadline, SHALL stop its sweeper and its lease renewal, and SHALL then close the broker connection and its database, Redis, and storage handles in an order that keeps the in-flight work valid.
 
-The sweeper SHALL be cancelled and **joined** before those handles close, exactly as `cmd/api` joins its outbox relay: it holds a database transaction while it runs, and closing the pool underneath a requeue would abort it rather than resolve it. Lease renewal SHALL stop when the in-flight job does. The lease SHALL be released only when this worker applied a terminal outcome or its bounded completion retry found its own identical outcome already present. After a fenced write, an already-present failure, or a non-terminal error, this worker has no cleanup right and SHALL leave the lease to expire (or leave a newer epoch's lease untouched).
+The sweeper SHALL be cancelled and **joined** before those handles close, exactly as `cmd/api` joins its outbox relay: it holds a database transaction while it runs, and closing the pool underneath a requeue would abort it rather than resolve it. Lease renewal SHALL stop when the in-flight job does. Lease release SHALL be attempted only when this worker applied a terminal outcome or its bounded completion retry found its own identical outcome already present. A release error SHALL be logged and left to TTL expiry without changing the normal Ack/Reject disposition. After a fenced write, an already-present failure, or a non-terminal error, this worker has no cleanup right and SHALL leave the lease to expire (or leave a newer epoch's lease untouched).
 
 It SHALL NOT abandon an in-flight extraction by exiting immediately. The redelivery that would follow cannot re-claim the job — the claim predicate refuses a `processing` row — so an abrupt exit converts an orderly restart into a job that only the sweeper can recover, after the lease it stopped renewing has expired.
 
-Shutdown SHALL be bounded: if the in-flight job does not finish within the deadline, the worker SHALL exit anyway rather than block indefinitely, logging the job identifier so it is enumerable. Such a job is no longer stranded permanently — its lease lapses and a sweeper returns it to the queue — and the deadline's cost is a duplicated extraction rather than a lost job.
+Shutdown SHALL be bounded: if the in-flight job does not finish within the deadline, the worker SHALL exit anyway rather than block indefinitely, logging the job identifier so it is enumerable. Such a job is no longer stranded permanently: after its lease lapses, the sweeper requeues it or terminally abandons it at the configured bound. The accepted deadline cost is duplicated work or bounded terminal failure rather than indefinite `processing`.
 
 #### Scenario: An in-flight job is finished before exit
 
-- **GIVEN** a worker mid-extraction
+- **GIVEN** a worker mid-extraction whose handler finishes successfully before the shutdown deadline
 - **WHEN** it receives `SIGTERM`
 - **THEN** it completes that job, acknowledges the message, and exits — and the job is `completed`, not `processing`
 
@@ -180,7 +180,7 @@ Shutdown SHALL be bounded: if the in-flight job does not finish within the deadl
 
 #### Scenario: A job finished during shutdown has its lease released
 
-- **GIVEN** a worker that finished its in-flight job during shutdown
+- **GIVEN** a worker that applied a cleanup-eligible terminal outcome during shutdown and whose lease release succeeds
 - **WHEN** it exits
 - **THEN** the lease store reports that job as not held immediately, without waiting for the expiry
 

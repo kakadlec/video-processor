@@ -14,7 +14,7 @@ The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID an
 
 **The fence epoch `StartProcessing` reports SHALL be carried through the sequence**: `ProcessVideoJob` SHALL pass it to its own `FailJob` calls and SHALL report it in its result, so the caller's `CompleteJob` is fenced by the same value. It SHALL NOT re-read the epoch from the job at the point of the write — by then the row may carry a successor's, and a fence checked against that value would pass in exactly the case it exists to reject.
 
-**`ProcessVideoJob` SHALL hold the job's lease for the duration of its extraction.** It SHALL acquire the lease at the moment `StartProcessing` reports a won claim — it is the only component that observes that moment, since its caller does not regain control until the sequence returns — and SHALL renew it until the sequence ends. It SHALL NOT release it: the lease must survive until the caller's terminal write commits, so release belongs to that caller, and the conditional release makes performing it elsewhere safe. Acquire and renew failures SHALL be logged and SHALL NOT stop the extraction; a renewal that finds a superseded epoch SHALL stop renewing rather than overwrite it.
+**`ProcessVideoJob` SHALL attempt to maintain the job's lease for the duration of its extraction.** It SHALL acquire the lease at the moment `StartProcessing` reports a won claim — it is the only component that observes that moment, since its caller does not regain control until the sequence returns — and SHALL renew it until the sequence ends. When those lease operations succeed, the lease SHALL remain held throughout the extraction. It SHALL NOT release it: the lease must survive until the caller's terminal write commits, so release belongs to that caller, and the conditional release makes performing it elsewhere safe. Acquire and renew failures SHALL be logged and SHALL NOT stop the extraction; a renewal that finds a superseded epoch SHALL stop renewing rather than overwrite it.
 
 **`ProcessVideoJob`'s result SHALL report whether its own `FailJob` write was applied by this call or found the outcome already present.** The caller performs `CompleteJob` itself and reads that distinction from its return value, but the failure write happens inside this use case, and the caller's obligations turn on it: `videojob-worker` gates deleting the source object and clearing the idempotency key on **having applied this job's terminal write**, and a run that merely found the row already `failed` — as a sweeper reaching the requeue bound at the same epoch leaves it — applied nothing and owns neither cleanup. Reporting the failure without that flag would make the caller's rule unimplementable and would let two actors clean up after one job.
 
@@ -30,7 +30,7 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 
 #### Scenario: The lease is held for the duration of the extraction
 
-- **GIVEN** a `VideoJob` in `queued` status and an extraction that outlives the lease's own expiry
+- **GIVEN** a `VideoJob` in `queued` status, an extraction that outlives the lease's own expiry, and a lease store whose acquire and renew operations succeed
 - **WHEN** `ProcessVideoJob.Execute` runs it
 - **THEN** the lease store reports the job as held throughout, and still reports it as held when `Execute` returns
 

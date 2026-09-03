@@ -6,7 +6,7 @@ The Video Processing context SHALL define a job-lease port in its domain layer, 
 
 That distinction is not pedantry. Acquisition fails open, so the rightful holder may hold no lease at all; a superseded claimant's late acquire then finds the key absent and writes its own older epoch. A query keyed only on the job would report that row as protected, the sweeper would skip it forever, and the job would be unrecoverable while its only lease belongs to a worker the fence has already locked out.
 
-A lease SHALL carry an expiry, and its value SHALL be the fence epoch its holder claimed with (see below). Renewal and release SHALL be conditional on the stored value still naming that epoch, so a worker whose job has already been taken over can neither extend nor delete the lease its successor holds. The epoch identifies a holder unambiguously: only a requeue changes it, and only a requeue can produce a second holder.
+A lease SHALL carry an expiry, and its value SHALL be the fence epoch its holder claimed with (see below). Renewal and release SHALL be conditional on the stored value still naming that epoch, so a worker whose job has already been taken over can neither extend nor delete the lease its successor holds. Release SHALL be best effort after an eligible terminal outcome: an error SHALL be logged without changing the message disposition, and the key MAY remain until its TTL expires. The epoch identifies a holder unambiguously: only a requeue changes it, and only a requeue can produce a second holder.
 
 **Acquisition SHALL be conditional too**, though on a weaker predicate than renewal: it SHALL replace an absent lease or one naming an *older or equal* epoch, and SHALL refuse to replace one naming a *newer* one. An unconditional write is unsafe because winning the claim and setting the lease are two steps: a claimant that stalls between them can be swept, requeued, and superseded, and its late write would then replace the rightful holder's lease with a stale epoch — after which the holder's own renewals are refused, its live job looks abandoned once that stale entry expires, and it is requeued a second time under a worker that is still running. Refusing on a newer stored value SHALL NOT be reported as an error to the caller: it is the successor's lease, correctly left alone.
 
@@ -20,6 +20,7 @@ It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` an
 
 #### Scenario: A lease is held for the duration of an extraction
 
+- **GIVEN** a lease store whose acquire and renew operations succeed
 - **WHEN** a worker wins a job's claim and begins extracting
 - **THEN** the lease store reports that job as held, and continues to report it as held for as long as the extraction runs
 
@@ -59,11 +60,17 @@ It SHALL NOT be placed in `internal/platform/`. It is keyed by a `VideoJobID` an
 - **WHEN** renewal reports the key absent and the holder conditionally reacquires at its epoch
 - **THEN** the lease is restored and renewal continues; but if the stored epoch is newer, reacquisition is refused and the old holder stops renewing
 
-#### Scenario: The lease is released when the outcome is committed
+#### Scenario: A successful release removes the lease after commit
 
-- **GIVEN** a worker that has committed a job's terminal state
+- **GIVEN** a worker that has committed a job's terminal state and whose release operation succeeds
 - **WHEN** it finishes with that job
 - **THEN** the lease store reports the job as not held, without waiting for the expiry
+
+#### Scenario: A failed release falls back to expiry
+
+- **GIVEN** a cleanup-eligible terminal outcome whose lease release returns an error
+- **WHEN** the worker finishes with that job
+- **THEN** it logs the error, preserves its normal message disposition, and the lease may remain until its TTL expires
 
 ### Requirement: The Fence Epoch Is Won Atomically and Carried, Never Re-Read
 
@@ -87,7 +94,7 @@ Reading it from a lookup that precedes the claim SHALL NOT be substituted either
 
 ### Requirement: A Terminal Write Is Conditional on the Fence Epoch
 
-The persistence path behind `CompleteJob` and `FailJob` SHALL apply its write only if the stored row still carries the epoch the caller claimed with **and is still in `processing` status**, and SHALL report a distinct, exported sentinel error when no row matches. That sentinel SHALL be distinguishable from a not-found error and from an invalid-transition error: the row exists and the transition was legal, but the caller may no longer commit it.
+The persistence path behind `CompleteJob` and `FailJob` SHALL apply its write only if the stored row still carries the epoch the caller claimed with **and is still in `processing` status**. When no row matches, it SHALL classify the authoritative stored row: the exact same terminal outcome already stored at the same epoch is an idempotent success with `Applied=false`; a missing row is the not-found error; every other existing state returns the distinct, exported `ErrJobFenced` sentinel. That sentinel SHALL remain distinguishable from not-found and invalid-transition errors: the row exists, but this caller may no longer commit its proposed outcome.
 
 Both conjuncts are load-bearing and neither subsumes the other. The epoch rejects a worker whose job was taken from it. The status makes the write *exclusive*, which the epoch alone cannot: the epoch advances only on a requeue, so a live leaseless worker and the sweeper abandoning it can hold the same epoch, and an epoch-only predicate would let both commit, the second overwriting the first. With the status conjunct exactly one terminal write per job can ever affect a row, and the cleanup that follows a terminal state has exactly one owner.
 
@@ -123,7 +130,7 @@ The requeue SHALL be conditional on the job still being `processing` **and** sti
 
 The confirmation state SHALL be worker-local and in-memory, never persisted or shared between replicas: each replica confirms its own observations, and what makes concurrent sweepers safe remains the conditional requeue and the fenced terminal write. A restarted replica simply re-observes, at a cost of one cycle.
 
-Recovery SHALL NOT be built on broker redelivery. When a worker process dies its unacknowledged delivery is requeued by the broker immediately, so the redelivery arrives while the lease is still live and is dead-lettered; by the time the lease could be observed as lapsed there is no message left. A delayed-retry queue SHALL NOT be substituted either: its delay would have to exceed every possible extraction to be correct.
+Recovery SHALL NOT be built on broker redelivery. When a worker process dies its unacknowledged delivery is requeued by the broker immediately, usually before a successfully acquired lease lapses; regardless of whether any lease exists, the redelivery is dead-lettered because the PostgreSQL row remains `processing` and the claim admits only `queued`. By the time lease absence can authorize recovery there is no message left. A delayed-retry queue SHALL NOT be substituted either: its delay would have to exceed every possible extraction to be correct.
 
 The claim predicate SHALL NOT be widened to admit a `processing` row instead. Doing so would make `ClaimForProcessing` read the lease, and the lease is Redis-backed and fails open — a Redis outage would then license two workers to claim one live job, which is the exact hazard the conditional claim exists to close.
 

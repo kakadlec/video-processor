@@ -88,9 +88,9 @@ A record written by a previous release carries no epoch at all. Such a record SH
 
 #### Scenario: A successful Update caches the epoch it wrote at
 
-- **GIVEN** a `VideoJob` loaded from a record written by a previous release, so its in-memory epoch is zero, and a `CompleteJob` that commits at a non-zero held epoch
-- **WHEN** the decorator writes through
-- **THEN** the cached record carries the epoch the write committed at, not zero
+- **GIVEN** a terminal `VideoJob` whose in-memory epoch is zero and a non-zero held epoch passed directly to `CachedVideoJobRepository.Update`
+- **WHEN** the underlying update applies and the decorator writes through
+- **THEN** the cached record carries the epoch argument the write committed at, not the aggregate's zero
 
 #### Scenario: A won requeue caches the advanced epoch
 
