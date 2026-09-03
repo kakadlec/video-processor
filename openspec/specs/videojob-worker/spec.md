@@ -82,7 +82,7 @@ It SHALL NOT requeue such a message: none of these conditions is transient, so r
 
 It SHALL NOT acknowledge such a message either. An acknowledged message is gone from the broker, which would leave nothing to enumerate afterwards — the dead-letter queue is the only place these anomalies remain visible, and `videojob-messaging` keeps it unversioned so there is one place to look.
 
-A rejected message SHALL NOT cause a transition. In particular a lost claim SHALL NOT be turned into a `FailJob` call: the job belongs to whichever consumer won. A fenced write SHALL NOT be retried unfenced, re-read, or converted into a failure for the same reason.
+Rejecting a message SHALL NOT cause any additional job transition as part of that rejection. In particular a lost claim SHALL NOT be turned into a `FailJob` call: the job belongs to whichever consumer won. A fenced write SHALL NOT be retried unfenced, re-read, or converted into a failure for the same reason.
 
 A fenced outcome SHALL be logged distinctly from a lost claim, naming the job, the epoch the worker held, and — when the extraction had succeeded — the result key it stored. That key is not necessarily an orphan: it is the job's own result key, so the object under it may be the successor's or this run's, whichever was written last. `videojob-lease-recovery` states why either is acceptable; the log line exists so an operator can tell that a second run produced a result at all, not so the object can be recovered separately.
 
@@ -144,11 +144,11 @@ The deletion SHALL be best effort, as it was when the HTTP handler owned it: one
 - **WHEN** the worker gives up on the message
 - **THEN** the job is still `processing`, the source object is still present, the message is dead-lettered rather than acknowledged, and the job identifier and result storage key are logged
 
-#### Scenario: A fenced worker leaves the source object for the job's new holder
+#### Scenario: A fenced worker does not delete the source object
 
 - **GIVEN** a worker whose job was requeued and re-claimed mid-extraction, so its terminal write is refused by the fence
 - **WHEN** it gives up on the message
-- **THEN** the source object is still present, and the new holder's extraction reads it successfully
+- **THEN** this worker makes no source-deletion call; the object remains available while a successor still needs it, or may already have been removed by that successor's own terminal cleanup
 
 #### Scenario: A panic mid-extraction does not delete the source object
 
