@@ -96,7 +96,7 @@ pending → queued → processing → completed
 - `ContentHash` is fixed at creation and never rewritten by a transition either.
 - **`queued → processing` is a claim, not merely a transition.** It is persisted through one conditional statement (`… WHERE id = $1 AND status = 'queued' RETURNING lease_epoch`), so of two consumers handed the same dispatch exactly one wins and receives the epoch it must carry. Losing returns a distinct sentinel and touches nothing.
 - **A terminal write is fenced.** `CompleteJob` and `FailJob` apply only while the row is still `processing` at the epoch the claim returned. A requeue advances the epoch; a previous holder then receives `ErrJobFenced` and cannot overwrite the successor.
-- **The Redis lease is liveness, not ownership.** Pickup never consults it. The sweeper requires two successful not-held observations at the same epoch before conditionally requeueing; a Redis query error clears the confirmation and takes over nothing.
+- **The Redis lease is liveness, not ownership.** Pickup never consults it. The sweeper requires two successful not-held observations at the same epoch before conditionally requeueing; a Redis query error for that job clears its confirmation and takes over nothing.
 
 ### Use Cases
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in the Video Processing bounded context's `infrastructure` layer, and the transactional-outbox behavior on job creation and on the `pending → queued` transition. This is infrastructure only — no HTTP route or composition-root wiring is in scope here; see `videojob-lifecycle` for the domain/application use cases this repository implements the port for, and the Change Backlog in `docs/roadmap.md` for what wires it in.
+Define the PostgreSQL-backed implementation of `domain.VideoJobRepository` in the Video Processing bounded context's `infrastructure` layer, and the transactional-outbox behavior on job creation, the initial `pending → queued` transition, and recovery `processing → queued` transitions. This is infrastructure only — no HTTP route or composition-root wiring is in scope here; see `videojob-lifecycle` for the domain/application use cases this repository implements the port for, and the Change Backlog in `docs/roadmap.md` for what wires it in.
 ## Requirements
 ### Requirement: PostgreSQL Repository Implements VideoJobRepository
 
