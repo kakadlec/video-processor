@@ -68,18 +68,18 @@ The `FrameExtractor` port SHALL continue to receive a local file path and SHALL 
 
 #### Scenario: The downloaded copy is removed after a successful extraction
 
-- **WHEN** an upload is processed successfully
-- **THEN** no file remains under `temp/` for that job after the request completes
+- **WHEN** `ProcessVideoJob.Execute` processes an upload successfully and returns
+- **THEN** no transient source file remains under the worker's `temp/` for that job
 
 #### Scenario: The downloaded copy is removed after a failed extraction
 
 - **GIVEN** a video whose content `ffmpeg` cannot decode
 - **WHEN** processing fails
-- **THEN** the transient local copy this request downloaded no longer exists under `temp/`
+- **THEN** the transient local copy that processing run downloaded no longer exists under the worker's `temp/`
 
 #### Scenario: A download failure fails the job without invoking ffmpeg
 
-- **GIVEN** a source key whose object is absent from the bucket
+- **GIVEN** a source key whose object is absent from the bucket and a failure write that this run can apply
 - **WHEN** `ProcessVideoJob.Execute` is called with it
 - **THEN** the job ends in `failed` status with a non-empty `ErrorReason`, and `ffmpeg` is never invoked
 
@@ -109,14 +109,14 @@ This is an obligation to **attempt**, deliberately not a guarantee of absence. T
 
 #### Scenario: A duplicate's source object is deleted without touching the original's
 
-- **GIVEN** a duplicate request that stored its own source object under its own `uploadID` before discovering the conflict, and storage reachable throughout
+- **GIVEN** a duplicate request that stored its own source object under its own `uploadID` before discovering the conflict, and whose cleanup deletion succeeds
 - **WHEN** the handler cleans up
 - **THEN** that request's own source object is deleted and the original job's artifacts are untouched
 
 #### Scenario: A job that cannot be created or enqueued deletes its source object
 
 - **GIVEN** a stored source object whose `CreateVideoJob` or `EnqueueVideoJob` call fails
-- **WHEN** the handler unwinds
+- **WHEN** the handler unwinds and its cleanup deletion succeeds
 - **THEN** no object exists under that request's source key, because ownership never transferred
 
 #### Scenario: A client disconnect before the enqueue still triggers cleanup
@@ -135,7 +135,7 @@ This is an obligation to **attempt**, deliberately not a guarantee of absence. T
 
 - **GIVEN** a worker dies after claiming a job but before committing a terminal outcome
 - **WHEN** the lease expires and the recovery path eventually applies that job's terminal outcome
-- **THEN** the source remains available for every re-dispatched run and is deleted only by the actor that applies the final outcome
+- **THEN** the source remains owned by the job during recovery, and only the actor that applies the final outcome earns the one-attempt cleanup right; any residue remains lifecycle-managed
 
 #### Scenario: A cleanup failure is logged, not fatal, and not specified away
 
