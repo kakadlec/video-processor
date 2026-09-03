@@ -77,6 +77,12 @@ The queue is declared now, two changes before anything consumes it. That is the 
 
 The alternative — write rows in this change and defer topology and relay to the consumer's change — was rejected because it would concentrate the relay generalization, the topology, the consumer, HMAC signing, and the retry policy into one oversized change, and because it makes this change unverifiable end to end.
 
+`rabbitmq.Topology` today carries a single `RoutingKey`, and `DeclareTopology` issues one `QueueBind` with it. It becomes `RoutingKeys []string`, bound in a loop; the dispatch topology passes a one-element slice and is unchanged in behavior. This is the same generalization decision 4 makes to `Claim`, and it is made here rather than in the middle of implementation because `Topology` is the one struct both generations of both topologies flow through.
+
+The alternative — a second descriptor type for multi-binding topologies, leaving `Topology` alone — was rejected: it would need its own `DeclareTopology` sibling duplicating the dead-letter-first declaration order, which is the load-bearing part of that function, and the two would drift. A slice field carries no bounded-context name, so the `ddd-architecture` test asserting `internal/platform/` imports and names nothing context-specific keeps holding; that is what task 4.1's "without naming this context" clause is protecting, and a `[]string` of caller-supplied keys satisfies it by construction.
+
+An empty `RoutingKeys` is a caller defect, not a fanout: the work exchange is direct, so a queue with no binding receives nothing and every mandatory publish into that exchange is returned unroutable. `DeclareTopology` rejects it rather than declaring a topology that looks complete and routes nothing — the same failure mode the dead-letter-first ordering already exists to prevent.
+
 ### 6. The terminal relay runs in `cmd/worker`
 
 The rows are written by the worker (its own terminal writes and its sweeper's abandonment write), so the relay draining them is placed there. Running it in `cmd/api` would work — the table is shared and `FOR UPDATE SKIP LOCKED` makes concurrent relays safe — but it would make notification of a job's outcome depend on an API replica being up, which is a dependency the outcome itself does not have.

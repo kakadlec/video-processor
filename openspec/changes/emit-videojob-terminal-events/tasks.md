@@ -26,7 +26,8 @@ Implementation order follows the dependency chain: the payload contract and the 
 
 ## 4. Terminal-event topology
 
-- [ ] 4.1 Add the terminal exchange, queue, and both routing-key bindings to `topology.go`, reusing the existing dead-letter exchange and queue. `rabbitmq.Topology` carries a single `RoutingKey`; extend it to accept a set of bindings, in `internal/platform/rabbitmq` where the descriptor lives, without naming this context anywhere in that package.
+- [ ] 4.1 Replace `rabbitmq.Topology.RoutingKey` with `RoutingKeys []string` and bind each in `DeclareTopology`, per design decision 5. Reject an empty slice with an error. No name from this context enters `internal/platform/rabbitmq`.
+- [ ] 4.1a Update the existing dispatch topology to pass a one-element `RoutingKeys`, and add the terminal exchange, queue, and both routing-key bindings to `topology.go`, reusing the existing dead-letter exchange and queue.
 - [ ] 4.2 Give the terminal queue the same `x-max-length` + `reject-publish` bound as the job queue and no message TTL, and comment why the TTL is absent — the reason differs from the job queue's and is worth stating: an expired terminal event is an outcome that is never announced.
 - [ ] 4.3 Extend `TestRoutingKeyMatchesTheOutboxEventType` to assert the equality for every published event type, over a table rather than one pair.
 
@@ -48,6 +49,7 @@ Implementation order follows the dependency chain: the payload contract and the 
 - [ ] 6.8 `messaging`: the publisher publishes each message under its own routing key; a message whose key matches no binding is reported unpublished. Skips cleanly without `RABBITMQ_TEST_URL`, like the existing tests.
 - [ ] 6.9 `messaging`: a contract test decoding each terminal payload struct against the `postgres` payload it pairs with, in the shape of `TestJobQueuedMessageDecodesTheOutboxPayload`. Add the consumer-side structs this change needs for that test and nothing more.
 - [ ] 6.10 `messaging`: the terminal topology is declared idempotently on redial, and both routing keys land on one queue.
+- [ ] 6.10a `platform/rabbitmq`: a descriptor naming two work-queue routing keys routes both to one queue, and a descriptor with an empty set is refused with nothing declared. Test-scoped names, torn down on failure, skipping cleanly without `RABBITMQ_TEST_URL`, like the rest of that package.
 - [ ] 6.11 `cmd/worker`: a job run to completion by the real handler leaves a terminal outbox row; the platform test asserting `internal/platform/` imports and names nothing context-specific still passes after task 4.1.
 - [ ] 6.12 Existing dispatch-path tests pass unchanged — that is the evidence the one-element set is behaviour-preserving. Do not adjust them to fit the new signature beyond the mechanical argument change.
 
