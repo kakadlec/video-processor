@@ -41,9 +41,9 @@ Processing is asynchronous as of Phase 6, but the system is not yet complete:
 
 - **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Scale by running more worker processes — each holds exactly one job at a time by design.
 - **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so the worker downloads each source into its own `temp/`, extracts frames there, and builds the zip there, removing all of it before the job finishes. Nothing durable lives on local disk (Phase 5): uploaded source videos go to MinIO too, as **transient** objects whose owner deletes them — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
-- **A source object can leak.** A job that is enqueued but never dispatched — the relay never published it, the message was dead-lettered before a claim, or a worker died between delivery and cleanup — leaves its source in the bucket with nothing to reclaim it. Configure the `uploads/`-prefix expiration lifecycle rule; it is the only guarantee. See [docs/operations.md](docs/operations.md).
+- **A source object can leak.** A job never dispatched, a dispatch dead-lettered before any claim, or a worker interrupted after a terminal commit but before best-effort cleanup can leave its source in the bucket. Mid-extraction crashes are recovered by the worker sweeper. Configure the `uploads/`-prefix expiration lifecycle rule; it remains the only exhaustive guarantee. See [docs/operations.md](docs/operations.md).
 - **No notifications** — users must stay on the page (which polls the job's status URL) or poll `GET /api/status` to find out when processing completes. Phase 7.
-- **In-flight work is lost on restart** — a worker drains for up to five minutes on `SIGTERM`, but a job whose worker dies mid-extraction stays stuck in `processing` and is never resumed: the atomic claim admits only `queued` rows, so every redelivery is refused. Recovering those is `add-worker-job-lock` (Phase 6).
+- **Crash recovery is bounded, not immediate.** A worker renews an epoch-scoped Redis lease while extracting. After the lease expires, the sweeper requires two successful missing-lease observations before requeueing; after three recoveries, it fails the job rather than loop forever. Redis outages delay takeover instead of authorizing it.
 
 These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
 
@@ -80,7 +80,7 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 - **Identity and job persistence:** PostgreSQL (via `pgx`), including a transactional outbox
 - **Job dispatch:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — outbox relay in `cmd/api`, consumer in `cmd/worker`
 - **Object storage:** MinIO / S3-compatible (via [`minio-go`](https://github.com/minio/minio-go)) for source videos and ZIP results
-- **Idempotency, rate limiting, status cache:** Redis (via [`go-redis`](https://github.com/redis/go-redis))
+- **Idempotency, rate limiting, status cache, worker leases:** Redis (via [`go-redis`](https://github.com/redis/go-redis))
 - **Password hashing:** bcrypt
 - **Access tokens:** JWT ([`golang-jwt/jwt`](https://github.com/golang-jwt/jwt))
 - **CI:** GitHub Actions — `go vet`, `go test`, [gosec](https://github.com/securego/gosec), [govulncheck](https://go.dev/security/vuln)

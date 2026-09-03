@@ -10,11 +10,11 @@ The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID an
 
 **The fence epoch `StartProcessing` reports SHALL be carried through the sequence**: `ProcessVideoJob` SHALL pass it to its own `FailJob` calls and SHALL report it in its result, so the caller's `CompleteJob` is fenced by the same value. It SHALL NOT re-read the epoch from the job at the point of the write — by then the row may carry a successor's, and a fence checked against that value would pass in exactly the case it exists to reject.
 
-**`ProcessVideoJob` SHALL hold the job's lease for the duration of its extraction.** It SHALL acquire the lease at the moment `StartProcessing` reports a won claim — it is the only component that observes that moment, since its caller does not regain control until the sequence returns — and SHALL renew it until the sequence ends. It SHALL NOT release it: the lease must survive until the caller's terminal write commits, so release belongs to that caller, and the conditional release makes performing it elsewhere safe. Acquire and renew failures SHALL be logged and SHALL NOT stop the extraction; a renewal that finds a superseded epoch SHALL stop renewing rather than overwrite it.
+**`ProcessVideoJob` SHALL attempt to maintain the job's lease for the duration of its extraction.** It SHALL acquire the lease at the moment `StartProcessing` reports a won claim — it is the only component that observes that moment, since its caller does not regain control until the sequence returns — and SHALL renew it until the sequence ends. When those lease operations succeed, the lease SHALL remain held throughout the extraction. It SHALL NOT release it: the lease must survive until the caller's terminal write commits, so release belongs to that caller, and the conditional release makes performing it elsewhere safe. Acquire and renew failures SHALL be logged and SHALL NOT stop the extraction; a renewal that finds a superseded epoch SHALL stop renewing rather than overwrite it.
 
 **`ProcessVideoJob`'s result SHALL report whether its own `FailJob` write was applied by this call or found the outcome already present.** The caller performs `CompleteJob` itself and reads that distinction from its return value, but the failure write happens inside this use case, and the caller's obligations turn on it: `videojob-worker` gates deleting the source object and clearing the idempotency key on **having applied this job's terminal write**, and a run that merely found the row already `failed` — as a sweeper reaching the requeue bound at the same epoch leaves it — applied nothing and owns neither cleanup. Reporting the failure without that flag would make the caller's rule unimplementable and would let two actors clean up after one job.
 
-**A fenced write SHALL be reported, never retried and never worked around.** When `FailJob` is refused because the epoch has been superseded, `ProcessVideoJob` SHALL surface that sentinel to its caller rather than falling back to an unfenced write, re-loading the job, or reporting the job as failed. The job was taken over while this sequence was running, and its outcome belongs to whoever holds it now. The transient local copy SHALL still be removed, as on every other path.
+**A fenced write SHALL be reported, never retried and never worked around.** When `FailJob` is refused because the stored row no longer matches `processing` at the held epoch — either a newer epoch superseded the run or another actor committed a different terminal outcome at the same epoch — `ProcessVideoJob` SHALL surface that sentinel to its caller rather than falling back to an unfenced write, re-loading the job, or reporting the job as failed. Its error result SHALL preserve the job ID and the epoch this run held, including when that epoch is non-zero, so the worker's fence log identifies the refused attempt. The persisted outcome belongs to the newer holder or same-epoch terminal winner. The transient local copy SHALL still be removed, as on every other path.
 
 It SHALL NOT call `EnqueueVideoJob`. That transition belongs to the submitting handler, and calling it here would be a rejected `queued → queued` transition: `POST /upload` enqueues the job itself, immediately after creating it, so that the `pending → queued` update commits in the same transaction as the event describing it. `docs/domain-model.md`'s use-case table has always assigned `EnqueueVideoJob` the actor "API (post-upload)". An implementer SHALL NOT restore the call to keep the use case's sequence "complete". It SHALL NOT call the requeue transition either: returning an abandoned job to the queue is `videojob-lease-recovery`'s sweeper's, and a use case that requeued the job it was running would re-dispatch its own work.
 
@@ -26,7 +26,7 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 
 #### Scenario: The lease is held for the duration of the extraction
 
-- **GIVEN** a `VideoJob` in `queued` status and an extraction that outlives the lease's own expiry
+- **GIVEN** a `VideoJob` in `queued` status, an extraction that outlives the lease's own expiry, and a lease store whose acquire and renew operations succeed
 - **WHEN** `ProcessVideoJob.Execute` runs it
 - **THEN** the lease store reports the job as held throughout, and still reports it as held when `Execute` returns
 
@@ -70,7 +70,7 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 
 - **GIVEN** a `VideoJob` whose extraction failed and whose fence epoch advanced while that extraction ran
 - **WHEN** `ProcessVideoJob.Execute` reaches its `FailJob` call
-- **THEN** it returns the fence sentinel, the job is not moved to `failed`, no unfenced write is attempted, and the transient local copy no longer exists
+- **THEN** it returns the fence sentinel together with the job ID and held epoch, the job is not moved to `failed`, no unfenced write is attempted, and the transient local copy no longer exists
 
 #### Scenario: A source object that cannot be fetched fails the job
 

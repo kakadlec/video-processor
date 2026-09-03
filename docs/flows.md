@@ -94,10 +94,13 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │    ClaimForProcessing      │                   │
   │                        │    UPDATE … WHERE id=$1     │                  │
   │                        │      AND status='queued'   │                   │
+  │                        │      RETURNING lease_epoch │                   │
   │                        │───────────────────────────►│                  │
   │                        │    no row → ErrJobClaimLost │                  │
   │                        │    → Reject → DLQ, nothing  │                  │
   │                        │      touched at all         │                  │
+  │                        │    acquire/renew Redis lease│                  │
+  │                        │      at returned epoch      │                  │
   │                        │    SourceStorage.Get →      │                  │
   │                        │    temp/<jobID>_source      │                  │
   │                        │◄──────────────────────────────────────────────│
@@ -111,17 +114,20 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │──────────────────────────────────────────────►│
   │                        │    FailJob if fetch,        │                  │
   │                        │    extraction OR storage    │                  │
-  │                        │    failed (the worker never │                  │
-  │                        │    calls FailJob itself)    │                  │
+  │                        │    failed, fenced by epoch  │                  │
   │                        │───────────────────────────►│                  │
-  │                        │  on failure:                │                  │
+  │                        │  ErrJobFenced: Reject → DLQ,│                  │
+  │                        │    keep source and release  │                  │
+  │                        │    no lease                 │                  │
+  │                        │  on applied failure:        │                  │
   │                        │    delete the source object │                  │
   │                        │    clear the idempotency key│                  │
   │                        │    (rebuilt from UserID +   │                  │
   │                        │     persisted content_hash) │                  │
-  │                        │    → Ack                    │                  │
+  │                        │    release held lease → Ack │                  │
   │                        │  on success:                │                  │
-  │                        │    CompleteJob, retried 4×  │                  │
+  │                        │    CompleteJob at the held  │                  │
+  │                        │    epoch, retried 4×        │                  │
   │                        │    with backoff on a context│                  │
   │                        │    detached from shutdown   │                  │
   │                        │───────────────────────────►│                  │
@@ -130,11 +136,13 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │    StorageKey logged        │                  │
   │                        │    delete the source object │                  │
   │                        │──────────────────────────────────────────────►│
-  │◄───────────────────────│    → Ack                    │                  │
+  │◄───────────────────────│    release lease → Ack      │                  │
   │  ack / reject           │                            │                  │
 ```
 
-An acknowledgement asserts that the job reached a **terminal state**, not that it succeeded: a `failed` job is acked, because there is nothing left to redeliver for it.
+An acknowledgement asserts that a **terminal outcome exists**, not that processing succeeded or that this call necessarily applied it. An applied failure is acked with cleanup; an identical failure already present is also acked, but this later run performs no second cleanup because it did not apply the outcome. A fenced run is rejected and performs no source, idempotency, or lease cleanup because this actor did not apply the terminal outcome.
+
+A sibling sweeper scans bounded batches of `processing` rows every 60 seconds. After two successful observations that no lease is held at the same epoch, it conditionally returns the row to `queued`, increments the epoch, and writes a fresh outbox dispatch in one transaction. After three requeues, or for a legacy row with no source key, it applies terminal abandonment instead. A Redis query error for that job resets its prior confirmation and takes over nothing.
 
 ### Polling and download
 
@@ -171,19 +179,18 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 - `POST /upload` returns `202` as soon as the job is `queued`. The status code acknowledges the **submission**, not the work — a client must not read success from it. There is no frame count, result key, or download URL in that body, because none exists yet.
 - **Uploads are not processed unless at least one worker is running.** With `cmd/api` alone, jobs accumulate in `queued` and the API reports exactly that.
 - Content-hash idempotency: identical bytes uploaded twice by the same user reuse the first request's `VideoJob` rather than running `ffmpeg` again (Phase 4, `add-upload-idempotency-keys`) — see `docs/architecture.md`'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md`. `REDIS_ADDR` is required at startup for this. A duplicate is answered with the **same** `202` shape naming the existing job, whatever state that job is in, so a client needs no duplicate branch and learns the difference on its first poll.
-- **Clearing a failed job's key is the worker's**, not the handler's — the handler returns before an outcome exists. The key is rebuilt from the job's `UserID` and a persisted `content_hash` column, and deleted only if it still names that job. The reservation *token* is never persisted.
-- Dispatch is **at-least-once**, and `queued → processing` is an atomic conditional claim (`WHERE id = $1 AND status = 'queued'`) rather than a read-then-write. Of two consumers handed the same message exactly one wins; the loser writes nothing, deletes nothing, and dead-letters its copy. What that does *not* do is recover a job whose worker died mid-extraction — that job stays `processing` and is stranded until `add-worker-job-lock` (Phase 6) ships a fence.
+- **Clearing a failed job's key belongs to whichever worker applied the failure**, not the handler — either the consumer or the abandonment sweeper. The key is rebuilt from the job's `UserID` and persisted `content_hash`, and deleted only if it still names that job. Fenced and already-present outcomes clear nothing; the reservation token is never persisted.
+- Dispatch is **at-least-once**, and `queued → processing` is an atomic conditional PostgreSQL claim (`WHERE id = $1 AND status = 'queued' RETURNING lease_epoch`). Of two consumers handed the same message exactly one wins. Worker death after the claim is recovered separately: an epoch-scoped Redis lease supplies liveness, the sweeper advances the PostgreSQL epoch and re-dispatches, and terminal writes from the previous holder are fenced.
 - The client learns everything through `GET /api/video-jobs/:id`, polling from 2 s and backing off to a 10 s ceiling. Those polls share one per-user rate-limit budget with the submission and the download issuance, which is why the interval is chosen against the default 60/60s rather than for responsiveness. A `429` is a back-off signal, not a job failure.
 - Nothing the client uploads touches local disk on the way in, and `cmd/api` has no `temp/` directory at all any more. The only local copy is the one `ProcessVideoJob` downloads for `ffmpeg`, on the **worker's** filesystem, removed on every path (Phase 5, `migrate-upload-storage-to-minio`).
-- The source object has exactly one owner at a time: the request until its job commits as `queued`, the worker afterwards. A job that is enqueued but never dispatched leaks its source permanently — the bucket's `uploads/`-prefix expiration rule is the only guarantee such objects are reclaimed. See `docs/operations.md`.
+- The source object belongs to the request until its job commits as `queued`; afterwards only a consumer that applied a terminal result or the sweeper that applied abandonment deletes it. Fenced runs delete nothing. Jobs never dispatched and best-effort cleanup failures can still leak, so the bucket's `uploads/`-prefix expiration rule remains the only exhaustive reclamation guarantee. See `docs/operations.md`.
 - Authentication (Phase 2) is required on every step of the path; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and always from the `VideoJob` row. `cmd/worker` makes **no** access-control decision — it acts on an internal dispatch, never on behalf of a caller — and holds no Identity configuration. A job identifier alone grants nothing.
 - The download is a two-step exchange, not a proxied stream (Phase 5, `add-presigned-download-urls`). `GET /download/:filename` authorizes and issues; the client redeems the issued URL against MinIO with no `Authorization` header. Entitlement is evaluated **only** at issuance, since the URL carries no identity — nothing re-checks ownership when it is redeemed, and nothing can withdraw it before its five minutes are up. The `Stat` before signing is not optional: signing is offline and succeeds for a key holding no object, so without it a missing object would surface as MinIO's own `404` instead of this endpoint's byte-identical one.
 
 ---
 
-## What is still missing (Phase 6 remainder, and Phase 7)
+## What is still missing (Phase 7)
 
-- **Recovering a stranded job.** A worker that dies mid-extraction leaves its job stored as `processing`; every redelivery is refused by the claim and dead-lettered. `add-worker-job-lock` is the change that adds a fence letting such a job be safely re-admitted.
 - **Notifications.** On completion the Notification context is meant to be triggered by a `VideoJobCompleted` / `VideoJobFailed` domain event over RabbitMQ. Neither event is written anywhere yet: `CompleteJob` and `FailJob` persist through `Repository.Update`, which is deliberately not an outbox writer, so Phase 7 decides their shape on its own terms.
 
 ---

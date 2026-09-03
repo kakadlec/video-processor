@@ -67,30 +67,36 @@
 | `FrameCount` | int | ≥ 0; set only on transition to `completed` |
 | `ErrorReason` | string | Non-empty only in `failed` state |
 | `JobStatus` | enum | Transitions only via defined commands (see state machine below) |
+| `LeaseEpoch` | integer (application-generated values are non-negative) | Counts how many times recovery returned the job to `queued`; application paths start at zero and advance only on requeue, while the persistence boundary does not add a database `CHECK` or reject a stored integer during restoration |
 
 ### State Machine
 
 ```
 pending → queued → processing → completed
                              ↘ failed
+          queued ← recovery ← processing
 ```
+
+`processing → queued` is the single backwards edge. It is available only to the recovery sweeper after the job is confirmed unleased; it is not a general retry or operator reset.
 
 | State | Meaning | Entered by |
 |---|---|---|
 | `pending` | Job created, upload stored; not yet on the queue | `CreateVideoJob` use case |
-| `queued` | Dispatch recorded in the outbox and committed with the transition; the broker message follows, published out of band by the relay | `EnqueueVideoJob` use case |
-| `processing` | `cmd/worker` has dequeued the job and won the claim; frame extraction is under way | `cmd/worker`'s `StartProcessing` command — an **atomic conditional claim**, see below |
-| `completed` | Frames extracted and ZIP stored; `FrameCount` and `StorageKey` populated | `cmd/worker`'s `CompleteJob` command |
-| `failed` | Processing failed; `ErrorReason` populated | `ProcessVideoJob`'s own `FailJob` call, inside `cmd/worker` |
+| `queued` | Dispatch recorded in the outbox and committed with the transition; the broker message follows, published out of band by the relay | `EnqueueVideoJob` for first dispatch, or the recovery sweeper's fenced requeue |
+| `processing` | `cmd/worker` has dequeued the job and won the claim; frame extraction is under way and the worker attempts to maintain an epoch-scoped lease | `cmd/worker`'s `StartProcessing` command — an **atomic conditional claim**, see below |
+| `completed` | Frames extracted and ZIP stored; `FrameCount` and `StorageKey` populated | `cmd/worker`'s epoch-fenced `CompleteJob` command |
+| `failed` | Processing failed or exhausted recovery; `ErrorReason` populated | `ProcessVideoJob`'s fenced `FailJob`, or the recovery sweeper's abandonment write |
 
 **Invariants:**
-- A job may not transition backwards.
+- A job may not transition backwards except for `processing → queued`, used only to recover a confirmed abandonment; `completed` and `failed` remain terminal.
 - `FrameCount` MUST be zero until the job reaches `completed`.
 - `ErrorReason` MUST be empty unless the job is `failed`.
 - `StorageKey` for the result MUST be set atomically with the `completed` transition.
 - `SourceKey` MUST be non-zero to enter `queued`, and is fixed at creation — it is never rewritten by a transition.
 - `ContentHash` is fixed at creation and never rewritten by a transition either.
-- **`queued → processing` is a claim, not merely a transition.** It is persisted through a single conditional statement (`… WHERE id = $1 AND status = 'queued'`), so of two consumers handed the same dispatch exactly one wins and the loser mutates nothing. Dispatch is at-least-once by construction, so without that predicate both would pass the transition check and both would extract. Losing the claim is a distinct, non-failing outcome: the loser returns a sentinel, does not call `FailJob`, and touches neither the job nor its source object.
+- **`queued → processing` is a claim, not merely a transition.** It is persisted through one conditional statement (`… WHERE id = $1 AND status = 'queued' RETURNING lease_epoch`), so of two consumers handed the same dispatch exactly one wins and receives the epoch it must carry. Losing returns a distinct sentinel and touches nothing.
+- **A terminal write is fenced.** `CompleteJob` and `FailJob` apply only while the row is still `processing` at the epoch the claim returned. A requeue advances the epoch; a previous holder then receives `ErrJobFenced` and cannot overwrite the successor.
+- **The Redis lease is liveness, not ownership.** Pickup never consults it. The sweeper requires two successful not-held observations at the same epoch before conditionally requeueing; a Redis query error for that job clears its confirmation and takes over nothing. Because acquisition and renewal fail open, an absent lease is evidence that requires confirmation, not proof that no worker is running.
 
 ### Use Cases
 
@@ -102,10 +108,11 @@ pending → queued → processing → completed
 | `EnqueueVideoJob` | API (post-upload) | Job in `pending` with a non-zero `SourceKey` | Job transitions to `queued` and a `VideoJobQueued` outbox row is committed in the **same transaction** — the dispatch is *recorded for relay*, not published. The broker message is the relay's separate step and may not arrive at all while the broker is down |
 | `GetJobStatus` | Authenticated user (via API) | Job exists; caller's `UserID` matches job's `UserID` | Returns current `JobStatus`, `FrameCount`, and result URL if `completed` |
 | `ListUserJobs` | Authenticated user (via API) | — | Returns paginated list of the caller's jobs with their statuses |
-| `StartProcessing` | `cmd/worker` (internal) | Job in `queued` | Job transitions to `processing`, persisted as an atomic conditional claim. If the stored status is no longer `queued`, nothing is written and a lost-claim sentinel is returned — a `pending` job is reported differently, since a dispatch naming an un-enqueued job is an anomaly rather than a duplicate |
-| `CompleteJob` | `cmd/worker` (internal) | Job in `processing`, result already stored in the bucket | Job transitions to `completed`; `StorageKey` and `FrameCount` set; `VideoJobCompleted` event emitted (Phase 7). The worker retries this write with backoff before giving up — the artifact is already durable, so abandoning it would orphan finished work |
-| `FailJob` | `ProcessVideoJob`, inside `cmd/worker` | Job in `processing` | Job transitions to `failed`; `ErrorReason` set; `VideoJobFailed` event emitted (Phase 7). The worker never calls it directly — `ProcessVideoJob` fails the job itself, and a second failure write would be the overwrite the claim exists to prevent |
-| `ClearJobIdempotencyKey` | `cmd/worker` (internal) | Job reached `failed` | The job's idempotency key is deleted, but only if it still names that job — rebuilt from the job's `UserID` and persisted `ContentHash`, read from the undecorated PostgreSQL repository. An immediate resubmission of the same bytes is then treated as fresh instead of being deduplicated onto the failure for the rest of the 24-hour window |
+| `StartProcessing` | `cmd/worker` consumer | Job in `queued` | Job transitions to `processing` through an atomic PostgreSQL claim and returns the row's current `LeaseEpoch`; a lost claim writes nothing |
+| `CompleteJob` | `cmd/worker` consumer | Job in `processing`, result stored, caller holds the claimed epoch | Job transitions to `completed` only if status and epoch still match; `StorageKey` and `FrameCount` are set. A superseded caller, or one that lost a same-epoch race to a **different** terminal outcome, receives `ErrJobFenced`; an identical outcome already present is successful but not applied |
+| `FailJob` | `ProcessVideoJob` or recovery sweeper | Job in `processing`, caller holds the observed epoch | Job transitions to `failed` only if status and epoch still match; `ErrorReason` is set. The return distinguishes a write this call applied from an identical terminal outcome already present |
+| Recovery sweep (`Requeue`/abandon) | `cmd/worker` sweeper | Job in `processing`, observed unleased twice at the same epoch | Below the bound, atomically returns it to `queued`, advances `LeaseEpoch`, and records a new dispatch. At the bound (or with no source key), applies fenced `failed` instead |
+| `ClearJobIdempotencyKey` | `cmd/worker` consumer or sweeper | This actor applied the job's `failed` write | Deletes the key only if it still names that job; fenced and already-present outcomes clear nothing |
 
 #### Identity Context (implemented, Phase 2)
 

@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is **two** Go processes built from one image: `cmd/api` (the HTTP surface) and `cmd/worker` (the frame-extraction consumer). Neither is a prerequisite for the other to start, and neither switches behaviour on a mode flag — the image's default command runs the API, and the worker is started by overriding it (`/app/worker`). There is no orchestration. External services are a required PostgreSQL instance, used by both the identity module (Phase 2) and, as of Phase 3's `wire-videojob-http-endpoints`, the video job module, and (as of Phase 4's `add-upload-idempotency-keys`) a required Redis instance backing `POST /upload`'s idempotency keys, every authenticated route's per-user rate limiting (`add-rate-limiting-middleware`), and, as of `add-videojob-status-cache`, a non-authoritative `VideoJob` status cache; a required MinIO (or S3-compatible) bucket holding both source videos and results; and a required RabbitMQ broker carrying the dispatch. Every one of those needs environment-specific configuration — the per-process surface is the table below, and no process runs on defaults beyond the port.
+The application is **two** Go processes built from one image: `cmd/api` (the HTTP surface) and `cmd/worker` (the frame-extraction consumer and recovery sweeper). Neither is a prerequisite for the other to start, and neither switches behaviour on a mode flag — the image's default command runs the API, and the worker is started by overriding it (`/app/worker`). There is no orchestration. External services are PostgreSQL for authoritative identity and video-job state; Redis for upload idempotency, per-user rate limiting, the non-authoritative status cache, and worker leases; MinIO for source videos and results; and RabbitMQ for dispatch. Every service needs environment-specific configuration — the per-process surface is below.
 
 ### Docker
 
@@ -43,6 +43,10 @@ docker run \
 
 The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.27-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships **both** binaries (`/app/app` and `/app/worker`) and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). `ffmpeg` is there for the worker now rather than for the API, and stays for that reason. See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
 
+> **Fenced-worker cutover and rollback:** when crossing the version boundary between pre-fence workers and this fenced generation, drain every pre-fence worker before starting any recovery sweeper. Those workers set no lease and do not honor `lease_epoch`, so overlap can let an unconditional terminal write overwrite a successor. A rollback across that same boundary must first stop every fenced worker and sweeper before any pre-fence worker starts. `cmd/worker` waits up to five minutes on SIGTERM; configure more than five minutes of termination grace, with additional margin for the sweeper join and final resource shutdown and verify the departing generation has exited before scaling the other one up. The additive `lease_epoch` column may remain during rollback.
+>
+> Ordinary later fenced-to-fenced releases do not inherit that overwrite hazard merely because one build is older. Drain them separately when a release can produce different or incompatible extraction output, so an in-flight job finishes on the intended generation rather than being recovered onto the next build.
+
 ### Environment Variables
 
 The two processes have deliberately different configuration surfaces:
@@ -51,7 +55,7 @@ The two processes have deliberately different configuration surfaces:
 |---|---|---|
 | `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY` | **required** | **not read** — the worker makes no access-control decision |
 | `VIDEO_POSTGRES_DSN` | required | required |
-| `REDIS_ADDR` | required | required (status cache + clearing a failed job's idempotency key) |
+| `REDIS_ADDR` | required | required (status cache, worker leases, and clearing failed-job idempotency keys) |
 | `VIDEO_MINIO_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET` | required | required |
 | `VIDEO_MINIO_PUBLIC_ENDPOINT`, `VIDEO_MINIO_PUBLIC_USE_SSL` | optional | optional, and **read even though unused** — see below |
 | `RABBITMQ_URL` | required | required |
@@ -67,7 +71,7 @@ The one row that needs explaining is `VIDEO_MINIO_PUBLIC_*`. The worker never mi
 | `IDENTITY_POSTGRES_DSN` | unset | PostgreSQL connection string for the Identity module (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). Required at startup. |
 | `IDENTITY_JWT_SIGNING_KEY` | unset | Symmetric key used to sign/verify access tokens (HMAC-SHA256). Required at startup. There is no default signing key — startup fails clearly rather than falling back to one. |
 | `VIDEO_POSTGRES_DSN` | unset | PostgreSQL connection string for the Video Processing module's `VideoJob` repository (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable` — same instance/database as `IDENTITY_POSTGRES_DSN` by design, not a separate one). Required at startup as of Phase 3's `wire-videojob-http-endpoints`, which wires `cmd/api/video.go`'s `setupVideo` into `main()`. |
-| `REDIS_ADDR` | unset | Address (`host:port`) of the Redis instance backing `POST /upload`'s idempotency keys and every authenticated route's rate limiting (e.g. `redis:6379`). Required at startup as of Phase 4's `add-upload-idempotency-keys`, which wires `internal/platform/redis` and `internal/video/infrastructure/idempotency.RedisStore` into `setupVideo`. |
+| `REDIS_ADDR` | unset | Address (`host:port`) of the Redis instance backing upload idempotency, rate limiting, status caching, and worker leases (e.g. `redis:6379`). Required by both processes. The client is constructed at startup but establishes network connections lazily; reachability failures degrade individual Redis-backed behaviors rather than failing startup. |
 | `RATE_LIMIT_MAX_REQUESTS` | `60` | Maximum requests per authenticated user within one rate-limit window before `429` responses start. Optional as of Phase 4's `add-rate-limiting-middleware` — unlike `REDIS_ADDR`, absence is not a startup failure, it just uses the default. |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Length (seconds) of the fixed rate-limit window `RATE_LIMIT_MAX_REQUESTS` applies to. Optional, same as above. |
 | `VIDEO_MINIO_ENDPOINT` | unset | Address (`host:port`) of the MinIO instance for the Video Processing context (e.g. `minio:9000`). Required at startup as of Phase 5's `migrate-result-storage-to-minio`. |
@@ -124,14 +128,14 @@ Neither uploaded source videos nor processed ZIP results are on local disk any m
 | Location | Created by | Contents | Cleaned by |
 |---|---|---|---|
 | `temp/` (worker only) | `cmd/worker`'s `createDirs()` at startup, plus per-job subpaths | Downloaded source copy, PNG frames, the built ZIP | Always, by `defer` on every path |
-| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | Whichever component owns the job's outcome — the request if the job never reached `queued`, the worker once it has processed it. **Not guaranteed**, see below |
+| Bucket, `uploads/` prefix | `POST /upload` per request | `uploads/<uploadID>_<filename>` source videos | The request before enqueue; the worker after an applied terminal result or its own completion retry finds that result already present; or the sweeper after an applied abandonment failure. **Not guaranteed**, see below |
 | Bucket, flat keys | `ProcessVideoJob` on success | `frames_<jobID>.zip` results | Never (manual cleanup required) |
 
-**Source cleanup is best effort, and since the async cutover it is also not exhaustive.** A source object has exactly one owner at a time: the `POST /upload` request until its job commits as `queued`, and the worker that processes it afterwards. Each deletes through a single call — one `RemoveObject`, no retry — so a MinIO hiccup at that instant leaves the object behind, logged with its key so the residue is enumerable.
+**Source cleanup is best effort, and since the async cutover it is also not exhaustive.** A source object is owned by the `POST /upload` request until its job commits as `queued`; afterwards only a worker that applied a terminal outcome, or the sweeper that applied terminal abandonment, may delete it. Fenced outcomes and already-present failures delete nothing. The bounded completion retry is the exception: when it finds its own identical `completed` outcome already present after a possibly lost response, it completes that run's source and lease cleanup. Each cleanup uses one `RemoveObject` call with no retry, so a MinIO hiccup can leave residue logged by key.
 
-**A job that is enqueued but never dispatched leaks its source permanently.** The request has given up ownership and no worker ever took it. That happens when the relay never publishes the row, when the message is dead-lettered before any claim, or when a worker dies between delivery and its own cleanup.
+**A job that is enqueued but never dispatched can leak its source permanently.** The request has given up ownership and no worker ever took it; this occurs when the relay never publishes or a message is dead-lettered before any claim. A worker crash after claim is now recovered by the sweeper, but a crash after a terminal commit and before best-effort cleanup can still leave the source behind.
 
-The bucket **expiration lifecycle rule scoped to the `uploads/` prefix** is therefore no longer a recommended backstop — it is the **only** guarantee those objects are ever reclaimed. Configure it: expire objects under `uploads/` after one day (comfortably longer than any extraction). It must be scoped to that prefix, because result objects live in the same bucket under flat `frames_*.zip` keys and must never expire. No code path assumes the rule exists, which is exactly why its absence is silent.
+The bucket **expiration lifecycle rule scoped to the `uploads/` prefix** is therefore no longer a recommended backstop — it is the **only** guarantee residual objects are eventually reclaimed. Configure it, but do not assume one day is universally safe. Retention must exceed the deployment's supported end-to-end job lifetime: maximum queue wait, the initial extraction, up to three recovery attempts, lease-expiry and confirmation delays, and backlog-driven scan rotations. The application enforces no upper bound on queue wait or extraction duration, so no finite lifecycle can both preserve every arbitrarily slow recoverable job and reclaim residue. Define that operational lifetime, monitor the oldest non-terminal jobs, and set a margin above it; a job exceeding the policy can lose its source and fail on recovery. The rule must be scoped to `uploads/`, because result objects live in the same bucket under flat `frames_*.zip` keys and must never expire. No code path assumes the rule exists, which is exactly why its absence is silent.
 
 Results accumulate indefinitely. There is no expiry, no lifecycle rule, no cleanup job, and no size limit for them — growth must be monitored manually in the current deployment. Moving artifacts off local disk removed the container-disk pressure, not the retention gap.
 
@@ -174,13 +178,16 @@ Authoritative state store for users (`User` aggregate) and `VideoJob`s, configur
 - **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
 - **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
 
-### Redis — Connection adapter, idempotency keys, rate limiting, and status cache all implemented (Phase 4 complete)
+### Redis — Idempotency, rate limiting, status cache, and worker leases implemented
 
-`internal/platform/redis` (`add-redis-infrastructure`) provides connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close`. It is wired into `cmd/api`'s `setupVideo` as of `add-upload-idempotency-keys`, which requires `REDIS_ADDR` at startup like the PostgreSQL DSNs above. All three of Redis's planned Phase 4 feature responsibilities (all additive to PostgreSQL, not a replacement) are now implemented:
+`internal/platform/redis` provides connection plumbing — `Config`/`LoadConfigFromEnv`, `Open`, `Ping`, `Close`. Both processes require `REDIS_ADDR`. Redis remains additive to PostgreSQL, not a replacement. Four responsibilities are implemented:
 
 1. **Idempotency keys** — **Implemented.** `internal/video/infrastructure/idempotency.RedisStore` deduplicates `POST /upload` requests by content hash + `UserID`: a `Reserve`/`Finalize`/`Clear`/`Lookup` protocol backs the "prevent duplicate job creation from client retries" goal. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md`.
 2. **Rate limiting** — **Implemented.** `internal/platform/ratelimit.Limiter` enforces a per-user, fixed-window request cap (`RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`, both optional with defaults) on every authenticated route, mounted via `cmd/api/ratelimit.go`'s `rateLimitMiddleware`. Denied requests get `429` + `Retry-After`; a limiter failure (or an internal bounded timeout) fails open. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/rate-limiting/spec.md`.
-3. **Status cache** — **Implemented.** `internal/video/infrastructure/cache.CachedVideoJobRepository` decorates the PostgreSQL `VideoJobRepository` with a cache-aside/write-through cache for `FindByID` lookups (backing `GetJobStatus`'s repeated polling reads via `GET /api/video-jobs/:id`), wired into `setupVideo` ahead of every use case. No new environment variable — the cache TTL is a fixed constant, not configurable. See [docs/architecture.md](architecture.md)'s Request pipeline section and `openspec/specs/videojob-status-cache/spec.md`.
+3. **Status cache** — **Implemented.** `CachedVideoJobRepository` provides cache-aside polling reads and atomic epoch/status-ordered write-through. Ownership decisions bypass the cache; Redis errors fall back to PostgreSQL correctness. No separate environment variable; the TTL is fixed at five minutes.
+4. **Worker leases** — **Implemented.** `internal/video/infrastructure/lease.RedisStore` stores `videojob:lease:<jobID> = <lease_epoch>` with a fixed 90-second TTL. A holder renews every 30 seconds and reacquires an absent equal-epoch lease; the recovery sweeper uses successful absence at the observed epoch as its liveness signal. Lease errors fail open for execution but fail closed for takeover.
+
+During a Redis outage, rate limiting, idempotency, status caching, and lease maintenance fail open for request/execution availability, while each sweeper query fails closed: it logs `lease store unreachable ... taking over none`, clears the queried job's prior confirmation, and takes over that job only after two later successful absence observations. PostgreSQL claims and fence predicates continue to prevent state corruption. Marks for jobs outside the failing scan batch are not globally cleared; if one survives the outage, its first successful post-outage absence can complete the pair. This is part of the documented prolonged-stall risk, not a two-fresh-observations guarantee for every job after any Redis outage.
 
 ### MinIO — Source and result storage implemented (Phase 5)
 
@@ -273,37 +280,44 @@ Its lifecycle transitions are logged — started, connection lost, reconnected, 
 
 `cmd/worker` consumes `video.jobs.queued.v2` with a **prefetch of one**: one unacknowledged delivery at a time, because the unit of work is a full `ffmpeg` run and buffering a second delivery would hide it from every other consumer for the duration. Scale out by running more worker processes; there is no concurrency setting to raise.
 
-A delivery is acknowledged only after the transition that makes its job terminal has committed. Everything else is rejected without requeue, which sends it to `video.jobs.dlx`:
+A delivery is acknowledged only after a terminal outcome is confirmed. Cleanup depends on whether this actor applied it; everything without a terminal outcome is rejected without requeue and reaches `video.jobs.dlx`:
 
-| Situation | Disposition | Job left as | Source object |
+| Situation | Disposition | Job left as | Source / lease cleanup |
 |---|---|---|---|
-| Body will not decode, or names no source key | Reject → DLQ | untouched | untouched |
-| Claim lost (job already `processing`/terminal — a duplicate delivery) | Reject → DLQ | untouched | **kept** — another consumer is probably reading it right now |
-| Dispatch names an unknown job | Reject → DLQ | n/a | untouched |
-| Run broke before any terminal state committed | Reject → DLQ | wherever it was | **kept** |
-| Extraction/storage failed (`ProcessVideoJob` committed `failed` itself) | **Ack** | `failed` with a reason | deleted, and the idempotency key cleared so a retry works |
-| Result stored but `CompleteJob` will not commit after 4 retries | Reject → DLQ | `processing` | **kept**, and the result `StorageKey` logged |
-| Success | **Ack** | `completed` | deleted |
+| Body will not decode, names no source key, or names an unknown job | Reject → DLQ | untouched / n/a | untouched |
+| Claim lost (duplicate or stale dispatch) | Reject → DLQ | untouched | kept; this run acquired no lease |
+| Run broke before any terminal state committed | Reject → DLQ | usually `processing` | kept; lease left to expire so recovery can act |
+| This run applied `failed` | **Ack** | `failed` | one best-effort attempt each to delete the source, conditionally clear the idempotency key, and release the held lease; failures are logged without changing the Ack |
+| An identical `failed` outcome was already present | **Ack** | `failed` | no cleanup; this actor did not apply the write |
+| Result stored but completion still errors after 4 retries | Reject → DLQ | usually `processing` | source and lease kept; result key logged |
+| Terminal write returns `ErrJobFenced` | Reject → DLQ | authoritative winner's state | source/idempotency untouched and no lease released; held epoch is logged, plus the result key when a fenced completion produced one. The current log says `taken over` for both a newer epoch and a same-epoch terminal winner |
+| Completion succeeds, including a retry that finds its identical outcome already present | **Ack** | `completed` | one best-effort attempt each to delete the source and release the held lease; failures are logged without changing the Ack |
 
-Requeue is never used except on one path — a delivery pulled off the channel *after* the shutdown signal, which nothing has been done to yet. Requeueing anything else would loop rather than recover, since a redelivery of a job past `queued` can only lose the claim again.
+The AMQP consumer requeues only a delivery pulled off the channel after shutdown, before handling began. Crash recovery does not broker-requeue a `processing` delivery: the sweeper first commits a new `queued` row state and outbox event, and the ordinary relay publishes a fresh dispatch.
 
-**Operator symptom: jobs stuck in `processing`.** That state means a worker claimed the job and did not reach a terminal write. Two causes, distinguishable by the DLQ:
+**Operator symptom: a job remains `processing`.** After successful acquisition, a claimed job holds Redis key `videojob:lease:<jobID>` with its PostgreSQL `lease_epoch` as the value and a 90-second TTL. Acquisition errors fail open, so a running job may temporarily have no key. The worker renews every 30 seconds. The sweeper runs every 60 seconds, scans at most 50 rows with a rotating keyset cursor, and acts only after two consecutive successful "not held at this epoch" observations. A Redis query error clears the first observation and takes over nothing.
 
 ```sql
-SELECT id, original_filename, created_at
+SELECT id, user_id, status, source_key, lease_epoch, created_at
   FROM video_jobs
  WHERE status = 'processing'
-   AND created_at < now() - interval '1 hour';
+ ORDER BY id ASC;
 ```
 
-- If `video.jobs.dead` holds the matching dispatch, the worker gave up deliberately — most likely the terminal write failed after the result was already stored. The worker's log line names the job and the result `StorageKey`; the artifact is in the bucket and the row can be reconciled by hand.
-- If nothing is in the DLQ **yet**, the most likely explanation is a worker that died mid-extraction — but absence from the DLQ does not prove it, so do not read it as a diagnosis. The message was never acknowledged, so the broker requeues it when that connection drops; between the crash and another consumer picking it up it is simply queued or unacknowledged and appears nowhere. Once a consumer does take it, `ClaimForProcessing` admits only `queued` rows, so the redelivery is refused and dead-lettered as a lost claim — at which point the job matches the first bullet's DLQ shape without having its first bullet's cause. A dead-lettered message can also have aged out of `video.jobs.dead` by the time you look. Check `rabbitmqctl list_queues name messages messages_unacknowledged` alongside the DLQ before concluding anything.
+Correlate each candidate with worker logs and, from an authorized Redis shell, `GET videojob:lease:<jobID>` plus `PTTL videojob:lease:<jobID>`:
 
-  Either way **the job stays stranded**, and that is a known gap rather than a surprise: no redelivery can re-claim a `processing` row, and recovering it is `add-worker-job-lock`'s subject (Phase 6). Until then, resolution is manual, and the source object is still in the bucket unless the lifecycle rule has already expired it.
+- the same epoch with a positive TTL shows only that the lease has not expired; sample `PTTL` again to confirm it increases on renewal rather than counting down to zero — extraction duration alone does not imply abandonment;
+- no key is one observation, not permission to mutate the row — allow the sweeper a second successful observation;
+- a greater key epoch belongs to a successor and fences the older run;
+- `lease store unreachable ... taking over none` means Redis recovery failed closed and all pending confirmations for affected jobs were reset;
+- `requeued job ... at epoch N` means the row advanced and a new outbox dispatch committed;
+- `failed after abandonment` means the row exhausted three requeues, or had no source key, and the sweep applied the terminal write.
 
-Shutdown is `SIGINT`/`SIGTERM`: the worker stops taking new deliveries immediately and then waits up to **5 minutes** for the job in hand to reach a terminal state and be acknowledged. The handler runs on a context detached from that signal, so a shutdown never kills a running `ffmpeg` or aborts the write that records its outcome. If the deadline expires, the abandoned job is logged by ID and the process exits with that delivery still unacknowledged, so the broker **does** requeue it — but the row is `processing` by then, so the next consumer loses the claim and dead-letters it rather than resuming the work. The job is stranded exactly as in the crash case above; the redelivery buys nothing until `add-worker-job-lock` lands. Give worker containers a stop timeout at least as long as the drain, or an impatient orchestrator will strand exactly the jobs the drain exists to save.
+Normal recovery latency includes the remaining lease TTL plus up to two sweep intervals. A backlog may add cycles because one cycle examines 50 rows. Restarting a worker also discards its in-memory first-observation marks, deliberately requiring two fresh observations. Confirmation mitigates the ordinary claim-to-acquire race but is not a proof against a process paused across multiple scans: such a run may be treated as abandoned and fenced when it resumes; at the requeue bound, recovery may instead commit `failed` and remove the source.
 
-A fourth Redis-backed responsibility — a **distributed lease** letting a redelivered message safely re-claim a job whose worker died — is still planned for later in Phase 6 (`add-worker-job-lock`). Concurrent pickup of the *same* job is already prevented by PostgreSQL, not Redis: `ClaimForProcessing`'s `WHERE id = $1 AND status = 'queued'` admits exactly one consumer. What the lease is for is the case that predicate cannot address, the stranded-`processing` job above.
+Do **not** manually change `status` or `lease_epoch`, publish a dispatch, or delete a lease. The requeue and outbox insert must commit together, and the epoch increment is what fences a prior worker. If recovery does not happen, preserve the row and artifacts, inspect the logs above, verify `source_key` still exists, and check for `frames_<jobID>.zip` from a fenced run. Escalate rather than bypassing repository predicates.
+
+Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking deliveries and the recovery sweeper to stop concurrently. `run` joins the sweeper first, then waits up to **5 minutes** for the consumer's job in hand. The handler is detached from the shutdown signal, so a normal shutdown does not kill `ffmpeg` or abort its terminal write. If the deadline expires and the process is terminated, the delivery may be redelivered and lose its old claim; after the abandoned lease expires and absence is confirmed, the sweeper either advances the row's epoch and emits a fresh dispatch or, at the requeue bound, commits terminal `failed` without another dispatch. Give worker containers more than five minutes of stop grace, adding margin for the preceding sweeper join and final resource shutdown, to avoid duplicated extraction even though the fence protects state.
 
 ---
 

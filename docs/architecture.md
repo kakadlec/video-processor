@@ -2,7 +2,7 @@
 
 ## Current Implementation
 
-The video-processing HTTP surface lives in `cmd/api` (package `main`, split across `main.go`, `identity.go`, and `video.go`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own. Phase 3's `wire-videojob-http-endpoints` wired `internal/video` in the same way, behind a preview `/api/video-jobs` HTTP surface, and `migrate-ffmpeg-execution-to-videojob-application` then cut `POST /upload`'s own `ffmpeg` execution over to run through that same `internal/video` application layer — see the Routes table below. Phase 6's `migrate-upload-to-async-processing` then moved that execution out of the request entirely: `cmd/worker` is a second composition root (package `main`, `cmd/worker/main.go`) that consumes the job queue and runs the pipeline, and `POST /upload` answers `202` as soon as the job is queued.
+The video-processing HTTP surface lives in `cmd/api` (package `main`, split across `main.go`, `identity.go`, and `video.go`) — Phase 3's `extract-cmd-api-entrypoint` moved it there from the repo root. Phase 2 added the first real internal package: `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into `cmd/api`'s composition root rather than a package of its own. Phase 3's `wire-videojob-http-endpoints` wired `internal/video` in the same way, behind a preview `/api/video-jobs` HTTP surface, and `migrate-ffmpeg-execution-to-videojob-application` then cut `POST /upload`'s own `ffmpeg` execution over to run through that same `internal/video` application layer — see the Routes table below. Phase 6's `migrate-upload-to-async-processing` then moved that execution out of the request entirely: `cmd/worker` is a second composition root that consumes the job queue and runs the pipeline, and `POST /upload` answers `202` as soon as the job is queued. `add-worker-job-lock` completed the phase with epoch-scoped Redis leases, fenced terminal writes, and a sweeper that re-dispatches jobs abandoned in `processing`.
 
 ```
 video-processor/
@@ -19,9 +19,11 @@ video-processor/
         styles.css
         app.js
     worker/
-      main.go          # Worker composition root: consumes the job queue, runs ProcessVideoJob, completes/cleans up
+      main.go          # Worker composition root: consumer lifecycle, disposition table, terminal cleanup
+      sweeper.go       # Lease-aware recovery of jobs abandoned in processing
       main_test.go     # createDirs / configuration-surface tests
       worker_test.go   # End-to-end dispatch tests against real PostgreSQL, Redis, MinIO, and a broker
+      sweeper_test.go  # Recovery, fencing, scan rotation, and shutdown tests
   internal/
     identity/
       domain/         # User, UserID, ports (repository, password hasher, token issuer/verifier)
@@ -31,7 +33,7 @@ video-processor/
       domain/         # VideoJob aggregate + transition methods, value objects, repository/FrameExtractor ports
       application/    # CreateVideoJob, GetJobStatus, ListUserJobs, EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, ProcessVideoJob use cases
       infrastructure/ # PostgreSQL adapter, UUID generator, ffmpeg-backed FrameExtractor adapter,
-                      #   MinIO storage, Redis idempotency/cache, AMQP messaging (topology, Publisher, Relay, Consumer)
+                      #   MinIO storage, Redis idempotency/cache/lease, AMQP messaging (topology, Publisher, Relay, Consumer)
     platform/
       redis/ ratelimit/ rabbitmq/   # Cross-cutting connection/lifecycle plumbing owned by no context
   go.mod / go.sum  # Module definition: gin, pgx, golang-jwt, bcrypt, google/uuid, go-redis, minio-go, amqp091-go
@@ -111,10 +113,12 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
         ├─ ProcessVideoJob (job_id, source_key):
         │    ├─ StartProcessing → ClaimForProcessing
         │    │    UPDATE video_jobs SET status='processing'
-        │    │      WHERE id=$1 AND status='queued'
+        │    │      WHERE id=$1 AND status='queued' RETURNING lease_epoch
         │    │    └─ no row affected → ErrJobClaimLost → Reject → DLQ,
-        │    │         touching nothing at all (another consumer owns it,
-        │    │         and is very likely reading the source right now)
+        │    │         touching nothing at all (another consumer owns it)
+        │    ├─ Acquire Redis lease at the returned epoch; renew every 30s
+        │    │    for the run (errors fail open; an absent lease is
+        │    │    reacquired, a newer epoch stops the heartbeat)
         │    ├─ SourceStorage.Get → temp/<jobID>_source (no extension; ffmpeg
         │    │    probes content, so no path component comes from a filename)
         │    ├─ Remove temp/<jobID>_source           (ProcessVideoJob's own
@@ -132,32 +136,30 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
         │    ├─ ResultStorage.Put (infrastructure/storage):
         │    │    └─ FPutObject → bucket/frames_<jobID>.zip
         │    └─ FailJob if fetch, extraction, OR storage failed
-        │         (processing → failed). The worker never calls FailJob
-        │         itself — a second failure write would be the overwrite
-        │         the claim exists to prevent
-        ├─ result.Success == false:
+        │         (processing → failed), conditional on the claimed epoch
+        ├─ ErrJobFenced from failure or completion:
+        │    └─ Reject → DLQ; keep source and idempotency key; release no
+        │         lease; log held epoch and any result key
+        ├─ result.Success == false and `failed` was already present:
+        │    └─ Ack without cleanup (this actor applied nothing)
+        ├─ result.Success == false and this run applied `failed`:
         │    ├─ Delete the source object
-        │    ├─ ClearJobIdempotencyKey (derives the key from the job's
-        │    │    UserID + persisted content_hash, and deletes it only if
-        │    │    the key still names this job) → an immediate retry works
-        │    └─ Ack       (the job reached a terminal state; that is what
-        │                  the acknowledgement asserts, not "it worked")
+        │    ├─ ClearJobIdempotencyKey (conditional on this job still owning it)
+        │    ├─ Release the lease at this run's epoch
+        │    └─ Ack
         └─ result.Success == true:
-             ├─ CompleteJob (processing → completed), retried 4× with
-             │    backoff on a context detached from shutdown — the zip is
-             │    already durable, so giving up here would orphan finished work
-             │    └─ still failing → Reject → DLQ, source object KEPT, the
-             │         result StorageKey logged: the job stays 'processing'
-             │         with an artifact no listing shows
-             ├─ Delete the source object    (gated on the commit, not on the
-             │    claim — a defer registered at claim time would fire on
-             │    every failure path above too)
+             ├─ CompleteJob (processing → completed at the claimed epoch),
+             │    retried 4× with detached context and backoff
+             │    └─ still failing → Reject → DLQ, source object and lease KEPT,
+             │         result StorageKey logged
+             ├─ Delete the source object (gated on this terminal commit)
+             ├─ Release the lease at this run's epoch
              └─ Ack
 ```
 
 `ProcessVideoJob` still leaves a successful job in `processing` for its caller to complete, but the caller is now `cmd/worker` and the split has acquired a real reason. Storing the result is `ProcessVideoJob`'s own step, so a successful return already means the artifact is durable — but the worker has to own the terminal write, because acknowledging the message is what that write licenses. Folding `CompleteJob` inside the use case would put the commit out of reach of the retry-and-dead-letter policy the worker applies to it.
 
-**Two writes, two processes, one job.** The claim (`ClaimForProcessing`) is a *correctness* primitive, not a recovery one: dispatch is at-least-once by construction, and `Update` is a read-then-unconditional-write, so without the conditional predicate two deliveries would both pass `queued → processing` and both run an extraction over the same source. It deliberately does **not** recover a job whose worker died mid-extraction — such a job is stored as `processing`, `status = 'queued'` refuses every redelivery, and it stays stranded. Widening that predicate needs a fencing mechanism first; that is `add-worker-job-lock`'s subject (Phase 6), not this one's.
+**Claim and recovery are separate correctness decisions.** `ClaimForProcessing` still admits only `queued`, so duplicate dispatch cannot run two extractions and Redis is absent from pickup. Recovery is a periodic sibling goroutine in `cmd/worker`: each 60-second cycle scans at most 50 `processing` rows using a rotating keyset cursor, queries the Redis lease at the row's epoch, and acts only after two successful not-held observations at the same epoch. A query error for that row clears its confirmation and takes over nothing. Recovery conditionally writes `processing → queued`, increments `lease_epoch`, and inserts a fresh `video_job.queued.v2` outbox row in one transaction. The old holder's terminal `Update` requires both its epoch and `status = 'processing'`, so a requeue or another terminal winner fences it. After three requeues, or when a legacy row has no source key, the sweeper commits `failed` and cleans up only if its own write was applied.
 
 **Outbox relay (Phase 6, `add-videojob-source-key-and-outbox-relay`; generation bumped by `migrate-upload-to-async-processing`):** `POST /upload` records a job dispatch; it never talks to the broker. `Repository.Enqueue` commits the `pending → queued` update and a `video_job.queued.v2` outbox row together, and a relay goroutine started by `cmd/api/main.go` carries those rows to RabbitMQ afterwards — `internal/video/infrastructure/messaging.Relay`, composing an `OutboxRepository` in `internal/video/infrastructure/postgres` with an AMQP `Publisher`, so neither infrastructure package has to depend on both a database driver and a broker client. Each cycle opens a transaction, claims a bounded batch with `SELECT … FOR UPDATE SKIP LOCKED` filtered to `event_type = 'video_job.queued.v2'` (the table still holds an unpublished `video_job.created` row for every job ever created, and those are internal events that must never reach the job queue), publishes each message mandatory on a confirm-mode channel, stamps `published_at` only for messages the broker both acknowledged **and** did not return, then commits. Holding row locks across a broker round trip is the deliberate cost: committing the claim first would, on a crash before the publish, lose a dispatch silently, whereas this ordering can only ever republish. A nack is not an error — the job queue's `reject-publish` overflow policy nacks when it is full, which is designed back-pressure — so the row simply stays unstamped for the next poll. The relay dials through `internal/platform/rabbitmq.Open` in its own goroutine, declares `JobDispatchTopology()` after **every** successful dial (the worker's consumer declares the same topology on every dial too, so neither process depends on the other having started first, and a reconnect to a recreated broker would otherwise publish into a missing exchange), and retries with backoff. `RABBITMQ_URL` is therefore required at startup while broker *reachability* is not — see [docs/operations.md](operations.md). **`cmd/worker` consumes that queue**, so a published message is now a live trigger. The generation suffix is carried by the exchange, the queue, **and the `event_type` string** — not by the exchange alone. Versioning the exchange isolates nothing on its own: every replica's relay reads the same `video_job_outbox` table, so with one shared event type a redeployed replica's relay would claim a not-yet-redeployed replica's row and publish it into the new generation. What that protects against is the rolling-deploy window, not stale messages: during a deploy where an in-request replica and a worker are both live, both can act on one legitimately-`queued` job — the claim decides who processes it, but the loser's cleanup would then delete the source out from under the winner's running extraction. A migration stamped `published_at` on the previous generation's still-unpublished rows, recording an exclusion the event-type filter already enforces. See `openspec/specs/videojob-outbox-relay/spec.md` and `openspec/specs/videojob-messaging/spec.md` for the full contract.
 
@@ -165,7 +167,7 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
 
 **Rate limiting (Phase 4, `add-rate-limiting-middleware`):** every route gated by `identity.requireBearerAuth()` is also gated by a per-user, Redis-backed fixed-window rate limiter (`internal/platform/ratelimit.Limiter`, mounted as `cmd/api/ratelimit.go`'s `rateLimitMiddleware` on the `videoRoutes` group, immediately after the auth middleware). A request that crosses the configured limit within the current window is rejected with `429` and a `Retry-After` header before any handler runs, keyed independently per authenticated `UserID`. Thresholds are configurable via optional `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` (defaults 60 requests / 60 seconds) — unlike `REDIS_ADDR`, neither is required at startup. If the Redis check itself fails or exceeds a short internal timeout, the middleware fails open (allows the request, logs the error) rather than blocking otherwise-healthy traffic on an infrastructure hiccup. That timeout only actually bounds the real Redis call because `internal/platform/redis.Open` sets `ContextTimeoutEnabled: true` on the shared client — go-redis v9 otherwise silently discards a passed context's deadline on every command, a subtlety this change had to fix and cover with a real-client test (`internal/platform/redis/client_test.go`) after an initial fix attempt turned out not to work. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, static assets) are out of scope. The limiter governs *requests to this API*, which since `add-presigned-download-urls` is narrower than it reads: `GET /download/:filename` issues a URL and is limited, but the transfer that URL authorizes goes to MinIO, which this middleware does not sit in front of. Bounding artifact egress is an object-storage concern. See `openspec/specs/rate-limiting/spec.md` for the full contract.
 
-**Status cache (Phase 4, `add-videojob-status-cache`):** `internal/video/infrastructure/cache.CachedVideoJobRepository` decorates the PostgreSQL `VideoJobRepository` with a Redis-backed cache for `FindByID` lookups, wired into `cmd/api/video.go`'s `setupVideo` so every use case that touches a `VideoJob` — including `GetJobStatus`, which backs `GET /api/video-jobs/:id`'s repeated polling reads — shares one cached repository instance. Reads are cache-aside (a hit skips PostgreSQL; a miss, Redis error, or corrupted entry falls back to PostgreSQL, always unconditionally — the fallback read never itself fails); the four state-transition use cases' writes are write-through (`Update` writes PostgreSQL first, then overwrites the cache entry with the confirmed new state). Miss-repopulation uses `SET NX`, not a plain `SET`, so a slow reader that read a pre-transition value can never clobber a fresher write-through entry a concurrent transition already wrote — a race caught during review and covered by a dedicated concurrency test. A malformed-but-string cache entry is removed via a compare-and-delete Lua script (mirroring the idempotency store's own atomicity pattern) before repopulation, so it's guaranteed to self-heal without reopening that same race — but a generic Redis error on the read (e.g. `WRONGTYPE` from a key holding an incompatible value) only gets a best-effort repopulation attempt, since `SET NX` can't replace an existing key of the wrong type; PostgreSQL correctness is unaffected either way, only that job's caching benefit is what's at risk. Entries carry a fixed 5-minute TTL as a safety net, not the source of correctness. `FindByUserID` (the `GET /api/video-jobs` list endpoint) and `Create` are intentionally left uncached. This closes out all three of Phase 4's planned Redis responsibilities. See `openspec/specs/videojob-status-cache/spec.md` for the full contract.
+**Status cache (Phase 4, extended by Phase 6 recovery):** `internal/video/infrastructure/cache.CachedVideoJobRepository` provides cache-aside `FindByID` reads for polling. `GetJobStatus` and `EnqueueVideoJob` use those reads; ownership decisions (`StartProcessing`, `CompleteJob`, `FailJob`, download entitlement, and the sweeper scan) bypass them and read PostgreSQL. Every applied transition still writes through the decorator. Miss-repopulation uses `SET NX`, while transition write-through uses an atomic Redis CAS ordered first by `lease_epoch` and then by state progression within the epoch; a delayed requeue write therefore cannot replace a successor's `processing` or terminal record. An ambiguous database error invalidates the entry because it may have occurred after commit; `ErrJobFenced` is a decided zero-row result and leaves the winner's entry intact. Cache failures remain best effort, and entries carry a fixed five-minute TTL. See `openspec/specs/videojob-status-cache/spec.md`.
 
 **Result download (Phase 5, `add-presigned-download-urls`):** `GET /download/:filename` no longer carries result bytes. It authorizes exactly as before — the key must parse to a `VideoJobID`, and that job must exist, belong to the caller, be `completed`, and record that exact key, read from the *undecorated* PostgreSQL repository — then confirms the object exists with one `Stat` and returns `200 {"url", "expires_at"}`. The client redeems that URL against MinIO directly:
 
@@ -199,12 +201,12 @@ Both uploaded source videos and results live in MinIO; user accounts and job row
 | Store | Purpose | Durability |
 |---|---|---|
 | `temp/` (**`cmd/worker`'s filesystem**) | Per-job scratch — the downloaded source copy, the extracted frames, and the zip built from them; always cleaned up (defer). `cmd/api` no longer creates or touches it | Ephemeral |
-| MinIO bucket, `uploads/` prefix | Uploaded source videos, keyed `uploads/<uploadID>_<filename>`. Transient, with exactly one owner at a time: the request until its job is queued, the worker afterwards. A job that is enqueued but never dispatched (relay never published, message dead-lettered before a claim, worker died between delivery and cleanup) leaks its source permanently — the bucket's `uploads/`-prefix expiration rule is the **only** guarantee those are ever reclaimed | Not meant to outlive its job |
+| MinIO bucket, `uploads/` prefix | Uploaded source videos, keyed `uploads/<uploadID>_<filename>`. Transient, with one owner at a time: the request until queueing, then the worker or recovery sweep that applies the terminal outcome. A mid-extraction crash is recovered automatically; an upload never dispatched, dead-lettered before claim, or interrupted after terminal commit but before cleanup can still leak, so the `uploads/`-prefix expiration rule remains the **only** exhaustive reclamation guarantee | Not meant to outlive its job |
 | MinIO bucket, flat keys | Durable ZIP results, keyed `frames_<jobID>.zip`; served directly to the client under a presigned URL `/download/:filename` issues. Flat because `app.js` still uses the key verbatim as that route's single path segment — a `/` would percent-encode and break the match, which is exactly why sources may carry a prefix and results may not. The constraint survived the move to presigned URLs unchanged, since the route did | Persistent, external to the container |
 | PostgreSQL `users` table | User accounts (normalized email, password hash) | Persistent, external to the container |
 | PostgreSQL `video_jobs` table | `VideoJob` rows — created both by `POST /upload` (this pipeline) and by `POST /api/video-jobs` (the preview API below); the two share the same repository and owner-scoping | Persistent, external to the container |
 
-RabbitMQ carries job dispatch — `video.jobs.v2` / `video.jobs.queued.v2`, with an unversioned `video.jobs.dlx` fanout sink both generations share, since a dead-lettered message is for inspection and one place to look beats one per generation. Redis backs idempotency keys, rate limiting, and (as of `add-videojob-status-cache`) a non-authoritative `VideoJob` status cache — PostgreSQL remains the source of truth on any cache miss.
+RabbitMQ carries job dispatch — `video.jobs.v2` / `video.jobs.queued.v2`, with an unversioned `video.jobs.dlx` fanout sink. Redis backs idempotency keys, rate limiting, the non-authoritative `VideoJob` status cache, and epoch-scoped worker leases. PostgreSQL remains authoritative for job state, claims, fence epochs, and recovery transitions.
 
 ### Routes (current)
 
@@ -243,18 +245,18 @@ There is no separate frontend build, no Node.js toolchain, and no bundler.
 
 ---
 
-## Target Architecture (Partially implemented — Phases 1–5 done, Phase 6 all but its worker job lock)
+## Target Architecture (Partially implemented — Phases 1–6 done)
 
 The hackathon requirements include user authentication, asynchronous processing, notifications, and object storage. The target architecture introduces Domain-Driven Design structure across three bounded contexts, delivered incrementally.
 
-> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Phase 5 is done: `add-minio-infrastructure` added `internal/video/infrastructure/storage`, `migrate-result-storage-to-minio` wired it into `cmd/api`, `migrate-upload-storage-to-minio` moved uploaded source videos there too, and `add-presigned-download-urls` took the API out of the result-byte path — `GET /download/:filename` now issues a bounded URL the client redeems against MinIO directly. Both `outputs/` and `uploads/` are gone along with the whole ownership-sidecar mechanism, MinIO is a fail-closed startup dependency, and `ProcessVideoJob` now takes a storage key rather than a local path — the seam Phase 6's worker needs. Phase 6 is nearly done: `add-rabbitmq-infrastructure` shipped the shared AMQP adapter and this context's job-dispatch topology, `add-videojob-source-key-and-outbox-relay` made the source key durable, moved the `pending → queued` transition into `POST /upload` where it commits with its own outbox row, and started the relay that carries those rows to the broker, and `migrate-upload-to-async-processing` then added `cmd/worker` and cut `POST /upload` over to a `202` acknowledgement. **Processing is now asynchronous end to end.** What remains of Phase 6 is `add-worker-job-lock`: the conditional claim makes duplicate dispatch safe but does not recover a job whose worker died mid-extraction. Notification (Phase 7) remains planned.
+> Identity (Phase 2) and Phase 3 (the `cmd/api` split, the `VideoJob` HTTP surface, and `POST /upload`'s ffmpeg execution migrated into the application layer) are both fully implemented as described below. Phase 4 is done: `internal/platform/redis` provides connection plumbing (`add-redis-infrastructure`), and all three of its planned features are wired in — idempotency keys on `POST /upload` (`add-upload-idempotency-keys`), per-user rate limiting on every authenticated route (`add-rate-limiting-middleware`), and a `VideoJob` status cache (`add-videojob-status-cache`). Phase 5 is done: `add-minio-infrastructure` added `internal/video/infrastructure/storage`, `migrate-result-storage-to-minio` wired it into `cmd/api`, `migrate-upload-storage-to-minio` moved uploaded source videos there too, and `add-presigned-download-urls` took the API out of the result-byte path — `GET /download/:filename` now issues a bounded URL the client redeems against MinIO directly. Both `outputs/` and `uploads/` are gone along with the whole ownership-sidecar mechanism, MinIO is a fail-closed startup dependency, and `ProcessVideoJob` now takes a storage key rather than a local path — the seam Phase 6's worker needs. Phase 6 is done: `add-rabbitmq-infrastructure` shipped the shared AMQP adapter and job topology; `add-videojob-source-key-and-outbox-relay` made source keys durable and added transactional dispatch; `migrate-upload-to-async-processing` added `cmd/worker` and the `202` acknowledgement; and `add-worker-job-lock` added Redis leases, PostgreSQL fence epochs, and the recovery sweeper. **Processing is asynchronous, and jobs abandoned after a successful claim are recovered by the lease sweeper.** Queued jobs whose dispatch is never published or is dead-lettered before claim remain outside that recovery scope. Notification (Phase 7) remains planned.
 
 ### Bounded Contexts
 
 | Context | Responsibility | Status |
 |---|---|---|
 | **Identity** | User registration, authentication, JWT issuance and verification | Implemented (Phase 2) |
-| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, result storage | Implemented (Phase 3: creation/status/listing wired into HTTP; Phase 5: source and result storage in MinIO; Phase 6: `POST /upload` enqueues and answers `202`, the outbox relay publishes the dispatch to RabbitMQ, and `cmd/worker` consumes it and runs the pipeline). Recovery of a job stranded by a worker crash is still outstanding — `add-worker-job-lock`, Phase 6 |
+| **Video Processing** | VideoJob lifecycle — creation, queueing, async execution, recovery, result storage | Implemented (Phase 3: lifecycle and HTTP; Phase 5: source/results in MinIO; Phase 6: asynchronous dispatch and `cmd/worker`, plus lease/fence-based recovery for jobs abandoned in `processing`) |
 | **Notification** | Reacting to domain events and delivering notifications (email, webhook) | Planned (Phase 7) |
 
 ### Target Package Topology
@@ -267,8 +269,9 @@ video-processor/
         index.html  # Extracted from getHTMLForm()
         styles.css
         app.js
-    worker/     # Async frame-extraction worker (implemented, Phase 6 — migrate-upload-to-async-processing): own composition root, no HTTP, no IDENTITY_* configuration
-      main.go
+    worker/     # Async frame-extraction worker (implemented, Phase 6): own composition root, no HTTP, no IDENTITY_* configuration
+      main.go     # Consumer, fenced terminal disposition, lifecycle
+      sweeper.go  # Redis-lease-aware recovery and bounded abandonment
   internal/
     platform/
       redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close, wired into cmd/api by add-upload-idempotency-keys
@@ -283,7 +286,8 @@ video-processor/
       application/    # Use cases: CreateVideoJob, GetJobStatus, ListUserJobs, EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, ProcessVideoJob (all implemented, Phase 3)
       infrastructure/ # PostgreSQL adapter, ffmpeg-backed FrameExtractor adapter (both implemented, Phase 3 — wired into cmd/api by wire-videojob-http-endpoints / migrate-ffmpeg-execution-to-videojob-application)
         idempotency/  # Redis-backed IdempotencyStore adapter (implemented, Phase 4 — add-upload-idempotency-keys), wired into cmd/api's POST /upload handler
-        cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4 — add-videojob-status-cache), wired into cmd/api's setupVideo ahead of every use case
+        cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4; epoch/status-aware write ordering added in Phase 6)
+        lease/        # Epoch-scoped Redis worker lease (implemented, Phase 6 — add-worker-job-lock)
         storage/      # MinIO adapter (implemented, Phase 5) — Config/Open/Ping/EnsureBucket connection plumbing (add-minio-infrastructure) plus ResultStorage, the domain port carrying result artifacts into and out of the bucket (migrate-result-storage-to-minio)
         messaging/    # This context's job-dispatch topology, the outbox relay that publishes into it, and the consumer that reads from it (implemented, Phase 6 — add-rabbitmq-infrastructure for JobDispatchTopology(), add-videojob-source-key-and-outbox-relay for Publisher/Relay, migrate-upload-to-async-processing for Consumer): Publisher wraps a confirm-mode channel and publishes mandatory; Relay claims outbox rows through postgres.OutboxRepository, publishes them, and stamps published_at, started as a goroutine by cmd/api/main.go and stopped on shutdown; Consumer dials, redeclares the topology on every dial, sets prefetch 1, and hands each delivery to a Handler that returns Ack or Reject — it knows nothing about jobs, claims, or storage, and cmd/worker holds the whole decision table
     notification/
@@ -299,11 +303,11 @@ video-processor/
 | Component | Role | Status |
 |---|---|---|
 | PostgreSQL | Authoritative state store for users, plus `video_jobs`/`video_job_outbox` (Phase 3) | **Implemented** (Phase 2 for identity; Phase 3 schema/adapter for video, wired into `cmd/api` by `wire-videojob-http-endpoints` and driven by `POST /upload` since `migrate-ffmpeg-execution-to-videojob-application`), required at deployment time — see [docs/operations.md](operations.md) |
-| Redis | Idempotency keys, rate limiting, status cache | Connection adapter (`internal/platform/redis`), idempotency keys (`add-upload-idempotency-keys`), rate limiting (`add-rate-limiting-middleware`), and the `VideoJob` status cache (`add-videojob-status-cache`) — all three **implemented** (Phase 4 complete) |
+| Redis | Idempotency keys, rate limiting, status cache, worker leases | Connection adapter and the first three responsibilities are implemented from Phase 4; `add-worker-job-lock` completed the fourth in Phase 6 with `internal/video/infrastructure/lease`. Redis remains non-authoritative and is not consulted by the PostgreSQL claim or fence |
 | MinIO | Object storage for uploads and ZIP results (S3-compatible) | Fully implemented: ZIP results through `internal/video/domain.ResultStorage` (`migrate-result-storage-to-minio`) and uploaded source videos through `SourceStorage` (`migrate-upload-storage-to-minio`), sharing one bucket, separated by key prefix, with configuration required at startup. Results are handed to clients as presigned URLs rather than proxied (`add-presigned-download-urls`), so the API is absent from the transfer path |
 | RabbitMQ | Durable async task queue for job dispatch | **Implemented, publishing, and consumed** (Phase 6, `add-rabbitmq-infrastructure` + `add-videojob-source-key-and-outbox-relay` + `migrate-upload-to-async-processing`): `internal/platform/rabbitmq` opens, health-checks, and declares a topology; `internal/video/infrastructure/messaging` defines this context's exchange, queue, and dead-letter sink, the outbox relay that publishes `video_job.queued.v2` events into it, and the consumer `cmd/worker` reads them with. `RABBITMQ_URL` is **required at both `cmd/api` and `cmd/worker` startup**, but a reachable broker is not — relay and consumer each own their connection, dial in their own goroutine, redeclare the topology after every dial, and retry with backoff |
 
-A fourth Redis-backed responsibility — a distributed lock around `cmd/worker` job pickup — is still planned for Phase 6 (`add-worker-job-lock`). Concurrent pickup of the same job is *already* prevented, by PostgreSQL rather than Redis: `ClaimForProcessing`'s `WHERE id = $1 AND status = 'queued'` admits exactly one consumer. What the lock is for is the case that predicate cannot address — a worker that dies mid-extraction leaves its job stored as `processing`, which no redelivery can re-claim, and re-admitting such a job safely needs a fence that stops the previous consumer from later writing over the new one's work.
+The fourth Redis responsibility is implemented as a **lease for liveness**, not a lock around pickup. Concurrent pickup remains prevented by PostgreSQL's literal `status = 'queued'` claim. Redis gives the sweeper advisory evidence about whether a `processing` row still has a live worker, while PostgreSQL's `lease_epoch` and conditional terminal update provide the fence. A lease-query error itself authorizes no takeover, but fail-open acquisition or renewal can leave a live extraction without a matching key; two later successful absence observations may requeue it and let a successor run concurrently. The PostgreSQL fence prevents the superseded run from overwriting the authoritative outcome, but deliberately does not prevent duplicated extraction work.
 
 See [docs/roadmap.md](roadmap.md) for the full phase plan.
 

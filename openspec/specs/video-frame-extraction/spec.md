@@ -23,8 +23,8 @@ The system SHALL accept an uploaded video file only when its filename extension 
 For an accepted video upload, the system SHALL invoke `ffmpeg` to extract one frame per second of video as PNG images.
 
 #### Scenario: N-second video yields N frames
-- **WHEN** a valid video of approximately N seconds is uploaded
-- **THEN** the response reports `frame_count` approximately equal to N (one frame per second of source video)
+- **WHEN** a valid video of approximately N seconds is uploaded and its asynchronous job completes
+- **THEN** the completed job reports `frame_count` approximately equal to N (one frame per second of source video)
 
 ### Requirement: Zip Packaging Of Extracted Frames
 
@@ -32,26 +32,33 @@ The system SHALL package all extracted frames into a single downloadable `.zip` 
 
 #### Scenario: Zip contains all extracted frames
 
-- **WHEN** frame extraction succeeds for an upload
-- **THEN** the response includes a `zip_path`, and following the URL `GET /download/:filename` issues for that path yields a zip archive whose entry count matches the reported `frame_count`
+- **WHEN** frame extraction succeeds for an upload and its asynchronous job completes
+- **THEN** the completed job exposes a result path, and following the URL `GET /download/:filename` issues for that path yields a zip archive whose entry count matches the job's `frame_count`
 
 #### Scenario: The zip is stored in the bucket, not on local disk
 
 - **WHEN** frame extraction succeeds for an upload
-- **THEN** the zip exists as an object in the configured bucket, and the transient zip this request produced under `temp/` no longer exists after the request completes
+- **THEN** the zip exists as an object in the configured bucket, and the transient zip the worker produced under `temp/` no longer exists after the processing sequence completes
 
-### Requirement: Original Upload Cleanup After Successful Processing
+### Requirement: Original Upload Cleanup Is Attempted After Successful Processing
 
-On successful processing, the system SHALL delete the stored source object, leaving the zip object in the configured MinIO bucket as the only durable artifact.
+On successful processing, the worker SHALL make one best-effort attempt to delete the stored source object. A successful deletion leaves the zip object as the only durable job artifact, but a deletion error or interruption after the terminal commit MAY leave source residue for the `uploads/` lifecycle rule to reclaim.
 
-The source has not lived on the local filesystem since Phase 5: it is an object under the `uploads/` key prefix of the same bucket (see `videojob-source-storage`). Since the asynchronous cutover the cleanup no longer happens inside the submitting request at all — the object is deleted by `cmd/worker` once the job it processed reaches a terminal state, and the transient local copy it downloaded for `ffmpeg` is removed from **the worker's** `temp/` directory as part of the same sequence. The submitting API's filesystem is not involved in processing and holds no copy.
+The source has not lived on the local filesystem since Phase 5: it is an object under the `uploads/` key prefix of the same bucket (see `videojob-source-storage`). Since the asynchronous cutover the cleanup no longer happens inside the submitting request at all — `cmd/worker` attempts to delete the object after it applies the job's terminal state, and the transient local copy it downloaded for `ffmpeg` is removed from **the worker's** `temp/` directory as part of the same sequence. The submitting API's filesystem is not involved in processing and holds no copy.
 
 "After successful processing" therefore means after the job reaches `completed`, which is observable through the job's status rather than through the upload response. An observer SHALL NOT expect the source object to be gone by the time the submission is acknowledged.
 
-#### Scenario: Uploaded file removed after success
+#### Scenario: Successful cleanup removes the uploaded object
 
-- **WHEN** a video upload is processed successfully
-- **THEN** no object exists under that job's source key, and no local copy of it remains under any `temp/` directory, once the job's status is `completed`
+- **GIVEN** a video upload that is processed successfully and whose source deletion succeeds
+- **WHEN** the worker's post-commit cleanup finishes
+- **THEN** no object exists under that job's source key, and no transient local copy remains in the worker's `temp/` directory
+
+#### Scenario: Cleanup failure leaves lifecycle-managed residue
+
+- **GIVEN** a video upload whose job commits `completed`
+- **WHEN** source deletion fails or the worker stops between commit and deletion
+- **THEN** the job remains completed, no transient local copy survives the processing sequence, and the source object may remain until the `uploads/` lifecycle rule expires it
 
 #### Scenario: The source object still exists while the job is queued
 
@@ -69,8 +76,8 @@ The endpoint has no unauthenticated behavior: it is reachable only behind bearer
 
 #### Scenario: Newly created zip appears in status listing
 
-- **WHEN** an upload has been successfully processed
-- **THEN** `GET /api/status` includes an entry whose `filename` matches the returned `zip_path`
+- **WHEN** an upload's asynchronous job has completed successfully
+- **THEN** `GET /api/status` includes an entry whose `filename` matches that job's result path
 
 #### Scenario: Listing is scoped to the authenticated owner
 
@@ -114,35 +121,36 @@ The endpoint has no unauthenticated behavior: it is reachable only behind bearer
 - **THEN** the bytes travel from the storage service to the client, and no response from this API carries them
 
 ### Requirement: Temporary Frame Directory Cleanup
-The system SHALL remove the per-request temporary frame-extraction directory under `temp/` after a request completes, whether frame extraction succeeds or fails.
+The worker SHALL remove each job's temporary frame-extraction directory under `temp/` after its processing sequence completes, whether frame extraction succeeds or fails.
 
 #### Scenario: Temp directory removed after failed extraction
-- **WHEN** a video upload with a valid extension but content `ffmpeg` cannot decode is processed
-- **THEN** no leftover per-request directory remains under `temp/` after the request completes
+- **WHEN** a video upload with valid extension but content `ffmpeg` cannot decode is processed
+- **THEN** no leftover directory for that job remains under the worker's `temp/` after the processing sequence completes
 
 #### Scenario: Temp directory removed after successful extraction
 - **WHEN** a video upload is processed successfully
-- **THEN** no leftover per-request directory remains under `temp/` after the request completes
+- **THEN** no leftover directory for that job remains under the worker's `temp/` after the processing sequence completes
 
-### Requirement: Source Object Removed On Processing Failure
+### Requirement: Source Object Deletion Is Attempted On Processing Failure
 
-When frame extraction or result storage fails, the system SHALL delete the stored source object rather than retaining it. With storage reachable, a failed job leaves behind neither a source object in the bucket nor a local copy under any `temp/` directory.
+When frame extraction or result storage fails and this run applies the job's `failed` outcome, the worker SHALL make one best-effort attempt to delete the stored source object rather than intentionally retaining it. The local copy SHALL still be removed, while a source deletion error MAY leave bucket residue for the `uploads/` lifecycle rule.
 
 The deletion is an obligation to attempt, not a guarantee of absence — `videojob-source-storage` owns the full semantics, including which component is obliged to attempt it and what happens when the attempt itself fails. The point of this requirement is the reversal of intent: failure is no longer a reason to keep the source.
 
 This inverts the behavior the removed "Uploaded File Retained On Processing Failure" requirement documented. Retention was a known leak, tolerable only because a local file is reclaimed when its container is replaced; the same leak in object storage would be durable and unbounded, with nothing in this system to reap it.
 
-Two consequences, both accepted deliberately. A failed job cannot be retried from the original bytes, because they are gone; a retry is a fresh submission, which `upload-idempotency` keeps unblocked by clearing a failed job's key immediately. And a job that fails *before* any component claims it — one whose dispatch was never delivered — is not covered by this requirement at all: nothing processes it, so nothing deletes its source, and the object-storage lifecycle rule is what reclaims it.
+Two consequences, both accepted deliberately. The system does not retry a failed job from the original bytes; a retry is a fresh submission, which the worker attempts to unblock promptly by clearing the failed job's idempotency key. And a job that fails *before* any component claims it — one whose dispatch was never delivered — is not covered by this requirement at all: nothing processes it, so nothing deletes its source, and the object-storage lifecycle rule is what reclaims it.
 
-#### Scenario: Failed processing leaves no source object
+#### Scenario: Successful cleanup removes the source after extraction failure
 
-- **WHEN** a submitted video with a valid extension but content `ffmpeg` cannot decode is processed
+- **GIVEN** source deletion succeeds
+- **WHEN** a submitted video with a valid extension but content `ffmpeg` cannot decode is processed and its failure write applies
 - **THEN** the job's status is `failed` with a recorded reason, and no object exists under its source key
 
-#### Scenario: Failed result storage also removes the source
+#### Scenario: Successful cleanup removes the source after result-storage failure
 
-- **GIVEN** frames were extracted successfully but the result zip cannot be stored
-- **WHEN** the job reaches its terminal state
+- **GIVEN** frames were extracted successfully, the result zip cannot be stored, and source deletion succeeds
+- **WHEN** the failure write applies and post-commit cleanup finishes
 - **THEN** the job is `failed` and no object exists under its source key
 
 #### Scenario: A job that was never claimed is not covered

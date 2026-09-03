@@ -63,7 +63,7 @@ The wrapped error itself MAY carry the client's own text, and does: that is what
 
 The object key for a `VideoJob`'s result SHALL be `frames_<jobID>.zip`, derived from the job's ID by a single function in `internal/video/domain` that both the storing and the retrieving side use. The key SHALL contain no `/` character.
 
-The flat shape is a hard constraint, not a stylistic preference: the key is returned to the browser as `POST /upload`'s `zip_path` and used verbatim as the `:filename` path segment of `GET /download/:filename`. A `/` inside it percent-encodes to `%2F`, which is decoded back into the request path and prevents the single-segment route parameter from matching.
+The flat shape is a hard constraint, not a stylistic preference: the key is persisted as the completed `VideoJob`'s `StorageKey`, exposed as `filename` by the status listing, and used verbatim as the `:filename` path segment of `GET /download/:filename`. A `/` inside it percent-encodes to `%2F`, which is decoded back into the request path and prevents the single-segment route parameter from matching.
 
 `internal/video/domain` SHALL also expose the inverse: recovering a `VideoJobID` from a well-formed key, and failing clearly for a key that does not have that shape.
 
@@ -209,9 +209,9 @@ The route SHALL have no unauthenticated behavior, for the same reason as the dow
 
 #### Scenario: A completed job's result appears in the listing
 
-- **GIVEN** an upload that has been processed successfully
+- **GIVEN** an upload whose asynchronous job has completed successfully with a persisted `StorageKey`
 - **WHEN** its owner requests `GET /api/status`
-- **THEN** the response includes an entry whose `filename` equals the `zip_path` the upload returned, with a non-zero `size` and a non-empty `created_at`
+- **THEN** the response includes an entry whose `filename` equals that `StorageKey`, with a non-zero `size` and a non-empty `created_at`
 
 #### Scenario: The listing is scoped to the authenticated owner
 
