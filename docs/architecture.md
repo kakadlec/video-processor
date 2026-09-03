@@ -138,8 +138,10 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
         │    └─ FailJob if fetch, extraction, OR storage failed
         │         (processing → failed), conditional on the claimed epoch
         ├─ ErrJobFenced from failure or completion:
-        │    └─ Reject → DLQ; keep source and idempotency key; do not release
-        │         the successor's lease; log held epoch and any result key
+        │    └─ Reject → DLQ; keep source and idempotency key; release no
+        │         lease; log held epoch and any result key
+        ├─ result.Success == false and `failed` was already present:
+        │    └─ Ack without cleanup (this actor applied nothing)
         ├─ result.Success == false and this run applied `failed`:
         │    ├─ Delete the source object
         │    ├─ ClearJobIdempotencyKey (conditional on this job still owning it)

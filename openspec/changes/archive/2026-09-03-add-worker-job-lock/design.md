@@ -82,7 +82,7 @@ The epoch then travels `StartProcessing` → `ProcessVideoJobResult` → `Comple
 
 Two Redis interactions with opposite postures, and the asymmetry is the point.
 
-- **Acquiring or renewing a lease**: on error, log and proceed. The job is protected by the unconditional claim, so a leaseless extraction is correct; it is merely invisible to the sweeper, and the worst case is one duplicated extraction that the fence resolves.
+- **Acquiring or renewing a lease**: on error, log and proceed. The job is protected by the Redis-independent conditional PostgreSQL claim and terminal fence, so a leaseless extraction is correct; it is merely invisible to the sweeper, and the worst case is one duplicated extraction that the fence resolves.
 - **Deciding a lease has lapsed**: on error, *do not requeue*. "Cannot tell" is not evidence of expiry. Declining preserves exactly today's behaviour — the job stays stranded until Redis returns — instead of inverting a Redis outage into a licence to take over every live job in the system at once.
 
 Renewal and release are conditional on the stored value still naming this worker's epoch, so a worker that has already been taken over can neither extend nor delete the lease it no longer owns.

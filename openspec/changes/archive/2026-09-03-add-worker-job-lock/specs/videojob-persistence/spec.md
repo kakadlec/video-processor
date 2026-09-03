@@ -36,7 +36,7 @@ The update SHALL be conditional on the row still being in `processing` status **
 
 The outbox row SHALL be indistinguishable from the one `Enqueue` writes — same `event_type` constant, same payload shape, same fields — so recovery reuses the dispatch path end to end rather than introducing a second message the worker would have to recognise.
 
-It SHALL be a distinct method rather than a mode of `Enqueue` or of `Update`. `Enqueue` asserts a `pending → queued` transition on a job that has never run; `Update` is the unconditional-by-id path this requirement's sibling now fences. Folding the requeue into either would give a general-purpose method a second concurrency contract.
+It SHALL be a distinct method rather than a mode of `Enqueue` or of `Update`. `Enqueue` asserts a `pending → queued` transition on a job that has never run; `Update` is the formerly unconditional-by-id terminal path that this requirement's sibling now fences. Folding the requeue into either would give a general-purpose method a second concurrency contract.
 
 `CachedVideoJobRepository` SHALL implement it write-through, and SHALL write through **only when a row was affected** — a requeue that lost its race changed nothing in PostgreSQL, and publishing the caller's in-memory `queued` job would contradict the winner.
 
@@ -131,7 +131,7 @@ The fence SHALL NOT be confused with the claim. `ClaimForProcessing` decides who
 The ways `Update` can affect no row SHALL be distinguishable to its caller, through the same follow-up lookup `ClaimForProcessing` already uses to separate a missing row from a lost claim. There are three readings and they do **not** share one disposition:
 
 - **A strictly greater epoch** means the job was taken over. Fence sentinel; the caller rejects, keeps the source object, clears no idempotency key, and performs no cleanup.
-- **A matching epoch on a terminal row whose recorded outcome differs** from the one being written means another actor at the same epoch finished first. Same disposition as above, and a single sentinel MAY carry both — but the log SHALL tell them apart, since an abandonment race and a takeover mean different things.
+- **A matching epoch on a terminal row whose recorded outcome differs** from the one being written means another actor at the same epoch finished first. It has the same disposition as above and SHALL use the same sentinel. The application and current worker log are not required to retain which predicate produced that sentinel; the log may describe both as a takeover because neither allows this actor to clean up.
 - **A matching epoch on a terminal row carrying exactly the outcome being written** is not a fence at all. `videojob-lifecycle` requires it to be reported as success, marked *already present* rather than *applied*, so a caller retrying its own lost-response write can acknowledge and clean up. Reporting the fence sentinel here would dead-letter a message whose work committed.
 
 #### Scenario: Update persists a transitioned job

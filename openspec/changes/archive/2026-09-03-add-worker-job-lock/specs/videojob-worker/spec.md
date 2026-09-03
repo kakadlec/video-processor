@@ -38,15 +38,13 @@ A fenced outcome SHALL be logged distinctly from a lost claim, naming the job, t
 
 ### Requirement: The Worker Deletes the Source Object, and Only If It Won the Claim
 
-**This requirement's name is now shorthand for a wider rule and SHALL be read through this paragraph.** Winning the claim is the *consumer's* way of earning the right to delete a source object, and it is no longer the only one: the sweeper never claims anything, yet `videojob-lease-recovery` requires it to delete the source of a job it abandons. The governing condition is therefore **having applied this job's terminal write** — the consumer applies it by claiming, extracting, and committing; the sweeper applies it by winning the conditional abandonment write at the epoch its scan observed. Every "did not win the claim" clause below is an instance of that condition, not an independent one, and an actor that did not apply the terminal write deletes nothing whichever role it is in.
+The governing rule is **having applied this job's terminal write**, not claim ownership by itself. The consumer applies it by claiming, extracting, and committing; the sweeper applies it by winning the conditional abandonment write at the epoch its scan observed. An actor that did not apply the terminal write deletes nothing, except that a bounded completion retry may finish cleanup when it finds the identical outcome from its own possibly lost-response attempt.
 
-The worker SHALL delete the source object named by the message once the job it claimed has **committed** a terminal state — `completed` or `failed` — on success and on failure alike. The deletion SHALL be attempted on every path that returns normally after such a commit. It is deliberately *not* a deferred cleanup: a panic unwinding between the commit and the delete leaves the object behind, which is the same leak this requirement already accepts below and strictly safer than the alternative a defer would invite.
+The consumer SHALL delete the source object named by the message when its terminal write was **applied**. A completion retry that finds its identical outcome already present MAY also delete because that bounded retry is completing cleanup for its own possibly lost-response write; a failure path that merely finds an identical outcome already present SHALL acknowledge but SHALL NOT clean up. The sweeper earns the same right only by applying its conditional abandonment write. Deletion SHALL be attempted on every normal return that satisfies one of those conditions. It is deliberately *not* deferred: a panic between commit and delete leaves the object behind, which is safer than deleting before ownership is established.
 
 **It SHALL NOT delete the source object on any path where the job did not reach a committed terminal state**, and this is the condition that matters most, because getting it wrong is unrecoverable rather than merely untidy. A panic mid-extraction, a `CompleteJob` write that would not commit, a shutdown deadline that expired — each leaves the job in `processing`, and the source bytes are the only thing from which that job can ever be finished. Deleting them turns a job the sweeper's fenced takeover could have recovered into one that can only be failed. An unconditional deferred delete registered at claim time therefore SHALL NOT be used; the delete SHALL be guarded on the committed outcome.
 
-**It SHALL NOT delete the source object when its terminal write was refused by the fence**, and this case is now the sharpest instance of the rule rather than a hypothetical. A fenced write means another worker holds the job *right now* and is reading those exact bytes; deleting them would destroy a running extraction's input. The commit the delete is guarded on SHALL be this worker's own committed write, never merely the observation that the job has reached a terminal state.
-
-The bytes left behind in that case leak, and that is the deliberate trade: a leaked object is reclaimable by the storage lifecycle rule, while a deleted one is gone.
+**It SHALL NOT delete the source object when its terminal write was refused by the fence.** The fence can mean either that a newer epoch owns the job or that another actor committed a different terminal outcome at the same epoch; in both cases this actor applied nothing and has no cleanup right. When a successor is still processing, deletion would also destroy its input. Any residue is safer than premature deletion and remains reclaimable by the storage lifecycle rule.
 
 A consumer SHALL NOT delete the source object when it did not win the claim either. Another consumer is processing that job from those exact bytes, and deleting them would destroy a running extraction's input — the failure mode generation isolation exists to prevent, reintroduced from inside.
 
@@ -64,7 +62,7 @@ The deletion SHALL be best effort, as it was when the HTTP handler owned it: one
 
 #### Scenario: A failed job's source object is gone
 
-- **GIVEN** a dispatched job whose extraction fails
+- **GIVEN** a dispatched job whose extraction fails and whose failure write this run applies
 - **WHEN** the message has been acknowledged
 - **THEN** the job is `failed` and no object exists under its source key
 

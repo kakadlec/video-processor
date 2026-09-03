@@ -117,8 +117,8 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │    failed, fenced by epoch  │                  │
   │                        │───────────────────────────►│                  │
   │                        │  ErrJobFenced: Reject → DLQ,│                  │
-  │                        │    keep source and successor│                  │
-  │                        │    lease                    │                  │
+  │                        │    keep source and release  │                  │
+  │                        │    no lease                 │                  │
   │                        │  on applied failure:        │                  │
   │                        │    delete the source object │                  │
   │                        │    clear the idempotency key│                  │
@@ -140,7 +140,7 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │  ack / reject           │                            │                  │
 ```
 
-An acknowledgement asserts that this run committed a **terminal state**, not that it succeeded: an applied `failed` result is acked. A fenced run is rejected and performs no source, idempotency, or lease cleanup because a successor owns the advanced epoch.
+An acknowledgement asserts that a **terminal outcome exists**, not that processing succeeded or that this call necessarily applied it. An applied failure is acked with cleanup; an identical failure already present is also acked but cleaned up by neither this run nor a second actor. A fenced run is rejected and performs no source, idempotency, or lease cleanup because this actor did not apply the terminal outcome.
 
 A sibling sweeper scans bounded batches of `processing` rows every 60 seconds. After two successful observations that no lease is held at the same epoch, it conditionally returns the row to `queued`, increments the epoch, and writes a fresh outbox dispatch in one transaction. After three requeues, or for a legacy row with no source key, it applies terminal abandonment instead. A Redis query error resets prior confirmation and takes over nothing.
 
