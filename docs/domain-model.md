@@ -67,7 +67,7 @@
 | `FrameCount` | int | ≥ 0; set only on transition to `completed` |
 | `ErrorReason` | string | Non-empty only in `failed` state |
 | `JobStatus` | enum | Transitions only via defined commands (see state machine below) |
-| `LeaseEpoch` | non-negative integer | Counts how many times recovery returned the job to `queued`; starts at zero, advances only on requeue, and fences terminal writes from superseded workers |
+| `LeaseEpoch` | integer (application-generated values are non-negative) | Counts how many times recovery returned the job to `queued`; application paths start at zero and advance only on requeue, while the persistence boundary does not add a database `CHECK` or reject a stored integer during restoration |
 
 ### State Machine
 
