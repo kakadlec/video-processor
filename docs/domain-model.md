@@ -83,7 +83,7 @@ pending → queued → processing → completed
 |---|---|---|
 | `pending` | Job created, upload stored; not yet on the queue | `CreateVideoJob` use case |
 | `queued` | Dispatch recorded in the outbox and committed with the transition; the broker message follows, published out of band by the relay | `EnqueueVideoJob` for first dispatch, or the recovery sweeper's fenced requeue |
-| `processing` | `cmd/worker` has dequeued the job and won the claim; frame extraction is under way and an epoch-scoped lease is renewed | `cmd/worker`'s `StartProcessing` command — an **atomic conditional claim**, see below |
+| `processing` | `cmd/worker` has dequeued the job and won the claim; frame extraction is under way and the worker attempts to maintain an epoch-scoped lease | `cmd/worker`'s `StartProcessing` command — an **atomic conditional claim**, see below |
 | `completed` | Frames extracted and ZIP stored; `FrameCount` and `StorageKey` populated | `cmd/worker`'s epoch-fenced `CompleteJob` command |
 | `failed` | Processing failed or exhausted recovery; `ErrorReason` populated | `ProcessVideoJob`'s fenced `FailJob`, or the recovery sweeper's abandonment write |
 
@@ -96,7 +96,7 @@ pending → queued → processing → completed
 - `ContentHash` is fixed at creation and never rewritten by a transition either.
 - **`queued → processing` is a claim, not merely a transition.** It is persisted through one conditional statement (`… WHERE id = $1 AND status = 'queued' RETURNING lease_epoch`), so of two consumers handed the same dispatch exactly one wins and receives the epoch it must carry. Losing returns a distinct sentinel and touches nothing.
 - **A terminal write is fenced.** `CompleteJob` and `FailJob` apply only while the row is still `processing` at the epoch the claim returned. A requeue advances the epoch; a previous holder then receives `ErrJobFenced` and cannot overwrite the successor.
-- **The Redis lease is liveness, not ownership.** Pickup never consults it. The sweeper requires two successful not-held observations at the same epoch before conditionally requeueing; a Redis query error for that job clears its confirmation and takes over nothing.
+- **The Redis lease is liveness, not ownership.** Pickup never consults it. The sweeper requires two successful not-held observations at the same epoch before conditionally requeueing; a Redis query error for that job clears its confirmation and takes over nothing. Because acquisition and renewal fail open, an absent lease is evidence that requires confirmation, not proof that no worker is running.
 
 ### Use Cases
 

@@ -60,7 +60,7 @@ The event-type string SHALL be a single constant shared between the insert, the 
 
 The claim SHALL use `SELECT … FOR UPDATE SKIP LOCKED`, so that a second `cmd/api` replica polling at the same moment steps over rows already claimed rather than blocking on them or re-reading them.
 
-This system is being prepared to run multiple `cmd/api` replicas, each running its own relay. The guard is PostgreSQL-side deliberately: it protects the outbox row, not the job, which is a different contention from the Redis lease a later change adds around worker job pickup.
+This system is being prepared to run multiple `cmd/api` replicas, each running its own relay. The guard is PostgreSQL-side deliberately: it protects the outbox row, not the job, which is different contention from the Redis liveness lease used by worker recovery. Job pickup itself remains a conditional PostgreSQL update and never consults the lease.
 
 #### Scenario: Two concurrent relays split the work
 

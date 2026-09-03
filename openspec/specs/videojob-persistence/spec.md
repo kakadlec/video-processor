@@ -104,7 +104,7 @@ The payload SHALL carry `type` (that same event-type string), `job_id`, `user_id
 
 This is a dedicated method rather than a status-dependent behavior added to `Update`. `Update` is also `CompleteJob`'s and `FailJob`'s path, so making it outbox-aware would turn event emission into a side effect of a general-purpose method and would decide, as a by-product, the shape Phase 7 inherits for `VideoJobCompleted`/`VideoJobFailed`.
 
-`internal/video/infrastructure/cache.CachedVideoJobRepository` SHALL implement `Enqueue` write-through, like `Update`: PostgreSQL first, then an unconditional cache write. It SHALL NOT pass the call through uncached — a job left `pending` in the cache while `queued` in PostgreSQL would make `GET /api/video-jobs/:id` contradict the row the relay is about to publish.
+`internal/video/infrastructure/cache.CachedVideoJobRepository` SHALL implement `Enqueue` write-through, like `Update`: PostgreSQL first, then the cache's atomic epoch/status-ordered write. It SHALL NOT pass the call through uncached — a job left `pending` in the cache while `queued` in PostgreSQL would make `GET /api/video-jobs/:id` contradict the row the relay is about to publish. The ordered write also prevents a delayed enqueue cache update from replacing a newer state.
 
 #### Scenario: Enqueue records a matching outbox row
 
