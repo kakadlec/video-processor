@@ -178,7 +178,7 @@ Shutdown SHALL be bounded: if the in-flight job does not finish within the deadl
 - **WHEN** the worker shuts down
 - **THEN** the requeue either commits or rolls back on its own terms, and no database handle is closed underneath it
 
-#### Scenario: An abandoned job's lease is released rather than left to expire
+#### Scenario: A job finished during shutdown has its lease released
 
 - **GIVEN** a worker that finished its in-flight job during shutdown
 - **WHEN** it exits

@@ -296,7 +296,7 @@ The AMQP consumer requeues only a delivery pulled off the channel after shutdown
 **Operator symptom: a job remains `processing`.** A claimed job holds Redis key `videojob:lease:<jobID>` with its PostgreSQL `lease_epoch` as the value and a 90-second TTL. The worker renews every 30 seconds. The sweeper runs every 60 seconds, scans at most 50 rows with a rotating keyset cursor, and acts only after two consecutive successful "not held at this epoch" observations. A Redis query error clears the first observation and takes over nothing.
 
 ```sql
-SELECT id, user_id, status, source_key, lease_epoch, updated_at
+SELECT id, user_id, status, source_key, lease_epoch, created_at
   FROM video_jobs
  WHERE status = 'processing'
  ORDER BY id ASC;
@@ -304,7 +304,7 @@ SELECT id, user_id, status, source_key, lease_epoch, updated_at
 
 Correlate each candidate with worker logs and, from an authorized Redis shell, `GET videojob:lease:<jobID>` plus `PTTL videojob:lease:<jobID>`:
 
-- the same epoch with positive TTL indicates a worker is live enough to renew; extraction duration alone does not imply abandonment;
+- the same epoch with a positive TTL shows only that the lease has not expired; sample `PTTL` again to confirm it increases on renewal rather than counting down to zero — extraction duration alone does not imply abandonment;
 - no key is one observation, not permission to mutate the row — allow the sweeper a second successful observation;
 - a greater key epoch belongs to a successor and fences the older run;
 - `lease store unreachable ... taking over none` means Redis recovery failed closed and all pending confirmations for affected jobs were reset;

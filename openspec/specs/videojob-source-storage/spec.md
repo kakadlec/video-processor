@@ -1,7 +1,7 @@
 # videojob-source-storage Specification
 
 ## Purpose
-Define the `SourceStorage` domain port and its MinIO adapter: how an uploaded source video reaches the bucket without touching local disk, how its key is derived and why that key may carry a prefix when a result key may not, how `ProcessVideoJob` obtains the transient local copy `ffmpeg` needs, and the transient-lifetime contract that assigns each source object exactly one owner — the submitting request until the job is queued, and the consumer that processes it afterwards. Result artifacts are `videojob-result-storage`'s concern; the two share one bucket and are separated only by key prefix.
+Define the `SourceStorage` domain port and its MinIO adapter: how an uploaded source video reaches the bucket without touching local disk, how its key is derived and why that key may carry a prefix when a result key may not, how `ProcessVideoJob` obtains the transient local copy `ffmpeg` needs, and the transient-lifetime contract that assigns cleanup first to the submitting request and, after enqueue, to the consumer or recovery sweeper that applies the job's terminal outcome. Result artifacts are `videojob-result-storage`'s concern; the two share one bucket and are separated only by key prefix.
 
 ## Requirements
 
@@ -11,7 +11,7 @@ Define the `SourceStorage` domain port and its MinIO adapter: how an uploaded so
 
 The port SHALL expose `Put`, `Get`, and `Delete`. `Put` SHALL accept an `io.Reader` rather than a local path — the source has no local existence at upload time, and requiring one would reintroduce the file this capability exists to remove. `Get` SHALL write the object to a caller-supplied local path, since its only consumer needs a file for `ffmpeg`.
 
-This requirement constrains the **inbound** path only, observed while the request is in flight. What survives the request is specified separately by "A Source Object Is Deleted By Whichever Component Owns Its Job's Outcome"; the two are not in tension, because the object's existence mid-request is exactly what makes its later deletion — by the request itself, or by the consumer that took ownership of it — meaningful.
+This requirement constrains the **inbound** path only, observed while the request is in flight. What survives the request is specified separately by "A Source Object Is Deleted By Whichever Component Owns Its Job's Outcome"; the two are not in tension, because the object's existence mid-request is exactly what makes its later deletion — by the request itself, or by the execution/recovery actor that earns cleanup rights — meaningful.
 
 #### Scenario: A successful upload writes no local copy of the source
 
@@ -90,17 +90,17 @@ The `FrameExtractor` port SHALL continue to receive a local file path and SHALL 
 
 ### Requirement: A Source Object Is Deleted By Whichever Component Owns Its Job's Outcome
 
-A stored source object SHALL be deleted by exactly one component, and which one it is SHALL be decided by whether the job was successfully enqueued.
+A stored source object SHALL be deleted only by an actor that has earned its cleanup right, and which actors can do so SHALL be decided first by whether the job was successfully enqueued and then by which terminal write was applied.
 
 **Before the enqueue commits, the object belongs to the request.** Every `POST /upload` request that stores a source object SHALL attempt to delete it before the request completes on every exit path that does not end in a queued job: a duplicate-content conflict, a `CreateVideoJob` error, an `EnqueueVideoJob` error, and any other early return after the object was written. The attempt SHALL be made from a single deferred call registered as soon as the object is stored, guarded on whether the enqueue succeeded, rather than from per-path cleanup calls — so no future early-return path can be added without it.
 
-**Once the enqueue commits, the object belongs to the job's consumer.** The handler SHALL NOT delete it, and SHALL NOT delete it "just in case" on its way out: the bytes are the consumer's input, and a handler that removed them would destroy a running extraction. `videojob-worker` defines the consumer's obligation and the one condition under which it must also refrain.
+**Once the enqueue commits, the object belongs to the job's execution/recovery lifecycle.** The handler SHALL NOT delete it, and SHALL NOT delete it "just in case" on its way out: the bytes are worker input. The consumer may delete only after applying a terminal write (or completing cleanup for its own identical completion retry), and the recovery sweeper may delete only after applying terminal abandonment. A fenced actor, a lost claim, an already-present failure, and a losing sweeper delete nothing. `videojob-worker` and `videojob-lease-recovery` define those obligations.
 
 The deletion SHALL be performed on a context detached from the request's own, because a canceled request context may itself be the reason the request is unwinding. Deleting a key that is already absent SHALL NOT be treated as an error.
 
 This is an obligation to **attempt**, deliberately not a guarantee of absence. The attempt is one call with no retry and no persisted cleanup record, so a storage failure at that instant leaves the object behind with nothing in this system to reclaim it. A failure SHALL be logged with the leaked key — so the residual set is enumerable from logs rather than invisible — and SHALL NOT fail the request.
 
-**A job that is enqueued but never dispatched leaks its source object permanently, and no requirement here claims otherwise.** The handler has given up ownership and no consumer ever took it, so nothing deletes the object: this happens when the relay never publishes the row, when the message is dead-lettered before a claim, or when a worker dies between delivery and its own cleanup. An expiration lifecycle rule on the `uploads/` key prefix is no longer a recommended backstop but the **only** guarantee that such objects are ever reclaimed, and `docs/operations.md` SHALL describe it in those terms.
+**Application cleanup is not exhaustive, and no requirement here claims otherwise.** A job enqueued but never dispatched has no actor that can apply a terminal outcome. A worker that dies mid-extraction is recoverable by the lease sweeper, but interruption after a terminal commit and before deletion can still leave the object behind, as can a best-effort deletion failure. An expiration lifecycle rule on the `uploads/` key prefix is therefore the **only exhaustive guarantee** that source residue is reclaimed, and `docs/operations.md` SHALL describe it in those terms.
 
 #### Scenario: A queued upload does not delete its own source object
 
@@ -130,6 +130,12 @@ This is an obligation to **attempt**, deliberately not a guarantee of absence. T
 - **GIVEN** a request whose context is canceled after the job was successfully enqueued
 - **WHEN** the handler unwinds
 - **THEN** the source object is left in place, and the job is processed normally by its consumer
+
+#### Scenario: A worker crash during extraction transfers cleanup to recovery
+
+- **GIVEN** a worker dies after claiming a job but before committing a terminal outcome
+- **WHEN** the lease expires and the recovery path eventually applies that job's terminal outcome
+- **THEN** the source remains available for every re-dispatched run and is deleted only by the actor that applies the final outcome
 
 #### Scenario: A cleanup failure is logged, not fatal, and not specified away
 
