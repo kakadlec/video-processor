@@ -56,7 +56,7 @@ The cached record SHALL mirror the persisted column set exactly, source key, con
 
 If the cache cannot decode or otherwise order the existing entry, the write-through MAY replace a malformed entry; if the atomic operation itself fails, the decorator SHALL attempt to invalidate the key. A missing cache entry remains safe: the next read falls back to PostgreSQL.
 
-**Every write-through SHALL serialize the epoch the database operation actually committed at, not assume the aggregate handed to the decorator already carries it.** A claim can return an epoch newer than the one its pre-claim aggregate loaded, and a requeue advances the stored epoch by one. The authoritative metadata SHALL therefore be used explicitly — the claim's returned epoch, the requeue aggregate's advanced epoch, and `Update`'s caller-supplied epoch. The requeue's aggregate transition advances its in-memory epoch, matching the conditional statement's `lease_epoch = lease_epoch + 1` by construction.
+**Every write-through SHALL serialize the epoch represented by the successful database operation.** A claim can return an epoch newer than the one its pre-claim aggregate loaded, so that path SHALL use the returned epoch explicitly. Requeue serializes the aggregate's advanced epoch, matching `lease_epoch = lease_epoch + 1` by construction. Terminal ownership use cases load their aggregate directly from PostgreSQL and an `Update` applies only at that same held epoch, so terminal write-through serializes the authoritative aggregate; the decorator does not repair an artificial direct call whose aggregate epoch differs from its epoch argument.
 
 **A won claim's write-through SHALL serialize the epoch the claim reported, not the epoch on the aggregate the caller passed in.** Those differ in exactly the case that matters: a consumer can load a `queued` job at one epoch, lose a race to a sweep that requeues it, and then win the claim on the re-dispatched job at the advanced epoch. Caching the pre-claim aggregate would publish a superseded value, so the next `FindByID` served from that entry would hand its caller an aggregate whose epoch disagrees with the row it claims to describe.
 
@@ -86,11 +86,11 @@ A record written by a previous release carries no epoch at all. Such a record SH
 - **WHEN** `CachedVideoJobRepository.ClaimForProcessing` succeeds and reports a row affected
 - **THEN** a subsequent `FindByID` served from cache returns `processing`
 
-#### Scenario: A successful Update caches the epoch it wrote at
+#### Scenario: An applied terminal Update caches its authoritative aggregate epoch
 
-- **GIVEN** a terminal `VideoJob` whose in-memory epoch is zero and a non-zero held epoch passed directly to `CachedVideoJobRepository.Update`
-- **WHEN** the underlying update applies and the decorator writes through
-- **THEN** the cached record carries the epoch argument the write committed at, not the aggregate's zero
+- **GIVEN** a terminal ownership use case that loaded a `processing` job directly from PostgreSQL at the epoch it holds
+- **WHEN** its `Update` applies and the decorator writes through
+- **THEN** the cached terminal record carries that authoritative aggregate epoch
 
 #### Scenario: A won requeue caches the advanced epoch
 

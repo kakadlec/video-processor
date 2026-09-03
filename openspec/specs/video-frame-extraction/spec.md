@@ -23,8 +23,8 @@ The system SHALL accept an uploaded video file only when its filename extension 
 For an accepted video upload, the system SHALL invoke `ffmpeg` to extract one frame per second of video as PNG images.
 
 #### Scenario: N-second video yields N frames
-- **WHEN** a valid video of approximately N seconds is uploaded
-- **THEN** the response reports `frame_count` approximately equal to N (one frame per second of source video)
+- **WHEN** a valid video of approximately N seconds is uploaded and its asynchronous job completes
+- **THEN** the completed job reports `frame_count` approximately equal to N (one frame per second of source video)
 
 ### Requirement: Zip Packaging Of Extracted Frames
 
@@ -32,26 +32,33 @@ The system SHALL package all extracted frames into a single downloadable `.zip` 
 
 #### Scenario: Zip contains all extracted frames
 
-- **WHEN** frame extraction succeeds for an upload
-- **THEN** the response includes a `zip_path`, and following the URL `GET /download/:filename` issues for that path yields a zip archive whose entry count matches the reported `frame_count`
+- **WHEN** frame extraction succeeds for an upload and its asynchronous job completes
+- **THEN** the completed job exposes a result path, and following the URL `GET /download/:filename` issues for that path yields a zip archive whose entry count matches the job's `frame_count`
 
 #### Scenario: The zip is stored in the bucket, not on local disk
 
 - **WHEN** frame extraction succeeds for an upload
-- **THEN** the zip exists as an object in the configured bucket, and the transient zip this request produced under `temp/` no longer exists after the request completes
+- **THEN** the zip exists as an object in the configured bucket, and the transient zip the worker produced under `temp/` no longer exists after the processing sequence completes
 
-### Requirement: Original Upload Cleanup After Successful Processing
+### Requirement: Original Upload Cleanup Is Attempted After Successful Processing
 
-On successful processing, the system SHALL delete the stored source object, leaving the zip object in the configured MinIO bucket as the only durable artifact.
+On successful processing, the worker SHALL make one best-effort attempt to delete the stored source object. A successful deletion leaves the zip object as the only durable job artifact, but a deletion error or interruption after the terminal commit MAY leave source residue for the `uploads/` lifecycle rule to reclaim.
 
 The source has not lived on the local filesystem since Phase 5: it is an object under the `uploads/` key prefix of the same bucket (see `videojob-source-storage`). Since the asynchronous cutover the cleanup no longer happens inside the submitting request at all — the object is deleted by `cmd/worker` once the job it processed reaches a terminal state, and the transient local copy it downloaded for `ffmpeg` is removed from **the worker's** `temp/` directory as part of the same sequence. The submitting API's filesystem is not involved in processing and holds no copy.
 
 "After successful processing" therefore means after the job reaches `completed`, which is observable through the job's status rather than through the upload response. An observer SHALL NOT expect the source object to be gone by the time the submission is acknowledged.
 
-#### Scenario: Uploaded file removed after success
+#### Scenario: Successful cleanup removes the uploaded object
 
-- **WHEN** a video upload is processed successfully
-- **THEN** no object exists under that job's source key, and no local copy of it remains under any `temp/` directory, once the job's status is `completed`
+- **GIVEN** a video upload that is processed successfully and whose source deletion succeeds
+- **WHEN** its job reaches `completed`
+- **THEN** no object exists under that job's source key, and no transient local copy remains in the worker's `temp/` directory
+
+#### Scenario: Cleanup failure leaves lifecycle-managed residue
+
+- **GIVEN** a video upload whose job commits `completed`
+- **WHEN** source deletion fails or the worker stops between commit and deletion
+- **THEN** the job remains completed, no transient local copy survives the processing sequence, and the source object may remain until the `uploads/` lifecycle rule expires it
 
 #### Scenario: The source object still exists while the job is queued
 
@@ -69,8 +76,8 @@ The endpoint has no unauthenticated behavior: it is reachable only behind bearer
 
 #### Scenario: Newly created zip appears in status listing
 
-- **WHEN** an upload has been successfully processed
-- **THEN** `GET /api/status` includes an entry whose `filename` matches the returned `zip_path`
+- **WHEN** an upload's asynchronous job has completed successfully
+- **THEN** `GET /api/status` includes an entry whose `filename` matches that job's result path
 
 #### Scenario: Listing is scoped to the authenticated owner
 
