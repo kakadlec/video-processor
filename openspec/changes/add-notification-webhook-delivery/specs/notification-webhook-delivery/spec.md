@@ -1,0 +1,217 @@
+## ADDED Requirements
+
+### Requirement: An Event Is Delivered Only to Preferences That Existed Before It Occurred
+
+A terminal event SHALL be delivered to a preference only when all of the following hold: the preference belongs to the event's owning user, names the event's type, is `enabled`, and was **created before the event occurred**. A preference failing any of these SHALL receive nothing, and the event SHALL be treated as fully handled rather than as an error.
+
+The creation time is the enrolment boundary, and it is a rule rather than a one-time cutoff. The terminal queue accumulated events for the whole period between `emit-videojob-terminal-events` and this change, so a consumer with no boundary would announce, on its first start, outcomes its users were never subscribed to. `videojob-outbox-relay` answered the same problem with an explicit `occurred_at` cutoff, but a cutoff fixed at a deploy also discards events that are legitimately old — every event that arrived while the consumer was down. A standing instruction that does not announce what happened before it was given needs no constant, keeps holding once the backlog is drained, and cannot be forgotten at the next deploy.
+
+The boundary SHALL be the preference's creation time and SHALL NOT be its last-updated time. Disabling and re-enabling a preference therefore SHALL NOT re-open the window over events that occurred while it was disabled: those were not delivered when they arrived, and the record of that decision is not revisited.
+
+#### Scenario: An event predating the preference is not delivered
+
+- **GIVEN** a terminal event whose `occurred_at` is earlier than its owner's matching preference's creation time
+- **WHEN** the consumer handles it
+- **THEN** no request is made to the destination, the event is treated as handled, and no delivery record is created
+
+#### Scenario: An event after enrolment is delivered
+
+- **GIVEN** an enabled webhook preference for an event type, created before a matching event occurred
+- **WHEN** the consumer handles that event
+- **THEN** a signed request is made to the registered destination
+
+#### Scenario: A disabled preference receives nothing
+
+- **GIVEN** a webhook preference for the event's type whose `enabled` flag is false
+- **WHEN** a matching event is handled
+- **THEN** no request is made and the event is treated as handled
+
+#### Scenario: An event with no matching preference is handled, not failed
+
+- **GIVEN** a terminal event whose owner has registered no preference for its type
+- **WHEN** the consumer handles it
+- **THEN** nothing is delivered, nothing is recorded, and the event is not dead-lettered or retried
+
+#### Scenario: Re-enabling a preference does not replay the events it missed
+
+- **GIVEN** a preference that was disabled while matching events occurred and has since been re-enabled
+- **WHEN** those earlier events are not redelivered by the broker
+- **THEN** nothing replays them, and only events occurring after the re-enable are delivered
+
+### Requirement: A Delivery Is Claimed Before It Is Attempted, and a Claim Is Granted Once
+
+Before any outbound request is made, the system SHALL durably claim the delivery identified by the owning user, the event type, the channel, and the job the event names. A claim SHALL be granted at most once for that identity while it holds. When a claim is refused, no request SHALL be made and the message SHALL be treated as handled.
+
+This is the deduplication obligation `videojob-terminal-events` assigns to whatever consumes its queue, and the claim SHALL precede the attempt rather than record it afterwards. Recording afterwards leaves a read-then-act window that two consumer processes lose: both read "not delivered", and both deliver. The claim SHALL be a single atomic statement in the Notification context's own storage, so the guarantee holds across processes rather than within one.
+
+A claim that was granted but never resolved to an outcome SHALL become reclaimable after a bounded period, so a consumer that dies mid-delivery does not strand the delivery permanently. Reclaiming SHALL preserve the delivery's identifier, so a receiver that deduplicates on it still sees one logical delivery.
+
+A refused claim SHALL NOT be reported as a failure. A duplicate is the expected consequence of at-least-once transport, not an incident.
+
+#### Scenario: A redelivered message delivers nothing a second time
+
+- **GIVEN** a terminal event already delivered to a preference
+- **WHEN** the same event is delivered to the consumer again
+- **THEN** the claim is refused, no request is made to the destination, and the message is treated as handled
+
+#### Scenario: Two consumers racing on one event produce one request
+
+- **GIVEN** two consumer processes handling copies of the same terminal event for the same preference at the same time
+- **WHEN** both attempt to claim it
+- **THEN** exactly one claim is granted and exactly one outbound request is made
+
+#### Scenario: A claim abandoned mid-delivery is reclaimable
+
+- **GIVEN** a delivery whose claim was granted and whose consumer stopped before recording an outcome
+- **WHEN** the same event is redelivered after the reclaim period
+- **THEN** the claim is granted again, under the same delivery identifier, and the delivery is attempted
+
+#### Scenario: One preference per triple means one request per event
+
+- **GIVEN** a user with preferences for both terminal event types on the webhook channel
+- **WHEN** one job completes
+- **THEN** exactly one request is made, for the completion event only
+
+### Requirement: The Delivered Payload Is the Notification Context's Own and Carries a Generation
+
+The request body SHALL be a payload defined by the Notification context, carrying the delivery's identifier, the event type, the time the outcome occurred, and the outcome's data. It SHALL NOT be the Video Processing wire payload forwarded verbatim.
+
+Forwarding would make an internal contract public: every subsequent change to what the outbox writes would become a breaking change for every registered endpoint, and the generation suffix `videojob-terminal-events` uses to isolate producer changes would be leaking out of the system it isolates. The Notification payload SHALL therefore be versioned in its own right, independently of the event type's generation.
+
+The payload SHALL NOT carry the owning user's identifier: the receiver is that user, addressed at a URL only that user registered, so including it adds nothing and widens what a mis-delivered request would disclose. It SHALL NOT carry the signing secret, and it SHALL NOT carry a credential of any kind — the result storage key names an object that is still only retrievable through an authenticated, owner-scoped route.
+
+#### Scenario: A completion delivery names the job and its result
+
+- **WHEN** a completion event is delivered
+- **THEN** the body carries the delivery identifier, the event type, the time the outcome occurred, the job identifier, the frame count, and the result storage key
+
+#### Scenario: A failure delivery names the job and its reason
+
+- **WHEN** a failure event is delivered
+- **THEN** the body carries the delivery identifier, the event type, the time the outcome occurred, the job identifier, and the failure reason
+
+#### Scenario: The delivered body is not the internal wire payload
+
+- **WHEN** a delivery body is compared with the outbox payload for the same event
+- **THEN** they are separate contracts, and the delivered body carries no field whose only purpose is internal routing or relay bookkeeping
+
+### Requirement: Every Delivery Is Signed With the Preference's Secret Over a Timestamp and the Body
+
+Each request SHALL carry an HMAC-SHA256 signature computed with the preference's stored secret over a value that binds the request timestamp to the request body, and SHALL carry that timestamp as a header so a receiver can reject a stale one. The event type and the delivery identifier SHALL also be carried as headers, so a receiver can route and deduplicate without parsing the body.
+
+Signing the body alone SHALL NOT be sufficient: a captured request would then be replayable against the receiver forever. Binding the timestamp into the signed value is what lets a receiver bound that window without the attacker being able to move the timestamp.
+
+The secret SHALL be read on the delivery path and nowhere else, and SHALL NOT appear in the request body, in any header other than as the signature's output, in any log line, or in any stored delivery record.
+
+Every attempt for one delivery SHALL carry the same delivery identifier, so a receiver deduplicating on it treats a retried attempt as the same logical delivery rather than as a new one.
+
+#### Scenario: A delivery carries a signature over the timestamp and body
+
+- **GIVEN** a preference with a stored secret
+- **WHEN** a delivery is made to its destination
+- **THEN** the request carries a timestamp header and an HMAC-SHA256 signature computed with that secret over the timestamp and the exact body sent
+
+#### Scenario: A receiver can verify with the secret it registered
+
+- **GIVEN** the secret a user submitted when registering the preference
+- **WHEN** the receiver recomputes the signature over the timestamp header and the received body
+- **THEN** it equals the signature header
+
+#### Scenario: Retried attempts share one delivery identifier
+
+- **GIVEN** a delivery whose first attempt did not succeed
+- **WHEN** a later attempt is made within the budget
+- **THEN** it carries the same delivery identifier as the first
+
+#### Scenario: The secret does not appear in logs or records
+
+- **GIVEN** a completed delivery, successful or failed
+- **WHEN** the process's log output and the stored delivery record are examined
+- **THEN** neither contains the secret's value
+
+### Requirement: A Destination Is Refused Both Where It Is Registered and Where It Is Dialled
+
+The system SHALL apply one destination policy at two points: when a preference is written, and again when a connection is opened. The policy SHALL require a transport-secure scheme and SHALL refuse addresses that are loopback, private, link-local, or otherwise not routable to a third party — including cloud instance-metadata addresses. At dial time it SHALL be evaluated against the **resolved network address**, not against the hostname alone. Redirects SHALL NOT be followed, the response body SHALL be bounded, and every attempt SHALL be bounded in time.
+
+Two evaluations are required rather than one, and neither is redundant. A write-time check alone cannot survive a hostname that resolves differently later, nor a policy tightened after the row was stored. A dial-time check alone silently accepts a destination that will never be delivered to, which is the outcome the closed `Channel` set already rejects for `email`: a preference the system stores and never acts on is indistinguishable, to its owner, from one that works.
+
+A single configuration switch MAY relax the policy for environments that have no TLS and no public addressing — local development and the compose stack. It SHALL default to the restrictive behaviour, and it SHALL relax both the scheme rule and the address rule together, because they are wanted in exactly the same situation and separating them invites enabling half of it where neither belongs.
+
+Preferences stored before this policy took effect SHALL NOT be migrated or deleted. One that the policy now refuses SHALL simply not deliver, and the recorded reason SHALL say so.
+
+#### Scenario: A plaintext destination is refused at registration
+
+- **GIVEN** the policy in its default, restrictive configuration
+- **WHEN** a user submits a preference whose destination uses `http`
+- **THEN** the request is rejected with `400` and no preference is stored
+
+#### Scenario: An internal address is refused at registration
+
+- **WHEN** a user submits a destination naming a loopback, private, or link-local address
+- **THEN** the request is rejected with `400` and no preference is stored
+
+#### Scenario: A hostname resolving to an internal address is refused at dial
+
+- **GIVEN** a stored destination whose hostname resolves to a private or link-local address
+- **WHEN** a delivery to it is attempted
+- **THEN** no connection is made to that address, and the delivery is recorded as refused by policy
+
+#### Scenario: A redirect is not followed
+
+- **GIVEN** a destination that answers with a redirect to another address
+- **WHEN** a delivery is attempted
+- **THEN** the redirect is not followed and the attempt does not succeed
+
+#### Scenario: A previously stored destination that the policy now refuses does not deliver
+
+- **GIVEN** a preference stored before the policy took effect whose destination the policy now refuses
+- **WHEN** a matching event is handled
+- **THEN** nothing is delivered, the preference row is left untouched, and the recorded reason names the policy
+
+#### Scenario: The relaxation is opt-in and covers both rules
+
+- **GIVEN** the relaxation switch is enabled
+- **WHEN** a destination using `http` and naming a private address is registered and delivered to
+- **THEN** both are accepted, and with the switch absent or disabled both are refused
+
+### Requirement: Delivery Attempts Are Bounded, and the Outcome Is Recorded Rather Than Retried Indefinitely
+
+A delivery SHALL be attempted a bounded number of times with backoff between attempts, each attempt bounded in time, and the whole budget SHALL be small enough that one unreachable destination costs the consumer seconds rather than minutes. A `2xx` response SHALL record the delivery as delivered. Any other outcome — a non-`2xx` status, a timeout, a refused connection, a policy refusal — SHALL exhaust the budget and record the delivery as failed, naming the last observed reason.
+
+**Both outcomes SHALL result in the message being acknowledged.** A failing endpoint SHALL NOT be dead-lettered and SHALL NOT be requeued. `videojob-worker`'s "dead-letter, never requeue" disposition is calibrated for a claim-fenced job and SHALL NOT be inherited here: a third party's endpoint being down is not a defect in this system, and a dead-letter queue filling with one user's broken URL buries the messages that queue exists to surface.
+
+Attempts SHALL NOT be conditioned on which status code was observed. The budget is small enough that retrying a permanent rejection costs little, whereas a table classifying third-party status codes as retryable or not is a source of confident wrong guesses about endpoints this system does not control.
+
+A failed delivery SHALL NOT change any `VideoJob`, SHALL NOT be visible to the Video Processing context, and SHALL NOT affect what any HTTP route reports about the job.
+
+The attempt count and the per-attempt timeout SHALL be configurable, with documented defaults, so the budget can be tuned without a code change.
+
+#### Scenario: A successful delivery is recorded and acknowledged
+
+- **GIVEN** a destination answering `2xx`
+- **WHEN** the delivery is made
+- **THEN** it is recorded as delivered and the message is acknowledged
+
+#### Scenario: A failing endpoint exhausts the budget and is acknowledged
+
+- **GIVEN** a destination answering `500` to every attempt
+- **WHEN** the delivery is attempted
+- **THEN** the attempts stop at the configured bound, the delivery is recorded as failed with the observed reason, and the message is acknowledged rather than dead-lettered or requeued
+
+#### Scenario: A permanent rejection is not treated specially
+
+- **GIVEN** a destination answering `404`
+- **WHEN** the delivery is attempted
+- **THEN** it follows the same bounded budget as any other failure and is recorded as failed
+
+#### Scenario: A failed delivery leaves the job untouched
+
+- **GIVEN** a `completed` `VideoJob` whose owner's webhook delivery failed
+- **WHEN** the owner reads the job through the API
+- **THEN** it still reports `completed`, and nothing in its state or its result records the delivery failure
+
+#### Scenario: One slow destination does not stall the consumer indefinitely
+
+- **GIVEN** a destination that accepts connections and never responds
+- **WHEN** a delivery to it is attempted
+- **THEN** each attempt ends at the per-attempt timeout and the whole delivery ends within the configured budget
