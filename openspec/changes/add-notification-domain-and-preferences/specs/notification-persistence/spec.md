@@ -38,6 +38,12 @@ The Notification context SHALL create its own storage at `cmd/api` startup, and 
 - **WHEN** `cmd/api` starts again against it
 - **THEN** startup succeeds and existing preferences are preserved
 
+#### Scenario: Two replicas starting together both migrate successfully
+
+- **GIVEN** a database where the Notification schema does not yet exist
+- **WHEN** two replicas start simultaneously and both attempt to create it
+- **THEN** both succeed and the storage exists once — a first-time create SHALL be serialized rather than left to race, because a replica losing that race would fail to start
+
 #### Scenario: Migration failure fails startup
 
 - **GIVEN** a database where the schema cannot be created
@@ -46,7 +52,7 @@ The Notification context SHALL create its own storage at `cmd/api` startup, and 
 
 ### Requirement: Storage Enforces One Preference Per User, Event Type, and Channel
 
-The stored form SHALL make the triple of user, event type, and channel unique, and the uniqueness SHALL be enforced by the database rather than by a read-then-write in application code. A write SHALL be a single atomic upsert, so two concurrent writes of the same triple SHALL leave exactly one row and SHALL NOT fail with a constraint violation surfaced to either caller.
+The stored form SHALL make the triple of user, event type, and channel unique, and the uniqueness SHALL be enforced by the database rather than by a read-then-write in application code. A write SHALL resolve in a single atomic statement that reads no row beforehand, so two concurrent writes of the same triple SHALL leave exactly one row and SHALL NOT fail with a constraint violation surfaced to either caller.
 
 Enforcing the invariant in the schema is what keeps a second API replica from creating a duplicate that the consumer would later resolve to two conflicting destinations for one event.
 

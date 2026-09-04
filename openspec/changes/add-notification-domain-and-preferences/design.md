@@ -34,9 +34,13 @@ The aggregate has no identity independent of what it configures, nothing referen
 
 *Alternative considered:* UUID primary key + `UNIQUE (user_id, event_type, channel)`. Rejected as the same guarantee with one more column, one more package, and one more thing to keep unique.
 
-### The write is a single `INSERT ... ON CONFLICT DO UPDATE`
+### The write branches on what the request carries, not on what the database holds
 
-The spec requires two concurrent writes of one triple to converge without either caller seeing a constraint violation, and requires an omitted secret to preserve the stored one. Both fall out of one statement:
+The two secret rules pull against each other: a **create** with no secret must be refused, while an **update** with no secret must preserve the stored one. Distinguishing them appears to need a read of the row — which is what an upsert exists to avoid.
+
+It does not. The branch that matters is knowable before any statement runs, because it is a property of the *request*: did the caller send a secret? Each answer maps to one atomic statement.
+
+**Secret present** — a single upsert, whose conflict clause overwrites the stored secret:
 
 ```
 INSERT INTO notification_preferences
@@ -45,34 +49,42 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
 ON CONFLICT (user_id, event_type, channel) DO UPDATE
    SET enabled     = EXCLUDED.enabled,
        destination = EXCLUDED.destination,
-       secret      = COALESCE(NULLIF(EXCLUDED.secret, ''), notification_preferences.secret),
+       secret      = EXCLUDED.secret,
        updated_at  = EXCLUDED.updated_at
 RETURNING enabled, destination, secret <> '' AS has_secret, created_at, updated_at
 ```
 
-The `COALESCE(NULLIF(...))` is what makes "omitted means keep" atomic. A read-then-write in Go would need a transaction to be safe and would still be two round trips; here the row never has to be read.
-
-The domain layer, not SQL, is what refuses an *explicitly empty* secret — an empty string reaches the repository only as the encoding of "the caller did not send one," which is why the SQL can treat empty as "keep."
-
-*Alternative considered:* `SELECT` then `INSERT`/`UPDATE` in a transaction. Rejected: more round trips, a serialization concern to reason about, and it puts a credential through the application layer on a path that does not need it.
-
-### A `CHECK` constraint is what makes "a create needs a secret" reachable
-
-The two secret rules pull against each other: a **create** with no secret must be refused, while an **update** with no secret must preserve the stored one. Distinguishing them needs to know whether a row already exists — which is exactly what the single-statement upsert refuses to look up, and what a `NOT NULL DEFAULT ''` column would happily accept, storing `secret = ''` and reporting `has_secret: false`.
-
-The column therefore carries a named constraint instead of a default:
+**Secret omitted** — a single `UPDATE` that never names the `secret` column at all, so there is nothing to preserve it *from*:
 
 ```
-secret TEXT NOT NULL
-    CONSTRAINT notification_preferences_secret_not_empty CHECK (secret <> '')
+UPDATE notification_preferences
+   SET enabled = $4, destination = $5, updated_at = $6
+ WHERE user_id = $1 AND event_type = $2 AND channel = $3
+RETURNING enabled, destination, secret <> '' AS has_secret, created_at, updated_at
 ```
 
-The insert path violates it precisely when a create omits the secret. The conflict path can never violate it, because `COALESCE(NULLIF(EXCLUDED.secret, ''), notification_preferences.secret)` yields either the submitted secret or the stored one, and the stored one is non-empty by the same constraint. So one statement enforces both rules, and the adapter's only job is to map that one constraint — matched by name, not by SQLSTATE `23514` alone, so a future constraint on another column is not silently folded into the same error — to a typed domain error the handler renders as `400`.
+Affecting **zero rows** is the create-with-no-secret case, and the only signal needed to refuse it. No row was read, no row was written, and the answer is exact rather than inferred from a snapshot.
 
-The discriminating case is two concurrent first-writes of the same triple where one omits the secret. Whichever lands second takes the conflict path, finds a stored secret, and preserves it — a correct outcome, because by the time it executes a preference *is* stored and its write genuinely is an update. A read-then-write would decide "create" from a snapshot taken before the other insert committed and would then have to fail on the insert anyway; the constraint is what makes the outcome well-defined either way.
+This replaces an earlier decision in this document that put `COALESCE(NULLIF(EXCLUDED.secret, ''), notification_preferences.secret)` in the conflict clause and relied on a `CHECK (secret <> '')` to catch the create. That does not work, and the failure is silent in review but total at runtime: PostgreSQL evaluates `NOT NULL` and `CHECK` constraints against the **proposed** tuple before it detects the uniqueness conflict, so an omitted secret encoded as `''` aborts the statement and the `DO UPDATE` branch never executes. Verified against PostgreSQL 16 before rewriting this section:
 
-*Alternative considered:* `RETURNING (xmax = 0) AS inserted` inside a transaction, rolling back when it inserted without a secret. Same guarantee, but it adds a transaction to do what the constraint does for free, and leaves the invariant expressible only in Go — a second writer of this table could violate it.
+```
+ERROR:  new row for relation "np_probe" violates check constraint "np_probe_secret_not_empty"
+DETAIL:  Failing row contains (u1, video_job.completed.v1, webhook, https://CHANGED, ).
+```
 
+All four paths of the two-statement design were then verified against the same instance: create with a secret, update omitting one (secret intact, `has_secret` still true), create omitting one (zero rows), and a secret replaced through the insert path.
+
+Concurrency is well-defined on every path. Two concurrent creates carrying secrets both take the upsert and converge on one row. An update omitting a secret, racing a create of the same triple, either finds the row and preserves the just-written secret or finds nothing and is refused — and being refused is correct, because at the moment it executed no preference was stored for it to update. No transaction, no retry loop, and no read-then-write window in either branch.
+
+*Alternative considered:* `RETURNING (xmax = 0) AS inserted` in a transaction, rolling back when it inserted without a secret. Works, but it deliberately writes a row it intends to discard, needs a transaction, and leaves "a create needs a secret" expressible only in Go.
+
+*Alternative considered:* `SELECT` then `INSERT`/`UPDATE` in a transaction. Rejected: more round trips, a serialization window to reason about, and it puts a credential through the application layer on a path that does not need it.
+
+### The `CHECK` constraint stays, as an invariant rather than a mechanism
+
+`secret TEXT NOT NULL CONSTRAINT notification_preferences_secret_not_empty CHECK (secret <> '')` remains in the schema, and no code path depends on catching its violation. Its job is to make "a stored preference always carries a usable secret" true of the table rather than true of the one package that writes it — so the guarantee survives a second writer, a manual `INSERT` during an incident, and a future channel added by a later change.
+
+Because the two statements above can never violate it — the insert path always carries a non-empty secret, the update path never names the column — the adapter needs no constraint-name matching and no SQLSTATE handling. A violation would be a genuine bug, and surfacing as a `500` is the right outcome for one.
 ### The secret is column-plaintext, and non-disclosure is the whole control
 
 HMAC signing needs the original bytes, so bcrypt — the tool `internal/identity/infrastructure/password` uses — is structurally unavailable. Encrypting at rest would require a key-management story (a new required variable, rotation, and a decision about what happens to stored rows when the key changes) that is disproportionate to a hackathon deliverable and is not what the delivery change asked for.
@@ -90,6 +102,8 @@ There is deliberately no `DELETE` route in this change. Nothing in the delivery 
 ### Validation lives in the domain, as value objects
 
 `EventType` and `Channel` are constructed through parsing functions over closed sets, `Destination` over an absolute `http`/`https` URL, `Secret` over a minimum length. Handlers map a construction error to `400` and never re-implement a check. This mirrors `internal/identity/domain`'s `Email` and `internal/video/domain`'s `OriginalFilename`/`StorageKey`, and it is what keeps the closed sets from being duplicated between a handler and a repository.
+
+A **write intent** is a distinct type from a **stored preference**, and the distinction is load-bearing rather than stylistic. The intent carries an *optional* secret, because omission is a legitimate request the caller can make; a stored preference always carries one, because the create path refuses anything else. Collapsing them into a single aggregate whose constructor demands a secret would force `SetPreference` to know create-from-update before writing — the pre-read the persistence decision above exists to avoid — and would leave the constructor either rejecting valid updates or admitting an aggregate that violates its own stated invariant. The read view is a third shape, carrying `HasSecret bool` and no secret field at all.
 
 Minimum secret length is **16 bytes**, stated as a decision rather than derived: it is the shortest length that is not obviously weak for HMAC-SHA256 and does not push a user toward generating a key with tooling they may not have. `http` destinations are accepted alongside `https` because local development and the compose stack have no TLS, and rejecting them would make the feature untestable in the only environment this project runs in; the trade-off is recorded below.
 
@@ -123,13 +137,15 @@ PUT /api/notification-preferences
   → 429  rate limited
 ```
 
+The global CORS middleware in `setupRouter` currently advertises `Access-Control-Allow-Methods: POST, GET, OPTIONS`, which predates any `PUT` route. It must gain `PUT`, or a browser client's preflight rejects the write before it is ever sent — the route would be mounted correctly and unreachable from the only kind of client that sends an `Origin`. This is a one-word change to an existing middleware and is called out here because nothing else in the diff would prompt it.
+
 `PUT` rather than `POST` because the operation is idempotent on the triple the body names: the same request repeated produces the same stored state. A `user_id` in the body is ignored, not rejected — the authenticated subject is the only source, and rejecting would leak whether a guessed identifier exists.
 
 *Alternative considered:* `PUT /api/notification-preferences/:eventType/:channel`. Rejected — a versioned, dotted event type is a fragile path segment for no gain, and the body already has to carry the rest.
 
 ## Risks / Trade-offs
 
-- **A constraint violation is a `400`, not a `500`** → The adapter matches `notification_preferences_secret_not_empty` by name and returns a typed error; every other constraint failure stays a `500`. A rename of the constraint in `schema.sql` without the matching change in the adapter would turn a validation error back into a `500`, so the test for "create without a secret" runs against a real database rather than a fake repository.
+- **"Create with no secret" is refused by a row count, which a fake repository cannot reproduce** → The rule lives in the interaction between the two statements and the stored row, so its test runs against a real PostgreSQL (the adapter suite gated on `NOTIFICATION_POSTGRES_TEST_DSN`), not against an in-memory double that would agree with whatever the use case did.
 - **A plaintext secret in a database column** → Never returned by any route, never logged, not loaded on the read path (`secret <> ''` is projected instead), and confined to a database that already holds password hashes and job records. Recorded in `docs/operations.md` so an operator knows the column's sensitivity. A future change can encrypt at rest without altering the route contract, because the value is already write-only from the API's point of view.
 - **`http` destinations are accepted, so a signed payload can travel in clear text** → Accepted deliberately for local development, where no TLS exists. The delivery change is the right place to add an operator-facing switch that restricts destinations to `https` in production, because it is the process that opens the connection.
 - **Two independently-declared copies of each event-type string** → Pinned by a composition-root test that fails on either side's rename. Failure mode without it — a consumer resolving preferences against a name no row carries — is silent, which is precisely why the pin is in this change rather than the next.
@@ -139,6 +155,8 @@ PUT /api/notification-preferences
 ## Migration Plan
 
 No data migration. The new table is created by the context's own idempotent `Migrate` at `cmd/api` startup, and no existing table is touched.
+
+`Migrate` wraps its `CREATE TABLE IF NOT EXISTS` in a transaction holding `pg_advisory_xact_lock` on a constant this context owns. `IF NOT EXISTS` is idempotent once the table exists, but it does not serialize two *first-time* creates: two replicas starting together can both find the table absent and one can then fail on a catalog uniqueness violation, which at `cmd/api` startup means a replica that refuses to boot. The lock makes the second replica wait and then find the table present. This is stricter than the identity and video adapters, which do not take it; that is a latent race in those two rather than a reason to copy it, and `notification-persistence` is the first spec in this repository to state the concurrent-replica guarantee explicitly, so it should be the first adapter to actually hold it.
 
 Deployment ordering is unconstrained in one direction and constrained in the other: `NOTIFICATION_POSTGRES_DSN` must be present in the environment **before** the new image starts, or `cmd/api` will not boot. `cmd/worker` is unaffected and needs no coordinated deploy.
 
