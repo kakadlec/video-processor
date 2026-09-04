@@ -26,6 +26,12 @@ The system SHALL be organized into exactly three bounded contexts — `Identity`
 - **WHEN** the Notification context receives it
 - **THEN** it delivers the notification per the user's preferences without the Video Processing context knowing or caring how delivery works
 
+#### Scenario: Notification context owns delivery preferences and their HTTP surface
+
+- **GIVEN** a user needs to record where and how they want to be told a job ended
+- **WHEN** that preference is read or written
+- **THEN** the Notification context owns the preference, its storage, and the authenticated owner-scoped routes that expose it; no other context stores a delivery destination, and being reachable over HTTP does not make the context something another context calls to trigger a delivery
+
 ### Requirement: VideoJob as Aggregate Root With Enforced Invariants
 
 The `VideoJob` SHALL be the aggregate root of the Video Processing bounded context. Its invariants SHALL be enforced at the domain layer, not at the application or infrastructure layer.

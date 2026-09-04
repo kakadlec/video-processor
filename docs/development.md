@@ -26,7 +26,7 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity, Video Processing, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
+Identity, Video Processing, Notification, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
 
 **Running the API alone is not enough to process an upload.** Since the async cutover, `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`. Run both (see below); with the API alone, jobs stay `queued` forever and the status endpoint reports exactly that.
 
@@ -35,13 +35,17 @@ Identity, Video Processing, Redis, MinIO, and broker configuration are all requi
 go mod download
 
 # Start PostgreSQL, Redis, MinIO, and RabbitMQ for the identity, video,
-# idempotency-key, storage, and outbox-relay modules
+# notification, idempotency-key, storage, and outbox-relay modules
 docker compose up -d postgres redis minio rabbitmq
 
-# Set required identity, video, Redis, MinIO, and broker configuration
+# Set required identity, video, notification, Redis, MinIO, and broker
+# configuration. The three DSNs name the same database on purpose: each
+# bounded context owns its own pool and its own tables, and pointing them at
+# one server is a deployment choice, not a shared connection.
 export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
 export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
+export NOTIFICATION_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export REDIS_ADDR="localhost:6379"
 export VIDEO_MINIO_ENDPOINT="localhost:9000"
 export VIDEO_MINIO_ACCESS_KEY="minioadmin"
@@ -58,7 +62,8 @@ export RABBITMQ_URL="amqp://video:video@localhost:5672/"
 # Start the API (listens on :8080)
 go run ./cmd/api
 
-# In a second shell, with the same exports minus the IDENTITY_* ones,
+# In a second shell, with the same exports minus the IDENTITY_* and
+# NOTIFICATION_* ones,
 # start the worker. It serves no HTTP and exposes no port.
 go run ./cmd/worker
 
@@ -67,7 +72,7 @@ go build -o app ./cmd/api
 go build -o worker ./cmd/worker
 ```
 
-`cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` variables — it makes no access-control decision, so exporting them anyway is harmless. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
+`cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` and **no** `NOTIFICATION_*` variables — it makes no access-control decision and resolves no delivery preference, so exporting them anyway is harmless. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
 
 `cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **`cmd/api` creates no directory at all** any more: extraction moved to the worker, so the API never touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk: both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which both processes require at startup and the API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running both processes from the same working directory is fine — the API does not use it.
 
@@ -100,7 +105,9 @@ docker compose run --build --rm app-test go test ./... -v
 
 `app-test` builds from the `Dockerfile`'s `test` stage (Go toolchain + `ffmpeg`) and runs `go test` inside it, against the compose-provided PostgreSQL, Redis, and MinIO — no local Go, ffmpeg, or MinIO install required. With result storage now in MinIO, this is the path of least resistance for anyone not already running one. It's a separate service from `app` because `app`'s image (the hardened, deployed build) deliberately has no Go toolchain; see "Docker Workflow" below. `app-test` is gated behind Compose's `test` profile so it never starts as part of a plain `docker compose up`/`up --build` — `docker compose run` targets it explicitly regardless, so the command above needs no extra flag.
 
-`internal/identity/infrastructure/postgres`'s adapter tests, which otherwise skip (not fail) when `IDENTITY_POSTGRES_TEST_DSN` is unset, run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and `IDENTITY_POSTGRES_TEST_DSN` is already pointed at it — no manual export needed.
+The three PostgreSQL adapter suites — `internal/identity/infrastructure/postgres`, `internal/video/infrastructure/postgres`, and `internal/notification/infrastructure/postgres` — otherwise skip (not fail) when their own `IDENTITY_POSTGRES_TEST_DSN` / `VIDEO_POSTGRES_TEST_DSN` / `NOTIFICATION_POSTGRES_TEST_DSN` is unset. All three run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and all three variables are already pointed at it — no manual export needed.
+
+Notification's is the one most worth reaching for deliberately, because the rule it covers has no in-memory equivalent: "creating a preference without a signing secret is refused" is decided by whether the adapter's `UPDATE … RETURNING` affected a row, so a skipped run exercises none of it while still reporting green. `NOTIFICATION_POSTGRES_DSN` — the *runtime* variable — is a separate thing and is **not** needed to run the suite: no test in `cmd/api` calls `setupNotification` (or `setupIdentity`, or `setupVideo`); every one builds its modules by hand, which is why `TestMain`'s startup gate names neither it nor the other two DSNs.
 
 That database is separate from the runtime `identity` database `IDENTITY_POSTGRES_DSN` uses, so this is safe to run even while `docker compose up --build` is serving real registered users — the test run's `TRUNCATE` only touches `identity_test`.
 

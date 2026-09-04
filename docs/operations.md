@@ -10,13 +10,14 @@ The application is **two** Go processes built from one image: `cmd/api` (the HTT
 # Build
 docker build -t video-processor .
 
-# Run the API (identity, video, Redis, MinIO, and RabbitMQ configuration are all
+# Run the API (identity, video, notification, Redis, MinIO, and RabbitMQ configuration are all
 # required — see Environment Variables below; the container exits at startup if
 # any is missing)
 docker run -p 8080:8080 \
   -e IDENTITY_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e IDENTITY_JWT_SIGNING_KEY="change-me" \
   -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
+  -e NOTIFICATION_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e REDIS_ADDR="host:6379" \
   -e VIDEO_MINIO_ENDPOINT="host:9000" \
   -e VIDEO_MINIO_ACCESS_KEY="minio-access-key" \
@@ -26,8 +27,9 @@ docker run -p 8080:8080 \
   video-processor
 
 # Run the worker — same image, different command, no port, and NO IDENTITY_*
-# variables: it makes no access-control decision, so requiring identity
-# configuration would misrepresent what the process does
+# or NOTIFICATION_* variables: it makes no access-control decision and
+# registers no preference, so requiring either would misrepresent what the
+# process does
 docker run \
   -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e REDIS_ADDR="host:6379" \
@@ -55,6 +57,7 @@ The two processes have deliberately different configuration surfaces:
 |---|---|---|
 | `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY` | **required** | **not read** — the worker makes no access-control decision |
 | `VIDEO_POSTGRES_DSN` | required | required |
+| `NOTIFICATION_POSTGRES_DSN` | **required** | **not read** — the worker registers no preference and reads none |
 | `REDIS_ADDR` | required | required (status cache, worker leases, and clearing failed-job idempotency keys) |
 | `VIDEO_MINIO_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET` | required | required |
 | `VIDEO_MINIO_PUBLIC_ENDPOINT`, `VIDEO_MINIO_PUBLIC_USE_SSL` | optional | optional, and **read even though unused** — see below |
@@ -70,7 +73,8 @@ The one row that needs explaining is `VIDEO_MINIO_PUBLIC_*`. The worker never mi
 | `GIN_MODE` | `debug` | Set to `release` to suppress Gin debug output |
 | `IDENTITY_POSTGRES_DSN` | unset | PostgreSQL connection string for the Identity module (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). Required at startup. |
 | `IDENTITY_JWT_SIGNING_KEY` | unset | Symmetric key used to sign/verify access tokens (HMAC-SHA256). Required at startup. There is no default signing key — startup fails clearly rather than falling back to one. |
-| `VIDEO_POSTGRES_DSN` | unset | PostgreSQL connection string for the Video Processing module's `VideoJob` repository (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable` — same instance/database as `IDENTITY_POSTGRES_DSN` by design, not a separate one). Required at startup as of Phase 3's `wire-videojob-http-endpoints`, which wires `cmd/api/video.go`'s `setupVideo` into `main()`. |
+| `VIDEO_POSTGRES_DSN` | unset | PostgreSQL connection string for the Video Processing module's `VideoJob` repository (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable` — pointed at the same instance and database as `IDENTITY_POSTGRES_DSN` in this deployment, which is a deployment decision rather than a code assumption). Required at startup as of Phase 3's `wire-videojob-http-endpoints`, which wires `cmd/api/video.go`'s `setupVideo` into `main()`. |
+| `NOTIFICATION_POSTGRES_DSN` | unset | PostgreSQL connection string for the Notification module's `NotificationPreference` repository (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). The split is one pool per bounded context, not one server per context: which server this value names is a deployment decision, and pointing all three DSNs at one database — what local development and Compose do — is a choice this deployment makes, not something the code assumes (see [openspec/specs/notification-persistence/spec.md](../openspec/specs/notification-persistence/spec.md)). Required at `cmd/api` startup as of Phase 7's `add-notification-domain-and-preferences`, and connectivity-checked like the other two. Not read by `cmd/worker`. |
 | `REDIS_ADDR` | unset | Address (`host:port`) of the Redis instance backing upload idempotency, rate limiting, status caching, and worker leases (e.g. `redis:6379`). Required by both processes. The client is constructed at startup but establishes network connections lazily; reachability failures degrade individual Redis-backed behaviors rather than failing startup. |
 | `RATE_LIMIT_MAX_REQUESTS` | `60` | Maximum requests per authenticated user within one rate-limit window before `429` responses start. Optional as of Phase 4's `add-rate-limiting-middleware` — unlike `REDIS_ADDR`, absence is not a startup failure, it just uses the default. |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Length (seconds) of the fixed rate-limit window `RATE_LIMIT_MAX_REQUESTS` applies to. Optional, same as above. |
@@ -108,7 +112,7 @@ An issued URL also **cannot be revoked**: deleting the job, changing its owner, 
 
 Their `VIDEO_` prefix marks them as the Video Processing context's own configuration, matching `VIDEO_POSTGRES_DSN` and distinguishing them from `internal/platform/`'s unprefixed `REDIS_ADDR`.
 
-`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: both PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`). `RABBITMQ_URL` is required to be set by both processes but is not connectivity-checked at startup by either (see the RabbitMQ section below).
+`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables are all required to be *set*: the process exits at startup with a clear configuration error if any is empty, rather than running with unsafe defaults or an unauthenticated fallback (see [openspec/specs/identity-authentication/spec.md](../openspec/specs/identity-authentication/spec.md), [openspec/specs/videojob-http-api/spec.md](../openspec/specs/videojob-http-api/spec.md), and [openspec/specs/upload-idempotency/spec.md](../openspec/specs/upload-idempotency/spec.md)). Startup validation depth differs by dependency, though: all three PostgreSQL DSNs are also *connectivity*-checked at startup (`db.PingContext`), so an unreachable or malformed database fails fast. `REDIS_ADDR` is not — `platformredis.Open` only constructs the client, and a malformed address or unreachable Redis surfaces later, at the first `POST /upload` request that needs it, not at startup. MinIO sits at the strict end: it is connectivity-checked *and* its bucket is provisioned at startup, so a wrong endpoint or bad credentials stop the process rather than surfacing on the first upload. `RATE_LIMIT_MAX_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS` and `VIDEO_MINIO_USE_SSL`, unlike the required variables above, are optional — startup only fails if either is *set* to something malformed (non-integer or non-positive), never for being unset (see `openspec/specs/rate-limiting/spec.md`). `RABBITMQ_URL` is required to be set by both processes but is not connectivity-checked at startup by either (see the RabbitMQ section below).
 
 `cmd/worker` applies the same rules to the subset it reads: `RABBITMQ_URL` is loaded first, before any I/O, then `VIDEO_POSTGRES_DSN` (opened, pinged, migrated), `REDIS_ADDR`, and the four `VIDEO_MINIO_*` variables (opened, pinged, bucket ensured). It also creates `temp/` at startup and **exits if it cannot** — every delivery downloads its source there, so a worker without it would claim jobs and fail each one for a reason unrelated to the job, deleting the source on the way out. Being unavailable is the honest outcome.
 
@@ -173,9 +177,13 @@ Those queues do not drain on their own either: the job queue carries no message 
 
 ## Implemented Infrastructure
 
-### PostgreSQL — Implemented (Phase 2 for identity, Phase 3 for video), required
+### PostgreSQL — Implemented (Phase 2 for identity, Phase 3 for video, Phase 7 for notification), required
 
-Authoritative state store for users (`User` aggregate) and `VideoJob`s, configured via `IDENTITY_POSTGRES_DSN` and `VIDEO_POSTGRES_DSN` respectively — by design the same PostgreSQL instance and database, not two separate ones. Schema/migrations for both are applied automatically at startup (`postgres.Migrate`). The video processing schema (`video_jobs` and the transactional-outbox `video_job_outbox` table) was added by Phase 3's `add-videojob-infrastructure`; `cmd/api/video.go`'s `setupVideo` (added by `wire-videojob-http-endpoints`) is what actually instantiates and migrates it at startup — `VIDEO_POSTGRES_DSN` is required exactly like `IDENTITY_POSTGRES_DSN`.
+Authoritative state store for users (`User` aggregate), `VideoJob`s, and `NotificationPreference`s, configured via `IDENTITY_POSTGRES_DSN`, `VIDEO_POSTGRES_DSN`, and `NOTIFICATION_POSTGRES_DSN` respectively — three independent variables and three independent pools, which this deployment points at one PostgreSQL instance and database. That is a deployment decision, not a design constraint: nothing in the code assumes the three resolve to the same server, and separating them needs no code change. Schema/migrations for all three are applied automatically at startup (`postgres.Migrate`). The video processing schema (`video_jobs` and the transactional-outbox `video_job_outbox` table) was added by Phase 3's `add-videojob-infrastructure`; `cmd/api/video.go`'s `setupVideo` (added by `wire-videojob-http-endpoints`) is what actually instantiates and migrates it at startup — `VIDEO_POSTGRES_DSN` is required exactly like `IDENTITY_POSTGRES_DSN`. Phase 7's `add-notification-domain-and-preferences` added a third: `notification_preferences`, migrated by `cmd/api/notification.go`'s `setupNotification` from its own pool under `NOTIFICATION_POSTGRES_DSN`, also fatal when absent. `cmd/worker` opens neither the identity nor the notification pool.
+
+- **`notification_preferences` holds a plaintext webhook signing secret, and that column is the most sensitive data this system stores.** It cannot be hashed: HMAC signing at delivery time needs the original bytes, so bcrypt — what `identity_users` uses for passwords — is structurally unavailable here. The application never discloses it (no route returns it, no read query even selects it, and `domain.Secret` refuses to render or serialize), so **database access and backups are the disclosure surface**. Treat a dump of this database the way you would treat a credential store: restrict `SELECT` on the column, keep backups encrypted and access-logged, and do not copy production data into a development environment. A leaked secret lets a third party forge a signature that a user's webhook endpoint will accept as coming from this system; rotating one means the user writing a new value through `PUT /api/notification-preferences`, since there is no operator-side rotation path and no way to read the old value back.
+- **A `CHECK (secret <> '')` constraint on that column is an invariant, not a mechanism.** No adapter path depends on catching a violation — the insert statement always carries a non-empty secret and the update statement never names the column — so a violation in the logs means a genuine bug or a second writer, not a rejected request.
+- **`Migrate` takes a `pg_advisory_xact_lock`** (class `0x46494158`, object `1`) for the length of its transaction, unlike the identity and video adapters. `CREATE TABLE IF NOT EXISTS` does not serialize two *first-time* creates, so without it two `cmd/api` replicas starting together against a fresh database can race to a catalog uniqueness violation — which at startup means a replica that refuses to boot. If you add an advisory lock elsewhere, take a new object id under that same class; the comment in `internal/notification/infrastructure/postgres/migrate.go` is the registry.
 
 - **Local/CI service:** `docker-compose.yml` at the repo root starts a matching `postgres:16-alpine` instance (`docker compose up -d postgres`) for running identity-dependent tests locally; CI provisions the same image as a service container. See [docs/development.md](development.md).
 - **Local/CI credentials** (`identity`/`identity`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
@@ -349,7 +357,7 @@ Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking d
 
 ### Email / Webhook delivery — Planned (Phase 7)
 
-Notification infrastructure for `VideoJobCompleted` and `VideoJobFailed` events. **Both events are already emitted** — `emit-videojob-terminal-events` records them transactionally and publishes them to `video.jobs.terminal.v1`; what is missing is the consumer, so see "The terminal-event queue has no consumer yet" above for how that queue behaves in the meantime. Owned by the Notification bounded context. Delivery methods and preferences are per-user. Webhook delivery includes retry logic and HMAC signature verification.
+Notification infrastructure for `VideoJobCompleted` and `VideoJobFailed` events. **The preferences side already exists** — `add-notification-domain-and-preferences` shipped the `NotificationPreference` aggregate, its table, and `GET`/`PUT /api/notification-preferences`, so a user can register a webhook destination and signing secret today; nothing resolves one yet, so registering one delivers nothing. **Both events are already emitted** — `emit-videojob-terminal-events` records them transactionally and publishes them to `video.jobs.terminal.v1`; what is missing is the consumer, so see "The terminal-event queue has no consumer yet" above for how that queue behaves in the meantime. Owned by the Notification bounded context. Delivery methods and preferences are per-user. Webhook delivery includes retry logic and HMAC signature verification.
 
 ### Observability — Planned (Phase 8)
 
