@@ -1,6 +1,6 @@
 # Domain Model
 
-> The domain model described here is the **target design** established by the DDD architecture foundation. Identity (Phase 2) is implemented as described below. Video Processing and Notification, and their aggregate roots and domain events, are introduced incrementally across Phases 3–7. See [docs/roadmap.md](roadmap.md) for the phase plan.
+> The domain model described here is the **target design** established by the DDD architecture foundation. Identity (Phase 2) is implemented as described below, as is Video Processing (Phases 3–6). Notification is partially implemented: `add-notification-domain-and-preferences` (Phase 7) shipped its `NotificationPreference` aggregate, its persistence, and its HTTP surface, while every delivery use case below is still planned. See [docs/roadmap.md](roadmap.md) for the phase plan.
 
 ## Bounded Contexts
 
@@ -38,15 +38,23 @@
 
 ### Notification
 
-**Responsibility:** React to domain events from Video Processing and Identity, and deliver notifications to users (email, webhook).
+**Responsibility:** Own the user's delivery preferences — where and how they want to be told a job ended — and, once the delivery changes ship, react to domain events from Video Processing and Identity to deliver notifications (email, webhook).
 
-**Aggregate root:** `NotificationPreference` (per-user, per-event-type delivery configuration).
+**Aggregate root:** `NotificationPreference`, identified by the triple `(UserID, EventType, Channel)` — there is no surrogate id, because nothing references one by an id, and the triple gives the upsert its conflict target for free. Both `EventType` and `Channel` are **closed sets**, parsed through the domain and never re-checked in a handler: `video_job.completed.v1` and `video_job.failed.v1`, and `webhook` alone. `email` is deliberately rejected until `add-notification-email-delivery` ships an adapter that honours it — a channel a user can configure and that silently delivers nothing is worse than a rejected value.
 
-**Domain events consumed:** `VideoJobCompleted`, `VideoJobFailed`, `UserRegistered`.
+The aggregate has **three shapes**, and the split is load-bearing rather than stylistic. A *write intent* carries an **optional** secret, because omitting one is a legitimate update. A *stored preference* always carries one, because the create path refuses anything else. A *read view* carries `HasSecret bool` and no secret field at all. Collapsing them would force the use case to know create-from-update before writing — the pre-read the persistence design exists to avoid.
 
-**Public interface to other contexts:** None — Notification is a downstream consumer only.
+**Absence of a row means not subscribed.** There is no implicit default and no backfill: a user who has registered nothing receives nothing, which is the only safe reading when the destination is a URL the system was never given. `enabled` is a stored flag rather than a deletion, so disabling keeps the destination and the secret and re-enabling is not a re-registration; there is deliberately no `DELETE` route.
 
-**Introduced in:** Phase 7, not yet decomposed into named changes (see [docs/roadmap.md](roadmap.md) — Phases 4–8 are listed at phase granularity only).
+**The webhook secret is a credential, and non-disclosure is its whole protection.** HMAC signing needs the original bytes, so it cannot be hashed the way a password is. It is accepted on write, never returned by any read, never logged, and not even *loaded* on the read path — every read projects `secret <> ''` instead of the column. `domain.Secret` renders a redacted placeholder from `String`/`GoString`/`Format`, refuses to `MarshalJSON`, holds its value behind an unexported pointer so `%p` reaches an address, and exposes the bytes through one deliberately-named `Reveal()`. Required on create, optional on update, and an explicitly empty value is rejected rather than read as a removal.
+
+**Domain events consumed:** `VideoJobCompleted`, `VideoJobFailed`, `UserRegistered` — all still planned. Nothing consumes anything yet.
+
+**Public interface to other contexts:** None — Notification is a downstream consumer only. Having an authenticated HTTP surface of its own does not make it a context another context calls to trigger a delivery, and the surface is for a *user* managing their own preferences.
+
+**Cross-context independence:** it imports neither `internal/video` nor `internal/identity` — enforced by `internal/notification/dependency_rules_test.go` — so it declares its own `UserID` value object and its own copies of the two event-type strings. `TestNotificationEventTypesMatchTheEmittedTerminalEventTypes` in `cmd/api`, the one place that legitimately imports both sides, pins those copies against `internal/video/infrastructure/postgres`'s.
+
+**Introduced in:** Phase 7 — `add-notification-domain-and-preferences` for the aggregate, its PostgreSQL adapter, and the two routes; `add-notification-webhook-delivery` and `add-notification-email-delivery` for delivery (see [docs/roadmap.md](roadmap.md)).
 
 ---
 
@@ -127,8 +135,12 @@ Token verification is bearer middleware (`requireBearerAuth`), not a use case ob
 
 | Use case | Actor | Pre-condition | Post-condition |
 |---|---|---|---|
-| `SendJobCompletionNotification` | Event handler | `VideoJobCompleted` event received | Notification delivered per user's preferences |
-| `SendJobFailureNotification` | Event handler | `VideoJobFailed` event received | Notification delivered per user's preferences |
+| `SetPreference` | Authenticated user | Event type, channel, destination, and (on create) secret all parse | Exactly one preference upserted for the caller's own triple, in one atomic statement that reads no row; the result carries `HasSecret`, never the secret. **Implemented** (`add-notification-domain-and-preferences`) |
+| `ListPreferences` | Authenticated user | — | The caller's own preferences, ordered by `(event_type, channel)`; an empty set is a legitimate answer. The `UserID` is a parameter, never read from anywhere ambient. **Implemented** (`add-notification-domain-and-preferences`) |
+| `SendJobCompletionNotification` | Event handler | `VideoJobCompleted` event received | Notification delivered per user's preferences. Planned — `add-notification-webhook-delivery` |
+| `SendJobFailureNotification` | Event handler | `VideoJobFailed` event received | Notification delivered per user's preferences. Planned — `add-notification-webhook-delivery` |
+
+`SetPreference` deliberately does **not** pre-read to decide create-from-update. The branch that matters is a property of the *request* — did the caller send a secret? — and each answer maps to one atomic statement in the adapter: an `INSERT … ON CONFLICT DO UPDATE` that overwrites the secret, or an `UPDATE … RETURNING` that never names the `secret` column. Affecting **zero rows** on the second is the create-with-no-secret case, and is the only signal needed to refuse it (`ErrSecretRequired`, surfaced as a `400`). No transaction, no retry loop, and no read-then-write window on either path.
 
 ---
 
@@ -154,4 +166,4 @@ Integration events that cross context boundaries are published to RabbitMQ (Phas
 
 - **`UserID`** is the identifier that crosses bounded context boundaries, but not as a shared type: each context defines and owns its own local `UserID` value object (`internal/identity/domain/user_id.go` and, as of Phase 3's `add-videojob-domain-and-application`, `internal/video/domain/user_id.go`) — two distinct Go types, never a package shared between the two contexts' `domain` layers. Translation between a source context's identifier and a consuming context's local type happens only at the composition root or via consumed integration events. `cmd/api` is where that translation happens: `cmd/api/video.go`'s HTTP handlers (wired by Phase 3's `wire-videojob-http-endpoints`) convert the bearer-auth middleware's already-verified `identity.UserID` string into `video.UserID` on every request. `cmd/worker` (Phase 6) is a second composition root but performs **no** such translation — it never sees a token and reads the `user_id` off the dispatch message, which the API already translated. It has no Identity configuration at all. No `pkg/` directory exists or is planned — a shared kernel was considered and rejected (see `add-videojob-domain-and-application`'s `design.md` in the archive) as tighter coupling than this architecture's context-independence goal justifies.
 - The Video Processing context's own `UserID` constructor enforces only non-emptiness, not any identifier format or existence check — the identifier itself is minted once, at user creation, by Identity's `UserIDGenerator`; the bearer-auth middleware only verifies the token and supplies that already-minted, already-verified value to the handler, which Video Processing's `UserID` then wraps.
-- The Notification context receives integration events over RabbitMQ and resolves delivery preferences by `UserID` alone, never by calling into Identity or Video Processing internals.
+- The Notification context receives integration events over RabbitMQ and resolves delivery preferences by `UserID` alone, never by calling into Identity or Video Processing internals. As of `add-notification-domain-and-preferences` the preferences it will resolve exist and are stored in its own database under its own DSN; the event consumption is still planned. Its independence is enforced rather than asserted — `internal/notification/dependency_rules_test.go` fails the build on an import of either other context.

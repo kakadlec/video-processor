@@ -12,7 +12,7 @@ A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`,
 
 ## Quickstart
 
-The API requires identity, video, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since neither process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` ones. Without it, uploads are accepted and never processed. See [docs/development.md](docs/development.md) for running both directly. The fastest path with no manual wiring is Docker:
+The API requires identity, video, notification, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since neither process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` and `NOTIFICATION_*` ones. Without it, uploads are accepted and never processed. See [docs/development.md](docs/development.md) for running both directly. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
@@ -42,7 +42,7 @@ Processing is asynchronous as of Phase 6, but the system is not yet complete:
 - **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Scale by running more worker processes — each holds exactly one job at a time by design.
 - **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so the worker downloads each source into its own `temp/`, extracts frames there, and builds the zip there, removing all of it before the job finishes. Nothing durable lives on local disk (Phase 5): uploaded source videos go to MinIO too, as **transient** objects whose owner deletes them — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
 - **A source object can leak.** A job never dispatched, a dispatch dead-lettered before any claim, or a worker interrupted after a terminal commit but before best-effort cleanup can leave its source in the bucket. Mid-extraction crashes are recovered by the worker sweeper. Configure the `uploads/`-prefix expiration lifecycle rule; it remains the only exhaustive guarantee. See [docs/operations.md](docs/operations.md).
-- **No notifications** — users must stay on the page (which polls the job's status URL) or poll `GET /api/status` to find out when processing completes. Phase 7.
+- **No notifications are delivered yet.** Users must stay on the page (which polls the job's status URL) or poll `GET /api/status` to find out when processing completes. Phase 7 is under way: a job's outcome is now recorded and published to a durable queue, and `GET`/`PUT /api/notification-preferences` let a user register a webhook destination and signing secret — but nothing reads that queue and nothing resolves a preference, so registering one delivers nothing until `add-notification-webhook-delivery` ships.
 - **Crash recovery is bounded, not immediate.** A worker renews an epoch-scoped Redis lease while extracting. After the lease expires, the sweeper requires two successful missing-lease observations before requeueing; after three recoveries, it fails the job rather than loop forever. Redis outages delay takeover instead of authorizing it.
 
 These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
@@ -71,13 +71,15 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 | `GET` | `/api/video-jobs/:id` | Poll a job's status (`queued` → `processing` → `completed`/`failed`); this is what `status_url` names. Owner-only |
 | `GET` | `/download/:filename` | Issue a 5-minute presigned URL for a processed ZIP: `200 {"url", "expires_at"}`, not the archive itself. Owner-only; follow the returned URL (no `Authorization` header) to fetch the bytes from MinIO |
 | `GET` | `/api/status` | List processed ZIPs with metadata; scoped to the caller's own uploads |
+| `GET` | `/api/notification-preferences` | List the caller's own delivery preferences; `has_secret` instead of the signing secret, which no route ever returns. An empty set is `200` with an empty array |
+| `PUT` | `/api/notification-preferences` | Register or update one preference, named by `event_type` + `channel` in the body. `secret` is required to create one and optional to update one. Owner-only; a `user_id` in the body is ignored. **Nothing consumes these yet** — see Current Limitations |
 
 ## Tech Stack
 
 - **Language:** Go 1.27
 - **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12
 - **Frame extraction:** `ffmpeg` (via `exec.CommandContext`, in `cmd/worker`)
-- **Identity and job persistence:** PostgreSQL (via `pgx`), including a transactional outbox
+- **Identity, job, and notification-preference persistence:** PostgreSQL (via `pgx`), including a transactional outbox
 - **Job dispatch and terminal events:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — dispatch outbox relay in `cmd/api`, consumer in `cmd/worker`, and a second outbox relay in `cmd/worker` publishing each job's `completed`/`failed` outcome (no consumer yet)
 - **Object storage:** MinIO / S3-compatible (via [`minio-go`](https://github.com/minio/minio-go)) for source videos and ZIP results
 - **Idempotency, rate limiting, status cache, worker leases:** Redis (via [`go-redis`](https://github.com/redis/go-redis))
