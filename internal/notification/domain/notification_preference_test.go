@@ -119,6 +119,31 @@ func TestNewPreferenceIntent_DoesNotRequireASecret(t *testing.T) {
 	}
 }
 
+// TestNewPreferenceIntent_CopiesTheSubmittedSecret pins that the intent owns
+// its secret rather than aliasing the caller's variable. Storing the caller's
+// pointer would let a later assignment to that variable change what an
+// already-validated intent returns, which would defeat the constructor's own
+// non-zero-secret check.
+func TestNewPreferenceIntent_CopiesTheSubmittedSecret(t *testing.T) {
+	parts := validParts(t)
+	secret := parts.secret
+
+	intent, err := domain.NewPreferenceIntent(parts.userID, parts.eventType, parts.channel, true, parts.destination, &secret)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	secret = domain.Secret{}
+
+	stored, ok := intent.Secret()
+	if !ok {
+		t.Fatal("the intent lost its secret after the caller reassigned its own variable")
+	}
+	if stored.Reveal() != validSecret {
+		t.Fatalf("the intent aliased the caller's Secret: Reveal() = %q", stored.Reveal())
+	}
+}
+
 func TestNewNotificationPreference(t *testing.T) {
 	parts := validParts(t)
 

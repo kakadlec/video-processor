@@ -77,13 +77,23 @@ func NewPreferenceIntent(userID UserID, eventType EventType, channel Channel, en
 	if secret != nil && secret.IsZero() {
 		return PreferenceIntent{}, ErrInvalidSecret
 	}
+	// The submitted Secret is copied rather than aliased. Keeping the
+	// caller's pointer would let a later assignment to their variable change
+	// what an already-validated intent returns, so the check just above
+	// would guarantee nothing. Copying the struct is enough: its bytes are
+	// reachable only through this package, and a Go string is immutable.
+	var owned *Secret
+	if secret != nil {
+		copied := *secret
+		owned = &copied
+	}
 	return PreferenceIntent{
 		userID:      userID,
 		eventType:   eventType,
 		channel:     channel,
 		enabled:     enabled,
 		destination: destination,
-		secret:      secret,
+		secret:      owned,
 	}, nil
 }
 
