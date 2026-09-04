@@ -189,7 +189,7 @@ func publish(t *testing.T, ch *amqp.Channel, confirms <-chan amqp.Confirmation, 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := ch.PublishWithContext(ctx, topo.Exchange, topo.RoutingKey, false, false, amqp.Publishing{
+	if err := ch.PublishWithContext(ctx, topo.Exchange, topo.RoutingKeys[0], false, false, amqp.Publishing{
 		DeliveryMode: amqp.Persistent,
 		Body:         []byte(body),
 	}); err != nil {
@@ -235,5 +235,80 @@ func waitForDepth(t *testing.T, conn *amqp.Connection, queue string, want int) {
 			t.Fatalf("queue %s never reached depth %d", queue, want)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestDeclareTopology_BindsEveryRoutingKeyToOneQueue is the descriptor's
+// multi-binding contract. A topology whose queue must receive several event
+// types gets one binding per key, and every one of them routes.
+func TestDeclareTopology_BindsEveryRoutingKeyToOneQueue(t *testing.T) {
+	conn := openTestConn(t)
+	topo := testTopology(t, conn)
+	const secondKey = "test.work.second"
+	topo.RoutingKeys = append(topo.RoutingKeys, secondKey)
+
+	if err := rabbitmq.DeclareTopology(conn, topo); err != nil {
+		t.Fatalf("DeclareTopology: %v", err)
+	}
+
+	ch := openChannel(t, conn)
+	if err := ch.Confirm(false); err != nil {
+		t.Fatalf("enable confirm mode: %v", err)
+	}
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 2))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, key := range topo.RoutingKeys {
+		if err := ch.PublishWithContext(ctx, topo.Exchange, key, true, false, amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			Body:         []byte(key),
+		}); err != nil {
+			t.Fatalf("publish under %q: %v", key, err)
+		}
+		select {
+		case confirmation := <-confirms:
+			if !confirmation.Ack {
+				t.Fatalf("publish under %q was nacked", key)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out awaiting the confirmation for %q", key)
+		}
+	}
+
+	if depth := queueDepth(t, conn, topo.WorkQueue); depth != len(topo.RoutingKeys) {
+		t.Fatalf("work queue depth = %d, want %d — one message per bound key", depth, len(topo.RoutingKeys))
+	}
+}
+
+// TestDeclareTopology_RefusesADescriptorWithNoRoutingKey pins the rejection
+// rather than the silence. The work exchange is direct, so a queue with no
+// binding receives nothing and every mandatory publish comes back unroutable
+// — a topology that declares "successfully" and then routes nothing at all.
+//
+// It also asserts nothing was declared, which is what makes the refusal
+// useful: a partially declared topology would be indistinguishable from a
+// complete one until the first publish.
+func TestDeclareTopology_RefusesADescriptorWithNoRoutingKey(t *testing.T) {
+	conn := openTestConn(t)
+	topo := testTopology(t, conn)
+	topo.RoutingKeys = nil
+
+	if err := rabbitmq.DeclareTopology(conn, topo); err == nil {
+		t.Fatal("DeclareTopology succeeded with no routing key")
+	}
+
+	// A passive declare of a queue that does not exist fails and closes the
+	// channel it ran on, so each check gets its own.
+	for _, queue := range []string{topo.WorkQueue, topo.DeadQueue} {
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Fatalf("open channel: %v", err)
+		}
+		_, err = ch.QueueDeclarePassive(queue, true, false, false, false, nil)
+		_ = ch.Close()
+		if err == nil {
+			t.Errorf("queue %s exists; a refused declaration must declare nothing", queue)
+		}
 	}
 }

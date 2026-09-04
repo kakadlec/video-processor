@@ -37,9 +37,15 @@ var _ domain.VideoJobRepository = (*Repository)(nil)
 // synchronous replica processes a job inline and then deletes the source
 // object out from under a new worker's running extraction — not to quarantine
 // stale rows, which ClaimForProcessing already renders harmless.
+//
+// The two terminal event types carry a generation of their own for the same
+// reason, and it is independent of the dispatch generation: they are claimed
+// by a different relay, from the same table, on the same predicate.
 const (
-	videoJobCreatedEventType = "video_job.created"
-	videoJobQueuedEventType  = "video_job.queued.v2"
+	videoJobCreatedEventType   = "video_job.created"
+	videoJobQueuedEventType    = "video_job.queued.v2"
+	videoJobCompletedEventType = "video_job.completed.v1"
+	videoJobFailedEventType    = "video_job.failed.v1"
 )
 
 // Repository implements domain.VideoJobRepository against PostgreSQL using
@@ -78,6 +84,28 @@ type videoJobQueuedPayload struct {
 	UserID      string    `json:"user_id"`
 	SourceKey   string    `json:"source_key"`
 	ContentHash string    `json:"content_hash"`
+	OccurredAt  time.Time `json:"occurred_at"`
+}
+
+// videoJobCompletedPayload and videoJobFailedPayload are the bodies of the
+// two terminal outbox rows Update writes. They are the producer halves of a
+// wire contract whose consumer halves live in
+// internal/video/infrastructure/messaging, pinned the same way
+// videoJobQueuedPayload is: by a round-trip test, not by a shared type.
+type videoJobCompletedPayload struct {
+	Type       string    `json:"type"`
+	JobID      string    `json:"job_id"`
+	UserID     string    `json:"user_id"`
+	FrameCount int       `json:"frame_count"`
+	StorageKey string    `json:"storage_key"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
+type videoJobFailedPayload struct {
+	Type        string    `json:"type"`
+	JobID       string    `json:"job_id"`
+	UserID      string    `json:"user_id"`
+	ErrorReason string    `json:"error_reason"`
 	OccurredAt  time.Time `json:"occurred_at"`
 }
 
@@ -263,12 +291,52 @@ const updateTerminalJobStatement = `
 
 // Update persists job's terminal outcome to its existing row, conditional on
 // epoch — the lease epoch the caller holds — and on the row still being
-// processing. Unlike Create and Enqueue, it writes no video_job_outbox row.
+// processing. Like Create and Enqueue, it writes a video_job_outbox row in
+// the same transaction: the outcome and the event announcing it commit
+// together or not at all.
+//
+// The event write is gated by the statement's own row count, not by a second
+// predicate evaluated separately. That is the whole reason emission lives
+// here rather than a layer up: the actor whose write applied and the actor
+// who announces the outcome cannot then be different actors.
 //
 // Zero rows affected has three readings, told apart by a follow-up lookup the
 // way ClaimForProcessing already tells a lost claim from an unknown job.
 func (r *Repository) Update(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
-	result, err := r.db.ExecContext(ctx, updateTerminalJobStatement,
+	// Truncated to the precision PostgreSQL stores, so the instant in the
+	// payload and the instant in the row's occurred_at column are the same
+	// value rather than one rounded copy of the other. A consumer correlating
+	// the two would otherwise see them disagree in the last three digits.
+	occurredAt := time.Now().UTC().Truncate(time.Microsecond)
+	eventType, payload, err := marshalTerminalOutboxPayload(job, occurredAt)
+	if err != nil {
+		return false, err
+	}
+
+	applied, err := r.writeTerminalOutcome(ctx, job, epoch, eventType, payload, occurredAt)
+	if err != nil {
+		return false, err
+	}
+	if applied {
+		return true, nil
+	}
+	// The transaction is already resolved by the time this runs, and the
+	// lookup deliberately reads the pool rather than a transaction that
+	// wrote nothing: it must see the row as every other reader does.
+	return false, r.classifyRefusedUpdate(ctx, job, epoch)
+}
+
+// writeTerminalOutcome runs the fenced statement and, only when it affected a
+// row, the outbox insert alongside it. Affecting no row rolls the whole thing
+// back and reports that to Update, which classifies the refusal.
+func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.VideoJob, epoch int64, eventType string, payload []byte, occurredAt time.Time) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("video: begin terminal update transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, updateTerminalJobStatement,
 		string(job.Status()),
 		job.FrameCount(),
 		job.ErrorReason(),
@@ -284,10 +352,63 @@ func (r *Repository) Update(ctx context.Context, job *domain.VideoJob, epoch int
 	if err != nil {
 		return false, fmt.Errorf("video: update video job: %w", err)
 	}
-	if affected > 0 {
-		return true, nil
+	if affected == 0 {
+		return false, nil
 	}
-	return false, r.classifyRefusedUpdate(ctx, job, epoch)
+
+	if err := insertOutboxEvent(ctx, tx, eventType, payload, occurredAt); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("video: commit terminal update transaction: %w", err)
+	}
+	return true, nil
+}
+
+// marshalTerminalOutboxPayload selects the event type and payload shape from
+// the job's own status, generating occurred_at once so the payload's field
+// and the row's column carry the same instant.
+//
+// A status that is neither completed nor failed is refused here, before any
+// statement runs. The fenced statement's status = processing conjunct would
+// stop such a write anyway, but it would stop it as a fence — reporting a
+// lost race for what is a caller defect, and doing so only after a round
+// trip.
+func marshalTerminalOutboxPayload(job *domain.VideoJob, occurredAt time.Time) (string, []byte, error) {
+	var (
+		eventType string
+		body      any
+	)
+	switch job.Status() {
+	case domain.JobStatusCompleted:
+		eventType = videoJobCompletedEventType
+		body = videoJobCompletedPayload{
+			Type:       videoJobCompletedEventType,
+			JobID:      job.ID().String(),
+			UserID:     job.UserID().String(),
+			FrameCount: job.FrameCount(),
+			StorageKey: job.StorageKey().String(),
+			OccurredAt: occurredAt,
+		}
+	case domain.JobStatusFailed:
+		eventType = videoJobFailedEventType
+		body = videoJobFailedPayload{
+			Type:        videoJobFailedEventType,
+			JobID:       job.ID().String(),
+			UserID:      job.UserID().String(),
+			ErrorReason: job.ErrorReason(),
+			OccurredAt:  occurredAt,
+		}
+	default:
+		return "", nil, fmt.Errorf("video: update video job: %q is not a terminal status", job.Status())
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", nil, fmt.Errorf("video: marshal outbox payload: %w", err)
+	}
+	return eventType, payload, nil
 }
 
 // classifyRefusedUpdate reads the row Update could not write and decides what
@@ -378,7 +499,7 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 		return fmt.Errorf("video: enqueue video job: %w", err)
 	}
 
-	if err := insertQueuedOutboxEvent(ctx, tx, payload, occurredAt); err != nil {
+	if err := insertOutboxEvent(ctx, tx, videoJobQueuedEventType, payload, occurredAt); err != nil {
 		return err
 	}
 
@@ -388,11 +509,13 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	return nil
 }
 
-// marshalQueuedOutboxPayload and insertQueuedOutboxEvent are shared by
-// Enqueue and Requeue rather than copied into each. The consumer cannot tell
-// a first dispatch from a re-dispatch and must not have to, so the two write
-// the same event type and the same payload; a drifted second copy would be a
-// message the consumer decodes to zero values.
+// marshalQueuedOutboxPayload is shared by Enqueue and Requeue rather than
+// copied into each. The consumer cannot tell a first dispatch from a
+// re-dispatch and must not have to, so the two write the same event type and
+// the same payload; a drifted second copy would be a message the consumer
+// decodes to zero values. The event type is named here, once, for both — the
+// insert below takes it as an argument precisely so that choice stays with
+// the payload it belongs to.
 func marshalQueuedOutboxPayload(job *domain.VideoJob, occurredAt time.Time) ([]byte, error) {
 	payload, err := json.Marshal(videoJobQueuedPayload{
 		Type:        videoJobQueuedEventType,
@@ -408,14 +531,18 @@ func marshalQueuedOutboxPayload(job *domain.VideoJob, occurredAt time.Time) ([]b
 	return payload, nil
 }
 
-func insertQueuedOutboxEvent(ctx context.Context, tx *sql.Tx, payload []byte, occurredAt time.Time) error {
+// insertOutboxEvent writes one outbox row inside the caller's transaction.
+// It is the single insert every emitting operation goes through, so the row
+// shape is written in one place; which event type a row carries is the
+// caller's decision, not this function's.
+func insertOutboxEvent(ctx context.Context, tx *sql.Tx, eventType string, payload []byte, occurredAt time.Time) error {
 	const insertOutbox = `
 		INSERT INTO video_job_outbox (id, event_type, payload, occurred_at)
 		VALUES ($1, $2, $3, $4)
 	`
 	if _, err := tx.ExecContext(ctx, insertOutbox,
 		uuid.NewString(),
-		videoJobQueuedEventType,
+		eventType,
 		payload,
 		occurredAt,
 	); err != nil {
@@ -472,7 +599,7 @@ func (r *Repository) Requeue(ctx context.Context, job *domain.VideoJob, observed
 		return false, nil
 	}
 
-	if err := insertQueuedOutboxEvent(ctx, tx, payload, occurredAt); err != nil {
+	if err := insertOutboxEvent(ctx, tx, videoJobQueuedEventType, payload, occurredAt); err != nil {
 		return false, err
 	}
 

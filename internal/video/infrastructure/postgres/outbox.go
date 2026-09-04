@@ -7,11 +7,17 @@ import (
 )
 
 // VideoJobQueuedEventType is the event_type Repository.Enqueue writes and
-// the relay claims. It is exported because it is also the AMQP routing key
-// the relay publishes under: internal/video/infrastructure/messaging's
-// RoutingKeyJobQueued must equal it, and that package's tests assert the
+// the dispatch relay claims. VideoJobCompletedEventType and
+// VideoJobFailedEventType are what Repository.Update writes and the terminal
+// relay claims. All three are exported because they are also the AMQP routing
+// keys the relays publish under: internal/video/infrastructure/messaging's
+// routing-key constants must equal them, and that package's tests assert the
 // equality rather than leaving two literals to drift.
-const VideoJobQueuedEventType = videoJobQueuedEventType
+const (
+	VideoJobQueuedEventType    = videoJobQueuedEventType
+	VideoJobCompletedEventType = videoJobCompletedEventType
+	VideoJobFailedEventType    = videoJobFailedEventType
+)
 
 // OutboxRepository reads the transactional outbox Repository writes to.
 //
@@ -27,11 +33,15 @@ func NewOutboxRepository(db *sql.DB) *OutboxRepository {
 	return &OutboxRepository{db: db}
 }
 
-// OutboxMessage is one claimed row: the id used to stamp it published, and
-// the payload to deliver. Both are opaque to the relay.
+// OutboxMessage is one claimed row: the id used to stamp it published, the
+// event type it was written as, and the payload to deliver. All three are
+// opaque to the relay, which publishes the payload under the event type
+// rather than under a key fixed at construction — a relay claiming more than
+// one type could not otherwise name what it is publishing.
 type OutboxMessage struct {
-	ID      string
-	Payload []byte
+	ID        string
+	EventType string
+	Payload   []byte
 }
 
 // OutboxBatch owns the transaction holding a claim's row locks. The caller
@@ -54,36 +64,52 @@ func (b *OutboxBatch) Messages() []OutboxMessage {
 	return b.messages
 }
 
-// Claim opens a transaction and locks up to limit unpublished rows of
-// eventType, oldest first, skipping rows another replica already holds. The
-// returned batch keeps those locks until it is committed or rolled back, so
-// the caller must always finish it.
+// Claim opens a transaction and locks up to limit unpublished rows whose
+// event_type is in eventTypes, oldest first across the whole set, skipping
+// rows another replica already holds. The returned batch keeps those locks
+// until it is committed or rolled back, so the caller must always finish it.
 //
-// The event_type predicate is not tuning. The table holds an unpublished
-// video_job.created row for every job created since Phase 3 and always
-// will — nothing publishes those — so an unfiltered claim would re-read that
-// permanent backlog on every poll and, with a bounded batch, never reach the
-// rows the relay exists to deliver.
+// The event_type predicate is not tuning, and it serves three purposes. The
+// table holds an unpublished video_job.created row for every job created
+// since Phase 3 and always will — nothing publishes those — so an unfiltered
+// claim would re-read that permanent backlog on every poll and, with a
+// bounded batch, never reach the rows the relay exists to deliver. It also
+// isolates dispatch generations during a rolling deploy, since the event type
+// is the only thing separating one generation's rows from another's in this
+// one shared table. And it keeps the two relays that now run against this
+// table — job dispatch in cmd/api, terminal events in cmd/worker — off each
+// other's rows: their sets are disjoint, so neither's backlog can starve the
+// other's.
 //
-// FOR UPDATE SKIP LOCKED is what makes concurrent cmd/api replicas safe: a
-// replica steps over rows another has claimed instead of blocking behind
-// them, so the same row is never published twice concurrently and no replica
-// waits on another's broker round trip.
-func (r *OutboxRepository) Claim(ctx context.Context, eventType string, limit int) (*OutboxBatch, error) {
+// The set is always explicit and closed. Passing every type, or no filter at
+// all, is never correct.
+//
+// FOR UPDATE SKIP LOCKED is what makes concurrent replicas safe: a replica
+// steps over rows another has claimed instead of blocking behind them, so the
+// same row is never published twice concurrently and no replica waits on
+// another's broker round trip.
+func (r *OutboxRepository) Claim(ctx context.Context, eventTypes []string, limit int) (*OutboxBatch, error) {
+	if len(eventTypes) == 0 {
+		return nil, fmt.Errorf("video: claim outbox rows: no event type given")
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("video: begin outbox claim transaction: %w", err)
 	}
 
+	// ANY over a text[] rather than a generated IN list: the parameter count
+	// then does not vary with the set's size, so one prepared statement
+	// serves every relay. MarkPublished binds a Go slice the same way.
 	const query = `
-		SELECT id, payload
+		SELECT id, event_type, payload
 		FROM video_job_outbox
-		WHERE event_type = $1 AND published_at IS NULL
+		WHERE event_type = ANY($1::text[]) AND published_at IS NULL
 		ORDER BY occurred_at
 		LIMIT $2
 		FOR UPDATE SKIP LOCKED
 	`
-	rows, err := tx.QueryContext(ctx, query, eventType, limit)
+	rows, err := tx.QueryContext(ctx, query, eventTypes, limit)
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, fmt.Errorf("video: claim outbox rows: %w", err)
@@ -93,7 +119,7 @@ func (r *OutboxRepository) Claim(ctx context.Context, eventType string, limit in
 	var messages []OutboxMessage
 	for rows.Next() {
 		var msg OutboxMessage
-		if err := rows.Scan(&msg.ID, &msg.Payload); err != nil {
+		if err := rows.Scan(&msg.ID, &msg.EventType, &msg.Payload); err != nil {
 			_ = tx.Rollback()
 			return nil, fmt.Errorf("video: scan outbox row: %w", err)
 		}

@@ -22,8 +22,17 @@ import (
 // bounded, and a caller able to vary them could declare an unbounded chain
 // through this same function.
 type Topology struct {
-	Exchange       string
-	RoutingKey     string
+	Exchange string
+	// RoutingKeys are the keys the work queue is bound under, one binding
+	// each. A topology carrying a single stream passes one; a topology
+	// whose queue must receive several event types passes several.
+	//
+	// An empty set is a caller defect and is refused rather than treated as
+	// a fanout. The work exchange is direct, so a queue with no binding
+	// receives nothing and every mandatory publish into that exchange comes
+	// back unroutable — a silent failure this function can cheaply make
+	// loud.
+	RoutingKeys    []string
 	WorkQueue      string
 	DeadExchange   string
 	DeadQueue      string
@@ -55,8 +64,8 @@ const (
 )
 
 // DeclareTopology declares topo's dead-letter sink, then its work exchange and
-// queue, together with the bindings between them. It is idempotent: declaring
-// the same topology again succeeds.
+// queue, together with one binding per routing key. It is idempotent:
+// declaring the same topology again succeeds.
 //
 // It opens its own channel and closes it before returning, so a failed
 // declaration cannot leave a caller's long-lived publishing or consuming
@@ -71,6 +80,9 @@ const (
 func DeclareTopology(conn *amqp.Connection, topo Topology) error {
 	if conn == nil {
 		return errors.New("platform/rabbitmq: declare topology: nil connection")
+	}
+	if len(topo.RoutingKeys) == 0 {
+		return errors.New("platform/rabbitmq: declare topology: no routing key")
 	}
 
 	ch, err := conn.Channel()
@@ -109,8 +121,10 @@ func DeclareTopology(conn *amqp.Connection, topo Topology) error {
 	if _, err := ch.QueueDeclare(topo.WorkQueue, true, false, false, false, workArgs); err != nil {
 		return fmt.Errorf("platform/rabbitmq: declare work queue %s: %w", topo.WorkQueue, err)
 	}
-	if err := ch.QueueBind(topo.WorkQueue, topo.RoutingKey, topo.Exchange, false, nil); err != nil {
-		return fmt.Errorf("platform/rabbitmq: bind work queue %s: %w", topo.WorkQueue, err)
+	for _, key := range topo.RoutingKeys {
+		if err := ch.QueueBind(topo.WorkQueue, key, topo.Exchange, false, nil); err != nil {
+			return fmt.Errorf("platform/rabbitmq: bind work queue %s under %s: %w", topo.WorkQueue, key, err)
+		}
 	}
 
 	return nil

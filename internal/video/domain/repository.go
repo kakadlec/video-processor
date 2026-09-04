@@ -52,8 +52,15 @@ type VideoJobRepository interface {
 	// returns are exactly the rows that endpoint renders.
 	FindCompletedByUserID(ctx context.Context, userID UserID) ([]*VideoJob, error)
 	// Update persists an already-loaded VideoJob's terminal outcome —
-	// status, frame count, error reason, and storage key. Unlike Create and
-	// Enqueue, it does not write a transactional-outbox row.
+	// status, frame count, error reason, and storage key — and, in the same
+	// transaction, the outbox event describing that outcome. The event is
+	// written if and only if the conditional write affected a row, which is
+	// part of this contract rather than an implementation detail: an
+	// outcome and its announcement have one author, so a caller that is
+	// fenced or finds its own outcome already recorded writes neither.
+	//
+	// A job whose status is neither completed nor failed is refused with an
+	// error and nothing is written — there is no event type for it.
 	//
 	// epoch is the lease epoch the caller holds, won from
 	// ClaimForProcessing or reported by the recovery scan, and the write
@@ -71,14 +78,14 @@ type VideoJobRepository interface {
 	// Enqueue persists a job that has just transitioned to queued and, in
 	// the same transaction, the outbox event describing that dispatch —
 	// the row and the event it announces are never observably
-	// inconsistent. That event is the only thing Enqueue writes which
-	// Update does not; the status column update itself is identical.
+	// inconsistent.
 	//
-	// It exists as its own method rather than as a status-dependent branch
-	// inside Update on purpose. Update is also CompleteJob's and FailJob's
-	// path, so making it outbox-aware would turn event publication into a
-	// side effect of a general-purpose write and would decide, in advance
-	// and by accident, what the completion and failure events look like.
+	// It stays its own method now that Update also writes an event, because
+	// what separates the two is the precondition, not the outbox: Enqueue
+	// writes pending -> queued unconditionally and is called only by the
+	// upload path, while Update writes a fenced terminal transition and is
+	// called only by CompleteJob and FailJob. Neither could stand in for the
+	// other.
 	Enqueue(ctx context.Context, job *VideoJob) error
 	// ClaimForProcessing persists an already-loaded job's queued ->
 	// processing transition conditionally: it takes effect only if the

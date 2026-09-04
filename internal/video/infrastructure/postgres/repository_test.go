@@ -392,43 +392,6 @@ func TestRepository_Update_PersistsTransitionedState(t *testing.T) {
 	}
 }
 
-func TestRepository_Update_DoesNotWriteOutboxRow(t *testing.T) {
-	db := testDB(t)
-	ids := idgen.New()
-	repo := postgres.NewRepository(db, ids)
-	ctx := context.Background()
-
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
-	if err := repo.Create(ctx, job); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Counted after the job has reached processing, so the outbox row
-	// Enqueue legitimately writes is part of the baseline and only Update's
-	// own effect is under test.
-	epoch := driveCreatedJobToProcessing(t, repo, job)
-
-	var before int
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&before); err != nil {
-		t.Fatalf("unexpected error counting outbox rows: %v", err)
-	}
-
-	if err := job.Fail("boom"); err != nil {
-		t.Fatalf("unexpected error failing: %v", err)
-	}
-	if _, err := repo.Update(ctx, job, epoch); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	var after int
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM video_job_outbox").Scan(&after); err != nil {
-		t.Fatalf("unexpected error counting outbox rows: %v", err)
-	}
-	if after != before {
-		t.Fatalf("outbox row count changed from %d to %d; Update must not write an outbox row", before, after)
-	}
-}
-
 // TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds
 // demonstrates the exact risk application.NewFinalizationContext exists
 // for: reusing a request context that's already canceled by the time a

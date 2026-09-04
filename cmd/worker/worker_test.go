@@ -100,7 +100,7 @@ func testTopology(t *testing.T, conn *amqp.Connection) platformrabbitmq.Topology
 
 	topo := platformrabbitmq.Topology{
 		Exchange:       prefix + ".exchange",
-		RoutingKey:     videomessaging.RoutingKeyJobQueued,
+		RoutingKeys:    []string{videomessaging.RoutingKeyJobQueued},
 		WorkQueue:      prefix + ".work",
 		DeadExchange:   prefix + ".dlx",
 		DeadQueue:      prefix + ".dead",
@@ -522,7 +522,7 @@ func declaredPublisher(t *testing.T, conn *amqp.Connection, topo platformrabbitm
 	if err := platformrabbitmq.DeclareTopology(conn, topo); err != nil {
 		t.Fatalf("declare topology: %v", err)
 	}
-	publisher, err := videomessaging.NewPublisher(conn, topo.Exchange, topo.RoutingKey)
+	publisher, err := videomessaging.NewPublisher(conn, topo.Exchange)
 	if err != nil {
 		t.Fatalf("open publisher: %v", err)
 	}
@@ -534,7 +534,7 @@ func declaredPublisher(t *testing.T, conn *amqp.Connection, topo platformrabbitm
 // acknowledged it and routed it to a queue.
 func publishDispatch(t *testing.T, publisher *videomessaging.Publisher, body []byte) {
 	t.Helper()
-	published, err := publisher.Publish(context.Background(), []videomessaging.Message{{ID: uuid.NewString(), Body: body}})
+	published, err := publisher.Publish(context.Background(), []videomessaging.Message{{ID: uuid.NewString(), RoutingKey: videomessaging.RoutingKeyJobQueued, Body: body}})
 	if err != nil {
 		t.Fatalf("publish dispatch: %v", err)
 	}
@@ -624,6 +624,44 @@ func TestWorker_ConsumesADispatchToCompletion(t *testing.T) {
 	})
 	if depth := queueDepth(t, conn, topo.DeadQueue); depth != 0 {
 		t.Fatalf("dead-letter queue depth = %d, want 0 — a completed job must not be dead-lettered", depth)
+	}
+
+	// The terminal event is written by the same transaction as the outcome,
+	// so by the time the job reads completed the row describing it exists.
+	// Asserted here rather than in its own test because what is under test is
+	// the real handler's path to the terminal write, and this is the only
+	// test that drives it end to end.
+	assertOneTerminalOutboxRow(t, env, job, "video_job.completed.v1")
+}
+
+// assertOneTerminalOutboxRow fails unless job has exactly one terminal outbox
+// row, of eventType, still unpublished — no relay runs in these tests.
+func assertOneTerminalOutboxRow(t *testing.T, env *workerTestEnv, job *videodomain.VideoJob, eventType string) {
+	t.Helper()
+
+	rows, err := env.db.QueryContext(context.Background(),
+		`SELECT event_type FROM video_job_outbox
+		 WHERE event_type = ANY($1::text[]) AND payload->>'job_id' = $2`,
+		[]string{"video_job.completed.v1", "video_job.failed.v1"}, job.ID().String(),
+	)
+	if err != nil {
+		t.Fatalf("read terminal outbox rows: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var found []string
+	for rows.Next() {
+		var got string
+		if err := rows.Scan(&got); err != nil {
+			t.Fatalf("scan terminal outbox row: %v", err)
+		}
+		found = append(found, got)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read terminal outbox rows: %v", err)
+	}
+	if len(found) != 1 || found[0] != eventType {
+		t.Fatalf("terminal outbox rows = %v, want exactly one %s", found, eventType)
 	}
 }
 
@@ -895,7 +933,7 @@ func publishWhenRoutable(t *testing.T, publisher *videomessaging.Publisher, body
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		published, err := publisher.Publish(context.Background(), []videomessaging.Message{{ID: uuid.NewString(), Body: body}})
+		published, err := publisher.Publish(context.Background(), []videomessaging.Message{{ID: uuid.NewString(), RoutingKey: videomessaging.RoutingKeyJobQueued, Body: body}})
 		if err != nil {
 			t.Fatalf("publish dispatch: %v", err)
 		}

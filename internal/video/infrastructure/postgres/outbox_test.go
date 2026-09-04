@@ -169,7 +169,7 @@ func TestOutboxRepository_Claim_SkipsTheCreatedBacklog(t *testing.T) {
 	seedCreatedOutboxRows(t, db, batchSize+1)
 	job := enqueuedJob(t, db, "user-1", "movie.mp4")
 
-	batch, err := postgres.NewOutboxRepository(db).Claim(ctx, postgres.VideoJobQueuedEventType, batchSize)
+	batch, err := postgres.NewOutboxRepository(db).Claim(ctx, []string{postgres.VideoJobQueuedEventType}, batchSize)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestOutboxRepository_MarkPublished_StampsOnlyTheGivenRows(t *testing.T) {
 	enqueuedJob(t, db, "user-1", "first.mp4")
 	enqueuedJob(t, db, "user-1", "second.mp4")
 
-	batch, err := outbox.Claim(ctx, postgres.VideoJobQueuedEventType, 10)
+	batch, err := outbox.Claim(ctx, []string{postgres.VideoJobQueuedEventType}, 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestOutboxRepository_MarkPublished_StampsOnlyTheGivenRows(t *testing.T) {
 
 	// The unstamped row is still claimable, which is what makes a refused
 	// publish retry rather than vanish.
-	next, err := outbox.Claim(ctx, postgres.VideoJobQueuedEventType, 10)
+	next, err := outbox.Claim(ctx, []string{postgres.VideoJobQueuedEventType}, 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestOutboxRepository_Claim_ConcurrentClaimsSplitTheRows(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			batch, err := outbox.Claim(ctx, postgres.VideoJobQueuedEventType, perClaim)
+			batch, err := outbox.Claim(ctx, []string{postgres.VideoJobQueuedEventType}, perClaim)
 			if err != nil {
 				claimedSignal <- err
 				return
@@ -460,7 +460,7 @@ func TestOutboxRepository_Claim_IsIsolatedToOneGeneration(t *testing.T) {
 		t.Fatal("test setup: the previous generation's row is already stamped, so this proves nothing about the claim")
 	}
 
-	batch, err := postgres.NewOutboxRepository(db).Claim(ctx, postgres.VideoJobQueuedEventType, 10)
+	batch, err := postgres.NewOutboxRepository(db).Claim(ctx, []string{postgres.VideoJobQueuedEventType}, 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,5 +472,182 @@ func TestOutboxRepository_Claim_IsIsolatedToOneGeneration(t *testing.T) {
 	}
 	if messages[0].ID != current {
 		t.Fatalf("claimed row %s, want %s", messages[0].ID, current)
+	}
+}
+
+// seedTypedOutboxRow writes one row of an arbitrary event type at an explicit
+// instant, so a test can pin the order a multi-type claim returns.
+func seedTypedOutboxRow(t *testing.T, db *sql.DB, eventType string, occurredAt time.Time) string {
+	t.Helper()
+
+	id := uuid.NewString()
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO video_job_outbox (id, event_type, payload, occurred_at) VALUES ($1, $2, $3, $4)`,
+		id, eventType, []byte(`{"type":"`+eventType+`"}`), occurredAt,
+	); err != nil {
+		t.Fatalf("unexpected error seeding a %s row: %v", eventType, err)
+	}
+	return id
+}
+
+// TestOutboxRepository_Claim_OverASetReturnsBothTypesOldestFirst is the
+// terminal relay's claim: two event types, one ordering, and nothing outside
+// the set. The dispatch rows and the permanent video_job.created backlog are
+// both present, and both must be left alone — the first because another relay
+// owns it, the second because nothing publishes it at all.
+func TestOutboxRepository_Claim_OverASetReturnsBothTypesOldestFirst(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	base := time.Now().UTC().Add(-time.Hour)
+	seedCreatedOutboxRows(t, db, 3)
+	enqueuedJob(t, db, "user-1", "movie.mp4")
+
+	failedID := seedTypedOutboxRow(t, db, postgres.VideoJobFailedEventType, base)
+	completedID := seedTypedOutboxRow(t, db, postgres.VideoJobCompletedEventType, base.Add(time.Second))
+
+	batch, err := postgres.NewOutboxRepository(db).Claim(ctx,
+		[]string{postgres.VideoJobCompletedEventType, postgres.VideoJobFailedEventType}, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer batch.Rollback()
+
+	messages := batch.Messages()
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2 — the set's rows and nothing else", len(messages))
+	}
+	// Oldest first across the whole set, not grouped by type: the failure
+	// was written first even though it is the second type in the set.
+	if messages[0].ID != failedID || messages[1].ID != completedID {
+		t.Fatalf("claimed ids = [%s %s], want [%s %s] — ordering is by occurred_at across the set",
+			messages[0].ID, messages[1].ID, failedID, completedID)
+	}
+	if messages[0].EventType != postgres.VideoJobFailedEventType {
+		t.Errorf("messages[0].EventType = %q, want %q", messages[0].EventType, postgres.VideoJobFailedEventType)
+	}
+	if messages[1].EventType != postgres.VideoJobCompletedEventType {
+		t.Errorf("messages[1].EventType = %q, want %q", messages[1].EventType, postgres.VideoJobCompletedEventType)
+	}
+}
+
+// TestOutboxRepository_Claim_TheTwoRelaysDoNotSeeEachOthersRows is the
+// disjointness the two relays depend on. Each claims its own set with the
+// other's rows present and unpublished.
+func TestOutboxRepository_Claim_TheTwoRelaysDoNotSeeEachOthersRows(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	outbox := postgres.NewOutboxRepository(db)
+
+	enqueuedJob(t, db, "user-1", "movie.mp4")
+	terminalID := seedTypedOutboxRow(t, db, postgres.VideoJobCompletedEventType, time.Now().UTC())
+
+	dispatch, err := outbox.Claim(ctx, []string{postgres.VideoJobQueuedEventType}, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, msg := range dispatch.Messages() {
+		if msg.ID == terminalID {
+			dispatch.Rollback()
+			t.Fatal("the dispatch relay claimed a terminal row")
+		}
+		if msg.EventType != postgres.VideoJobQueuedEventType {
+			dispatch.Rollback()
+			t.Fatalf("dispatch claim returned event type %q", msg.EventType)
+		}
+	}
+	dispatch.Rollback()
+
+	terminal, err := outbox.Claim(ctx,
+		[]string{postgres.VideoJobCompletedEventType, postgres.VideoJobFailedEventType}, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer terminal.Rollback()
+	messages := terminal.Messages()
+	if len(messages) != 1 || messages[0].ID != terminalID {
+		t.Fatalf("terminal claim = %v, want exactly the terminal row %s", messages, terminalID)
+	}
+}
+
+// TestOutboxRepository_Claim_RefusesAnEmptySet guards the one way a relay
+// could be pointed at everything: an empty predicate. It is a caller defect,
+// not "claim all", and it would publish the permanent video_job.created
+// backlog onto a broker.
+func TestOutboxRepository_Claim_RefusesAnEmptySet(t *testing.T) {
+	db := testDB(t)
+
+	batch, err := postgres.NewOutboxRepository(db).Claim(context.Background(), nil, 10)
+	if err == nil {
+		batch.Rollback()
+		t.Fatal("error = nil, want a refusal for an empty event-type set")
+	}
+	if batch != nil {
+		t.Fatal("batch is non-nil on a refused claim; its transaction would leak")
+	}
+}
+
+// TestOutboxRepository_MultiTypeClaimCanUseTheUnpublishedIndex is task 3.4's
+// check rather than its assumption: the partial index must be able to answer
+// `event_type = ANY($1::text[])`, not just the single-value equality it was
+// created for. A btree answers ANY through a ScalarArrayOpExpr, but the index
+// would be unusable for it if the key columns were ordered the other way.
+//
+// It disables sequential scans for the plan rather than seeding a table large
+// enough for the planner to prefer the index on its own. At any row count a
+// test can seed in reasonable time, a seq scan is genuinely cheaper — the
+// index is partial on `published_at IS NULL` and every seeded row qualifies,
+// so it covers the whole table. Forcing the choice asks the question that
+// actually matters, which is whether the index *can* serve this predicate.
+func TestOutboxRepository_MultiTypeClaimCanUseTheUnpublishedIndex(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	seedCreatedOutboxRows(t, db, 200)
+	base := time.Now().UTC()
+	for i := 0; i < 20; i++ {
+		seedTypedOutboxRow(t, db, postgres.VideoJobCompletedEventType, base.Add(time.Duration(i)*time.Second))
+	}
+	if _, err := db.ExecContext(ctx, `ANALYZE video_job_outbox`); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	// One connection for both statements: enable_seqscan is a session
+	// setting, and a pooled handle could otherwise run the EXPLAIN on a
+	// different connection than the SET.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, `SET enable_seqscan = off`); err != nil {
+		t.Fatalf("disable seq scans: %v", err)
+	}
+
+	rows, err := conn.QueryContext(ctx,
+		`EXPLAIN SELECT id, event_type, payload FROM video_job_outbox
+		 WHERE event_type = ANY($1::text[]) AND published_at IS NULL
+		 ORDER BY occurred_at LIMIT $2`,
+		[]string{postgres.VideoJobCompletedEventType, postgres.VideoJobFailedEventType}, 100,
+	)
+	if err != nil {
+		t.Fatalf("EXPLAIN: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scanning plan: %v", err)
+		}
+		plan.WriteString(line)
+		plan.WriteString("\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("reading plan: %v", err)
+	}
+	if !strings.Contains(plan.String(), "video_job_outbox_unpublished_idx") {
+		t.Fatalf("the partial index cannot answer a multi-type claim:\n%s", plan.String())
 	}
 }

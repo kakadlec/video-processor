@@ -62,7 +62,7 @@ func testTopology(t *testing.T, conn *amqp.Connection) rabbitmq.Topology {
 
 	topo := rabbitmq.Topology{
 		Exchange:       prefix + ".exchange",
-		RoutingKey:     "test.work.queued",
+		RoutingKeys:    []string{"test.work.queued"},
 		WorkQueue:      prefix + ".work",
 		DeadExchange:   prefix + ".dlx",
 		DeadQueue:      prefix + ".dead",
