@@ -243,11 +243,15 @@ Unlike the API, the worker SHALL exit non-zero if it cannot reach object storage
 - **WHEN** the worker starts
 - **THEN** it does not exit, it retries with backoff, and it begins consuming and relaying once the broker is available
 
-#### Scenario: The worker declares both topologies on every dial
+#### Scenario: Each of the worker's connections declares its own topology on every dial
 
 - **GIVEN** a broker whose exchanges and queues have been deleted while the worker was disconnected
-- **WHEN** the worker reconnects
-- **THEN** the job topology and the terminal-event topology are declared again, and consumption and publishing resume without a message being published into a missing exchange
+- **WHEN** the consumer's connection redials
+- **THEN** it declares the job topology and resumes consuming, and it declares nothing of the terminal-event topology
+- **AND WHEN** the terminal relay's connection redials
+- **THEN** it declares the terminal-event topology and resumes publishing without a message being published into a missing exchange
+
+The two loops are independent, so a redeclaration follows each connection's own dial rather than the worker's. Whichever of the two reconnects first restores its own half; the topology the other owns is restored when that one redials.
 
 #### Scenario: The worker does not claim job-dispatch rows
 
