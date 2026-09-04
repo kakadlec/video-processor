@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // ErrInvalidSecret is returned when a value fails Secret construction —
@@ -55,8 +56,19 @@ type Secret struct {
 // NewSecret validates raw as at least MinSecretLength bytes long. An
 // explicitly empty secret is rejected here rather than read as a removal —
 // there is no way to remove one, only to replace it.
+//
+// A NUL byte is rejected too, and not on taste: the value is stored in a
+// PostgreSQL text column, which cannot hold one. Without this a secret
+// carrying a NUL would pass every check the domain makes and then fail at
+// the write with a driver error the caller can do nothing about, turning
+// what is a malformed request into a 500. JSON encodes \u0000 as a real NUL
+// byte, so the path is reachable from a request body rather than
+// theoretical.
 func NewSecret(raw string) (Secret, error) {
 	if len(raw) < MinSecretLength {
+		return Secret{}, ErrInvalidSecret
+	}
+	if strings.IndexByte(raw, 0) >= 0 {
 		return Secret{}, ErrInvalidSecret
 	}
 	return Secret{value: &raw}, nil

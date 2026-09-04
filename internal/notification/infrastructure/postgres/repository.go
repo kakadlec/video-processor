@@ -16,9 +16,12 @@ var _ domain.PreferenceRepository = (*PreferenceRepository)(nil)
 // intent — did the caller send a secret? — and is therefore knowable before
 // any statement runs, so neither branch reads a row first.
 //
-// Both project `secret <> ”` rather than the secret. The value is not
-// loadable on any read path, which is what makes domain.PreferenceView's
-// missing secret field a guarantee rather than a convention.
+// Both project whether the secret column is non-empty, never the secret
+// itself, so the value is not loadable on any read path — which is what
+// makes domain.PreferenceView's missing secret field a guarantee rather
+// than a convention. The projection is spelled out in the statements below
+// and deliberately not repeated here: gofmt reads a pair of apostrophes in
+// a doc comment as a typographic closing quote and rewrites it.
 const (
 	// A secret was submitted: one upsert whose conflict clause overwrites
 	// the stored secret with the submitted one.
