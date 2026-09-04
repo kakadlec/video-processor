@@ -56,6 +56,23 @@ The domain layer, not SQL, is what refuses an *explicitly empty* secret — an e
 
 *Alternative considered:* `SELECT` then `INSERT`/`UPDATE` in a transaction. Rejected: more round trips, a serialization concern to reason about, and it puts a credential through the application layer on a path that does not need it.
 
+### A `CHECK` constraint is what makes "a create needs a secret" reachable
+
+The two secret rules pull against each other: a **create** with no secret must be refused, while an **update** with no secret must preserve the stored one. Distinguishing them needs to know whether a row already exists — which is exactly what the single-statement upsert refuses to look up, and what a `NOT NULL DEFAULT ''` column would happily accept, storing `secret = ''` and reporting `has_secret: false`.
+
+The column therefore carries a named constraint instead of a default:
+
+```
+secret TEXT NOT NULL
+    CONSTRAINT notification_preferences_secret_not_empty CHECK (secret <> '')
+```
+
+The insert path violates it precisely when a create omits the secret. The conflict path can never violate it, because `COALESCE(NULLIF(EXCLUDED.secret, ''), notification_preferences.secret)` yields either the submitted secret or the stored one, and the stored one is non-empty by the same constraint. So one statement enforces both rules, and the adapter's only job is to map that one constraint — matched by name, not by SQLSTATE `23514` alone, so a future constraint on another column is not silently folded into the same error — to a typed domain error the handler renders as `400`.
+
+The discriminating case is two concurrent first-writes of the same triple where one omits the secret. Whichever lands second takes the conflict path, finds a stored secret, and preserves it — a correct outcome, because by the time it executes a preference *is* stored and its write genuinely is an update. A read-then-write would decide "create" from a snapshot taken before the other insert committed and would then have to fail on the insert anyway; the constraint is what makes the outcome well-defined either way.
+
+*Alternative considered:* `RETURNING (xmax = 0) AS inserted` inside a transaction, rolling back when it inserted without a secret. Same guarantee, but it adds a transaction to do what the constraint does for free, and leaves the invariant expressible only in Go — a second writer of this table could violate it.
+
 ### The secret is column-plaintext, and non-disclosure is the whole control
 
 HMAC signing needs the original bytes, so bcrypt — the tool `internal/identity/infrastructure/password` uses — is structurally unavailable. Encrypting at rest would require a key-management story (a new required variable, rotation, and a decision about what happens to stored rows when the key changes) that is disproportionate to a hackathon deliverable and is not what the delivery change asked for.
@@ -112,6 +129,7 @@ PUT /api/notification-preferences
 
 ## Risks / Trade-offs
 
+- **A constraint violation is a `400`, not a `500`** → The adapter matches `notification_preferences_secret_not_empty` by name and returns a typed error; every other constraint failure stays a `500`. A rename of the constraint in `schema.sql` without the matching change in the adapter would turn a validation error back into a `500`, so the test for "create without a secret" runs against a real database rather than a fake repository.
 - **A plaintext secret in a database column** → Never returned by any route, never logged, not loaded on the read path (`secret <> ''` is projected instead), and confined to a database that already holds password hashes and job records. Recorded in `docs/operations.md` so an operator knows the column's sensitivity. A future change can encrypt at rest without altering the route contract, because the value is already write-only from the API's point of view.
 - **`http` destinations are accepted, so a signed payload can travel in clear text** → Accepted deliberately for local development, where no TLS exists. The delivery change is the right place to add an operator-facing switch that restricts destinations to `https` in production, because it is the process that opens the connection.
 - **Two independently-declared copies of each event-type string** → Pinned by a composition-root test that fails on either side's rename. Failure mode without it — a consumer resolving preferences against a name no row carries — is silent, which is precisely why the pin is in this change rather than the next.
