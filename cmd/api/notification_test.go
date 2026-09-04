@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"video-processor/internal/identity/infrastructure/jwtauth"
 	notificationapplication "video-processor/internal/notification/application"
 	notificationdomain "video-processor/internal/notification/domain"
+	notificationpostgres "video-processor/internal/notification/infrastructure/postgres"
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 )
 
@@ -614,5 +616,52 @@ func TestNotificationEventTypesMatchTheEmittedTerminalEventTypes(t *testing.T) {
 				t.Fatalf("notification event type %q does not match the emitted event type %q", tt.notification, tt.emitted)
 			}
 		})
+	}
+}
+
+// The composition path itself, which no route test reaches: every one of
+// them builds the module by hand. A regression in the startup gate would
+// otherwise leave the suite green while cmd/api refused to boot — or, worse,
+// booted without persistence.
+func TestSetupNotification_DSNMissing_ReturnsError(t *testing.T) {
+	t.Setenv("NOTIFICATION_POSTGRES_DSN", "")
+
+	module, db, err := setupNotification(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when NOTIFICATION_POSTGRES_DSN is not set")
+	}
+	if !errors.Is(err, notificationpostgres.ErrDSNRequired) {
+		t.Fatalf("expected error to wrap notificationpostgres.ErrDSNRequired, got: %v", err)
+	}
+	// The variable's own name has to survive into the message, so an
+	// operator reading a fatal startup log knows what to set.
+	if !strings.Contains(err.Error(), "NOTIFICATION_POSTGRES_DSN") {
+		t.Errorf("error %q does not name the missing variable", err)
+	}
+	if module != nil {
+		t.Fatalf("expected a nil module on error, got %+v", module)
+	}
+	if db != nil {
+		t.Fatalf("expected a nil db on error, got %+v", db)
+	}
+}
+
+func TestSetupNotification_UnreachablePostgres_ReturnsError(t *testing.T) {
+	// A loopback address on a port nothing listens on fails fast (connection
+	// refused) rather than hanging, so this stays a fast unit-style test.
+	t.Setenv("NOTIFICATION_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/notification?sslmode=disable&connect_timeout=1")
+
+	module, db, err := setupNotification(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when configured PostgreSQL is unreachable")
+	}
+	if strings.TrimSpace(err.Error()) == "" {
+		t.Fatal("expected a non-empty error message")
+	}
+	if module != nil {
+		t.Fatalf("expected a nil module on error, got %+v", module)
+	}
+	if db != nil {
+		t.Fatalf("expected a nil db on error, got %+v", db)
 	}
 }
