@@ -26,14 +26,29 @@ import (
 // never collide with the production one on a shared test database.
 const testEventType = "test_video_job.queued"
 
-// TestRoutingKeyMatchesTheOutboxEventType closes the one string that has to
+// TestRoutingKeyMatchesTheOutboxEventType closes the strings that have to
 // stay equal across two packages with nothing in the compiler enforcing it:
 // the routing key messages are published under and the event_type the outbox
-// stores. If they drift, Repository.Enqueue writes rows the relay's claim
-// never matches, and dispatch stops silently.
+// stores. If they drift, the writer records rows the relay's claim never
+// matches, and that stream stops silently.
+//
+// It covers every type either relay publishes, not one pair: the terminal
+// relay reads its routing key off the claimed row, so a drifted terminal
+// constant would publish under a key its own queue is not bound to — and a
+// mandatory publish that reaches no queue leaves the row unpublished forever.
 func TestRoutingKeyMatchesTheOutboxEventType(t *testing.T) {
-	if RoutingKeyJobQueued != postgres.VideoJobQueuedEventType {
-		t.Fatalf("RoutingKeyJobQueued = %q, want it equal to postgres.VideoJobQueuedEventType = %q", RoutingKeyJobQueued, postgres.VideoJobQueuedEventType)
+	for _, tc := range []struct {
+		name       string
+		routingKey string
+		eventType  string
+	}{
+		{"queued", RoutingKeyJobQueued, postgres.VideoJobQueuedEventType},
+		{"completed", RoutingKeyJobCompleted, postgres.VideoJobCompletedEventType},
+		{"failed", RoutingKeyJobFailed, postgres.VideoJobFailedEventType},
+	} {
+		if tc.routingKey != tc.eventType {
+			t.Errorf("%s: routing key %q, outbox event type %q — they must be byte-identical", tc.name, tc.routingKey, tc.eventType)
+		}
 	}
 }
 
@@ -129,7 +144,7 @@ func testTopology(t *testing.T, conn *amqp.Connection, maxLength int) rabbitmq.T
 
 	topo := rabbitmq.Topology{
 		Exchange:       prefix + ".exchange",
-		RoutingKey:     testEventType,
+		RoutingKeys:    []string{testEventType},
 		WorkQueue:      prefix + ".work",
 		DeadExchange:   prefix + ".dlx",
 		DeadQueue:      prefix + ".dead",
@@ -160,10 +175,10 @@ func testTopology(t *testing.T, conn *amqp.Connection, maxLength int) rabbitmq.T
 func newTestRelay(t *testing.T, db *sql.DB, topo rabbitmq.Topology) *Relay {
 	t.Helper()
 	return &Relay{
-		outbox:    postgres.NewOutboxRepository(db),
-		config:    rabbitmq.Config{URL: testBrokerURL(t)},
-		eventType: testEventType,
-		topology:  topo,
+		outbox:     postgres.NewOutboxRepository(db),
+		config:     rabbitmq.Config{URL: testBrokerURL(t)},
+		eventTypes: []string{testEventType},
+		topology:   topo,
 	}
 }
 
@@ -212,7 +227,7 @@ func declaredPublisher(t *testing.T, conn *amqp.Connection, topo rabbitmq.Topolo
 	if err := rabbitmq.DeclareTopology(conn, topo); err != nil {
 		t.Fatalf("declare topology: %v", err)
 	}
-	publisher, err := NewPublisher(conn, topo.Exchange, topo.RoutingKey)
+	publisher, err := NewPublisher(conn, topo.Exchange)
 	if err != nil {
 		t.Fatalf("open publisher: %v", err)
 	}
@@ -347,13 +362,13 @@ func TestPublisher_UnroutablePublishIsNotReportedAsPublished(t *testing.T) {
 	}
 	_ = ch.Close()
 
-	publisher, err := NewPublisher(conn, topo.Exchange, topo.RoutingKey)
+	publisher, err := NewPublisher(conn, topo.Exchange)
 	if err != nil {
 		t.Fatalf("open publisher: %v", err)
 	}
 	defer func() { _ = publisher.Close() }()
 
-	published, err := publisher.Publish(context.Background(), []Message{{ID: uuid.NewString(), Body: []byte(`{}`)}})
+	published, err := publisher.Publish(context.Background(), []Message{{ID: uuid.NewString(), RoutingKey: topo.RoutingKeys[0], Body: []byte(`{}`)}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -368,7 +383,7 @@ func TestPublisher_UnroutablePublishIsNotReportedAsPublished(t *testing.T) {
 	if err := rabbitmq.DeclareTopology(conn, topo); err != nil {
 		t.Fatalf("declare topology: %v", err)
 	}
-	routable := Message{ID: uuid.NewString(), Body: []byte(`{}`)}
+	routable := Message{ID: uuid.NewString(), RoutingKey: topo.RoutingKeys[0], Body: []byte(`{}`)}
 	published, err = publisher.Publish(context.Background(), []Message{routable})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -528,7 +543,7 @@ func TestPublisher_RejectsAnOversizedBatch(t *testing.T) {
 
 	messages := make([]Message, maxPublishBatch+1)
 	for i := range messages {
-		messages[i] = Message{ID: uuid.NewString(), Body: []byte(`{}`)}
+		messages[i] = Message{ID: uuid.NewString(), RoutingKey: topo.RoutingKeys[0], Body: []byte(`{}`)}
 	}
 
 	published, err := publisher.Publish(context.Background(), messages)
@@ -610,4 +625,95 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// TestPublisher_PublishesEachMessageUnderItsOwnRoutingKey is what the
+// terminal relay depends on: one publisher, one exchange, two event types.
+// A publisher fixed to one key would publish a failure under the completion
+// key — routable, decodable, and wrong.
+//
+// The third message is the control: a key nothing is bound to comes back as a
+// basic.return, so it is reported unpublished and its row stays claimable.
+func TestPublisher_PublishesEachMessageUnderItsOwnRoutingKey(t *testing.T) {
+	conn := openTestConn(t)
+
+	topo := testTopology(t, conn, 10)
+	const secondKey = "test.work.second"
+	topo.RoutingKeys = append(topo.RoutingKeys, secondKey)
+	publisher := declaredPublisher(t, conn, topo)
+
+	first := Message{ID: uuid.NewString(), RoutingKey: topo.RoutingKeys[0], Body: []byte(`{"n":1}`)}
+	second := Message{ID: uuid.NewString(), RoutingKey: secondKey, Body: []byte(`{"n":2}`)}
+	unroutable := Message{ID: uuid.NewString(), RoutingKey: "test.work.unbound", Body: []byte(`{"n":3}`)}
+
+	published, err := publisher.Publish(context.Background(), []Message{first, second, unroutable})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	accepted := make(map[string]bool, len(published))
+	for _, id := range published {
+		accepted[id] = true
+	}
+	if !accepted[first.ID] || !accepted[second.ID] {
+		t.Fatalf("published = %v, want both bound keys accepted (%s, %s)", published, first.ID, second.ID)
+	}
+	if accepted[unroutable.ID] {
+		t.Fatalf("published = %v, want the unbound key %s reported unpublished", published, unroutable.ID)
+	}
+	if depth := queueDepth(t, conn, topo.WorkQueue); depth != 2 {
+		t.Fatalf("work queue depth = %d, want 2 — both keys land on the one queue", depth)
+	}
+}
+
+// TestTerminalRelay_PublishesBothEventTypesToOneQueue drives the real
+// NewTerminalRelay cycle over test-seeded rows, so what is exercised is the
+// production event-type set and the production routing-key derivation, not a
+// test double's.
+//
+// It runs against a test-scoped copy of the terminal topology rather than the
+// production names, for the reason every other relay test does: a test must
+// not publish into a queue a deployed consumer is reading.
+func TestTerminalRelay_PublishesBothEventTypesToOneQueue(t *testing.T) {
+	db := testDB(t)
+	conn := openTestConn(t)
+
+	topo := testTopology(t, conn, 10)
+	topo.RoutingKeys = []string{postgres.VideoJobCompletedEventType, postgres.VideoJobFailedEventType}
+	if err := rabbitmq.DeclareTopology(conn, topo); err != nil {
+		t.Fatalf("declare topology: %v", err)
+	}
+
+	relay := NewTerminalRelay(postgres.NewOutboxRepository(db), rabbitmq.Config{URL: testBrokerURL(t)})
+	relay.topology = topo
+
+	completedID := seedOutboxRowOfType(t, db, postgres.VideoJobCompletedEventType, `{"type":"video_job.completed.v1"}`)
+	failedID := seedOutboxRowOfType(t, db, postgres.VideoJobFailedEventType, `{"type":"video_job.failed.v1"}`)
+
+	publisher := declaredPublisher(t, conn, topo)
+	if err := relay.cycle(context.Background(), publisher); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+
+	if depth := queueDepth(t, conn, topo.WorkQueue); depth != 2 {
+		t.Fatalf("work queue depth = %d, want 2 — both terminal types reach the one queue", depth)
+	}
+	for _, id := range []string{completedID, failedID} {
+		if !publishedAt(t, db, id).Valid {
+			t.Errorf("row %s is not stamped published", id)
+		}
+	}
+}
+
+func seedOutboxRowOfType(t *testing.T, db *sql.DB, eventType, body string) string {
+	t.Helper()
+
+	id := uuid.NewString()
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO video_job_outbox (id, event_type, payload, occurred_at) VALUES ($1, $2, $3, now())`,
+		id, eventType, []byte(body),
+	); err != nil {
+		t.Fatalf("seed %s row: %v", eventType, err)
+	}
+	return id
 }

@@ -7,8 +7,12 @@
 // acts on behalf of a caller — it acts on a job named by an internal
 // dispatch. It must not be reachable from outside the deployment.
 //
-// It also runs no outbox relay. The relay is the API's, and a second one here
-// would have two processes claiming from the same table for no gain.
+// It runs one outbox relay, and only one: the terminal-event relay, carrying
+// the video_job.completed.v1 and video_job.failed.v1 rows this process itself
+// writes. Job dispatch stays the API's, which is where those rows are
+// written. The two relays claim disjoint event-type sets, so neither polls
+// for the other's rows and running both costs no duplicated dispatch — and an
+// outcome's announcement does not come to depend on an API replica being up.
 package main
 
 import (
@@ -105,6 +109,24 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 	// while the handler goroutine writes it, hence atomic.
 	var inFlight atomic.Pointer[string]
 
+	// Its own cancellable context, so shutdown stops the relay explicitly at
+	// the point below rather than as a side effect of whatever cancels ctx.
+	relayCtx, stopRelay := context.WithCancel(ctx)
+	defer stopRelay()
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		// Absent in the tests that drive the consumer alone: they run
+		// against test-scoped queue names and have no use for a relay
+		// publishing into the production terminal topology.
+		if deps.terminalRelay == nil {
+			return
+		}
+		if err := deps.terminalRelay.Run(relayCtx); err != nil {
+			log.Printf("video: worker: terminal relay: %v", err)
+		}
+	}()
+
 	consumer := videomessaging.NewConsumer(deps.rabbit, topology, consumerTag, func(handlerCtx context.Context, body []byte) videomessaging.Disposition {
 		return deps.handle(handlerCtx, body, &inFlight)
 	})
@@ -135,6 +157,15 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 	// A sweep holds a transaction while it runs, so tearing the pool down
 	// underneath one would abort a claim instead of resolving it.
 	<-sweeperDone
+
+	// Joined here for the same reason and at the same point: the relay holds
+	// a transaction across its broker round trip. It is stopped wherever its
+	// current cycle has reached rather than drained to empty — a committed
+	// but unpublished terminal row is picked up by a later relay cycle, in
+	// this worker or another, exactly as an unpublished dispatch row is, so
+	// waiting for it would delay shutdown for nothing.
+	stopRelay()
+	<-relayDone
 
 	select {
 	case <-consumerDone:
@@ -168,6 +199,11 @@ type workerDeps struct {
 	rabbit platformrabbitmq.Config
 	db     *sql.DB
 	redis  *redis.Client
+
+	// terminalRelay publishes the terminal outbox rows this process writes.
+	// It dials on its own, so it is wired here even though the broker is not
+	// confirmed reachable at startup.
+	terminalRelay *videomessaging.Relay
 
 	process  *videoapplication.ProcessVideoJob
 	complete *videoapplication.CompleteJob
@@ -274,9 +310,10 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 	failJob := videoapplication.NewFailJob(plainRepo, repo, ids)
 
 	return &workerDeps{
-		rabbit: rabbitConfig,
-		db:     db,
-		redis:  redisClient,
+		rabbit:        rabbitConfig,
+		db:            db,
+		redis:         redisClient,
+		terminalRelay: videomessaging.NewTerminalRelay(videopostgres.NewOutboxRepository(db), rabbitConfig),
 		process: videoapplication.NewProcessVideoJob(
 			// Reader undecorated, writer cached, for all three ownership
 			// use cases: a decision about who owns a job does not read a

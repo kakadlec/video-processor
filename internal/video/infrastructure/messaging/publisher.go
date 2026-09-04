@@ -24,16 +24,22 @@ const maxPublishBatch = 100
 var ErrBatchTooLarge = fmt.Errorf("video: publisher: batch exceeds the maximum of %d messages", maxPublishBatch)
 
 // Message is one unit of work handed to a Publisher: an id used both to
-// correlate the broker's answer and to stamp the row it came from, and the
-// body to deliver.
+// correlate the broker's answer and to stamp the row it came from, the
+// routing key to publish it under, and the body to deliver.
+//
+// The key travels with the message rather than with the publisher because a
+// relay may carry more than one event type on one exchange, and a key fixed
+// at construction would then publish a message under the name of something
+// it is not. Its source is the claimed row's own event_type.
 type Message struct {
-	ID   string
-	Body []byte
+	ID         string
+	RoutingKey string
+	Body       []byte
 }
 
-// Publisher publishes messages to one exchange and routing key on a channel
-// running in confirm mode, and reports which of them the broker both
-// acknowledged and routed to a queue.
+// Publisher publishes messages to one exchange, each under its own routing
+// key, on a channel running in confirm mode, and reports which of them the
+// broker both acknowledged and routed to a queue.
 //
 // Both halves are needed and only the first is obvious. A publisher
 // confirmation says the *exchange* accepted the publish, not that any queue
@@ -43,21 +49,19 @@ type Message struct {
 // the broker sends before the acknowledgement, and a returned message is
 // reported as not published.
 type Publisher struct {
-	ch         *amqp.Channel
-	exchange   string
-	routingKey string
-	returns    chan amqp.Return
-	closed     chan *amqp.Error
+	ch       *amqp.Channel
+	exchange string
+	returns  chan amqp.Return
+	closed   chan *amqp.Error
 }
 
-// NewPublisher opens a confirm-mode channel on conn for the given exchange
-// and routing key.
+// NewPublisher opens a confirm-mode channel on conn for the given exchange.
 //
-// The exchange and routing key are arguments rather than read from
-// JobDispatchTopology inside: a publisher pointed at an exchange with no
-// matching binding is the only way to exercise the unroutable path this type
-// exists to handle, and the production topology always has one.
-func NewPublisher(conn *amqp.Connection, exchange, routingKey string) (*Publisher, error) {
+// The exchange is an argument rather than read from a topology function
+// inside: a publisher pointed at an exchange with no matching binding is the
+// only way to exercise the unroutable path this type exists to handle, and
+// the production topologies always have one.
+func NewPublisher(conn *amqp.Connection, exchange string) (*Publisher, error) {
 	if conn == nil {
 		return nil, errors.New("video: publisher: nil connection")
 	}
@@ -78,11 +82,10 @@ func NewPublisher(conn *amqp.Connection, exchange, routingKey string) (*Publishe
 	returns := ch.NotifyReturn(make(chan amqp.Return, maxPublishBatch))
 
 	return &Publisher{
-		ch:         ch,
-		exchange:   exchange,
-		routingKey: routingKey,
-		returns:    returns,
-		closed:     ch.NotifyClose(make(chan *amqp.Error, 1)),
+		ch:       ch,
+		exchange: exchange,
+		returns:  returns,
+		closed:   ch.NotifyClose(make(chan *amqp.Error, 1)),
 	}, nil
 }
 
@@ -132,7 +135,7 @@ func (p *Publisher) Publish(ctx context.Context, messages []Message) ([]string, 
 
 	confirmations := make([]*amqp.DeferredConfirmation, 0, len(messages))
 	for _, msg := range messages {
-		confirmation, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, p.exchange, p.routingKey, true, false, amqp.Publishing{
+		confirmation, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, p.exchange, msg.RoutingKey, true, false, amqp.Publishing{
 			// MessageId is the correlation handle. A basic.return carries
 			// the message's properties but no delivery tag, so it cannot be
 			// joined to its confirmation any other way.

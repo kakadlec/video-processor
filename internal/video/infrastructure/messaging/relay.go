@@ -36,10 +36,16 @@ const (
 // owns a real database transaction, so the tests below run against a real
 // PostgreSQL, exactly like the adapter's own.
 type outboxClaimer interface {
-	Claim(ctx context.Context, eventType string, limit int) (*postgres.OutboxBatch, error)
+	Claim(ctx context.Context, eventTypes []string, limit int) (*postgres.OutboxBatch, error)
 }
 
-// Relay carries video_job.queued outbox rows to the broker.
+// Relay carries one closed set of outbox event types to the broker.
+//
+// Two of them run: the dispatch relay in cmd/api carries video_job.queued.v2,
+// and the terminal relay in cmd/worker carries the two terminal events. Their
+// sets are disjoint, which is what makes running both against the one
+// video_job_outbox table free of contention — neither claims the other's rows
+// and neither's backlog can starve the other's.
 //
 // It owns its connection rather than receiving one: the composition root
 // must not treat broker reachability as a startup gate (see design.md
@@ -53,19 +59,34 @@ type outboxClaimer interface {
 // commits the claim before publishing, drops a dispatch permanently and
 // silently on the same crash.
 type Relay struct {
-	outbox    outboxClaimer
-	config    rabbitmq.Config
-	eventType string
-	topology  rabbitmq.Topology
+	outbox     outboxClaimer
+	config     rabbitmq.Config
+	eventTypes []string
+	topology   rabbitmq.Topology
 }
 
-// NewRelay wires a Relay to the outbox it drains and the broker it dials.
+// NewRelay wires the job-dispatch relay to the outbox it drains and the
+// broker it dials. Its set has one element, which is the shape every relay
+// had before a second stream existed.
 func NewRelay(outbox outboxClaimer, config rabbitmq.Config) *Relay {
 	return &Relay{
-		outbox:    outbox,
-		config:    config,
-		eventType: postgres.VideoJobQueuedEventType,
-		topology:  JobDispatchTopology(),
+		outbox:     outbox,
+		config:     config,
+		eventTypes: []string{postgres.VideoJobQueuedEventType},
+		topology:   JobDispatchTopology(),
+	}
+}
+
+// NewTerminalRelay wires the terminal-event relay. It carries both terminal
+// event types on one connection and into one queue, because a consumer
+// interested in how a job ended is interested in either outcome; splitting
+// them would mean two relays and two connections for one logical stream.
+func NewTerminalRelay(outbox outboxClaimer, config rabbitmq.Config) *Relay {
+	return &Relay{
+		outbox:     outbox,
+		config:     config,
+		eventTypes: []string{postgres.VideoJobCompletedEventType, postgres.VideoJobFailedEventType},
+		topology:   TerminalEventsTopology(),
 	}
 }
 
@@ -134,16 +155,18 @@ func (r *Relay) Run(ctx context.Context) error {
 // that is, whether it proved usable rather than merely dialable. Run uses it
 // to decide between redialing at once and backing off.
 func (r *Relay) serve(ctx context.Context, conn *amqp.Connection) (bool, error) {
-	// Declared on every dial, not once at startup. Nothing else declares
-	// this topology, so against a fresh broker the exchange does not exist
-	// and a publish to a missing exchange closes the channel instead of
-	// failing routably; and a broker recreated while the relay was
-	// disconnected gets its topology back on reconnect for the same reason.
+	// Declared on every dial, not once at startup. Against a fresh broker
+	// the exchange does not exist and a publish to a missing exchange closes
+	// the channel instead of failing routably; and a broker recreated while
+	// the relay was disconnected gets its topology back on reconnect for the
+	// same reason. Declaring is idempotent, so a topology something else also
+	// declares — the worker's consumer, for the dispatch topology — costs
+	// nothing here and removes any dependence on startup order.
 	if err := rabbitmq.DeclareTopology(conn, r.topology); err != nil {
 		return false, err
 	}
 
-	publisher, err := NewPublisher(conn, r.topology.Exchange, r.topology.RoutingKey)
+	publisher, err := NewPublisher(conn, r.topology.Exchange)
 	if err != nil {
 		return false, err
 	}
@@ -195,7 +218,7 @@ func (r *Relay) serve(ctx context.Context, conn *amqp.Connection) (bool, error) 
 // unpublished and the next poll retries them, and dropping a working
 // connection over it would help nothing.
 func (r *Relay) cycle(ctx context.Context, publisher *Publisher) error {
-	batch, err := r.outbox.Claim(ctx, r.eventType, maxPublishBatch)
+	batch, err := r.outbox.Claim(ctx, r.eventTypes, maxPublishBatch)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("video: outbox relay: claim: %v", err)
@@ -209,7 +232,11 @@ func (r *Relay) cycle(ctx context.Context, publisher *Publisher) error {
 
 	messages := make([]Message, 0, len(batch.Messages()))
 	for _, row := range batch.Messages() {
-		messages = append(messages, Message{ID: row.ID, Body: row.Payload})
+		// The routing key is the row's own event_type, not a per-relay
+		// constant: a relay carrying more than one type would otherwise
+		// publish every row under the name of whichever type it was
+		// configured with.
+		messages = append(messages, Message{ID: row.ID, RoutingKey: row.EventType, Body: row.Payload})
 	}
 	if len(messages) == 0 {
 		return nil

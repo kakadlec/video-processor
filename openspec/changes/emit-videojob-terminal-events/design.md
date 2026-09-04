@@ -109,4 +109,4 @@ Deploy order is unconstrained: an old worker writes no terminal events (harmless
 
 ## Open Questions
 
-- Whether `[]string` binds as `text[]` through the pgx stdlib driver, or whether the `string_to_array` fallback in decision 4 is needed. Resolved during implementation against the real PostgreSQL the suite runs on.
+- ~~Whether `[]string` binds as `text[]` through the pgx stdlib driver, or whether the `string_to_array` fallback in decision 4 is needed.~~ **Resolved: `ANY($1::text[])` with a Go `[]string`.** No experiment was needed — `OutboxRepository.MarkPublished` has bound a `[]string` to `ANY($1::uuid[])` through `database/sql` and the pgx stdlib driver in production since the outbox shipped, in the same file, on the same handle. The `string_to_array` fallback is not used and was not written.

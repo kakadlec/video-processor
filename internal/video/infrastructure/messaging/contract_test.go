@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -112,14 +113,14 @@ func TestJobDispatch_PreviousGenerationRoutingKeyReachesNoQueue(t *testing.T) {
 	// The current generation's exchange, addressed with the previous
 	// generation's routing key. The binding carries the generation too, so
 	// there is nothing for it to match.
-	previousKey := topo.RoutingKey + ".previous"
-	publisher, err := NewPublisher(conn, topo.Exchange, previousKey)
+	previousKey := topo.RoutingKeys[0] + ".previous"
+	publisher, err := NewPublisher(conn, topo.Exchange)
 	if err != nil {
 		t.Fatalf("open publisher: %v", err)
 	}
 	defer func() { _ = publisher.Close() }()
 
-	published, err := publisher.Publish(context.Background(), []Message{{ID: "00000000-0000-0000-0000-000000000001", Body: []byte(`{}`)}})
+	published, err := publisher.Publish(context.Background(), []Message{{ID: "00000000-0000-0000-0000-000000000001", RoutingKey: previousKey, Body: []byte(`{}`)}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -161,5 +162,158 @@ func TestJobDispatchTopology_DeclaresAgainstALiveBroker(t *testing.T) {
 	defer func() { _ = ch.Close() }()
 	if _, err := ch.QueueDeclarePassive(QueueJobs, true, false, false, false, nil); err != nil {
 		t.Fatalf("inspect %s: %v", QueueJobs, err)
+	}
+}
+
+// TestTerminalMessagesDecodeTheOutboxPayloads is the terminal streams' half
+// of the same contract TestJobQueuedMessageDecodesTheOutboxPayload closes for
+// dispatch: the bytes Repository.Update actually stored, decoded by the
+// structs a consumer will read them with, compared field by field against the
+// job that produced them.
+func TestTerminalMessagesDecodeTheOutboxPayloads(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+
+	t.Run("completed", func(t *testing.T) {
+		job, epoch := seedProcessingJob(t, repo, ids, "movie.mp4")
+		storageKey := domain.ResultStorageKey(job.ID())
+		if err := job.Complete(storageKey, 42); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		if _, err := repo.Update(ctx, job, epoch); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+
+		msg, err := ParseJobCompletedMessage(readTerminalPayload(t, db, postgres.VideoJobCompletedEventType, job))
+		if err != nil {
+			t.Fatalf("ParseJobCompletedMessage: %v", err)
+		}
+		if msg.Type != postgres.VideoJobCompletedEventType {
+			t.Errorf("Type = %q, want %q", msg.Type, postgres.VideoJobCompletedEventType)
+		}
+		if msg.JobID != job.ID().String() {
+			t.Errorf("JobID = %q, want %q", msg.JobID, job.ID().String())
+		}
+		if msg.UserID != job.UserID().String() {
+			t.Errorf("UserID = %q, want %q", msg.UserID, job.UserID().String())
+		}
+		if msg.FrameCount != 42 {
+			t.Errorf("FrameCount = %d, want 42", msg.FrameCount)
+		}
+		// The result key is what makes the message actionable: a notifier
+		// that cannot name the artifact has nothing to link to.
+		if msg.StorageKey != storageKey.String() {
+			t.Errorf("StorageKey = %q, want %q", msg.StorageKey, storageKey.String())
+		}
+		if msg.OccurredAt.IsZero() {
+			t.Error("OccurredAt is zero — the timestamp did not survive the round trip")
+		}
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		job, epoch := seedProcessingJob(t, repo, ids, "broken.mp4")
+		const reason = "ffmpeg exited with status 1"
+		if err := job.Fail(reason); err != nil {
+			t.Fatalf("Fail: %v", err)
+		}
+		if _, err := repo.Update(ctx, job, epoch); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+
+		msg, err := ParseJobFailedMessage(readTerminalPayload(t, db, postgres.VideoJobFailedEventType, job))
+		if err != nil {
+			t.Fatalf("ParseJobFailedMessage: %v", err)
+		}
+		if msg.Type != postgres.VideoJobFailedEventType {
+			t.Errorf("Type = %q, want %q", msg.Type, postgres.VideoJobFailedEventType)
+		}
+		if msg.JobID != job.ID().String() {
+			t.Errorf("JobID = %q, want %q", msg.JobID, job.ID().String())
+		}
+		if msg.UserID != job.UserID().String() {
+			t.Errorf("UserID = %q, want %q", msg.UserID, job.UserID().String())
+		}
+		if msg.ErrorReason != reason {
+			t.Errorf("ErrorReason = %q, want %q", msg.ErrorReason, reason)
+		}
+		if msg.OccurredAt.IsZero() {
+			t.Error("OccurredAt is zero — the timestamp did not survive the round trip")
+		}
+	})
+}
+
+// seedProcessingJob creates, enqueues, and claims a job, returning it with the
+// epoch its claim won — the state a terminal write starts from.
+func seedProcessingJob(t *testing.T, repo *postgres.Repository, ids domain.VideoJobIDGenerator, name string) (*domain.VideoJob, int64) {
+	t.Helper()
+	ctx := context.Background()
+
+	userID, err := domain.NewUserID("user-1")
+	if err != nil {
+		t.Fatalf("NewUserID: %v", err)
+	}
+	filename, err := domain.NewOriginalFilename(name)
+	if err != nil {
+		t.Fatalf("NewOriginalFilename: %v", err)
+	}
+	sourceKey, err := domain.NewStorageKey("uploads/upload-1_" + name)
+	if err != nil {
+		t.Fatalf("NewStorageKey: %v", err)
+	}
+
+	job, err := domain.NewVideoJob(ids, userID, filename, sourceKey, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", time.Now().UTC().Truncate(time.Microsecond))
+	if err != nil {
+		t.Fatalf("NewVideoJob: %v", err)
+	}
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := job.Enqueue(); err != nil {
+		t.Fatalf("job.Enqueue: %v", err)
+	}
+	if err := repo.Enqueue(ctx, job); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := job.StartProcessing(); err != nil {
+		t.Fatalf("job.StartProcessing: %v", err)
+	}
+	claimed, epoch, err := repo.ClaimForProcessing(ctx, job)
+	if err != nil {
+		t.Fatalf("ClaimForProcessing: %v", err)
+	}
+	if !claimed {
+		t.Fatal("ClaimForProcessing did not claim a freshly queued job")
+	}
+	return job, epoch
+}
+
+func readTerminalPayload(t *testing.T, db *sql.DB, eventType string, job *domain.VideoJob) []byte {
+	t.Helper()
+
+	var payload []byte
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT payload FROM video_job_outbox WHERE event_type = $1 AND payload->>'job_id' = $2`,
+		eventType, job.ID().String(),
+	).Scan(&payload); err != nil {
+		t.Fatalf("read %s payload: %v", eventType, err)
+	}
+	return payload
+}
+
+// TestTerminalEventsTopology_DeclaresAgainstALiveBroker is the check the
+// pinned names cannot make: that the terminal descriptor is one RabbitMQ will
+// accept, both bindings and all arguments included. It declares the real
+// names and deletes nothing, for the reason the dispatch equivalent does.
+func TestTerminalEventsTopology_DeclaresAgainstALiveBroker(t *testing.T) {
+	conn := openTestConn(t)
+	if err := rabbitmq.DeclareTopology(conn, TerminalEventsTopology()); err != nil {
+		t.Fatalf("declare the production terminal topology: %v", err)
+	}
+	// Declaring twice is what the relay does on every dial.
+	if err := rabbitmq.DeclareTopology(conn, TerminalEventsTopology()); err != nil {
+		t.Fatalf("redeclare the production terminal topology: %v", err)
 	}
 }

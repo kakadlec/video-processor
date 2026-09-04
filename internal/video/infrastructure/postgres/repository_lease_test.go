@@ -237,6 +237,18 @@ func TestRepository_Update_TwoTerminalWritesAtOneEpochProduceOneWinner(t *testin
 	if found.Status() != domain.JobStatusCompleted || found.FrameCount() != 4 {
 		t.Fatalf("job = %v/%d frames, want the first writer's completion", found.Status(), found.FrameCount())
 	}
+
+	// One outcome, one announcement. The two actors wrote genuinely
+	// different outcomes, so a second event here would be a duplicate no
+	// consumer could deduplicate — it would describe an end the job never
+	// reached.
+	rows := terminalOutboxRowsFor(t, db, job)
+	if len(rows) != 1 {
+		t.Fatalf("terminal outbox rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].eventType != completedEventType {
+		t.Fatalf("event_type = %q, want the winner's %q", rows[0].eventType, completedEventType)
+	}
 }
 
 // TestRepository_Update_ARetryOfItsOwnOutcomeAppliesNothingAndDoesNotFence

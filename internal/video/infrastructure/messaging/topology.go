@@ -1,5 +1,5 @@
-// Package messaging defines the Video Processing context's job-dispatch
-// topology on the shared AMQP broker.
+// Package messaging defines the Video Processing context's job-dispatch and
+// terminal-event topologies on the shared AMQP broker.
 //
 // The names live here rather than in internal/platform/rabbitmq because
 // ddd-architecture confines that package to connection/lifecycle plumbing,
@@ -61,15 +61,70 @@ const (
 	deadLetterMaxLength = 10000
 )
 
-// JobDispatchTopology returns the descriptor this context declares.
+// The declared terminal-event topology: a job's outcome, announced once it is
+// durable.
+//
+// It is a second topology rather than a second routing key on the dispatch
+// exchange because the two streams have different consumers, different
+// lifetimes, and different generations. Binding both to one exchange would
+// mean a dispatch generation bump renaming the terminal stream too.
+//
+// The queue name says "terminal.events" rather than naming a state, because
+// one queue carries both outcomes: a consumer interested in a job's end is
+// interested in either. The generation suffix on the exchange, the queue, and
+// the two routing keys moves together, and the routing keys must stay equal
+// to postgres.VideoJobCompletedEventType and postgres.VideoJobFailedEventType
+// for the reason the dispatch key must — TestRoutingKeyMatchesTheOutboxEventType
+// pins all three pairs.
+//
+// The dead-letter sink is the dispatch topology's, unversioned and shared,
+// for the same reason it is shared across generations: one place to look.
+const (
+	ExchangeTerminal        = "video.jobs.terminal.v1"
+	RoutingKeyJobCompleted  = "video_job.completed.v1"
+	RoutingKeyJobFailed     = "video_job.failed.v1"
+	QueueTerminalEvents     = "video.jobs.terminal.events.v1"
+	terminalEventsMaxLength = 10000
+)
+
+// JobDispatchTopology returns the dispatch descriptor this context declares.
 func JobDispatchTopology() rabbitmq.Topology {
 	return rabbitmq.Topology{
 		Exchange:       ExchangeJobs,
-		RoutingKey:     RoutingKeyJobQueued,
+		RoutingKeys:    []string{RoutingKeyJobQueued},
 		WorkQueue:      QueueJobs,
 		DeadExchange:   ExchangeDeadLetter,
 		DeadQueue:      QueueDeadLetter,
 		WorkMaxLength:  jobsMaxLength,
+		DeadMessageTTL: deadLetterTTL,
+		DeadMaxLength:  deadLetterMaxLength,
+	}
+}
+
+// TerminalEventsTopology returns the terminal-event descriptor this context
+// declares. Its queue is bound under both terminal routing keys, so one
+// consumer sees every outcome in the order the broker delivered them.
+//
+// The queue is declared before any consumer exists, which is the point: the
+// relay publishes mandatory and stamps published_at only for messages the
+// broker both acknowledged and routed, so publishing into an exchange with no
+// binding would return every message unroutable and re-attempt it on every
+// poll forever. A declared queue holds the events until a consumer arrives.
+//
+// Like the job queue it carries a maximum length with reject-publish and no
+// message TTL, but the TTL's absence has a different reason here. On the job
+// queue an expired message would leave a job reporting "queued" with nothing
+// able to advance it; here the job is already terminal and correct in the
+// database — what expiry would discard is the only announcement that outcome
+// ever gets.
+func TerminalEventsTopology() rabbitmq.Topology {
+	return rabbitmq.Topology{
+		Exchange:       ExchangeTerminal,
+		RoutingKeys:    []string{RoutingKeyJobCompleted, RoutingKeyJobFailed},
+		WorkQueue:      QueueTerminalEvents,
+		DeadExchange:   ExchangeDeadLetter,
+		DeadQueue:      QueueDeadLetter,
+		WorkMaxLength:  terminalEventsMaxLength,
 		DeadMessageTTL: deadLetterTTL,
 		DeadMaxLength:  deadLetterMaxLength,
 	}
