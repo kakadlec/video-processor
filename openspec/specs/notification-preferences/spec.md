@@ -44,14 +44,22 @@ Without that assertion the two independently-declared literals can drift with no
 
 ### Requirement: A Webhook Preference Carries a Destination and a Signing Secret
 
-A preference on the `webhook` channel SHALL carry an absolute `http` or `https` destination URL and a signing secret. Both SHALL be present when the preference is first created; a request that omits either SHALL be rejected with `400`. A destination that is not an absolute URL with one of those two schemes SHALL be rejected. A secret shorter than the required minimum length SHALL be rejected.
+A preference on the `webhook` channel SHALL carry an absolute `http` or `https` destination URL and a signing secret. Both SHALL be present when the preference is first created; a request that omits either SHALL be rejected with `400`. A destination that is not an absolute URL with one of those two schemes SHALL be rejected. A secret shorter than the required minimum length SHALL be rejected, and so SHALL one containing a NUL byte.
 
 The secret is registered here rather than by the delivery capability because a destination with no secret describes an endpoint that cannot be signed, and a user who registered one would have no way to learn that it will never be called.
+
+The NUL rule is a contract rather than a storage detail because it decides the status code a caller sees. JSON encodes `\u0000` as a real NUL byte, so a request body can carry one; the column the secret is stored in cannot hold it. Rejecting the value at validation is what makes a malformed request a `400` instead of a write that fails with a driver error and surfaces as a `500` the caller can do nothing about.
 
 #### Scenario: Creating a webhook preference without a secret is rejected
 
 - **GIVEN** an authenticated user with no preference stored for a triple
 - **WHEN** they submit a preference for that triple carrying a destination but no secret
+- **THEN** the request is rejected with `400` and no preference is stored
+
+#### Scenario: A secret carrying a NUL byte is rejected
+
+- **GIVEN** an authenticated user
+- **WHEN** they submit a secret of otherwise sufficient length whose bytes include a NUL
 - **THEN** the request is rejected with `400` and no preference is stored
 
 #### Scenario: A non-absolute or non-HTTP destination is rejected
