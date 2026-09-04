@@ -78,7 +78,7 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 - **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12
 - **Frame extraction:** `ffmpeg` (via `exec.CommandContext`, in `cmd/worker`)
 - **Identity and job persistence:** PostgreSQL (via `pgx`), including a transactional outbox
-- **Job dispatch:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — outbox relay in `cmd/api`, consumer in `cmd/worker`
+- **Job dispatch and terminal events:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — dispatch outbox relay in `cmd/api`, consumer in `cmd/worker`, and a second outbox relay in `cmd/worker` publishing each job's `completed`/`failed` outcome (no consumer yet)
 - **Object storage:** MinIO / S3-compatible (via [`minio-go`](https://github.com/minio/minio-go)) for source videos and ZIP results
 - **Idempotency, rate limiting, status cache, worker leases:** Redis (via [`go-redis`](https://github.com/redis/go-redis))
 - **Password hashing:** bcrypt

@@ -4,7 +4,9 @@
 
 Define `internal/video/infrastructure/messaging`, the Video Processing context's job-dispatch topology on the shared AMQP broker and the consumer that reads from it: the pinned exchange, routing key, queue, and dead-letter sink; the generation scheme that isolates one processing model from the next; and the obligation on any publisher to publish persistently.
 
-The names live in the context rather than in `internal/platform/rabbitmq` because `ddd-architecture` confines that package to connection/lifecycle plumbing, never a specific context's use case. The generic descriptor and the function that declares it are defined by `rabbitmq-infrastructure`; only the values are here. The outbox relay (`videojob-outbox-relay`) publishes to this topology from `cmd/api` and declares it on every connection; `cmd/worker` consumes from it and declares it on every connection too, so neither process depends on the other having started first. What the consumer then does with a delivery is `videojob-worker`'s.
+The names live in the context rather than in `internal/platform/rabbitmq` because `ddd-architecture` confines that package to connection/lifecycle plumbing, never a specific context's use case. The generic descriptor and the function that declares it are defined by `rabbitmq-infrastructure`; only the values are here. The dispatch relay (`videojob-outbox-relay`) publishes to this topology from `cmd/api` and declares it on every connection; `cmd/worker` consumes from it and declares it on every connection too, so neither process depends on the other having started first. What the consumer then does with a delivery is `videojob-worker`'s.
+
+This capability covers the **job-dispatch** topology only. The same Go package also defines the terminal-event topology and the relay that publishes to it, which run in `cmd/worker` and are specified by `videojob-terminal-events`; the two topologies are separate exchanges and queues sharing one dead-letter sink, and a dispatch generation bump does not rename the terminal stream. So `cmd/worker` is not only a consumer — it publishes too — and `cmd/api` is not the only process running an outbox relay.
 
 ## Requirements
 

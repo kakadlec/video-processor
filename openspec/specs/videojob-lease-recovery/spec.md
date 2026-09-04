@@ -211,7 +211,7 @@ An unbounded requeue SHALL NOT be shipped. A job that reliably kills the process
 
 - **GIVEN** a `processing` job whose `source_key` is empty, as a row predating that column carries
 - **WHEN** the sweeper finds it unleased
-- **THEN** it is `failed` on the cycle that confirms it, no outbox row is written for it, and it is not seen again by a later sweep
+- **THEN** it is `failed` on the cycle that confirms it, no further queued outbox row is written for it (the terminal write commits its own `video_job.failed.v1` row, per `videojob-terminal-events`), and it is not seen again by a later sweep
 
 #### Scenario: Only the sweeper that committed the failure cleans up
 

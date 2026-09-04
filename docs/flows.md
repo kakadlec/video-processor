@@ -191,7 +191,7 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 
 ## What is still missing (Phase 7)
 
-- **Notifications.** On completion the Notification context is meant to be triggered by a `VideoJobCompleted` / `VideoJobFailed` domain event over RabbitMQ. Neither event is written anywhere yet: `CompleteJob` and `FailJob` persist through `Repository.Update`, which is deliberately not an outbox writer, so Phase 7 decides their shape on its own terms.
+- **Notifications.** On completion the Notification context is meant to be triggered by a `VideoJobCompleted` / `VideoJobFailed` domain event over RabbitMQ. **Both events now exist** (`emit-videojob-terminal-events`): `CompleteJob` and `FailJob` persist through `Repository.Update`, which commits the matching `video_job.completed.v1`/`video_job.failed.v1` outbox row in the same transaction as the fenced terminal `UPDATE`, and only when that statement affected a row — so one job's outcome leaves exactly one record however many actors raced to finish it. A relay in `cmd/worker` publishes those rows to `video.jobs.terminal.v1`, where one durable queue bound under both routing keys holds them. What is missing is the **consumer**: no Notification context exists, nothing reads that queue, and no notification is delivered. Messages accumulate there by design until `add-notification-webhook-delivery` ships, and deduplicating repeated deliveries — the relay is at-least-once — is that consumer's obligation.
 
 ---
 

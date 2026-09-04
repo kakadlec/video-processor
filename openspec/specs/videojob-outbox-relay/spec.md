@@ -6,6 +6,8 @@ Define the transactional-outbox relay that carries the current job-dispatch gene
 
 The relay is the only thing in this system that publishes to `videojob-messaging`'s job-dispatch topology, and it is deliberately in no request path: `POST /upload` records the dispatch in the same transaction that queues the job (`videojob-persistence`) and returns without touching the broker. The row is the durable record; the relay is what turns it into a message. `cmd/worker` is what consumes those messages — see `videojob-worker` — so a message this relay publishes is now a live trigger rather than an inert side effect.
 
+The mechanism this capability defines now has a second instance: `videojob-terminal-events` runs one inside `cmd/worker` for the terminal events, claiming its own disjoint set of event types from the same table. Everything here about claiming, committing, and proving delivery applies to it unchanged; what stays specific to the dispatch relay is which process owns it and which topology it publishes to.
+
 ## Requirements
 
 ### Requirement: The Relay Carries Unpublished Outbox Rows to the Broker
@@ -26,22 +28,26 @@ The relay is not in any request path. `POST /upload` neither publishes nor waits
 - **WHEN** the relay runs
 - **THEN** it is not claimed and no further message is produced from it
 
-### Requirement: The Claim Is Scoped to One Event Type
+### Requirement: The Claim Is Scoped to an Explicit Set of Event Types
 
-The relay's claim SHALL filter on the `event_type` of the job-dispatch generation it publishes into, and a supporting index SHALL exist for that predicate.
+A relay's claim SHALL filter on an explicit, closed set of `event_type` values — the events that relay exists to publish — and a supporting index SHALL exist for that predicate. A relay publishing a single event type SHALL express that as a one-element set; the set SHALL never be widened to "everything unpublished".
 
-This is not an optimization, and it now serves two purposes rather than one.
+This is not an optimization, and it serves three purposes.
 
-It keeps internal events off the job queue. `video_job_outbox` has accumulated an unpublished `video_job.created` row for every job created since Phase 3, and those rows are internal events that must never reach the job queue. An unfiltered claim would re-read that backlog on every poll and, with a bounded batch, could starve the rows the relay exists to deliver — publishing nothing while appearing to work.
+It keeps internal events off the broker. `video_job_outbox` has accumulated an unpublished `video_job.created` row for every job created since Phase 3, and those rows are internal events that must never be dispatched. An unfiltered claim would re-read that backlog on every poll and, with a bounded batch, could starve the rows a relay exists to deliver — publishing nothing while appearing to work.
 
-**It is also what isolates dispatch generations, and that is load-bearing during a rolling deploy.** Every replica's relay reads the same `video_job_outbox` table, so a filter shared across generations would let a new replica's relay claim an old replica's row and publish it into the new generation, and an old replica's relay claim a new replica's row and publish it into the old one — where nothing consumes it and the job waits in `queued` forever. Isolating at the exchange cannot help, because the crossing happens before anything is published, and an already-deployed relay cannot be given a new predicate. The current generation's `event_type` SHALL therefore differ from every previous generation's, and a relay SHALL NOT be given a predicate that matches more than its own.
+**It isolates dispatch generations, and that is load-bearing during a rolling deploy.** Every replica's relay reads the same `video_job_outbox` table, so a filter shared across generations would let a new replica's relay claim an old replica's row and publish it into the new generation, and an old replica's relay claim a new replica's row and publish it into the old one — where nothing consumes it and the job waits in `queued` forever. Isolating at the exchange cannot help, because the crossing happens before anything is published, and an already-deployed relay cannot be given a new predicate. The current generation's `event_type` SHALL therefore differ from every previous generation's, and a relay SHALL NOT be given a predicate that matches more than its own.
 
-The event-type string SHALL be a single constant shared between the insert, the claim, and the routing key, so the writer, the reader, and the broker cannot drift apart into a relay that silently matches nothing.
+**It keeps two relays off each other's rows.** More than one relay now runs against this table — job dispatch in `cmd/api`, terminal events in `cmd/worker` (`videojob-terminal-events`). Their sets SHALL be disjoint, so neither claims work the other is responsible for and neither's backlog can starve the other's. Concurrency between replicas of the *same* relay remains safe by row locking, unchanged.
+
+Each event-type string SHALL be a single constant shared between the insert, the claim, and the routing key, so the writer, the reader, and the broker cannot drift apart into a relay that silently matches nothing. Where a relay claims more than one type, **the routing key SHALL be read from the claimed row's own `event_type`** rather than fixed per relay, so a message can only ever be published under the key naming what it actually is. The test pinning that equality SHALL cover every type a relay publishes, not one literal pair.
+
+Ordering within a claim SHALL remain oldest-first by `occurred_at` across the whole set.
 
 #### Scenario: Creation events are never dispatched
 
 - **GIVEN** unpublished `video_job.created` rows in the outbox
-- **WHEN** the relay runs
+- **WHEN** any relay runs
 - **THEN** none of them is published, and none of their `published_at` values changes
 
 #### Scenario: A backlog of other event types does not starve dispatch
@@ -55,6 +61,18 @@ The event-type string SHALL be a single constant shared between the insert, the 
 - **GIVEN** unpublished dispatch rows written under a previous generation's `event_type`
 - **WHEN** the current generation's relay runs
 - **THEN** none of them is claimed or published, and none of their `published_at` values changes as a result of that relay
+
+#### Scenario: A relay never claims a row outside its own set
+
+- **GIVEN** unpublished rows of an event type another relay is responsible for
+- **WHEN** this relay runs
+- **THEN** none of them is claimed or published, and none of their `published_at` values changes as a result of that relay
+
+#### Scenario: A multi-type relay publishes each row under its own event type
+
+- **GIVEN** unpublished rows of two different event types within one relay's set
+- **WHEN** the relay publishes them
+- **THEN** each message's routing key is byte-identical to the `event_type` of the row it came from
 
 ### Requirement: Concurrent Relays Do Not Publish the Same Row Twice
 
