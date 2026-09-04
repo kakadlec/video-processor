@@ -71,11 +71,15 @@ Each delivery SHALL be resolved to exactly one of three dispositions:
 
 | Situation | Disposition |
 |---|---|
-| Delivered; budget exhausted and recorded; or nothing to deliver — no matching preference, disabled, before the enrolment boundary, or claim refused | Acknowledge |
+| Delivered; budget exhausted and recorded; nothing to deliver — no matching preference, disabled, before the enrolment boundary, or claim refused; or an outcome that could not be recorded after the attempts were made | Acknowledge |
 | A body that cannot be decoded, or an event type this consumer does not recognize | Dead-letter, without requeue |
-| A failure of the consumer's own dependency — the Notification database unreachable while claiming or recording | Requeue, after a pause |
+| A failure of the consumer's own dependency **before any attempt is made** — the Notification database unreachable while claiming | Requeue, after a pause |
 
 The third disposition is a deliberate difference from `videojob-worker`, which has only the first two, and the difference SHALL NOT be read as an inconsistency. There, a requeued job meets a row that has already moved past `queued` and can only lose the claim again, so redelivery loops rather than recovers. Here the message has not been acted on at all and the dependency that failed is one that returns, so dead-lettering it would discard a user's notification because of a database blip. The pause before the next delivery is what prevents that disposition from becoming a hot loop against a database that is still down.
+
+**The requeue disposition SHALL be reachable only before an attempt has been made**, and this boundary is load-bearing rather than incidental. A claim that was never granted leaves nothing behind, so redelivery genuinely retries. A claim that *was* granted leaves a freshly-claimed row, and a redelivery meeting that row is refused the claim and acknowledged as "nothing to deliver" — so requeueing after a failed recording would discard the outcome permanently, and could send the webhook a second time first.
+
+An outcome that cannot be recorded SHALL therefore be retried a bounded number of times against a context detached from shutdown, exactly as `videojob-worker` retries a terminal write it has already earned. If it still cannot be recorded, the message SHALL be acknowledged and the failure SHALL be logged with the delivery identifier and the outcome that was lost. This leaves a row in `pending` that nothing will ever resolve, and that is an accepted accounting loss rather than a recoverable state: acknowledging is chosen because the webhook was actually sent, requeueing would lose the outcome as described above, and dead-lettering would report a failure for a delivery that succeeded. A `pending` row older than the reclaim bound with no consumer in flight is the operational signal for this case, and `docs/operations.md` SHALL name it as such.
 
 A message that cannot be decoded SHALL NOT be requeued: redelivering it produces the same failure forever.
 
@@ -91,11 +95,23 @@ A message that cannot be decoded SHALL NOT be requeued: redelivering it produces
 - **WHEN** the consumer handles it
 - **THEN** it is dead-lettered without requeue
 
-#### Scenario: A database outage requeues rather than discards
+#### Scenario: A database outage before any attempt requeues rather than discards
 
-- **GIVEN** the Notification database is unreachable
+- **GIVEN** the Notification database is unreachable when the consumer tries to claim
 - **WHEN** the consumer handles a terminal event
 - **THEN** the message is requeued, no delivery is attempted, and the consumer pauses before taking the next message
+
+#### Scenario: An outcome that cannot be recorded is acknowledged, not requeued
+
+- **GIVEN** a delivery whose attempts have completed and whose resolution fails on every bounded retry
+- **WHEN** the consumer finishes handling it
+- **THEN** the message is acknowledged, the loss is logged with the delivery identifier and the outcome, and the message is neither requeued nor dead-lettered
+
+#### Scenario: A resolution refused by the fence is acknowledged without retry
+
+- **GIVEN** a delivery whose claim was superseded by a reclaim while its attempts were running
+- **WHEN** it resolves and the write is refused because its claim token is no longer current
+- **THEN** the refusal is logged, no retry is made, and the message is acknowledged — the successor owns the outcome
 
 #### Scenario: Nothing to deliver is an acknowledgement, not a failure
 

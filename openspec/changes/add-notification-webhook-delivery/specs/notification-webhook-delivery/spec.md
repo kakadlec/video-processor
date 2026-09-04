@@ -6,7 +6,9 @@ A terminal event SHALL be delivered to a preference only when all of the followi
 
 The creation time is the enrolment boundary, and it is a rule rather than a one-time cutoff. The terminal queue accumulated events for the whole period between `emit-videojob-terminal-events` and this change, so a consumer with no boundary would announce, on its first start, outcomes its users were never subscribed to. `videojob-outbox-relay` answered the same problem with an explicit `occurred_at` cutoff, but a cutoff fixed at a deploy also discards events that are legitimately old — every event that arrived while the consumer was down. A standing instruction that does not announce what happened before it was given needs no constant, keeps holding once the backlog is drained, and cannot be forgotten at the next deploy.
 
-The boundary SHALL be the preference's creation time and SHALL NOT be its last-updated time. Disabling and re-enabling a preference therefore SHALL NOT re-open the window over events that occurred while it was disabled: those were not delivered when they arrived, and the record of that decision is not revisited.
+The boundary SHALL be the preference's creation time and SHALL NOT be its last-updated time, so that editing a destination or toggling the enabled flag never moves it.
+
+The two predicates are evaluated at different times, and the difference SHALL be stated rather than left to be inferred. `created_at` is compared against the event's `occurred_at`, so it is **historical**: it asks whether the preference existed when the thing happened. `enabled` is read as it stands **when the event is handled**, so it is a routing switch rather than a record of what was true at the time. The consequence is that an event which occurred while a preference was disabled, and which is still on the queue when its owner re-enables it, SHALL be delivered. This is accepted rather than prevented: the alternative is a persisted enablement history, which is materially more machinery for a case that only arises when the consumer is behind, and `enabled` means "send me these" rather than "and also forget what happened while you were not". What re-enabling SHALL NOT do is re-send anything already resolved — the delivery record refuses a second claim on it.
 
 #### Scenario: An event predating the preference is not delivered
 
@@ -25,6 +27,18 @@ The boundary SHALL be the preference's creation time and SHALL NOT be its last-u
 - **GIVEN** a webhook preference for the event's type whose `enabled` flag is false
 - **WHEN** a matching event is handled
 - **THEN** no request is made and the event is treated as handled
+
+#### Scenario: Re-enabling before the event is handled delivers it
+
+- **GIVEN** a preference created before an event occurred, disabled while the event was queued, and enabled again before the consumer reached it
+- **WHEN** the consumer handles that event
+- **THEN** it is delivered, because `enabled` is read when the event is handled and not as of the moment it occurred
+
+#### Scenario: Re-enabling does not re-send a resolved delivery
+
+- **GIVEN** a delivery already resolved for a preference
+- **WHEN** its owner disables and re-enables the preference
+- **THEN** nothing is re-sent, because the resolved delivery record refuses a second claim
 
 #### Scenario: An event with no matching preference is handled, not failed
 
@@ -74,16 +88,23 @@ A refused claim SHALL NOT be reported as a failure. A duplicate is the expected 
 
 ### Requirement: The Delivered Payload Is the Notification Context's Own and Carries a Generation
 
-The request body SHALL be a payload defined by the Notification context, carrying the delivery's identifier, the event type, the time the outcome occurred, and the outcome's data. It SHALL NOT be the Video Processing wire payload forwarded verbatim.
+The request body SHALL be a payload defined by the Notification context, carrying **its own version**, the delivery's identifier, the event type, the time the outcome occurred, and the outcome's data. It SHALL NOT be the Video Processing wire payload forwarded verbatim.
 
 Forwarding would make an internal contract public: every subsequent change to what the outbox writes would become a breaking change for every registered endpoint, and the generation suffix `videojob-terminal-events` uses to isolate producer changes would be leaking out of the system it isolates. The Notification payload SHALL therefore be versioned in its own right, independently of the event type's generation.
+
+That version SHALL appear **on the wire**, as a top-level field of the body, and SHALL NOT be left implicit in the event type's own `.v1` suffix. A version a receiver cannot read is not a version: the whole purpose of separating the two generations is that the payload can change while the event type does not, and a receiver that has only the event type to look at cannot tell the two shapes apart. It is a body field rather than a header or a media type so that it falls inside what the signature covers, and so a receiver that logs the body has logged the version with it. The two generations SHALL be free to advance independently, and neither SHALL be derived from the other.
 
 The payload SHALL NOT carry the owning user's identifier: the receiver is that user, addressed at a URL only that user registered, so including it adds nothing and widens what a mis-delivered request would disclose. It SHALL NOT carry the signing secret, and it SHALL NOT carry a credential of any kind — the result storage key names an object that is still only retrievable through an authenticated, owner-scoped route.
 
 #### Scenario: A completion delivery names the job and its result
 
 - **WHEN** a completion event is delivered
-- **THEN** the body carries the delivery identifier, the event type, the time the outcome occurred, the job identifier, the frame count, and the result storage key
+- **THEN** the body carries the payload version, the delivery identifier, the event type, the time the outcome occurred, the job identifier, the frame count, and the result storage key
+
+#### Scenario: The payload version is readable without parsing the event type
+
+- **WHEN** any delivery body is received
+- **THEN** a top-level version field states which payload contract it follows, it is covered by the signature, and its value is not derived from the event type's own generation suffix
 
 #### Scenario: A failure delivery names the job and its reason
 
@@ -131,7 +152,11 @@ Every attempt for one delivery SHALL carry the same delivery identifier, so a re
 
 ### Requirement: A Destination Is Refused Both Where It Is Registered and Where It Is Dialled
 
-The system SHALL apply one destination policy at two points: when a preference is written, and again when a connection is opened. The policy SHALL require a transport-secure scheme and SHALL refuse addresses that are loopback, private, link-local, or otherwise not routable to a third party — including cloud instance-metadata addresses. At dial time it SHALL be evaluated against the **resolved network address**, not against the hostname alone. Redirects SHALL NOT be followed, the response body SHALL be bounded, and every attempt SHALL be bounded in time.
+The system SHALL apply one destination policy at two points: when a preference is written, and again when a connection is opened. The policy SHALL require a transport-secure scheme. At dial time it SHALL be evaluated against the **resolved network address**, not against the hostname alone. Redirects SHALL NOT be followed, the response body SHALL be bounded, and every attempt SHALL be bounded in time.
+
+The address rule SHALL be expressed as a permission rather than a prohibition: **only an address that is globally reachable unicast may be dialled**, and everything else SHALL be refused. A deny-list of the ranges one happens to think of is the wrong shape for this rule, because the failure mode of forgetting a range is a reachable internal host, while the failure mode of an over-broad refusal is a destination a user must re-register.
+
+Refusal SHALL cover, at minimum: loopback, the unspecified address, link-local (which is what covers `169.254.169.254`), multicast, RFC 1918 private space, **shared address space `100.64.0.0/10`**, **benchmarking `198.18.0.0/15`**, IETF protocol assignments `192.0.0.0/24`, the documentation ranges `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`, reserved `240.0.0.0/4`, `0.0.0.0/8`, and the IPv6 equivalents including unique-local `fc00::/7` and IPv6 link-local. The three ranges named in bold are called out because a general "is this a global unicast address" predicate answers *yes* for all of them, so a policy built only from such a predicate would leave exactly the gap this requirement exists to close; the enumeration SHALL be explicit and SHALL be tested range by range. An address in an IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form SHALL be unwrapped to the IPv4 address it embeds and evaluated as that address, so a refused address cannot be reached by rewriting it.
 
 Two evaluations are required rather than one, and neither is redundant. A write-time check alone cannot survive a hostname that resolves differently later, nor a policy tightened after the row was stored. A dial-time check alone silently accepts a destination that will never be delivered to, which is the outcome the closed `Channel` set already rejects for `email`: a preference the system stores and never acts on is indistinguishable, to its owner, from one that works.
 
@@ -147,7 +172,7 @@ Preferences stored before this policy took effect SHALL NOT be migrated or delet
 
 #### Scenario: An internal address is refused at registration
 
-- **WHEN** a user submits a destination naming a loopback, private, or link-local address
+- **WHEN** a user submits a destination naming a loopback, private, or link-local address, or one in shared, benchmarking, documentation, or reserved space
 - **THEN** the request is rejected with `400` and no preference is stored
 
 #### Scenario: A hostname resolving to an internal address is refused at dial
@@ -155,6 +180,18 @@ Preferences stored before this policy took effect SHALL NOT be migrated or delet
 - **GIVEN** a stored destination whose hostname resolves to a private or link-local address
 - **WHEN** a delivery to it is attempted
 - **THEN** no connection is made to that address, and the delivery is recorded as refused by policy
+
+#### Scenario: A globally-unicast but non-public address is refused
+
+- **GIVEN** a destination whose address is in shared address space, benchmarking space, or reserved space — each of which a general global-unicast predicate accepts
+- **WHEN** it is registered, and when a delivery to it is attempted
+- **THEN** it is refused at both points
+
+#### Scenario: A mapped form of a refused address is still refused
+
+- **GIVEN** a destination resolving to an IPv4-mapped or NAT64 form of an address the policy refuses
+- **WHEN** the dial-time check runs
+- **THEN** the embedded address is evaluated and the connection is refused
 
 #### Scenario: A redirect is not followed
 

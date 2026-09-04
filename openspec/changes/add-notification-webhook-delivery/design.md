@@ -50,29 +50,36 @@ An event is delivered to a preference only when `event.occurred_at > preference.
 
 This does the job an explicit deploy-date cutoff would have done — `videojob-outbox-relay` carried exactly such a requirement for its own pre-existing rows — without its defect. A date constant discards everything older than the deploy, including events that are legitimately old because the notifier was down; and it needs a second decision, and a second deploy, every time the situation recurs. The preference's own age is self-limiting and states a rule rather than a fact about one afternoon: *a standing instruction does not announce what happened before it was given.*
 
-Consequences accepted deliberately: `created_at` is not touched by the upsert's update branch, so disabling and re-enabling a preference does not re-open the window; and a user who registers a preference one second after their job finished does not get told about that job. Both are the correct reading of "was not subscribed at the time".
+Consequences accepted deliberately: `created_at` is not touched by the upsert's update branch, so editing a destination or toggling `enabled` never moves the boundary; and a user who registers a preference one second after their job finished does not get told about that job. Both are the correct reading of "was not subscribed at the time".
+
+The two predicates are evaluated at different times, and it is worth being precise about which. `created_at` is compared against `occurred_at`, so it is historical. `enabled` is read as it stands when the event is *handled*, so it is a routing switch rather than a record of what was true when the event occurred. That means an event which occurred during a disabled interval, and is still queued when the preference is re-enabled, will be delivered. The alternative is persisting an enablement history and evaluating `occurred_at` against it, which is real machinery for a window that only opens when the consumer is behind; `enabled` reads naturally as "send me these", not "and also forget what happened while you weren't". Nothing already resolved is re-sent — the delivery record refuses a second claim on it.
 
 *Alternative rejected*: delivering the whole backlog. In today's data it would be nearly harmless — the feature is days old and few preferences exist — which is exactly why it is a bad rule to write down: it is right only until it isn't.
 
 ### Delivery records are claimed before the attempt, not written after it
 
-`notification_deliveries`, primary key `(user_id, event_type, channel, job_id)`, holds one row per logical delivery with an `id`, a status, an attempt count, and timestamps.
+`notification_deliveries`, primary key `(user_id, event_type, channel, job_id)`, holds one row per logical delivery with a stable `delivery_id`, a `claim_token`, a status, an attempt count, and timestamps.
 
 The row is written **before** the HTTP request, in one statement:
 
 ```
 INSERT ... ON CONFLICT (user_id, event_type, channel, job_id) DO UPDATE
-   SET claimed_at = $now, attempts = 0, id = notification_deliveries.id
+   SET claimed_at = $now, attempts = 0, claim_token = $token,
+       delivery_id = notification_deliveries.delivery_id
  WHERE notification_deliveries.status = 'pending'
    AND notification_deliveries.claimed_at < $stale
-RETURNING id
+RETURNING delivery_id, claim_token
 ```
 
-Zero rows means someone else already claimed this delivery, or it already reached a terminal outcome; the message is acked and nothing is sent. This is what discharges the obligation `videojob-terminal-events` assigns to its consumer, and it is a claim rather than a post-hoc record because writing afterwards leaves a read-then-act race that two notifier replicas would lose.
+Zero rows means someone else already claimed this delivery, or it already reached a terminal outcome; the message is acked and nothing is sent.
 
-The `status = 'pending' AND claimed_at < $stale` conjunct is one extra predicate that closes the only hole a claim-first design has: a process that dies between claiming and recording an outcome would otherwise strand the delivery forever. It is the same shape as the sweeper's takeover of an abandoned job, reduced to a single statement because there is no lease and no epoch — nothing here needs fencing, since a duplicate delivery is undesirable rather than corrupting.
+That refusal is also why a failure to *record* an outcome cannot be requeued. Only a claim-time failure requeues, because nothing was granted and redelivery genuinely retries. Once the claim is held, the row is freshly claimed, so a redelivery is refused the claim and acked as "nothing to deliver" — requeueing would discard the outcome permanently, and would re-send the webhook first. An unrecordable outcome is therefore retried on a shutdown-detached context (as `cmd/worker` retries `CompleteJob`) and then, if it still will not commit, logged with the delivery id and acked. That leaves a row in `pending` that nothing will ever resolve: no redelivery is coming, because the message was acked, and the reclaim branch only fires when a *new* delivery of the same event arrives. It is an accounting loss, accepted because every alternative is worse — requeue loses the outcome, dead-letter reports failure for a webhook that succeeded. `docs/operations.md` names the signal: a `pending` row well past the reclaim bound with no consumer in flight. This is what discharges the obligation `videojob-terminal-events` assigns to its consumer, and it is a claim rather than a post-hoc record because writing afterwards leaves a read-then-act race that two notifier replicas would lose.
 
-The `id` is a UUID generated at claim and reused across the attempt budget, so the receiver's own dedup key is stable across our retries; the `DO UPDATE ... SET id = notification_deliveries.id` clause is what keeps it stable across a takeover too.
+The `status = 'pending' AND claimed_at < $stale` conjunct is one extra predicate that closes the only hole a claim-first design has: a process that dies between claiming and recording an outcome would otherwise strand the delivery forever. It is the same shape as the sweeper's takeover of an abandoned job, reduced to a single statement because there is no lease to renew.
+
+It does, however, need a fence, and the two identifiers exist so it can have one. `delivery_id` is the receiver's dedup key, generated at claim, reused across the attempt budget, and preserved across a takeover by the `DO UPDATE ... SET delivery_id = notification_deliveries.delivery_id` clause. `claim_token` is reissued on every grant, and `ResolveDelivery` matches on `delivery_id AND claim_token AND status = 'pending'`. Without it the takeover predicate is unsound: `claimed_at < $stale` proves a claim is *old*, not that the process holding it stopped — a claimant blocked on a slow endpoint for longer than the bound is still running, and would otherwise resolve after its successor and overwrite the newer outcome. This is `videojob-worker`'s `lease_epoch` fence in a different spelling, and for the same reason.
+
+A resolve the fence refuses is not retried. It means a successor owns this delivery, so the correct action is to log and acknowledge.
 
 *Alternative rejected*: Redis, the store the upload idempotency key uses. That store is explicitly fail-open (`fail-open-upload-idempotency`), which there degrades to "an extra job" and here would degrade to "an extra webhook" — the exact thing the record exists to prevent. It is also the natural home for the delivery history the retry policy reports into, which Redis is not.
 
@@ -102,8 +109,10 @@ The third exists precisely because the reason `cmd/worker` forbids requeue does 
 
 One policy type in `internal/notification/domain`, consulted in two places:
 
-1. **At write** (`PUT /api/notification-preferences`, `cmd/api`): scheme must be `https`; the host must not be a literal loopback/private/link-local address or `localhost`. A destination that could never be delivered to is refused where the user sees the error — the argument the closed `Channel` set already makes for rejecting `email` rather than storing it and silently doing nothing.
+1. **At write** (`PUT /api/notification-preferences`, `cmd/api`): scheme must be `https`; the host must not be `localhost` or a literal address the policy refuses. A destination that could never be delivered to is refused where the user sees the error — the argument the closed `Channel` set already makes for rejecting `email` rather than storing it and silently doing nothing.
 2. **At dial** (`cmd/notifier`): the same policy re-checked against the **resolved IP** inside `net.Dialer.Control`, which is the only place a DNS name that resolves to `169.254.169.254` is actually caught. Redirects are not followed (`CheckRedirect` returns an error), the response body is read under a small cap and discarded, and the whole attempt runs under the per-attempt timeout.
+
+The address rule is written as an allow-list — only globally-reachable unicast may be dialled — rather than a deny-list of ranges someone thought of, because forgetting a range yields a reachable internal host while an over-broad refusal only costs a re-registration. It cannot be `IsGlobalUnicast()` alone, though: that predicate answers *yes* for `100.64.0.0/10` (CGNAT), `198.18.0.0/15` (benchmarking), and `240.0.0.0/4` (reserved), all of which route inside real operator networks. So the check is the stdlib predicates **plus** an explicit prefix table covering those and the documentation, protocol-assignment, and `0.0.0.0/8` ranges, with IPv4-mapped and NAT64 forms unwrapped to the embedded IPv4 address before evaluation — otherwise a refused address is reachable by rewriting it.
 
 Two layers rather than one, for the reason `Secret`'s own comment gives about `String`/`Format`/`%p`: each closes what the other leaves open. Write-time validation cannot survive DNS rebinding or a policy tightened after the row was stored; dial-time validation cannot tell the user why their URL was refused.
 
@@ -130,11 +139,13 @@ X-FiapX-Delivery: <delivery id>
 X-FiapX-Timestamp: <unix seconds>
 X-FiapX-Signature: sha256=<hex HMAC-SHA256 over "<timestamp>.<body>">
 
-{"id": "...", "type": "video_job.completed.v1", "occurred_at": "...",
+{"version": 1, "id": "...", "type": "video_job.completed.v1", "occurred_at": "...",
  "data": {"job_id": "...", "frame_count": 42, "storage_key": "frames_<id>.zip"}}
 ```
 
 The envelope is built by Notification rather than forwarded from Video Processing's wire payload. Forwarding would publish an internal contract: every future change to what the outbox writes would become a breaking change for every registered endpoint, and `videojob-terminal-events`' generation suffix would be leaking out of the system it was designed to isolate. `user_id` is omitted from `data` because the receiver is that user; the triple is theirs by construction.
+
+`version` is the Notification payload's own generation, and it is on the wire rather than implied. Saying the payload "is versioned independently of the event type" is empty if a receiver has only `type` to look at: the entire point of the separation is that the envelope can change while `video_job.completed.v1` does not, and the receiver is the party that needs to tell those apart. It is a body field rather than a header so it falls inside what the signature covers, and so a receiver that logs the body has logged the version with it.
 
 The signature covers `timestamp.body` rather than the body alone, so a captured request cannot be replayed indefinitely against a receiver that checks the timestamp's age. That is a property the receiver has to use, which is why the timestamp is a header rather than only a body field.
 

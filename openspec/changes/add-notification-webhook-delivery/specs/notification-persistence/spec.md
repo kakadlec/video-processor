@@ -2,9 +2,11 @@
 
 ### Requirement: Storage Holds One Delivery Record Per Preference and Job, Claimed Atomically
 
-The Notification context SHALL store one delivery record per `(user_id, event_type, channel, job_id)`, and the uniqueness of that identity SHALL be enforced by the database rather than by a read-then-write in application code. The record SHALL carry a stable delivery identifier, the delivery's status, the number of attempts made, and the times it was claimed and resolved. It SHALL NOT carry the signing secret, the request body, or any part of the destination beyond what identifies the preference.
+The Notification context SHALL store one delivery record per `(user_id, event_type, channel, job_id)`, and the uniqueness of that identity SHALL be enforced by the database rather than by a read-then-write in application code. The record SHALL carry a stable delivery identifier, a claim token, the delivery's status, the number of attempts made, and the times it was claimed and resolved. It SHALL NOT carry the signing secret, the request body, or any part of the destination beyond what identifies the preference.
 
 Claiming SHALL be a **single atomic statement that both inserts and refuses**: it SHALL create the record when none exists, SHALL refuse when one exists that is resolved or freshly claimed, and SHALL grant a claim over one that was claimed but left unresolved beyond a bounded period. It SHALL preserve the existing delivery identifier when it grants such a reclaim, so a receiver deduplicating on that identifier still sees one logical delivery.
+
+The two identifiers are separate because they answer different questions, and collapsing them would be a correctness bug rather than a simplification. The **delivery identifier** is what the receiver sees and deduplicates on, so it SHALL survive a reclaim. The **claim token** identifies *which* grant is current, and SHALL be reissued on every grant, reclaims included. Expiry of the reclaim bound proves only that a claim is old — it does not prove the process holding it stopped, so a slow first claimant can still be running when a second is granted. Resolution SHALL therefore be fenced on the claim token: a write whose token is no longer the current one SHALL be refused and SHALL change nothing, so the superseded claimant cannot overwrite the outcome its successor recorded. This is the same fence `videojob-worker` puts on a terminal write with `lease_epoch`, for the same reason.
 
 A single statement rather than a check followed by an insert is what makes the guarantee hold across processes. Two consumers evaluating "has this been delivered?" separately both read *no*, and both deliver; that is precisely the duplicate the record exists to prevent.
 
@@ -26,7 +28,19 @@ The table SHALL be created by the same migration path the context already owns, 
 
 - **GIVEN** a delivery record claimed but never resolved, older than the reclaim bound
 - **WHEN** a claim for the same identity is attempted
-- **THEN** it is granted, the attempt count restarts, and the delivery identifier is unchanged
+- **THEN** it is granted, the attempt count restarts, the delivery identifier is unchanged, and a new claim token is issued
+
+#### Scenario: A superseded claimant cannot resolve
+
+- **GIVEN** a delivery record reclaimed after the bound, so a new claim token is current
+- **WHEN** the previous claimant resolves using the token it holds
+- **THEN** the write is refused, no row is changed, and the record still reflects the current claimant
+
+#### Scenario: The current claimant resolves
+
+- **GIVEN** a delivery record whose claim token is the one the caller holds
+- **WHEN** it resolves the delivery
+- **THEN** the write is applied and the record moves out of `pending`
 
 #### Scenario: An unresolved claim inside the bound is refused
 
