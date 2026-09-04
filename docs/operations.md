@@ -167,6 +167,8 @@ Nothing publishes to or consumes from them once the rollout completes, so this i
 
 Those queues do not drain on their own either: the job queue carries no message TTL by design (see the RabbitMQ section below), so a superseded generation's backlog persists until it is deleted.
 
+**The terminal-event generation retires nothing.** `emit-videojob-terminal-events` introduced `video.jobs.terminal.v1` / `video.jobs.terminal.events.v1` as a first generation, so there is no predecessor to delete after that deploy; the `.v1` suffix is there so a later payload change has an escape hatch, not because anything is being replaced. Do not extend the deletions above to any `terminal` name.
+
 ---
 
 ## Implemented Infrastructure
@@ -210,17 +212,17 @@ Unlike Redis's, MinIO's contents are authoritative once results move there: `doc
 
 ---
 
-### RabbitMQ — Topology declared, published to by the outbox relay, consumed by `cmd/worker` (Phase 6)
+### RabbitMQ — Topologies declared, published to by two outbox relays, dispatch consumed by `cmd/worker` (Phase 6; terminal events Phase 7)
 
 `internal/platform/rabbitmq` opens, health-checks, and closes an AMQP connection and declares a topology; `internal/video/infrastructure/messaging` defines the one this context uses. Both shipped with `add-rabbitmq-infrastructure`.
 
-**Both processes open a connection.** `cmd/api` runs the outbox relay as a goroutine, publishing `video_job.queued.v2` events (`add-videojob-source-key-and-outbox-relay`); `cmd/worker` runs the consumer that reads them (`migrate-upload-to-async-processing`). Each declares the topology after every successful dial, so neither depends on the other having started first, and a broker recreated while one was disconnected gets its entities back. See "The outbox relay" and "The worker" below.
+**Three connections across the two processes.** `cmd/api` opens one, for the dispatch outbox relay publishing `video_job.queued.v2` events (`add-videojob-source-key-and-outbox-relay`). `cmd/worker` opens two: the consumer that reads those dispatches (`migrate-upload-to-async-processing`), and — since `emit-videojob-terminal-events` — a second relay publishing `video_job.completed.v1` and `video_job.failed.v1` (`add-notification-webhook-delivery` will add the consumer for those). Each declares its topology after every successful dial, so no process depends on another having started first, and a broker recreated while one was disconnected gets its entities back. See "The outbox relays" and "The worker" below.
 
 - **`RABBITMQ_URL`** holds a full AMQP URI (`amqp://user:pass@host:5672/vhost`), not a `host:port` pair like `REDIS_ADDR`: the URI carries the scheme that selects TLS, the credentials, and the virtual host. `cmd/api`'s `setupVideo` and `cmd/worker`'s `setupWorker` each load it through `LoadConfigFromEnv` as their **first** step, before any I/O, so a missing variable fails fast and clearly instead of after PostgreSQL and MinIO have already been opened.
 - **`Open` connects**, unlike the Redis and MinIO adapters, which construct a client without touching the network. AMQP has no lazy client, so an unreachable broker or wrong credentials surface immediately rather than on first use.
 - **The health check is a real round trip** — it opens a channel and closes it. The client's own `IsClosed()` predicate reports only what the process has already observed, which is stale for a broker that stopped answering without the connection being torn down.
 
-The declared topology, and the two operational policies in it that are decisions rather than defaults:
+The declared dispatch topology, and the two operational policies in it that are decisions rather than defaults:
 
 | Entity | Name | Arguments |
 |---|---|---|
@@ -229,6 +231,15 @@ The declared topology, and the two operational policies in it that are decisions
 | Job queue | `video.jobs.queued.v2` | `x-max-length` 10 000, `x-overflow` `reject-publish`, dead-letters to `video.jobs.dlx` |
 | Dead-letter exchange | `video.jobs.dlx` | `fanout`, durable |
 | Dead-letter queue | `video.jobs.dead` | `x-message-ttl` 24 h, `x-max-length` 10 000, `x-overflow` `drop-head`, forwards nowhere |
+
+The terminal-event topology, declared by `cmd/worker`'s relay and sharing the same dead-letter sink:
+
+| Entity | Name | Arguments |
+|---|---|---|
+| Terminal exchange | `video.jobs.terminal.v1` | `direct`, durable |
+| Routing keys | `video_job.completed.v1`, `video_job.failed.v1` | each equal to the outbox `event_type` string it carries |
+| Terminal queue | `video.jobs.terminal.events.v1` | bound under **both** routing keys; `x-max-length` 10 000, `x-overflow` `reject-publish`, dead-letters to `video.jobs.dlx` |
+
 
 - **A full job queue refuses new publishes; it does not drop old ones.** `reject-publish` means the broker nacks the publisher rather than evicting the oldest queued job, so a full queue becomes back-pressure: the publisher leaves its outbox row unstamped, retries, and the system resumes when the queue drains. Nothing is lost. Expect a stalled relay and a growing count of unpublished outbox rows as the symptom, not missing jobs.
 - **Job messages never expire**, and that takes two things, not one. The job queue deliberately carries no `x-message-ttl`; publishers must also leave the per-message `expiration` property unset, since RabbitMQ honours it independently of any queue setting. Either one would dead-letter a message without any update to its `video_jobs` row, and the state machine has no transition out of `queued` except to `processing` — so the job would report `queued` to its owner forever. A backlog therefore persists until it is consumed rather than aging out, which is the intended trade.
@@ -253,11 +264,13 @@ The volume is named `<project>_rabbitmq_data`, and Compose derives `<project>` f
 - **Local/CI service:** `docker-compose.yml` and CI both start `rabbitmq:4-alpine`. CI uses a service container, unlike MinIO, whose image needs command arguments a service container cannot supply.
 - **Local/CI credentials** (`video`/`video`) are fixed, non-secret defaults. They are a dedicated account rather than the built-in `guest` because RabbitMQ confines `guest` to loopback as the broker itself sees it, and every connection here arrives over a Docker network.
 
-#### The outbox relay
+#### The outbox relays
 
 `cmd/api` starts one relay goroutine (`internal/video/infrastructure/messaging.Relay`) and stops it on `SIGINT`/`SIGTERM`. It exists because `POST /upload` must not depend on the broker: `Repository.Enqueue` commits the `pending → queued` update and a `video_job.queued.v2` outbox row in one transaction, and the relay carries that row to RabbitMQ afterwards.
 
-Each cycle it opens a transaction, claims a bounded batch of unpublished rows with `SELECT … FOR UPDATE SKIP LOCKED` (so several `cmd/api` replicas can each run one without dispatching the same row twice), publishes them **mandatory** on a confirm-mode channel, stamps `published_at` only for the messages the broker both acknowledged and did not return, and commits. The poll interval (2 s), the batch size (100 rows), the confirmation timeout (15 s), and the dial backoff are compile-time constants — there is no environment variable to tune them, matching the status cache's fixed TTL.
+`cmd/worker` starts a second one, of the same type and with the same cycle, for the terminal events. It runs there rather than in `cmd/api` because the worker is the process that writes those rows — its own `CompleteJob`/`FailJob` commits and the sweeper's abandonment write — so an outcome is still announced when no API replica is up. The two relays claim **disjoint sets of event types** from the one shared `video_job_outbox` table (`event_type = ANY(...)`), so neither's backlog can starve the other's, and each publishes every row under the routing key that row's own `event_type` names.
+
+Each cycle it opens a transaction, claims a bounded batch of unpublished rows with `SELECT … FOR UPDATE SKIP LOCKED` (so several replicas can each run one without dispatching the same row twice), publishes them **mandatory** on a confirm-mode channel, stamps `published_at` only for the messages the broker both acknowledged and did not return, and commits. The poll interval (2 s), the batch size (100 rows), the confirmation timeout (15 s), and the dial backoff are compile-time constants — there is no environment variable to tune them, matching the status cache's fixed TTL.
 
 Operationally, three things are worth knowing before they surprise you:
 
@@ -271,10 +284,19 @@ Operationally, three things are worth knowing before they surprise you:
    GROUP BY event_type;
   ```
 
-  A growing `video_job.queued.v2` count with an ageing `min(occurred_at)` means the relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. A large and **steadily growing** `video_job.created` count is normal: one row is written per job created and none is ever marked published, so that number only ever goes up. Those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`) — which is exactly why an unbounded backlog there is harmless rather than a leak to chase.
-- **Delivery is at-least-once.** The relay commits only after the broker acknowledges, so a crash in between republishes rather than loses. A consumer must tolerate a duplicate regardless, since a nack or a consumer crash produces one too.
+  A growing `video_job.queued.v2` count with an ageing `min(occurred_at)` means the dispatch relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. The same reading applies to `video_job.completed.v1` and `video_job.failed.v1` for the worker's terminal relay, with one difference in the expected steady state: those two should hover near zero and drain within a poll or two even though **nothing consumes the queue they are published to**, because a stamped row means the broker accepted and routed the message, not that anyone read it. A growing unpublished count for them, paired with a `video.jobs.terminal.events.v1` depth sitting at its 10 000-message limit, is the `reject-publish` back-pressure symptom described below. A large and **steadily growing** `video_job.created` count is normal: one row is written per job created and none is ever marked published, so that number only ever goes up. Those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`) — which is exactly why an unbounded backlog there is harmless rather than a leak to chase.
+- **Delivery is at-least-once.** The relay commits only after the broker acknowledges, so a crash in between republishes rather than loses. A consumer must tolerate a duplicate regardless, since a nack or a consumer crash produces one too. That holds for the terminal events too: exactly one *row* is recorded per job outcome, but one row can still become more than one message, and deduplication (keyed on `job_id` and event type) belongs to whatever consumes the queue.
 
 Its lifecycle transitions are logged — started, connection lost, reconnected, stopped — because a healthy relay is otherwise invisible. Repeated dial failures back off from 1 s to a 30 s ceiling, and the topology is redeclared after every successful dial, so a broker that was recreated while the relay was disconnected gets its exchange and queues back before the next publish.
+
+#### The terminal-event queue has no consumer yet
+
+`video.jobs.terminal.events.v1` is declared, durable, and deliberately unread until `add-notification-webhook-delivery` ships. It is declared now rather than with its consumer because the relay publishes **mandatory**: an exchange with no bound queue returns every message unroutable, the row is never stamped, and the relay would re-attempt it on every poll forever.
+
+- **Expected depth: at least one message per terminal job, rising.** Every job that reaches `completed` or `failed` adds a message, nothing removes any, and delivery is at-least-once — one outcome row can become more than one message, so read the depth as a floor on outcomes announced, not as an exact count of them. A rising number is the system working, not a fault. A depth that stops rising while jobs keep finishing is a fault **only if the queue is not sitting at its bound**; at the bound it is the designed back-pressure described next, and the unpublished-row query above is what tells the two apart.
+- **At the 10 000-message bound it becomes back-pressure, not loss.** The queue carries `x-overflow reject-publish`, so the broker nacks the relay rather than evicting the oldest outcome; the relay leaves the row's `published_at` NULL and retries on the next poll. The symptom pair is a queue pinned at its limit **and** a growing count of unpublished `video_job.completed.v1`/`video_job.failed.v1` rows in the query above. Nothing is lost, and nothing about job processing degrades: uploads, extraction, and downloads are all unaffected, because the only thing stalled is the announcement.
+- **Clearing it discards those announcements permanently — that is the trade, not a caveat on it.** A purged message is not regenerated: its outbox row was stamped `published_at` the moment the broker acknowledged and routed it, so the relay has no reason to publish it again, and `videojob-terminal-events` specifies the queue as holding events until the consumer reads them. `rabbitmqctl purge_queue video.jobs.terminal.events.v1` therefore takes the outcome announcements of every job that finished before anyone was listening out of existence. What survives is the authoritative record — the `video_jobs` row and its outbox row — so nothing about a job's state, its artifact, or its download is affected; what is lost is only the notification those jobs would have produced. That is an acceptable trade **while no consumer exists**, and it is the available response to the bound in that window; once a consumer is deployed, do not purge, and let its first run work through the buffered burst instead.
+- **The queue carries no message TTL, and the reason differs from the job queue's.** There, an expired message would leave a job reporting `queued` with nothing able to advance it. Here the job is already terminal and correct in PostgreSQL — what expiry would discard is the only announcement that outcome ever gets.
 
 #### The worker
 
@@ -317,7 +339,7 @@ Normal recovery latency includes the remaining lease TTL plus up to two sweep in
 
 Do **not** manually change `status` or `lease_epoch`, publish a dispatch, or delete a lease. The requeue and outbox insert must commit together, and the epoch increment is what fences a prior worker. If recovery does not happen, preserve the row and artifacts, inspect the logs above, verify `source_key` still exists, and check for `frames_<jobID>.zip` from a fenced run. Escalate rather than bypassing repository predicates.
 
-Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking deliveries and the recovery sweeper to stop concurrently. `run` joins the sweeper first, then waits up to **5 minutes** for the consumer's job in hand. The handler is detached from the shutdown signal, so a normal shutdown does not kill `ffmpeg` or abort its terminal write. If the deadline expires and the process is terminated, the delivery may be redelivered and lose its old claim; after the abandoned lease expires and absence is confirmed, the sweeper either advances the row's epoch and emits a fresh dispatch or, at the requeue bound, commits terminal `failed` without another dispatch. Give worker containers more than five minutes of stop grace, adding margin for the preceding sweeper join and final resource shutdown, to avoid duplicated extraction even though the fence protects state.
+Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking deliveries and the recovery sweeper to stop concurrently. `run` joins the sweeper first, then stops and joins the terminal-event relay — both hold a database transaction while they run, so the pool must outlive them — and only then waits up to **5 minutes** for the consumer's job in hand. The handler is detached from the shutdown signal, so a normal shutdown does not kill `ffmpeg` or abort its terminal write. If the deadline expires and the process is terminated, the delivery may be redelivered and lose its old claim; after the abandoned lease expires and absence is confirmed, the sweeper either advances the row's epoch and emits a fresh dispatch or, at the requeue bound, commits terminal `failed` without another dispatch. Give worker containers more than five minutes of stop grace, adding margin for the preceding sweeper and relay joins and final resource shutdown, to avoid duplicated extraction even though the fence protects state. The relay is stopped where its cycle stands rather than drained to empty, so a terminal row committed during the drain is published by a later cycle — in the next worker to start, or in another replica — rather than delaying shutdown.
 
 ---
 
@@ -327,7 +349,7 @@ Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking d
 
 ### Email / Webhook delivery — Planned (Phase 7)
 
-Notification infrastructure for `VideoJobCompleted` and `VideoJobFailed` events. Owned by the Notification bounded context. Delivery methods and preferences are per-user. Webhook delivery includes retry logic and HMAC signature verification.
+Notification infrastructure for `VideoJobCompleted` and `VideoJobFailed` events. **Both events are already emitted** — `emit-videojob-terminal-events` records them transactionally and publishes them to `video.jobs.terminal.v1`; what is missing is the consumer, so see "The terminal-event queue has no consumer yet" above for how that queue behaves in the meantime. Owned by the Notification bounded context. Delivery methods and preferences are per-user. Webhook delivery includes retry logic and HMAC signature verification.
 
 ### Observability — Planned (Phase 8)
 
