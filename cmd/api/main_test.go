@@ -114,7 +114,7 @@ func startTestServerWithModule(t *testing.T) (*httptest.Server, string, *videoMo
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -386,7 +386,7 @@ func TestUpload_ValidVideo_QueuesTheJobAndAnswers202(t *testing.T) {
 func TestDownload_EveryRejectionIsByteIdentical(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -536,7 +536,7 @@ func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
 	repo := newInMemoryVideoJobRepository()
 	results := newFakeResultStorage()
 	module, _ := newIdempotencyTestVideoModuleWithRepoAndStorage(repo, results)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -594,7 +594,7 @@ func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
 func TestDownload_NonOwnerReceivesNoGrant(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -723,7 +723,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // discriminating signal.
 func TestUpload_LargeInvalidExtension_RejectsWithoutReadingFullBody(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
-	router := setupRouter(identity, newTestVideoModule(t), alwaysAllowRateLimiter{})
+	router := setupRouter(identity, newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{})
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
 	var headerBuf bytes.Buffer

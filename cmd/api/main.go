@@ -46,13 +46,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	notification, notificationDB, err := setupNotification(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	rateLimitConfig, err := platformratelimit.LoadConfigFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
 	limiter := platformratelimit.NewLimiter(redisClient, rateLimitConfig)
 
-	r := setupRouter(identity, video, limiter)
+	r := setupRouter(identity, video, notification, limiter)
 
 	// Signal-aware rather than log.Fatal(r.Run(...)): that exits through
 	// os.Exit, which runs no deferred call and waits for nothing, so the
@@ -118,6 +123,11 @@ func main() {
 
 	closeDB(videoDB)
 	closeDB(identityDB)
+	// Appended rather than inserted into the sequence above, which is
+	// ordered against the relay. Nothing borrows this pool for a whole
+	// operation — there is no notification relay and no goroutine holding
+	// it — so it closes alongside the other two rather than among them.
+	closeDB(notificationDB)
 	if err := redisClient.Close(); err != nil {
 		log.Printf("close redis: %v", err)
 	}
@@ -135,12 +145,12 @@ func serveEmbeddedFile(c *gin.Context, path, contentType string) {
 	c.Data(200, contentType, data)
 }
 
-func setupRouter(identity *identityModule, video *videoModule, limiter videoRateLimiter) *gin.Engine {
+func setupRouter(identity *identityModule, video *videoModule, notification *notificationModule, limiter videoRateLimiter) *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if c.Request.Method == "OPTIONS" {
@@ -173,6 +183,16 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	// entitlement from the VideoJob row — GET /download/:filename for
 	// results, and nothing at all for sources, which no route exposes.
 	video.registerRoutes(videoRoutes)
+
+	// A separate group from videoRoutes, carrying the same middleware pair
+	// in the same order. The pair is the invariant, not the group: these
+	// routes serve no video-processing artifact, and sharing videoRoutes
+	// would tie their authorization to a comment that describes something
+	// else.
+	notificationRoutes := r.Group("/")
+	notificationRoutes.Use(identity.requireBearerAuth())
+	notificationRoutes.Use(rateLimitMiddleware(limiter))
+	notification.registerRoutes(notificationRoutes)
 
 	identity.registerRoutes(r)
 

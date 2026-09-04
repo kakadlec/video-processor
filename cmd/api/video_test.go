@@ -576,7 +576,7 @@ func startTestVideoServer(t *testing.T) (*httptest.Server, jwtauth.Adapter) {
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens
 }
@@ -966,7 +966,7 @@ func startIdempotencyTestServer(t *testing.T) (*httptest.Server, jwtauth.Adapter
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store, _ := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens, store
 }
@@ -1010,7 +1010,7 @@ func startIdempotencyTestServerWithRepoAndStorage(t *testing.T, repo videodomain
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store := newIdempotencyTestVideoModuleWithRepoAndStorage(repo, results)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens, store
 }
@@ -1111,7 +1111,7 @@ func sha256Hex(content []byte) string {
 func TestHandleVideoUpload_DuplicateWhileReservationInFlight_ReturnsExistingJob(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1193,7 +1193,7 @@ func TestHandleVideoUpload_DuplicateWhileReservationInFlight_ReturnsExistingJob(
 func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameJobWithoutCreatingANewOne(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, _, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1235,7 +1235,7 @@ func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameJobWithoutCreatin
 func TestHandleVideoUpload_RetryAfterWorkerClearedTheKey_CreatesNewJob(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, _, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1327,7 +1327,7 @@ func TestHandleVideoUpload_ReservationNeverResolves_ReturnsConflict(t *testing.T
 func TestHandleVideoUpload_DuplicateAfterFailure_ReturnsTheFailedJobBeforeClear(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, _, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1409,7 +1409,7 @@ func TestHandleVideoUpload_CreateVideoJobFailure_ClearsReservationForImmediateRe
 func TestHandleVideoUpload_ReserveError_ProceedsWithoutIdempotencyProtection(t *testing.T) {
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	store.reserveErr = errors.New("simulated redis outage")
@@ -1681,7 +1681,7 @@ func startSourceStorageTestServer(t *testing.T) (srv *httptest.Server, token, us
 		ids,
 	)
 
-	srv = httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv = httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	user, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	return srv, token, user.String(), module, repo, inspector
@@ -1764,7 +1764,7 @@ func newEnqueueTestVideoModule() (*videoModule, *fakeIdempotencyStore, *inMemory
 func TestHandleVideoUpload_QueuesTheJobThroughTheOutboxWritingPath(t *testing.T) {
 	module, _, repo, _ := newEnqueueTestVideoModule()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1791,7 +1791,7 @@ func TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything(t 
 	module, store, repo, sources := newEnqueueTestVideoModule()
 	repo.enqueueErr = errors.New("outbox write failed")
 	identity, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1841,7 +1841,7 @@ func TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything(t 
 func TestHandleVideoUpload_QueuesTheJobBeforeFinalizingItsIdempotencyKey(t *testing.T) {
 	module, store, repo, _ := newEnqueueTestVideoModule()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(identity, module, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
