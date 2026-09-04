@@ -1,6 +1,10 @@
 package domain
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"io"
+)
 
 // ErrInvalidSecret is returned when a value fails Secret construction —
 // empty, or shorter than MinSecretLength.
@@ -29,13 +33,23 @@ const redactedSecret = "notification.Secret{REDACTED}"
 // redacted placeholder, MarshalJSON refuses outright, and the bytes come out
 // of exactly one deliberately-named accessor.
 //
-// Omitting String entirely would be worse than useless: fmt reaches an
-// unexported field through reflection, so a Secret with no String would
-// print its contents under %v and its field name and contents under %+v.
-// See NotificationPreference, which carries a Secret and redacts for the
-// same reason.
+// Three layers get it there, each closing what the one before leaves open.
+//
+// String alone would not: fmt consults Stringer only for %v, %s, %q, %x and
+// %X, and reflects over the struct for every other verb, so %d would render
+// {%!d(string=<the secret>)}. Format closes that, being consulted for every
+// verb — every verb but one. fmt answers %p before it looks for a Formatter,
+// and its "bad verb" diagnostic then re-prints the argument with method
+// dispatch disabled, so no rendering hook of any kind can intervene.
+//
+// Which is why the value is held behind a pointer: what reflection reaches
+// on that last path is an address rather than the bytes. It also protects
+// every type that holds a Secret as a field, where fmt cannot call methods
+// at all — see PreferenceIntent and NotificationPreference, which carry one.
+// The indirection costs nothing: a Secret is immutable, so copies sharing
+// one string are indistinguishable from copies holding their own.
 type Secret struct {
-	value string
+	value *string
 }
 
 // NewSecret validates raw as at least MinSecretLength bytes long. An
@@ -45,7 +59,7 @@ func NewSecret(raw string) (Secret, error) {
 	if len(raw) < MinSecretLength {
 		return Secret{}, ErrInvalidSecret
 	}
-	return Secret{value: raw}, nil
+	return Secret{value: &raw}, nil
 }
 
 // Reveal returns the secret's bytes. It is named to make every disclosure a
@@ -53,12 +67,15 @@ func NewSecret(raw string) (Secret, error) {
 // callers are the persistence adapter storing the value and, later, the
 // delivery adapter signing with it.
 func (s Secret) Reveal() string {
-	return s.value
+	if s.value == nil {
+		return ""
+	}
+	return *s.value
 }
 
 // IsZero reports whether the Secret is the unset zero value.
 func (s Secret) IsZero() bool {
-	return s.value == ""
+	return s.value == nil || *s.value == ""
 }
 
 // String renders a redacted placeholder so an accidental log line or error
@@ -70,6 +87,14 @@ func (s Secret) String() string {
 // GoString does the same for %#v.
 func (s Secret) GoString() string {
 	return redactedSecret
+}
+
+// Format renders the redacted placeholder for every verb it is consulted
+// for, including the numeric and boolean ones String cannot reach. %p is the
+// exception fmt gives no hook for; the pointer field above is what covers
+// that path.
+func (s Secret) Format(f fmt.State, verb rune) {
+	_, _ = io.WriteString(f, redactedSecret)
 }
 
 // MarshalJSON refuses. A Secret has no place in any response body, so an

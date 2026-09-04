@@ -40,8 +40,11 @@ func NewDestination(raw string) (Destination, error) {
 	}
 	// A scheme alone does not make a URL absolute in the sense that matters
 	// here: url.Parse("http:///path") reports scheme http and no host, which
-	// is not an address anything could be delivered to.
-	if parsed.Host == "" {
+	// is not an address anything could be delivered to. Hostname() rather
+	// than Host, because a port-only authority is the same failure wearing a
+	// disguise — url.Parse("http://:8080/hooks") reports Host ":8080" and no
+	// hostname at all.
+	if parsed.Hostname() == "" {
 		return Destination{}, ErrInvalidDestination
 	}
 

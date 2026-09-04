@@ -195,7 +195,7 @@ func TestNotificationPreference_IsNeverRenderedWithItsSecret(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q"} {
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%d", "%t", "%f", "%p"} {
 		t.Run(verb, func(t *testing.T) {
 			for _, rendered := range []string{
 				fmt.Sprintf(verb, preference),
@@ -204,8 +204,39 @@ func TestNotificationPreference_IsNeverRenderedWithItsSecret(t *testing.T) {
 				if strings.Contains(rendered, validSecret) {
 					t.Fatalf("fmt %s rendered the secret: %s", verb, rendered)
 				}
+				// %p is an address by construction: fmt answers it before
+				// consulting any rendering hook, so it can carry neither the
+				// secret nor the triple.
+				if verb == "%p" {
+					continue
+				}
 				if !strings.Contains(rendered, parts.userID.String()) {
 					t.Fatalf("fmt %s dropped the identifying triple: %s", verb, rendered)
+				}
+			}
+		})
+	}
+}
+
+// TestPreferenceIntent_IsNeverRenderedWithItsSecret covers the write intent,
+// which is the shape a handler actually holds and so the one most likely to
+// reach a log line.
+func TestPreferenceIntent_IsNeverRenderedWithItsSecret(t *testing.T) {
+	parts := validParts(t)
+
+	intent, err := domain.NewPreferenceIntent(parts.userID, parts.eventType, parts.channel, true, parts.destination, &parts.secret)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%d", "%t", "%f", "%p"} {
+		t.Run(verb, func(t *testing.T) {
+			for _, rendered := range []string{
+				fmt.Sprintf(verb, intent),
+				fmt.Sprintf(verb, &intent),
+			} {
+				if strings.Contains(rendered, validSecret) {
+					t.Fatalf("fmt %s rendered the secret: %s", verb, rendered)
 				}
 			}
 		})

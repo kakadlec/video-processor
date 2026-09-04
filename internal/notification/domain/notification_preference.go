@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -37,9 +38,7 @@ var ErrPreferenceTimestampsRequired = errors.New("notification: created at and u
 // one.
 //
 // The secret is held as a pointer so that "omitted" and "empty" stay
-// distinguishable all the way down from the request body, and as a side
-// effect fmt renders it as an address rather than a value when an intent is
-// printed as a struct field.
+// distinguishable all the way down from the request body.
 type PreferenceIntent struct {
 	userID      UserID
 	eventType   EventType
@@ -86,6 +85,21 @@ func NewPreferenceIntent(userID UserID, eventType EventType, channel Channel, en
 		destination: destination,
 		secret:      secret,
 	}, nil
+}
+
+// String renders the intent by the triple it names and nothing else, for
+// the same reason NotificationPreference does; see the note on its String.
+func (i PreferenceIntent) String() string {
+	return fmt.Sprintf("notification.PreferenceIntent{user:%s event_type:%s channel:%s}",
+		i.userID, i.eventType, i.channel)
+}
+
+// GoString does the same for %#v.
+func (i PreferenceIntent) GoString() string { return i.String() }
+
+// Format routes every verb through String.
+func (i PreferenceIntent) Format(f fmt.State, verb rune) {
+	_, _ = io.WriteString(f, i.String())
 }
 
 // UserID returns the owner the preference is stored for.
@@ -218,6 +232,16 @@ func (p NotificationPreference) String() string {
 
 // GoString does the same for %#v.
 func (p NotificationPreference) GoString() string { return p.String() }
+
+// Format routes every verb through String, including the numeric and boolean
+// ones fmt answers by reflecting over the struct — %d on a preference would
+// otherwise walk into the unexported secret field and print it inside a
+// %!d(string=...) diagnostic, which Secret's own Format cannot prevent for
+// the same reflection reason described above. %p is the one verb fmt offers
+// no hook for; Secret holding its bytes behind a pointer is what covers it.
+func (p NotificationPreference) Format(f fmt.State, verb rune) {
+	_, _ = io.WriteString(f, p.String())
+}
 
 // PreferenceView is what every read path returns: a preference described
 // without its secret, reporting only that one is present. It is a plain

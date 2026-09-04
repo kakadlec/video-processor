@@ -62,7 +62,11 @@ func TestSecret_IsNeverRenderedByFmt(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q"} {
+	// The non-string verbs are the ones String cannot reach: fmt consults
+	// Stringer only for %v, %s, %q, %x and %X, and reflects over the struct
+	// for the rest, so %d would render {%!d(string=<the secret>)}. Only
+	// Format covers them.
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d", "%t", "%f", "%c", "%p", "%U"} {
 		t.Run(verb, func(t *testing.T) {
 			rendered := fmt.Sprintf(verb, secret)
 			if strings.Contains(rendered, validSecret) {
@@ -74,8 +78,10 @@ func TestSecret_IsNeverRenderedByFmt(t *testing.T) {
 	// A pointer must be as safe as a value: fmt follows one at the top
 	// level, so a pointer-receiver-only String would leave this printing the
 	// struct's contents.
-	if rendered := fmt.Sprintf("%+v", &secret); strings.Contains(rendered, validSecret) {
-		t.Fatalf("fmt %%+v on a *Secret rendered the secret: %s", rendered)
+	for _, verb := range []string{"%+v", "%d", "%p"} {
+		if rendered := fmt.Sprintf(verb, &secret); strings.Contains(rendered, validSecret) {
+			t.Fatalf("fmt %s on a *Secret rendered the secret: %s", verb, rendered)
+		}
 	}
 }
 

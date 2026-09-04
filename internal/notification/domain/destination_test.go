@@ -25,6 +25,8 @@ func TestNewDestination(t *testing.T) {
 		{"javascript rejected", "javascript:alert(1)", domain.ErrInvalidDestination},
 		{"scheme with no host rejected", "http:///hooks", domain.ErrInvalidDestination},
 		{"bare scheme rejected", "https://", domain.ErrInvalidDestination},
+		{"port-only authority rejected", "http://:8080/hooks", domain.ErrInvalidDestination},
+		{"port-only https authority rejected", "https://:443", domain.ErrInvalidDestination},
 		{"unparseable rejected", "http://exa mple.test/%zz", domain.ErrInvalidDestination},
 	}
 
