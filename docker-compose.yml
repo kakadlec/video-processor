@@ -148,6 +148,13 @@ services:
       # infra-only; wiring lands in wire-videojob-http-endpoints).
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # Exercises internal/notification/infrastructure/postgres's own test
+      # suite against a real instance; without it that suite skips and the
+      # adapter's create-with-no-secret refusal — enforced by a row count
+      # rather than by any Go branch — goes uncovered. Same database as the
+      # two above, and NOTIFICATION_POSTGRES_DSN is deliberately absent
+      # until cmd/api actually opens a third pool.
+      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
       # Required as of add-upload-idempotency-keys: cmd/api's composition
       # root now opens a Redis client for POST /upload's idempotency
       # mechanism, the first real (non-test-only) consumer of this service.
@@ -251,6 +258,13 @@ services:
       # identical to the IDENTITY_* values.
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # Exercises internal/notification/infrastructure/postgres's own test
+      # suite against a real instance; without it that suite skips and the
+      # adapter's create-with-no-secret refusal — enforced by a row count
+      # rather than by any Go branch — goes uncovered. Same database as the
+      # two above, and NOTIFICATION_POSTGRES_DSN is deliberately absent
+      # until cmd/api actually opens a third pool.
+      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
       # Exercises internal/platform/redis's own test suite against a real
       # instance.
       REDIS_TEST_ADDR: redis:6379

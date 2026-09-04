@@ -22,6 +22,11 @@ func TestNewSecret(t *testing.T) {
 		{"longer accepted", validSecret + "-and-then-some", nil},
 		{"one byte short rejected", "0123456789abcde", domain.ErrInvalidSecret},
 		{"empty rejected", "", domain.ErrInvalidSecret},
+		// A NUL byte cannot be stored in the text column this value ends up
+		// in, so it is refused at construction — where it is a 400 — rather
+		// than at the write, where it would be a driver error.
+		{"nul byte rejected", validSecret + "\x00tail", domain.ErrInvalidSecret},
+		{"nul byte alone in an otherwise valid secret rejected", "0123456789abcde\x00", domain.ErrInvalidSecret},
 	}
 
 	for _, tt := range tests {

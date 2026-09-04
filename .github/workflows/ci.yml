@@ -171,6 +171,11 @@ jobs:
           # Same CI Postgres service and database as IDENTITY_POSTGRES_TEST_DSN —
           # video_jobs/video_job_outbox coexist with identity_users there.
           VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
+          # Same service and database again. Without it
+          # internal/notification/infrastructure/postgres's suite skips, and
+          # with it the adapter's create-with-no-secret refusal — enforced by
+          # a row count against a real database — is actually covered.
+          NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
           REDIS_TEST_ADDR: localhost:6379
           # cmd/api's composition root now requires this at startup
           # (add-upload-idempotency-keys) — same CI redis service as
