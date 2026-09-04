@@ -99,9 +99,9 @@ Retryable status codes are not distinguished from permanent ones, deliberately: 
 
 *Alternative rejected*: a delay-queue retry topology (TTL + DLX rebound to the work queue), which would give minutes-to-hours of retry. It is the right answer for a system whose notifications are contractual; it is a new topology, a new generation to version, and new operational surface for a hackathon deliverable whose events remain fully recorded in PostgreSQL either way. **Trigger to revisit**: the first time the `failed` rows in `notification_deliveries` show transient failures materially outnumbering permanent ones.
 
-### Three dispositions, not two
+### The disposition boundary is whether an attempt has been made
 
-`cmd/worker`'s handler answers `Ack` or `Reject`. This consumer needs a third:
+`cmd/worker`'s handler answers `Ack` or `Reject`. This consumer needs a third, and the rule that decides between all three is whether this handler has attempted anything yet:
 
 | Situation | Disposition |
 |---|---|

@@ -65,9 +65,9 @@ The dependency rule SHALL be enforced across **every** package of the Notificati
 - **WHEN** every package under the Notification context is inspected for its imports
 - **THEN** none of them imports any package of the Video Processing or Identity contexts, infrastructure packages included
 
-### Requirement: The Consumer's Disposition Table Has Three Outcomes, Not Two
+### Requirement: The Consumer's Disposition Turns on Whether an Attempt Has Been Made
 
-Each delivery SHALL be resolved to exactly one of three dispositions:
+Each delivery SHALL be resolved to exactly one disposition. The table below is the mapping, and it SHALL be read through the rule that produces it rather than as a list to be shortened: what a situation is entitled to depends first on whether **this handler has attempted anything yet**, and second on whether the condition that stopped it clears on its own. A situation that is not literally named here SHALL be placed by that rule, not by the nearest-looking row.
 
 | Situation | Disposition |
 |---|---|

@@ -21,7 +21,7 @@ No change to `POST /upload`, to the worker, to the job or terminal topologies, o
 
 ### New Capabilities
 - `notification-webhook-delivery`: what a delivered notification is — the enrolment boundary that decides whether an event reaches a preference, the outbound request and its versioned payload, the HMAC signature and what it covers, the destination policy applied at both write and dial, the bounded attempt budget, and the deduplication guarantee the terminal-event capability assigns to its consumer.
-- `notification-event-consumer`: the `cmd/notifier` process — the topology it declares on every dial, its startup requirements and the ones it deliberately lacks, its three-way disposition table and why it differs from `cmd/worker`'s two, and the shutdown ordering that joins an in-flight delivery before closing the pool it borrows.
+- `notification-event-consumer`: the `cmd/notifier` process — the topology it declares on every dial, its startup requirements and the ones it deliberately lacks, its disposition table and the rule that produces it — whether this handler has attempted anything yet — which is why it differs from `cmd/worker`'s, and the shutdown ordering that joins an in-flight delivery before closing the pool it borrows.
 
 ### Modified Capabilities
 - `notification-persistence`: gains the `notification_deliveries` table and its claim semantics, and the secret-loading read path — an explicit, narrowly scoped exception to the requirement that no read path loads the secret, rather than a relaxation of it.
