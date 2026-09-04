@@ -33,10 +33,7 @@ const ownContext = "notification"
 const internalPrefix = "video-processor/internal/"
 
 func TestDomainAndApplicationPackages_DoNotImportForbiddenDependencies(t *testing.T) {
-	// "application" joins this list when the use cases land; the package
-	// does not exist yet and checkPackageDependencies deliberately fails on
-	// a directory holding no Go files rather than passing vacuously.
-	for _, dir := range []string{"domain"} {
+	for _, dir := range []string{"domain", "application"} {
 		checkPackageDependencies(t, dir)
 	}
 }
