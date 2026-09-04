@@ -71,13 +71,17 @@ Each delivery SHALL be resolved to exactly one of three dispositions:
 
 | Situation | Disposition |
 |---|---|
-| Delivered; budget exhausted and recorded; nothing to deliver — no matching preference, disabled, before the enrolment boundary, or claim refused; or an outcome that could not be recorded after the attempts were made | Acknowledge |
+| Delivered; budget exhausted and recorded; nothing to deliver — no matching preference, disabled, before the enrolment boundary, or a claim refused because the delivery is **already resolved**; or an outcome that could not be recorded after the attempts were made | Acknowledge |
 | A body that cannot be decoded, or an event type this consumer does not recognize | Dead-letter, without requeue |
-| A failure of the consumer's own dependency **before any attempt is made** — the Notification database unreachable while claiming | Requeue, after a pause |
+| A failure of the consumer's own dependency **before any attempt is made** — the Notification database unreachable while reading preferences or while claiming — or a claim refused because another claim is **held and not yet reclaimable** | Requeue, after a pause |
 
-The third disposition is a deliberate difference from `videojob-worker`, which has only the first two, and the difference SHALL NOT be read as an inconsistency. There, a requeued job meets a row that has already moved past `queued` and can only lose the claim again, so redelivery loops rather than recovers. Here the message has not been acted on at all and the dependency that failed is one that returns, so dead-lettering it would discard a user's notification because of a database blip. The pause before the next delivery is what prevents that disposition from becoming a hot loop against a database that is still down.
+The third disposition is a deliberate difference from `videojob-worker`, which has only the first two, and the difference SHALL NOT be read as an inconsistency. There, a requeued job meets a row that has already moved past `queued` and can only lose the claim again, so redelivery loops rather than recovers. Here this handler has attempted nothing, and the condition that blocked it — a database that is down, or a claim another consumer still holds — is one that resolves itself, so dead-lettering would discard a user's notification because of a blip. The pause before the next delivery is what prevents that disposition from becoming a hot loop against a database that is still down.
 
-**The requeue disposition SHALL be reachable only before an attempt has been made**, and this boundary is load-bearing rather than incidental. A claim that was never granted leaves nothing behind, so redelivery genuinely retries. A claim that *was* granted leaves a freshly-claimed row, and a redelivery meeting that row is refused the claim and acknowledged as "nothing to deliver" — so requeueing after a failed recording would discard the outcome permanently, and could send the webhook a second time first.
+**The requeue disposition SHALL be reachable only before an attempt has been made by this handler**, and this boundary is load-bearing rather than incidental. Nothing this handler has done can be lost by a redelivery, so redelivery genuinely retries. Once *this* handler holds the claim, a redelivery meeting that row would be refused and requeued indefinitely rather than resolving anything — so requeueing after a failed recording would discard the outcome permanently, and could send the webhook a second time first. Every pre-attempt failure SHALL take this disposition, including a failure of the read that resolves preferences, not only a failure of the claim itself: at that point no request has been made and no claim is held, so nothing distinguishes the two.
+
+A claim refused as *held by another* is a pre-attempt outcome and SHALL requeue for the same reason, which is not a contradiction of the rule above but an application of it: this handler has attempted nothing. Acknowledging it instead would be the silent failure this table exists to prevent — a consumer that crashes after claiming is normally redelivered within seconds, long before the reclaim bound, so an acknowledgement there would strand a `pending` row nothing else will ever meet and drop the notification without a trace. The loop terminates: the holder either resolves the delivery, after which the refusal is reported as *already resolved* and acknowledged, or it stops without resolving, after which the reclaim bound expires and the claim is granted.
+
+The cost of that choice SHALL be stated rather than discovered: with a prefetch of one, a message requeued this way returns to the head of the queue and is taken again by the same consumer, so an abandoned claim blocks every other delivery on that queue until the reclaim bound expires. That is head-of-line blocking bounded by the reclaim bound, which is why the bound is sized as a small multiple of one claimant's maximum budget rather than as a comfortable round number. It is accepted over the alternatives: acknowledging loses a notification silently, and renewing a claim with a heartbeat — the mechanism `videojob-worker` uses — is substantially more machinery than a static bound plus a startup check, for a stall measured in minutes.
 
 An outcome that cannot be recorded SHALL therefore be retried a bounded number of times against a context detached from shutdown, exactly as `videojob-worker` retries a terminal write it has already earned. If it still cannot be recorded, the message SHALL be acknowledged and the failure SHALL be logged with the delivery identifier and the outcome that was lost. This leaves a row in `pending` that nothing will ever resolve, and that is an accepted accounting loss rather than a recoverable state: acknowledging is chosen because the webhook was actually sent, requeueing would lose the outcome as described above, and dead-lettering would report a failure for a delivery that succeeded. A `pending` row older than the reclaim bound with no consumer in flight is the operational signal for this case, and `docs/operations.md` SHALL name it as such.
 
@@ -100,6 +104,24 @@ A message that cannot be decoded SHALL NOT be requeued: redelivering it produces
 - **GIVEN** the Notification database is unreachable when the consumer tries to claim
 - **WHEN** the consumer handles a terminal event
 - **THEN** the message is requeued, no delivery is attempted, and the consumer pauses before taking the next message
+
+#### Scenario: A failure reading preferences requeues too
+
+- **GIVEN** the Notification database is unreachable when the consumer reads the owner's deliverable preferences, before any claim is attempted
+- **WHEN** the consumer handles a terminal event
+- **THEN** the message is requeued exactly as a claim-time failure is, and no delivery is attempted
+
+#### Scenario: A claim held by another consumer is requeued, not acknowledged
+
+- **GIVEN** a delivery whose claim is held by another consumer and is not yet past the reclaim bound
+- **WHEN** this consumer handles a redelivery of the same event
+- **THEN** the message is requeued after a pause, no request is made, and the message is not acknowledged
+
+#### Scenario: A claim refused because the delivery is resolved is acknowledged
+
+- **GIVEN** a delivery already resolved by an earlier handling of the same event
+- **WHEN** this consumer handles a redelivery of it
+- **THEN** the claim is refused as already resolved, no request is made, and the message is acknowledged
 
 #### Scenario: An outcome that cannot be recorded is acknowledged, not requeued
 

@@ -54,19 +54,27 @@ The two predicates are evaluated at different times, and the difference SHALL be
 
 ### Requirement: A Delivery Is Claimed Before It Is Attempted, and a Claim Is Granted Once
 
-Before any outbound request is made, the system SHALL durably claim the delivery identified by the owning user, the event type, the channel, and the job the event names. A claim SHALL be granted at most once for that identity while it holds. When a claim is refused, no request SHALL be made and the message SHALL be treated as handled.
+Before any outbound request is made, the system SHALL durably claim the delivery identified by the owning user, the event type, the channel, and the job the event names. A claim SHALL be granted at most once for that identity while it holds. When a claim is refused, no request SHALL be made — and what becomes of the message depends on *why* it was refused: a delivery already resolved SHALL be treated as handled, while a claim another consumer still holds SHALL leave the message unhandled and retried later, because the holder may have died before resolving it and nothing else would ever meet that row. `notification-event-consumer` carries the dispositions; what this requirement fixes is that the two refusals are not the same answer.
 
 This is the deduplication obligation `videojob-terminal-events` assigns to whatever consumes its queue, and the claim SHALL precede the attempt rather than record it afterwards. Recording afterwards leaves a read-then-act window that two consumer processes lose: both read "not delivered", and both deliver. The claim SHALL be a single atomic statement in the Notification context's own storage, so the guarantee holds across processes rather than within one.
 
 A claim that was granted but never resolved to an outcome SHALL become reclaimable after a bounded period, so a consumer that dies mid-delivery does not strand the delivery permanently. Reclaiming SHALL preserve the delivery's identifier, so a receiver that deduplicates on it still sees one logical delivery.
 
+That bounded period SHALL be longer than the longest time a single claimant can legitimately hold a claim — its whole attempt budget plus the bounded retries of its resolution — and `notification-persistence` requires the relationship to be enforced at startup. A shorter bound would let a second consumer be granted the claim while the first is still mid-request, and the claim token fences only the database write: it cannot recall a request already on the wire. The bound is therefore sized as a small multiple of that budget, not as a large round number, because the same value bounds how long an abandoned claim delays the rest of the queue.
+
 A refused claim SHALL NOT be reported as a failure. A duplicate is the expected consequence of at-least-once transport, not an incident.
 
 #### Scenario: A redelivered message delivers nothing a second time
 
-- **GIVEN** a terminal event already delivered to a preference
+- **GIVEN** a terminal event already delivered to a preference and resolved
 - **WHEN** the same event is delivered to the consumer again
-- **THEN** the claim is refused, no request is made to the destination, and the message is treated as handled
+- **THEN** the claim is refused as already resolved, no request is made to the destination, and the message is treated as handled
+
+#### Scenario: A redelivery meeting a live claim is not treated as handled
+
+- **GIVEN** a terminal event whose claim is held by another consumer and is not yet past the reclaim bound
+- **WHEN** the same event is delivered to this consumer
+- **THEN** the claim is refused as held, no request is made, and the message is left for a later attempt rather than treated as handled
 
 #### Scenario: Two consumers racing on one event produce one request
 
@@ -156,7 +164,11 @@ The system SHALL apply one destination policy at two points: when a preference i
 
 The address rule SHALL be expressed as a permission rather than a prohibition: **only an address that is globally reachable unicast may be dialled**, and everything else SHALL be refused. A deny-list of the ranges one happens to think of is the wrong shape for this rule, because the failure mode of forgetting a range is a reachable internal host, while the failure mode of an over-broad refusal is a destination a user must re-register.
 
-Refusal SHALL cover, at minimum: loopback, the unspecified address, link-local (which is what covers `169.254.169.254`), multicast, RFC 1918 private space, **shared address space `100.64.0.0/10`**, **benchmarking `198.18.0.0/15`**, IETF protocol assignments `192.0.0.0/24`, the documentation ranges `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`, reserved `240.0.0.0/4`, `0.0.0.0/8`, and the IPv6 equivalents including unique-local `fc00::/7` and IPv6 link-local. The three ranges named in bold are called out because a general "is this a global unicast address" predicate answers *yes* for all of them, so a policy built only from such a predicate would leave exactly the gap this requirement exists to close; the enumeration SHALL be explicit and SHALL be tested range by range. An address in an IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form SHALL be unwrapped to the IPv4 address it embeds and evaluated as that address, so a refused address cannot be reached by rewriting it.
+Refusal SHALL cover, at minimum, in IPv4: loopback, the unspecified address, link-local (which is what covers `169.254.169.254`), multicast, RFC 1918 private space, **shared address space `100.64.0.0/10`**, **benchmarking `198.18.0.0/15`**, IETF protocol assignments `192.0.0.0/24`, the documentation ranges `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`, reserved `240.0.0.0/4`, and `0.0.0.0/8`. The three ranges named in bold are called out because a general "is this a global unicast address" predicate answers *yes* for all of them, so a policy built only from such a predicate would leave exactly the gap this requirement exists to close.
+
+The IPv6 enumeration SHALL be its own list rather than "the equivalents", because the same predicate accepts native IPv6 special-use space that has no IPv4 counterpart. It SHALL cover: the unspecified address and loopback, link-local `fe80::/10`, unique-local `fc00::/7`, multicast `ff00::/8`, **documentation `2001:db8::/32`**, and **the discard-only prefix `100::/64`**. It SHALL also cover the two prefixes that embed an IPv4 address in an IPv6 one — **6to4 `2002::/16`** and **Teredo `2001::/32`** — which SHALL be refused outright rather than merely unwrapped, since an address in either reaches its embedded IPv4 destination through a relay this policy does not control.
+
+An address in an IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form SHALL be unwrapped to the IPv4 address it embeds and evaluated as that address, so a refused address cannot be reached by rewriting it. The whole enumeration, IPv4 and IPv6 alike, SHALL be explicit and SHALL be tested range by range.
 
 Two evaluations are required rather than one, and neither is redundant. A write-time check alone cannot survive a hostname that resolves differently later, nor a policy tightened after the row was stored. A dial-time check alone silently accepts a destination that will never be delivered to, which is the outcome the closed `Channel` set already rejects for `email`: a preference the system stores and never acts on is indistinguishable, to its owner, from one that works.
 
@@ -186,6 +198,12 @@ Preferences stored before this policy took effect SHALL NOT be migrated or delet
 - **GIVEN** a destination whose address is in shared address space, benchmarking space, or reserved space — each of which a general global-unicast predicate accepts
 - **WHEN** it is registered, and when a delivery to it is attempted
 - **THEN** it is refused at both points
+
+#### Scenario: A native IPv6 special-use address is refused
+
+- **GIVEN** a destination whose address is in IPv6 documentation, discard-only, 6to4, or Teredo space — none of which has an IPv4 counterpart and each of which a general global-unicast predicate accepts
+- **WHEN** it is registered, and when a delivery to it is attempted
+- **THEN** it is refused at both points, and a 6to4 or Teredo address is refused whatever IPv4 address it embeds
 
 #### Scenario: A mapped form of a refused address is still refused
 

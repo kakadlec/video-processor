@@ -26,7 +26,7 @@ A preference on the `webhook` channel SHALL carry an absolute destination URL th
 
 The destination rule is no longer "absolute `http` or `https`". `http` was accepted while nothing dialled a destination, and this capability's own record named the delivery change as the one that would restrict it; that change has arrived. The policy — a transport-secure scheme, and an address that is not loopback, private, link-local, or an instance-metadata address — SHALL be applied here, at registration, and again at dial time. Applying it here is what turns an undeliverable destination into an error its owner can see, rather than into a preference that is stored and silently never acted on: the same argument the closed `Channel` set makes for rejecting `email` outright.
 
-The policy's single relaxation switch, defaulting to restrictive, SHALL govern this route exactly as it governs the dial, so a local development stack that has no TLS can still register a destination it can actually reach.
+The policy's single relaxation switch, defaulting to restrictive, SHALL govern this route exactly as it governs the dial, so a local development stack that has no TLS can still register a destination it can actually reach. The two rules are therefore separate rather than one list of accepted schemes: a destination that is not an absolute `http` or `https` URL SHALL be rejected whatever the switch is set to, because no configuration of the policy makes it deliverable, while `http` and internal addresses SHALL be rejected under the default configuration and accepted under the relaxation.
 
 The secret is registered here rather than by the delivery capability because a destination with no secret describes an endpoint that cannot be signed, and a user who registered one would have no way to learn that it will never be called.
 
@@ -44,10 +44,10 @@ The NUL rule is a contract rather than a storage detail because it decides the s
 - **WHEN** they submit a secret of otherwise sufficient length whose bytes include a NUL
 - **THEN** the request is rejected with `400` and no preference is stored
 
-#### Scenario: A non-absolute destination is rejected
+#### Scenario: A malformed destination is rejected however the policy is configured
 
-- **GIVEN** an authenticated user
-- **WHEN** they submit a destination that is relative, empty, or carries a scheme other than `https`
+- **GIVEN** an authenticated user, regardless of how the destination policy is configured
+- **WHEN** they submit a destination that is relative, empty, or carries a scheme that is neither `http` nor `https`
 - **THEN** the request is rejected with `400` and no preference is stored
 
 #### Scenario: A plaintext destination is rejected under the default policy
@@ -55,6 +55,12 @@ The NUL rule is a contract rather than a storage detail because it decides the s
 - **GIVEN** an authenticated user and the destination policy in its default configuration
 - **WHEN** they submit an absolute `http` destination
 - **THEN** the request is rejected with `400` and no preference is stored
+
+#### Scenario: The relaxation accepts a plaintext destination
+
+- **GIVEN** an authenticated user and the destination policy's relaxation switch enabled
+- **WHEN** they submit an absolute `http` destination naming a host the relaxed policy permits
+- **THEN** the preference is stored
 
 #### Scenario: An internal address is rejected under the default policy
 

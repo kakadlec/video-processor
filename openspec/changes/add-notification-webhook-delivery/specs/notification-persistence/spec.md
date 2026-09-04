@@ -8,15 +8,19 @@ Claiming SHALL be a **single atomic statement that both inserts and refuses**: i
 
 The two identifiers are separate because they answer different questions, and collapsing them would be a correctness bug rather than a simplification. The **delivery identifier** is what the receiver sees and deduplicates on, so it SHALL survive a reclaim. The **claim token** identifies *which* grant is current, and SHALL be reissued on every grant, reclaims included. Expiry of the reclaim bound proves only that a claim is old — it does not prove the process holding it stopped, so a slow first claimant can still be running when a second is granted. Resolution SHALL therefore be fenced on the claim token: a write whose token is no longer the current one SHALL be refused and SHALL change nothing, so the superseded claimant cannot overwrite the outcome its successor recorded. This is the same fence `videojob-worker` puts on a terminal write with `lease_epoch`, for the same reason.
 
+A refusal SHALL be **classified**, because the two reasons a claim is refused call for opposite dispositions. A claim refused because the delivery is already **resolved** means there is nothing left to do and the message SHALL be treated as handled. A claim refused because another claim is **held and not yet reclaimable** means the delivery may still be in flight *or* may have been abandoned by a process that died before resolving, and the message SHALL NOT be treated as handled — acknowledging it would strand a `pending` row that nothing else will ever meet, because a broker redelivery normally arrives long before the reclaim bound expires and would be refused in exactly the same way. Classifying the refusal MAY be a second, separate read: the grant-or-refuse decision SHALL remain one atomic statement, and the read that follows a refusal is **not** authoritative — its only effect is choosing between acknowledging and retrying later, and misreading it costs one extra attempt at the claim, never a duplicate outbound request.
+
+The reclaim bound SHALL be configuration, and it SHALL be required to exceed the maximum time a single claimant can hold a claim — the attempt budget, each attempt's timeout and the backoff between them, plus the bounded retries of the resolution itself. A bound shorter than that budget makes concurrent outbound requests to the same destination reachable in normal operation, because the claim token fences only the database write and cannot recall a request already sent. The relationship SHALL be checked at startup and SHALL fail startup when it does not hold, rather than being left as a documented convention two independently-tuned variables can silently break.
+
 A single statement rather than a check followed by an insert is what makes the guarantee hold across processes. Two consumers evaluating "has this been delivered?" separately both read *no*, and both deliver; that is precisely the duplicate the record exists to prevent.
 
 The table SHALL be created by the same migration path the context already owns, and SHALL NOT alter any existing table.
 
-#### Scenario: A second claim on a resolved delivery is refused
+#### Scenario: A second claim on a resolved delivery is refused as resolved
 
 - **GIVEN** a delivery record whose status is resolved
 - **WHEN** a claim for the same identity is attempted
-- **THEN** it is refused and the stored record is unchanged
+- **THEN** it is refused, the refusal is reported as *already resolved*, and the stored record is unchanged
 
 #### Scenario: Concurrent claims grant exactly one
 
@@ -42,11 +46,17 @@ The table SHALL be created by the same migration path the context already owns, 
 - **WHEN** it resolves the delivery
 - **THEN** the write is applied and the record moves out of `pending`
 
-#### Scenario: An unresolved claim inside the bound is refused
+#### Scenario: An unresolved claim inside the bound is refused as held
 
 - **GIVEN** a delivery record claimed moments ago and not yet resolved
 - **WHEN** a claim for the same identity is attempted
-- **THEN** it is refused, so two consumers do not deliver concurrently
+- **THEN** it is refused so that two consumers do not deliver concurrently, and the refusal is reported as *held by another claim* rather than as a completed delivery
+
+#### Scenario: The reclaim bound is validated against the attempt budget
+
+- **GIVEN** a configured reclaim bound shorter than the maximum time one claimant can hold a claim
+- **WHEN** a process using the context starts
+- **THEN** startup fails naming both values, rather than starting a process that can issue concurrent requests to one destination
 
 #### Scenario: The record holds no secret
 
