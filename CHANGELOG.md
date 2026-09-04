@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.0.0](https://github.com/kakadlec/video-processor/compare/v1.0.0...v2.0.0) (2026-09-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* POST /upload returns 202 with {job_id, status, status_url} instead of a completed processing result. Clients must poll GET /api/video-jobs/:id for the outcome. The job-dispatch topology moves to video.jobs.v2 / video.jobs.queued.v2 with routing key video_job.queued.v2; the .v1 exchange and queue are retired by an operator after the deploy.
+
+### Features
+
+* add the RabbitMQ connection adapter and job-dispatch topology ([#190](https://github.com/kakadlec/video-processor/issues/190)) ([6228cb1](https://github.com/kakadlec/video-processor/commit/6228cb13ccc513646759802b90473dce38c627d0))
+* add VideoJob source key and the transactional outbox relay ([#194](https://github.com/kakadlec/video-processor/issues/194)) ([b9b77a5](https://github.com/kakadlec/video-processor/commit/b9b77a5521bd1fb146037490d3a2f4924953adc3))
+* process uploads asynchronously in a dedicated worker ([#197](https://github.com/kakadlec/video-processor/issues/197)) ([b04bee4](https://github.com/kakadlec/video-processor/commit/b04bee405b96813dbdd81a7ee4c2f827beecd5e9))
+* **video:** emit terminal job events through a transactional outbox ([#204](https://github.com/kakadlec/video-processor/issues/204)) ([aa6e463](https://github.com/kakadlec/video-processor/commit/aa6e463ef57750e0a454588201eed918e6987f74))
+* **worker:** recover abandoned video jobs with a lease, a sweeper, and a fence epoch ([#201](https://github.com/kakadlec/video-processor/issues/201)) ([6151f1a](https://github.com/kakadlec/video-processor/commit/6151f1ac3c87118319b1e51b0ab24a81d790ff56))
+
 ## [1.0.0](https://github.com/kakadlec/video-processor/compare/v0.10.0...v1.0.0) (2026-08-28)
 
 
