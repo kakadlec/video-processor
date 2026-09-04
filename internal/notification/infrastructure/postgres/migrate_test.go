@@ -21,8 +21,11 @@ func TestMigrate_ConcurrentFirstTimeCreatesBothSucceed(t *testing.T) {
 		t.Fatalf("unexpected error dropping table: %v", err)
 	}
 	t.Cleanup(func() {
+		// Errorf rather than Fatalf: Fatalf's runtime.Goexit does not belong
+		// in a cleanup function, which runs outside the test's own call
+		// stack.
 		if err := postgres.Migrate(context.Background(), db); err != nil {
-			t.Fatalf("unexpected error restoring schema: %v", err)
+			t.Errorf("unexpected error restoring schema: %v", err)
 		}
 	})
 
