@@ -162,19 +162,33 @@ Every attempt for one delivery SHALL carry the same delivery identifier, so a re
 
 The system SHALL apply one destination policy at two points: when a preference is written, and again when a connection is opened. The policy SHALL require a transport-secure scheme. At dial time it SHALL be evaluated against the **resolved network address**, not against the hostname alone. Redirects SHALL NOT be followed, the response body SHALL be bounded, and every attempt SHALL be bounded in time.
 
+The guarded dial SHALL be the only path to the destination: the delivery transport's proxy SHALL be nil, and a proxy SHALL NOT be taken from the process environment. This is a condition for the address rule meaning anything, not a hardening preference. With a proxy configured, the connection the guarded dial opens is a connection to the *proxy* — whose address is public and duly approved — after which the proxy resolves the user's hostname itself and connects to whatever it resolves to, so the entire enumeration below is bypassed by an environment variable an operator may have set for a reason that has nothing to do with this system.
+
 The address rule SHALL be expressed as a permission rather than a prohibition: **only an address that is globally reachable unicast may be dialled**, and everything else SHALL be refused. A deny-list of the ranges one happens to think of is the wrong shape for this rule, because the failure mode of forgetting a range is a reachable internal host, while the failure mode of an over-broad refusal is a destination a user must re-register.
 
 Refusal SHALL cover, at minimum, in IPv4: loopback, the unspecified address, link-local (which is what covers `169.254.169.254`), multicast, RFC 1918 private space, **shared address space `100.64.0.0/10`**, **benchmarking `198.18.0.0/15`**, IETF protocol assignments `192.0.0.0/24`, the documentation ranges `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`, reserved `240.0.0.0/4`, and `0.0.0.0/8`. The three ranges named in bold are called out because a general "is this a global unicast address" predicate answers *yes* for all of them, so a policy built only from such a predicate would leave exactly the gap this requirement exists to close.
 
-The IPv6 enumeration SHALL be its own list rather than "the equivalents", because the same predicate accepts native IPv6 special-use space that has no IPv4 counterpart. It SHALL cover: the unspecified address and loopback, link-local `fe80::/10`, unique-local `fc00::/7`, multicast `ff00::/8`, **documentation `2001:db8::/32`**, and **the discard-only prefix `100::/64`**. It SHALL also cover the two prefixes that embed an IPv4 address in an IPv6 one — **6to4 `2002::/16`** and **Teredo `2001::/32`** — which SHALL be refused outright rather than merely unwrapped, since an address in either reaches its embedded IPv4 destination through a relay this policy does not control.
+The IPv6 enumeration SHALL be its own list rather than "the equivalents", because the same predicate accepts native IPv6 special-use space that has no IPv4 counterpart. Its normative extent SHALL be **every prefix the IANA IPv6 Special-Purpose Address Registry marks as not globally reachable**, so the list is anchored to a maintained source rather than to what an author happened to recall; the enumeration that follows is that set as it stood when this was written, and it SHALL be reconciled against the registry when implemented. It SHALL cover: the unspecified address and loopback, link-local `fe80::/10`, unique-local `fc00::/7`, multicast `ff00::/8`, documentation `2001:db8::/32` and `3fff::/20`, the discard-only prefix `100::/64`, **benchmarking `2001:2::/48`**, **local-use IPv4/IPv6 translation `64:ff9b:1::/48`**, and **SRv6 SIDs `5f00::/16`**. Benchmarking is called out because it is the exact IPv6 counterpart of the `198.18.0.0/15` refused above, and refusing one twin while admitting the other is the asymmetry a separate list exists to prevent. It SHALL also cover the two prefixes that embed an IPv4 address in an IPv6 one — **6to4 `2002::/16`** and **Teredo `2001::/32`** — which SHALL be refused outright rather than merely unwrapped, since an address in either reaches its embedded IPv4 destination through a relay this policy does not control.
 
-An address in an IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form SHALL be unwrapped to the IPv4 address it embeds and evaluated as that address, so a refused address cannot be reached by rewriting it. The whole enumeration, IPv4 and IPv6 alike, SHALL be explicit and SHALL be tested range by range.
+An address in an IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form SHALL be unwrapped to the IPv4 address it embeds and evaluated as that address, so a refused address cannot be reached by rewriting it. **Only the well-known NAT64 prefix `64:ff9b::/96` SHALL be unwrapped; the local-use translation prefix `64:ff9b:1::/48` SHALL be refused outright.** The two differ by one field and read as the same thing, but the local-use prefix exists to translate *inside* an operator's network, so unwrapping it would evaluate an embedded address that is reached through a translator this policy does not control — the same reason 6to4 and Teredo are refused by prefix. The whole enumeration, IPv4 and IPv6 alike, SHALL be explicit and SHALL be tested range by range.
 
 Two evaluations are required rather than one, and neither is redundant. A write-time check alone cannot survive a hostname that resolves differently later, nor a policy tightened after the row was stored. A dial-time check alone silently accepts a destination that will never be delivered to, which is the outcome the closed `Channel` set already rejects for `email`: a preference the system stores and never acts on is indistinguishable, to its owner, from one that works.
 
 A single configuration switch MAY relax the policy for environments that have no TLS and no public addressing — local development and the compose stack. It SHALL default to the restrictive behaviour, and it SHALL relax both the scheme rule and the address rule together, because they are wanted in exactly the same situation and separating them invites enabling half of it where neither belongs.
 
 Preferences stored before this policy took effect SHALL NOT be migrated or deleted. One that the policy now refuses SHALL simply not deliver, and the recorded reason SHALL say so.
+
+#### Scenario: A proxy in the environment does not bypass the address rule
+
+- **GIVEN** a proxy is configured in the process environment
+- **WHEN** a delivery is attempted
+- **THEN** the connection is opened directly to the resolved destination address, the proxy is not used, and the address rule is evaluated against the destination rather than against the proxy
+
+#### Scenario: A native IPv6 benchmarking or local-translation address is refused
+
+- **GIVEN** a destination resolving to an address in `2001:2::/48` or `64:ff9b:1::/48`
+- **WHEN** the connection is opened
+- **THEN** it is refused before any packet is sent, and the local-translation address is refused as a prefix rather than unwrapped to what it embeds
 
 #### Scenario: A plaintext destination is refused at registration
 
@@ -233,13 +247,15 @@ Preferences stored before this policy took effect SHALL NOT be migrated or delet
 
 A delivery SHALL be attempted a bounded number of times with backoff between attempts, each attempt bounded in time, and the whole budget SHALL be small enough that one unreachable destination costs the consumer seconds rather than minutes. A `2xx` response SHALL record the delivery as delivered. Any other outcome — a non-`2xx` status, a timeout, a refused connection, a policy refusal — SHALL exhaust the budget and record the delivery as failed, naming the last observed reason.
 
+The recorded reason and every log line SHALL be built from a classified error value of this system's own, and SHALL NOT be built from a transport error's own text. A Go transport error is wrapped in a `*url.Error`, whose rendering includes the full request URL, so recording or logging one verbatim would write a destination's query string into the database and the logs. A destination may legitimately carry its credential there — many webhook receivers issue exactly that kind of URL — which makes the transport error's text a second, unguarded copy of a secret the rest of this specification is careful never to store or print.
+
 **Both outcomes SHALL result in the message being acknowledged.** A failing endpoint SHALL NOT be dead-lettered and SHALL NOT be requeued. `videojob-worker`'s "dead-letter, never requeue" disposition is calibrated for a claim-fenced job and SHALL NOT be inherited here: a third party's endpoint being down is not a defect in this system, and a dead-letter queue filling with one user's broken URL buries the messages that queue exists to surface.
 
 Attempts SHALL NOT be conditioned on which status code was observed. The budget is small enough that retrying a permanent rejection costs little, whereas a table classifying third-party status codes as retryable or not is a source of confident wrong guesses about endpoints this system does not control.
 
 A failed delivery SHALL NOT change any `VideoJob`, SHALL NOT be visible to the Video Processing context, and SHALL NOT affect what any HTTP route reports about the job.
 
-The attempt count and the per-attempt timeout SHALL be configurable, with documented defaults, so the budget can be tuned without a code change.
+The attempt count, the backoff between attempts, and the per-attempt timeout SHALL each be configurable, and each SHALL have a documented default, so the budget can be tuned without a code change. Every term SHALL have one, because the maximum time a claimant can hold a claim is computed from all of them and is what the reclaim bound is validated against; a term left undocumented makes that validation unreproducible.
 
 #### Scenario: A successful delivery is recorded and acknowledged
 
@@ -252,6 +268,12 @@ The attempt count and the per-attempt timeout SHALL be configurable, with docume
 - **GIVEN** a destination answering `500` to every attempt
 - **WHEN** the delivery is attempted
 - **THEN** the attempts stop at the configured bound, the delivery is recorded as failed with the observed reason, and the message is acknowledged rather than dead-lettered or requeued
+
+#### Scenario: A destination's query credential reaches neither the record nor the logs
+
+- **GIVEN** a destination whose URL carries a credential in its query string, and whose every attempt fails at the transport layer
+- **WHEN** the delivery is recorded and the failure is logged
+- **THEN** neither the stored reason nor any log line contains that credential or the destination's query string
 
 #### Scenario: A permanent rejection is not treated specially
 

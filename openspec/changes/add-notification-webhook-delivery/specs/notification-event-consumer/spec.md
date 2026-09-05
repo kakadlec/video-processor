@@ -143,9 +143,11 @@ A message that cannot be decoded SHALL NOT be requeued: redelivering it produces
 
 ### Requirement: Shutdown Joins the In-Flight Delivery Before Closing What It Borrows
 
-On a termination signal the consumer SHALL stop taking new deliveries, SHALL wait — under a bounded drain — for the delivery in hand to reach a disposition, and SHALL only then close the database pool that delivery borrows. The handler SHALL run on a context that shutdown does not cancel, so a signal does not abort an outbound request mid-flight or prevent an outcome from being recorded.
+On a termination signal the consumer SHALL stop taking new deliveries, SHALL wait — under a bounded drain — for the delivery in hand to reach a disposition, and SHALL close the database pool that delivery borrows only after that wait has succeeded. The handler SHALL run on a context that shutdown does not cancel, so a signal does not abort an outbound request mid-flight or prevent an outcome from being recorded.
 
 This is the ordering `cmd/api` and `cmd/worker` already hold, for the same reason: closing a handle underneath an operation that borrows it turns a resolvable state into an aborted one. A delivery interrupted after its claim but before its outcome is recorded is exactly the case the reclaim period exists to repair, and shutdown SHALL NOT be a routine way of producing it.
+
+The two rules meet when the drain expires, and the resolution SHALL be stated rather than left to the implementation: at that point the handler is still running on its detached context, so it can never be joined, and "close only after the join" and "exit at the bound" cannot both be honoured. **The bound SHALL win.** The process SHALL exit without an orderly close of the pool, and this SHALL be a named exception to the ordering above rather than a violation of it. Nothing is lost by it that the reclaim bound does not already cover: an unresolved claim left by an aborted process is precisely the state a later consumer reclaims, and a pool closed by process exit releases the same connections the server would reclaim on the closed socket. Skipping the close is chosen over extending the wait because an unbounded wait turns one hung destination into a process that never terminates.
 
 #### Scenario: A delivery in flight at shutdown is finished
 
@@ -163,4 +165,4 @@ This is the ordering `cmd/api` and `cmd/worker` already hold, for the same reaso
 
 - **GIVEN** a delivery that does not finish within the drain bound
 - **WHEN** the bound elapses
-- **THEN** the process exits rather than hanging, and the unresolved claim is reclaimable by a later consumer
+- **THEN** the process exits rather than hanging, the orderly pool close is skipped rather than waited on, and the unresolved claim is reclaimable by a later consumer
