@@ -36,8 +36,24 @@ func newNotificationModule(setPreference *application.SetPreference, listPrefere
 // The pool is this context's own even though it points at the same database
 // as the other two: the bounded contexts share an instance, not a
 // connection, and nothing here may reach a table another context owns.
+//
+// Every variable is read before any I/O, matching setupVideo and
+// cmd/notifier: a value this process will refuse to start on should refuse
+// before a migration has taken the advisory lock and created a table.
+//
+// The destination policy comes from the same variable and the same parser
+// cmd/notifier reads. One policy with two readers: this half refuses a
+// destination when it is registered, the notifier's half refuses the address
+// when it is dialled, and a deployment whose two processes disagree either
+// stores destinations it can never deliver to or refuses at dial what it
+// accepted at write time.
 func setupNotification(ctx context.Context) (*notificationModule, *sql.DB, error) {
 	pgConfig, err := postgres.LoadConfigFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	policy, err := webhook.LoadDestinationPolicyFromEnv()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -55,18 +71,6 @@ func setupNotification(ctx context.Context) (*notificationModule, *sql.DB, error
 		return nil, nil, fmt.Errorf("notification: connect to postgres: %w", err)
 	}
 
-	// The same variable and the same parser cmd/notifier reads. One policy
-	// with two readers: this half refuses a destination when it is registered,
-	// the notifier's half refuses the address when it is dialled, and a
-	// deployment whose two processes disagree either stores destinations it
-	// can never deliver to or refuses at dial what it accepted at write time.
-	// A non-boolean value is fatal here for the reason it is fatal there — the
-	// relaxation is a security posture, and neither way of guessing is safe.
-	policy, err := webhook.LoadDestinationPolicyFromEnv()
-	if err != nil {
-		closeDB(db)
-		return nil, nil, err
-	}
 	log.Printf("notification: destination policy: insecure destinations allowed=%t", policy.AllowsInsecure())
 
 	repo := postgres.NewPreferenceRepository(db)
