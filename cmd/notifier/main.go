@@ -20,7 +20,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
+	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -43,6 +46,23 @@ const consumerTag = "notification-notifier"
 // the budget does not: the broker round trip that acknowledges the delivery
 // once the outcome is recorded.
 const drainGrace = 30 * time.Second
+
+// The delivery budget's operator-tunable terms.
+//
+// The defaults, the arithmetic they feed, and the validator that refuses an
+// unsafe combination all live with DeliveryConfig in the application layer;
+// only the translation from the environment lives here. A use case that read
+// os.Getenv itself would be one no test could configure.
+//
+// Three variables and not seven: these are the terms design.md exposes. The
+// backoff intervals and the resolve-retry terms feed MaxClaimHold too, but
+// they keep their documented defaults — every variable added here is another
+// way to reach a configuration the validator has to refuse at startup.
+const (
+	envWebhookMaxAttempts     = "NOTIFICATION_WEBHOOK_MAX_ATTEMPTS"
+	envWebhookTimeoutSeconds  = "NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS"
+	envDeliveryReclaimSeconds = "NOTIFICATION_DELIVERY_RECLAIM_SECONDS"
+)
 
 // drainOutcome reports how the wait for the in-flight delivery ended. It is
 // a named result rather than a bare bool because what main does with it is a
@@ -95,8 +115,10 @@ type notifierDeps struct {
 
 // drainTimeout is how long shutdown waits for the delivery in hand.
 //
-// The sum cannot overflow: Validate has already refused any configuration
-// whose hold does not leave room for twice itself, so the hold this adds to
+// The sum cannot overflow, and that is an invariant setupNotifier holds
+// rather than a property of this struct: it validates the configuration
+// before any notifierDeps exists, and Validate refuses any configuration
+// whose hold does not leave room for twice itself — so the hold this adds to
 // is at most half the representable range.
 func (d *notifierDeps) drainTimeout() time.Duration {
 	return d.config.MaxClaimHold() + drainGrace
@@ -130,8 +152,8 @@ func setupNotifier(ctx context.Context) (*notifierDeps, error) {
 		return nil, err
 	}
 
-	config := notificationapplication.DefaultDeliveryConfig()
-	if err := config.Validate(); err != nil {
+	config, err := loadDeliveryConfig()
+	if err != nil {
 		return nil, err
 	}
 
@@ -169,6 +191,77 @@ func setupNotifier(ctx context.Context) (*notifierDeps, error) {
 			nil,
 		),
 	}, nil
+}
+
+// loadDeliveryConfig starts from the documented defaults, applies whatever
+// the environment overrides, and validates the result.
+//
+// Validating here is what makes the check meaningful at all: its own
+// documentation calls it a startup check rather than a comment "because
+// these are separately tunable variables", and a budget that could only ever
+// be the compile-time default would be one the validator could never refuse.
+func loadDeliveryConfig() (notificationapplication.DeliveryConfig, error) {
+	config := notificationapplication.DefaultDeliveryConfig()
+
+	attempts, err := positiveIntFromEnv(envWebhookMaxAttempts, config.MaxAttempts)
+	if err != nil {
+		return notificationapplication.DeliveryConfig{}, err
+	}
+	config.MaxAttempts = attempts
+
+	timeout, err := positiveSecondsFromEnv(envWebhookTimeoutSeconds, config.Timeout)
+	if err != nil {
+		return notificationapplication.DeliveryConfig{}, err
+	}
+	config.Timeout = timeout
+
+	reclaim, err := positiveSecondsFromEnv(envDeliveryReclaimSeconds, config.ReclaimBound)
+	if err != nil {
+		return notificationapplication.DeliveryConfig{}, err
+	}
+	config.ReclaimBound = reclaim
+
+	if err := config.Validate(); err != nil {
+		return notificationapplication.DeliveryConfig{}, err
+	}
+	return config, nil
+}
+
+// positiveIntFromEnv reads an optional whole-number override, keeping the
+// default when the variable is unset or empty.
+//
+// A value that is not a positive integer is refused rather than defaulted,
+// for the reason LoadDestinationPolicyFromEnv gives about a non-boolean:
+// both ways of guessing at a typo are wrong, and here one of them silently
+// restores a budget the operator meant to change — which is the budget the
+// reclaim bound is validated against.
+func positiveIntFromEnv(name string, fallback int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("notification: %s must be a positive integer, got %q", name, raw)
+	}
+	return value, nil
+}
+
+// maxConfigurableSeconds is the largest second count a time.Duration can
+// hold. Refused here rather than left to wrap: a wrapped product can land
+// back on a small positive duration, which Validate would then accept as a
+// deliberately tiny timeout.
+const maxConfigurableSeconds = int(math.MaxInt64 / int64(time.Second))
+
+func positiveSecondsFromEnv(name string, fallback time.Duration) (time.Duration, error) {
+	seconds, err := positiveIntFromEnv(name, int(fallback/time.Second))
+	if err != nil {
+		return 0, err
+	}
+	if seconds > maxConfigurableSeconds {
+		return 0, fmt.Errorf("notification: %s must be at most %d seconds, got %d", name, maxConfigurableSeconds, seconds)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 // run consumes until ctx is cancelled, waits up to drain for the delivery in
@@ -275,6 +368,9 @@ func decodeEvent(eventType string, body []byte) (notificationdomain.TerminalEven
 		if err != nil {
 			return notificationdomain.TerminalEvent{}, err
 		}
+		if err := matchesRoutingKey(eventType, message.Type); err != nil {
+			return notificationdomain.TerminalEvent{}, err
+		}
 		jobID, userID, err := identifiers(message.JobID, message.UserID)
 		if err != nil {
 			return notificationdomain.TerminalEvent{}, fmt.Errorf("notification: notifier: %s: %w", eventType, err)
@@ -290,6 +386,9 @@ func decodeEvent(eventType string, body []byte) (notificationdomain.TerminalEven
 		if err != nil {
 			return notificationdomain.TerminalEvent{}, err
 		}
+		if err := matchesRoutingKey(eventType, message.Type); err != nil {
+			return notificationdomain.TerminalEvent{}, err
+		}
 		jobID, userID, err := identifiers(message.JobID, message.UserID)
 		if err != nil {
 			return notificationdomain.TerminalEvent{}, fmt.Errorf("notification: notifier: %s: %w", eventType, err)
@@ -303,6 +402,23 @@ func decodeEvent(eventType string, body []byte) (notificationdomain.TerminalEven
 	default:
 		return notificationdomain.TerminalEvent{}, fmt.Errorf("notification: notifier: unrecognized event type %q", eventType)
 	}
+}
+
+// matchesRoutingKey refuses a payload whose own type field disagrees with
+// the routing key it arrived under.
+//
+// The routing key is what chooses the parser, and the two payload shapes
+// decode from each other's bytes without error: a completion read as a
+// failure yields an empty reason, which the domain accepts, so the mismatch
+// would be announced to a subscriber as a failure that never happened.
+// Neither the parser nor the domain can catch it — only the disagreement
+// between the two halves of the message can, and the producer sets both from
+// one event type, so a disagreement is a defect no redelivery repairs.
+func matchesRoutingKey(eventType, payloadType string) error {
+	if payloadType != eventType {
+		return fmt.Errorf("notification: notifier: %s: the payload declares type %q", eventType, payloadType)
+	}
+	return nil
 }
 
 // identifiers builds the two value objects both message shapes carry, naming

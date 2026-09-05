@@ -268,6 +268,18 @@ services:
       # service reachable from this process. Unset, the default posture is
       # https-only to globally-reachable unicast.
       NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
+    # Longer than this process's shutdown drain, which is MaxClaimHold() plus
+    # a 30s grace — 60s at the documented delivery budget. Compose's default
+    # is 10 seconds, so without this `docker compose stop`/`down` would
+    # SIGKILL a delivery still in flight and leave a claim unresolved: the
+    # exact state the join-before-close ordering exists to avoid, produced
+    # routinely by the documented local workflow.
+    #
+    # The coupling is to the budget, not to the number: raising
+    # NOTIFICATION_WEBHOOK_MAX_ATTEMPTS or NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS
+    # on this service lengthens the drain, and this value has to stay above
+    # MaxClaimHold() + 30s for whatever budget is configured here.
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy

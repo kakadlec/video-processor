@@ -31,6 +31,7 @@ func TestSetupNotifier_RequiresItsOwnConfiguration(t *testing.T) {
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
+			clearDeliveryBudgetEnv(t)
 			t.Setenv("RABBITMQ_URL", testCase.broker)
 			t.Setenv("NOTIFICATION_POSTGRES_DSN", testCase.dsn)
 
@@ -50,6 +51,7 @@ func TestSetupNotifier_RequiresItsOwnConfiguration(t *testing.T) {
 // pass: a value that is not a boolean fails startup before a connection is
 // opened, rather than leaving the process to guess at a security posture.
 func TestSetupNotifier_RefusesAnUnparseableDestinationPolicy(t *testing.T) {
+	clearDeliveryBudgetEnv(t)
 	t.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 	t.Setenv("NOTIFICATION_POSTGRES_DSN", "postgres://user:pass@localhost:5432/db?sslmode=disable")
 	t.Setenv(notificationwebhook.EnvAllowInsecureDestinations, "yes")
@@ -61,6 +63,99 @@ func TestSetupNotifier_RefusesAnUnparseableDestinationPolicy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), notificationwebhook.EnvAllowInsecureDestinations) {
 		t.Errorf("error %q does not name the variable", err)
+	}
+}
+
+// The delivery budget is operator-tunable, and that is what gives the
+// startup validator something to refuse: a budget that could only ever be
+// the compile-time default is one no configured value could ever break.
+func TestLoadDeliveryConfig_AppliesTheEnvironmentOverrides(t *testing.T) {
+	clearDeliveryBudgetEnv(t)
+	t.Setenv(envWebhookMaxAttempts, "5")
+	t.Setenv(envWebhookTimeoutSeconds, "10")
+	t.Setenv(envDeliveryReclaimSeconds, "300")
+
+	config, err := loadDeliveryConfig()
+	if err != nil {
+		t.Fatalf("loadDeliveryConfig() = %v", err)
+	}
+	if config.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want 5", config.MaxAttempts)
+	}
+	if config.Timeout != 10*time.Second {
+		t.Errorf("Timeout = %s, want 10s", config.Timeout)
+	}
+	if config.ReclaimBound != 300*time.Second {
+		t.Errorf("ReclaimBound = %s, want 5m0s", config.ReclaimBound)
+	}
+	// A term this process does not expose keeps its documented default; the
+	// overrides above are three variables, not a way in for every term.
+	if config.ResolveMaxAttempts != notificationapplication.DefaultResolveMaxAttempts {
+		t.Errorf("ResolveMaxAttempts = %d, want the default %d",
+			config.ResolveMaxAttempts, notificationapplication.DefaultResolveMaxAttempts)
+	}
+}
+
+// The refusal the validator exists for, now reachable: attempt terms raised
+// past what the default bound covers is a startup failure naming both
+// values, not a warning. A second consumer would otherwise be granted the
+// claim while this one still has a request on the wire.
+func TestLoadDeliveryConfig_RefusesABoundBelowTheConfiguredBudget(t *testing.T) {
+	clearDeliveryBudgetEnv(t)
+	t.Setenv(envWebhookMaxAttempts, "5")
+	t.Setenv(envWebhookTimeoutSeconds, "60")
+
+	_, err := loadDeliveryConfig()
+	if err == nil {
+		t.Fatal("a budget far exceeding the default reclaim bound was accepted")
+	}
+	// Computed the way the loader computes it rather than transcribed, so
+	// changing a default moves this assertion with it.
+	configured := notificationapplication.DefaultDeliveryConfig()
+	configured.MaxAttempts = 5
+	configured.Timeout = 60 * time.Second
+	for _, want := range []string{configured.ReclaimBound.String(), configured.MaxClaimHold().String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+}
+
+// A value that is not a positive, representable count is refused rather than
+// defaulted: silently restoring the default would leave an operator who
+// meant to change a term running the budget they thought they had replaced.
+func TestLoadDeliveryConfig_RefusesAValueThatIsNotAPositiveCount(t *testing.T) {
+	cases := map[string]struct {
+		name  string
+		value string
+	}{
+		"not a number":                 {envWebhookMaxAttempts, "many"},
+		"zero attempts":                {envWebhookMaxAttempts, "0"},
+		"a negative timeout":           {envWebhookTimeoutSeconds, "-5"},
+		"a bound no duration can hold": {envDeliveryReclaimSeconds, "9999999999999"},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearDeliveryBudgetEnv(t)
+			t.Setenv(testCase.name, testCase.value)
+
+			config, err := loadDeliveryConfig()
+			if err == nil {
+				t.Fatalf("%s=%q was accepted, yielding %+v", testCase.name, testCase.value, config)
+			}
+			if !strings.Contains(err.Error(), testCase.name) {
+				t.Errorf("error %q does not name %s", err, testCase.name)
+			}
+		})
+	}
+}
+
+// clearDeliveryBudgetEnv unsets every budget override, so a value in the
+// ambient environment cannot decide what a case exercises.
+func clearDeliveryBudgetEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{envWebhookMaxAttempts, envWebhookTimeoutSeconds, envDeliveryReclaimSeconds} {
+		t.Setenv(name, "")
 	}
 }
 
@@ -94,6 +189,20 @@ func TestHandle_DispositionTable(t *testing.T) {
 		"an unrecognized event type is dead-lettered": {
 			eventType: "video_job.completed.v99",
 			body:      completedBody(t, testJobID, testUserID),
+			want:      notificationmessaging.Reject,
+		},
+		// The routing key chooses the parser, and the two payload shapes
+		// decode from each other's bytes: read as a failure, a completion
+		// yields an empty reason the domain accepts, so a mismatch left
+		// unchecked would announce a failure that never happened.
+		"a completion routed as a failure is dead-lettered": {
+			eventType: notificationdomain.EventTypeVideoJobFailed,
+			body:      completedBody(t, testJobID, testUserID),
+			want:      notificationmessaging.Reject,
+		},
+		"a payload declaring no type at all is dead-lettered": {
+			eventType: notificationdomain.EventTypeVideoJobCompleted,
+			body:      completedBodyWithoutType(t),
 			want:      notificationmessaging.Reject,
 		},
 		"a message naming no user is dead-lettered": {
@@ -343,6 +452,20 @@ func completedBodyWithoutStorageKey(t *testing.T) []byte {
 		JobID:      testJobID,
 		UserID:     testUserID,
 		FrameCount: 12,
+		OccurredAt: time.Now(),
+	})
+}
+
+// A completion carrying no type field. The routing key says completion, so
+// the parser is the right one and every field the domain checks is valid —
+// only the two halves of the message disagree.
+func completedBodyWithoutType(t *testing.T) []byte {
+	t.Helper()
+	return marshal(t, notificationmessaging.JobCompletedMessage{
+		JobID:      testJobID,
+		UserID:     testUserID,
+		FrameCount: 12,
+		StorageKey: "frames_" + testJobID + ".zip",
 		OccurredAt: time.Now(),
 	})
 }
