@@ -425,6 +425,45 @@ func TestClient_RefusesANilPreference(t *testing.T) {
 	}
 }
 
+// The response body is bounded, which the spec requires of every attempt.
+//
+// The teeth are in the elapsed time rather than in the verdict: this
+// destination sends more than the cap and then holds the response open
+// forever. Bounded, the read ends at the cap and the attempt returns at
+// once; unbounded, io.Copy waits for an EOF that never comes and only the
+// client's own timeout ends it — returning the same nil, seconds later,
+// with a connection held the whole time.
+func TestClient_BoundsTheResponseBody(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, maxResponseBytes+1))
+		if flusher, flushable := w.(http.Flusher); flushable {
+			flusher.Flush()
+		}
+		<-release
+	}))
+	// Close after the handler is released: the server waits for outstanding
+	// requests, and one blocked on a channel would never finish.
+	defer server.Close()
+	defer close(release)
+
+	client := newTestClient(t, domain.NewDestinationPolicy(true))
+	preference := newTestPreference(t, server.URL+"/hook", testSecret)
+
+	start := time.Now()
+	err := client.Deliver(context.Background(), preference, completedEvent(t, 1), deliveryID(t, "d"))
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed >= testTimeout/2 {
+		t.Errorf("Deliver took %s against a destination still holding the response open, with a %s timeout: the response body is not bounded",
+			elapsed, testTimeout)
+	}
+}
+
 func newTestClient(t *testing.T, policy domain.DestinationPolicy) *Client {
 	t.Helper()
 	client := NewClient(policy, testTimeout)

@@ -924,6 +924,13 @@ const secretLoadingMethod = "FindDeliverable"
 // allowed to name it.
 const deliveryUseCaseFile = "deliver_notification.go"
 
+// deliveryUseCaseConstructor is how that file would be reached from a
+// composition root. Naming the constructor is not the same check as naming
+// the repository method: a wiring line calls the former and never mentions
+// the latter, so a scan for the method alone would report a clean cmd/api
+// that in fact builds the use case that loads secrets.
+const deliveryUseCaseConstructor = "NewDeliverNotification"
+
 // TestTheHTTPCompositionRootDoesNotLoadTheSecret is the assertion that
 // carries the weight of "the secret is read on the delivery path and nowhere
 // else".
@@ -960,6 +967,18 @@ func TestTheHTTPCompositionRootDoesNotLoadTheSecret(t *testing.T) {
 	}
 	if !slices.Contains(useCases, deliveryUseCaseFile) {
 		t.Fatalf("no file in the notification application layer names %s; this scan is passing vacuously", secretLoadingMethod)
+	}
+
+	// The wiring itself. cmd/notifier is the composition root that builds the
+	// delivery use case; this one must not, whatever the use case's own file
+	// happens to call.
+	wiring := namingFiles(t, filepath.Join("cmd", "api"), deliveryUseCaseConstructor)
+	if len(wiring) != 0 {
+		t.Errorf("%v under cmd/api name %s: wiring the delivery use case is what would give this process a path to a stored secret",
+			wiring, deliveryUseCaseConstructor)
+	}
+	if constructed := namingFiles(t, filepath.Join("internal", "notification", "application"), deliveryUseCaseConstructor); len(constructed) == 0 {
+		t.Fatalf("no file in the notification application layer names %s; this scan is passing vacuously", deliveryUseCaseConstructor)
 	}
 }
 

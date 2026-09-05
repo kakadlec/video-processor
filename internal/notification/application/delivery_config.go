@@ -2,6 +2,7 @@ package application
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -88,23 +89,56 @@ func (c DeliveryConfig) ResolveBudget() time.Duration {
 // constant so that lowering a default moves the floor with it, which a
 // constant transcribed once would not.
 func (c DeliveryConfig) MaxClaimHold() time.Duration {
-	return c.AttemptBudget() + c.ResolveBudget()
+	return addDuration(c.AttemptBudget(), c.ResolveBudget())
 }
+
+// maxDuration is what the arithmetic below saturates at rather than
+// wrapping. A doubling wait reaches it quickly — the default 2s backoff
+// overflows an int64 nanosecond count at around 33 attempts — and a wrapped
+// total is worse than a refused configuration: it is negative, so every
+// comparison it feeds silently inverts and a reclaim bound far below the
+// real hold passes validation.
+const maxDuration = time.Duration(math.MaxInt64)
 
 // budget totals n attempts of the given timeout with a doubling wait between
 // them. n attempts have n-1 waits, not n: nothing is waited for before the
 // first attempt or after the last.
+//
+// It saturates rather than wrapping; Validate is what refuses a saturated
+// budget, because only there is there something to report it to.
 func budget(attempts int, timeout, initialBackoff time.Duration) time.Duration {
-	if attempts <= 0 {
+	if attempts <= 0 || timeout < 0 || initialBackoff < 0 {
 		return 0
 	}
-	total := time.Duration(attempts) * timeout
+	total := mulDuration(timeout, attempts)
 	wait := initialBackoff
-	for i := 0; i < attempts-1; i++ {
-		total += wait
-		wait *= 2
+	for i := 0; i < attempts-1 && total < maxDuration; i++ {
+		total = addDuration(total, wait)
+		wait = mulDuration(wait, 2)
 	}
 	return total
+}
+
+// addDuration and mulDuration saturate at maxDuration. Both take
+// non-negative operands only; budget clamps its inputs before calling them.
+func addDuration(a, b time.Duration) time.Duration {
+	if a < 0 || b < 0 {
+		return 0
+	}
+	if b > maxDuration-a {
+		return maxDuration
+	}
+	return a + b
+}
+
+func mulDuration(d time.Duration, n int) time.Duration {
+	if d <= 0 || n <= 0 {
+		return 0
+	}
+	if d > maxDuration/time.Duration(n) {
+		return maxDuration
+	}
+	return d * time.Duration(n)
 }
 
 // Validate refuses a configuration whose reclaim bound is shorter than
@@ -138,7 +172,17 @@ func (c DeliveryConfig) Validate() error {
 	}
 
 	hold := c.MaxClaimHold()
-	floor := reclaimBoundSafetyFactor * hold
+	floor := mulDuration(hold, reclaimBoundSafetyFactor)
+	// A saturated hold or floor means the configured terms describe a budget
+	// no duration can hold, so there is no floor left to check the bound
+	// against. Refusing is the only honest answer: saturating quietly would
+	// accept a bound the arithmetic can no longer justify.
+	if hold >= maxDuration || floor >= maxDuration {
+		return fmt.Errorf(
+			"notification: the attempt budget is not representable as a duration (max attempts %d, timeout %s, initial backoff %s; resolve %d, %s, %s), so no reclaim bound can be validated against it",
+			c.MaxAttempts, c.Timeout, c.InitialBackoff,
+			c.ResolveMaxAttempts, c.ResolveTimeout, c.ResolveInitialBackoff)
+	}
 	if c.ReclaimBound < floor {
 		return fmt.Errorf(
 			"notification: reclaim bound %s is below %s, which is %d times the %s a claimant can hold a claim under the configured attempt budget",

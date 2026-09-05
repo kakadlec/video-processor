@@ -4,6 +4,9 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -65,16 +68,21 @@ func TestRenderTimestamp_IsUnixSeconds(t *testing.T) {
 	}
 }
 
-// revealCallSites are the only non-test files permitted to call Reveal.
+// revealCallSites are the only call sites in the repository permitted to
+// reveal a secret, as "<file>: <enclosing function>" pairs.
 //
 // The claim being enforced is narrow and has to be: the write path in
 // postgres reveals a secret its own caller handed it in the same call, in
 // order to store it, and that path is required. What must stay singular is
 // the reading of one back out of storage, which is what makes every other
 // projection's "has_secret" a guarantee rather than a convention.
+//
+// The pairs name functions rather than files because a file-wide allowance
+// is not the invariant: a second function added to repository.go could
+// reveal a secret it loaded, and the file would still be on the list.
 var revealCallSites = []string{
-	filepath.Join("internal", "notification", "infrastructure", "postgres", "repository.go"),
-	filepath.Join("internal", "notification", "infrastructure", "webhook", "signature.go"),
+	filepath.Join("internal", "notification", "infrastructure", "postgres", "repository.go") + ": (*PreferenceRepository).Set",
+	filepath.Join("internal", "notification", "infrastructure", "webhook", "signature.go") + ": sign",
 }
 
 // TestOnlyTheSignerRevealsAStoredSecret reads source rather than running
@@ -97,18 +105,17 @@ func TestOnlyTheSignerRevealsAStoredSecret(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		source, readErr := os.ReadFile(path) // #nosec G304
-		if readErr != nil {
-			return readErr
-		}
-		if !strings.Contains(string(source), ".Reveal()") {
-			return nil
-		}
 		relative, relErr := filepath.Rel(root, path)
 		if relErr != nil {
 			return relErr
 		}
-		found = append(found, relative)
+		sites, parseErr := revealSitesIn(path)
+		if parseErr != nil {
+			return parseErr
+		}
+		for _, site := range sites {
+			found = append(found, relative+": "+site)
+		}
 		return nil
 	})
 	if err != nil {
@@ -116,12 +123,60 @@ func TestOnlyTheSignerRevealsAStoredSecret(t *testing.T) {
 	}
 
 	slices.Sort(found)
+	found = slices.Compact(found)
 	want := slices.Clone(revealCallSites)
 	slices.Sort(want)
 
 	if !slices.Equal(found, want) {
-		t.Errorf("files calling Reveal() = %v, want %v — a new caller reads a stored secret somewhere the design says nothing does", found, want)
+		t.Errorf("call sites revealing a secret = %v, want %v — a new caller reads a stored secret somewhere the design says nothing does", found, want)
 	}
+}
+
+// revealSitesIn returns the enclosing function of every Reveal() call in one
+// file. A call outside any function — a package-level initialiser — is
+// reported under a name of its own rather than skipped, so it cannot slip
+// past a scan that only looks inside function bodies.
+func revealSitesIn(path string) ([]string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	var sites []string
+	for _, decl := range file.Decls {
+		enclosing := "<package-level initialiser>"
+		if function, isFunction := decl.(*ast.FuncDecl); isFunction {
+			enclosing = functionName(function)
+		}
+		ast.Inspect(decl, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			selector, isSelector := call.Fun.(*ast.SelectorExpr)
+			if isSelector && selector.Sel.Name == "Reveal" && len(call.Args) == 0 {
+				sites = append(sites, enclosing)
+			}
+			return true
+		})
+	}
+	return sites, nil
+}
+
+func functionName(function *ast.FuncDecl) string {
+	if function.Recv == nil || len(function.Recv.List) == 0 {
+		return function.Name.Name
+	}
+	receiver := function.Recv.List[0].Type
+	if pointer, isPointer := receiver.(*ast.StarExpr); isPointer {
+		if named, isNamed := pointer.X.(*ast.Ident); isNamed {
+			return "(*" + named.Name + ")." + function.Name.Name
+		}
+	}
+	if named, isNamed := receiver.(*ast.Ident); isNamed {
+		return named.Name + "." + function.Name.Name
+	}
+	return function.Name.Name
 }
 
 func repoRoot(t *testing.T) string {

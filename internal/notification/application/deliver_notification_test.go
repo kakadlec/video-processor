@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -320,11 +321,13 @@ func TestDeliverNotification_ClaimsAgainstTheConfiguredReclaimBound(t *testing.T
 // output names the triple and the delivery, and carries neither the secret
 // it signed with nor the body it sent.
 func TestDeliverNotification_LogsNeitherTheSecretNorTheBody(t *testing.T) {
-	var body []byte
+	// Buffered by one and read after Execute returns: a single Read can
+	// stop short of the whole body, which would leave the assertions below
+	// searching the log for a fragment and passing for the wrong reason.
+	received := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		read := make([]byte, 4096)
-		n, _ := r.Body.Read(read)
-		body = read[:n]
+		read, _ := io.ReadAll(r.Body)
+		received <- read
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -343,6 +346,11 @@ func TestDeliverNotification_LogsNeitherTheSecretNorTheBody(t *testing.T) {
 
 	if _, err := useCase.Execute(context.Background(), mustCompletedEvent(t, deliveryTestOccurredAt)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	var body []byte
+	select {
+	case body = <-received:
+	default:
 	}
 	if len(body) == 0 {
 		t.Fatal("the destination received no body; this test would then be asserting on nothing")

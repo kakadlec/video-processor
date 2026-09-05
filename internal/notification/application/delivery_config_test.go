@@ -87,3 +87,46 @@ func TestDeliveryConfig_RefusesNonPositiveTerms(t *testing.T) {
 		}
 	}
 }
+
+// A doubling wait overflows an int64 nanosecond count quickly: at the
+// default 2s backoff, the 33rd attempt's wait alone is around 272 years.
+// Wrapped, the total goes negative, the floor computed from it goes
+// negative too, and the default 120s bound clears a floor that in truth
+// exceeds any duration — a second consumer would reclaim a row whose first
+// claimant is still legitimately waiting.
+func TestDeliveryConfig_RefusesABudgetNoDurationCanHold(t *testing.T) {
+	config := application.DefaultDeliveryConfig()
+	config.MaxAttempts = 33
+
+	if got := config.AttemptBudget(); got < 0 {
+		t.Fatalf("AttemptBudget() = %s, want it saturated rather than wrapped negative", got)
+	}
+	if got := config.MaxClaimHold(); got < 0 {
+		t.Fatalf("MaxClaimHold() = %s, want it saturated rather than wrapped negative", got)
+	}
+	if err := config.Validate(); err == nil {
+		t.Errorf("MaxClaimHold() = %s, yet a bound of %s was accepted",
+			config.MaxClaimHold(), config.ReclaimBound)
+	}
+
+	// The same on the resolve side, whose terms feed the same total.
+	resolving := application.DefaultDeliveryConfig()
+	resolving.ResolveMaxAttempts = 64
+	if err := resolving.Validate(); err == nil {
+		t.Errorf("ResolveBudget() = %s, yet a bound of %s was accepted",
+			resolving.ResolveBudget(), resolving.ReclaimBound)
+	}
+
+	// And a hold just over half the representable range: the hold itself
+	// fits, but the safety factor's product does not, so there is still no
+	// floor to check the bound against.
+	unrepresentableFloor := application.DefaultDeliveryConfig()
+	unrepresentableFloor.MaxAttempts = 1
+	unrepresentableFloor.ResolveMaxAttempts = 1
+	unrepresentableFloor.Timeout = time.Duration(1) << 62
+	unrepresentableFloor.ResolveTimeout = time.Duration(1) << 62
+	if err := unrepresentableFloor.Validate(); err == nil {
+		t.Errorf("MaxClaimHold() = %s, yet a bound of %s was accepted",
+			unrepresentableFloor.MaxClaimHold(), unrepresentableFloor.ReclaimBound)
+	}
+}
