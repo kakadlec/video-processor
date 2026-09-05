@@ -22,7 +22,11 @@ const (
 var testNow = time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 
 func newSetPreference(repo *fakePreferenceRepository) *application.SetPreference {
-	return application.NewSetPreference(repo, fakeClock{now: testNow})
+	return application.NewSetPreference(repo, fakeClock{now: testNow}, domain.NewDestinationPolicy(false))
+}
+
+func newRelaxedSetPreference(repo *fakePreferenceRepository) *application.SetPreference {
+	return application.NewSetPreference(repo, fakeClock{now: testNow}, domain.NewDestinationPolicy(true))
 }
 
 func validSetInput() application.SetPreferenceInput {
@@ -208,6 +212,19 @@ func TestSetPreferenceRejectsInvalidInput(t *testing.T) {
 			mutate:  func(in *application.SetPreferenceInput) { in.Secret = &emptySecret },
 			wantErr: domain.ErrInvalidSecret,
 		},
+		// The policy's refusals arrive here as the same kind of validation
+		// failure as the rows above, and the shared setCalls assertion below is
+		// what pins the ordering: the check runs before the write, not after.
+		{
+			name:    "http destination",
+			mutate:  func(in *application.SetPreferenceInput) { in.Destination = "http://hooks.example.com/video-jobs" },
+			wantErr: domain.ErrDestinationRefused,
+		},
+		{
+			name:    "private address destination",
+			mutate:  func(in *application.SetPreferenceInput) { in.Destination = "https://169.254.169.254/latest/meta-data/" },
+			wantErr: domain.ErrDestinationRefused,
+		},
 	}
 
 	for _, tt := range tests {
@@ -251,5 +268,47 @@ func TestPreferenceResultDeclaresNoSecretField(t *testing.T) {
 		if strings.Contains(strings.ToLower(name), "secret") {
 			t.Errorf("PreferenceResult declares field %q; the secret must not be returnable", name)
 		}
+	}
+}
+
+// A disabled preference is judged too. Nothing revalidates a destination on
+// the way to being enabled, so skipping the check here would leave a refused
+// destination one flag flip away from being delivered to.
+func TestSetPreferenceJudgesTheDestinationOfADisabledPreference(t *testing.T) {
+	repo := newFakePreferenceRepository()
+	input := validSetInput()
+	input.Enabled = false
+	input.Destination = "http://hooks.example.com/video-jobs"
+
+	_, err := newSetPreference(repo).Execute(context.Background(), input)
+	if !errors.Is(err, domain.ErrDestinationRefused) {
+		t.Fatalf("Execute() error = %v, want %v", err, domain.ErrDestinationRefused)
+	}
+	if repo.setCalls != 0 {
+		t.Errorf("repository Set called %d times, want 0", repo.setCalls)
+	}
+}
+
+// The relaxation is what a local stack runs under: an http scheme and a
+// private address are both accepted, because there is no TLS there and a
+// receiver is a container hostname on a private network.
+func TestSetPreferenceAcceptsInsecureDestinationsUnderTheRelaxation(t *testing.T) {
+	for _, destination := range []string{
+		"http://receiver.internal/video-jobs",
+		"https://10.0.0.7:9000/video-jobs",
+	} {
+		t.Run(destination, func(t *testing.T) {
+			repo := newFakePreferenceRepository()
+			input := validSetInput()
+			input.Destination = destination
+
+			result, err := newRelaxedSetPreference(repo).Execute(context.Background(), input)
+			if err != nil {
+				t.Fatalf("Execute() error = %v, want nil", err)
+			}
+			if result.Destination != destination {
+				t.Errorf("Destination = %q, want %q", result.Destination, destination)
+			}
+		})
 	}
 }

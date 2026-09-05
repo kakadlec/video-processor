@@ -133,8 +133,15 @@ const notificationPreferencesPath = "/api/notification-preferences"
 const testWebhookSecret = "test-only-signing-secret"
 
 func newTestNotificationModule(repo notificationdomain.PreferenceRepository) *notificationModule {
+	return newTestNotificationModuleWithPolicy(repo, notificationdomain.NewDestinationPolicy(false))
+}
+
+// newTestNotificationModuleWithPolicy is the variant the destination-policy
+// tests use. The restrictive posture is the default above so that every
+// other test in this file keeps exercising what production runs under.
+func newTestNotificationModuleWithPolicy(repo notificationdomain.PreferenceRepository, policy notificationdomain.DestinationPolicy) *notificationModule {
 	return newNotificationModule(
-		notificationapplication.NewSetPreference(repo, systemClock{}),
+		notificationapplication.NewSetPreference(repo, systemClock{}, policy),
 		notificationapplication.NewListPreferences(repo),
 	)
 }
@@ -157,9 +164,25 @@ func newNotificationTestServer(t *testing.T, limiter videoRateLimiter) (*httptes
 
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	repo := newInMemoryPreferenceRepository()
-	srv := httptest.NewServer(setupRouter(identity, nil, newTestNotificationModule(repo), limiter))
+	return newNotificationTestServerOver(t, limiter, identity, repo, notificationdomain.NewDestinationPolicy(false)), tokens, repo
+}
+
+// newNotificationTestServerOver serves the real router over a caller-supplied
+// identity module, repository and policy, so two servers under two different
+// postures can be stood up over one repository — which is how a row written
+// before the policy existed is produced without reaching inside the fake.
+func newNotificationTestServerOver(
+	t *testing.T,
+	limiter videoRateLimiter,
+	identity *identityModule,
+	repo notificationdomain.PreferenceRepository,
+	policy notificationdomain.DestinationPolicy,
+) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(setupRouter(identity, nil, newTestNotificationModuleWithPolicy(repo, policy), limiter))
 	t.Cleanup(srv.Close)
-	return srv, tokens, repo
+	return srv
 }
 
 func putPreference(t *testing.T, baseURL, token string, payload any) *http.Response {
@@ -979,6 +1002,138 @@ func TestTheHTTPCompositionRootDoesNotLoadTheSecret(t *testing.T) {
 	}
 	if constructed := namingFiles(t, filepath.Join("internal", "notification", "application"), deliveryUseCaseConstructor); len(constructed) == 0 {
 		t.Fatalf("no file in the notification application layer names %s; this scan is passing vacuously", deliveryUseCaseConstructor)
+	}
+}
+
+// 6.3
+//
+// The write-time half of the destination policy. These are the two shapes it
+// exists to keep out: a plaintext scheme, and a destination naming an address
+// inside this deployment — 169.254.169.254 being the cloud metadata endpoint
+// an SSRF primitive is worth building to reach.
+func TestNotificationPreferences_RefuseInsecureDestinationsUnderTheDefaultPolicy(t *testing.T) {
+	srv, tokens, repo := newNotificationTestServer(t, alwaysAllowRateLimiter{})
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	for _, tt := range []struct {
+		name        string
+		destination string
+	}{
+		{"http scheme", "http://example.test/hooks/done"},
+		{"private address", "https://169.254.169.254/latest/meta-data/"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := validPreferenceBody()
+			body["destination"] = tt.destination
+
+			resp := putPreference(t, srv.URL, token, body)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("PUT status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+
+			// The refusal says the destination was refused and stops there. It
+			// must not name the rule: the rules enumerate this deployment's
+			// internal address space, and a caller who could tell "private"
+			// from "documentation" apart by resubmitting has a probe.
+			var decoded notificationErrorResponse
+			if err := json.Unmarshal(readBody(t, resp), &decoded); err != nil {
+				t.Fatalf("unexpected error decoding error response: %v", err)
+			}
+			for _, leak := range []string{"private", "loopback", "link-local", "scheme", "https", "unicast", tt.destination} {
+				if strings.Contains(strings.ToLower(decoded.Error), strings.ToLower(leak)) {
+					t.Errorf("error %q names %q; the response must not enumerate which rule caught it", decoded.Error, leak)
+				}
+			}
+		})
+	}
+
+	if repo.count() != 0 {
+		t.Errorf("%d preferences stored, want 0 — a refused destination is refused before the write", repo.count())
+	}
+}
+
+// The relaxation is what docker-compose.yml sets for the local stack, where
+// there is no TLS and a receiver is a container hostname on a private
+// network. Both shapes above are accepted under it.
+func TestNotificationPreferences_AcceptInsecureDestinationsUnderTheRelaxation(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	repo := newInMemoryPreferenceRepository()
+	srv := newNotificationTestServerOver(t, alwaysAllowRateLimiter{}, identity, repo, notificationdomain.NewDestinationPolicy(true))
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	for _, tt := range []struct {
+		eventType   string
+		destination string
+	}{
+		{notificationdomain.EventTypeVideoJobCompleted, "http://receiver:9000/hooks/done"},
+		{notificationdomain.EventTypeVideoJobFailed, "https://10.0.0.7:9000/hooks/failed"},
+	} {
+		body := validPreferenceBody()
+		body["event_type"] = tt.eventType
+		body["destination"] = tt.destination
+
+		resp := putPreference(t, srv.URL, token, body)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PUT %s status = %d, want %d (body %s)", tt.destination, resp.StatusCode, http.StatusOK, readBody(t, resp))
+		}
+	}
+
+	if repo.count() != 2 {
+		t.Errorf("%d preferences stored, want 2", repo.count())
+	}
+}
+
+// A row stored before the policy existed is neither migrated nor deleted.
+// The read path applies no policy at all, so it comes back listed with its
+// original destination — the tightening governs what may be written from now
+// on, and the dial-time check in the delivery client is what stops an
+// already-stored destination from being reached.
+func TestNotificationPreferences_StoredBeforeThePolicyAreNeitherMigratedNorDeleted(t *testing.T) {
+	identity, tokens := newTestIdentityModuleWithTokens(t)
+	repo := newInMemoryPreferenceRepository()
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	const legacyDestination = "http://legacy.internal/hooks/done"
+
+	// Written through a real server running under the relaxation, which is
+	// how the row would have been produced before the policy was tightened —
+	// rather than by reaching inside the fake, which would prove nothing
+	// about the write path.
+	relaxed := newNotificationTestServerOver(t, alwaysAllowRateLimiter{}, identity, repo, notificationdomain.NewDestinationPolicy(true))
+	body := validPreferenceBody()
+	body["destination"] = legacyDestination
+	seed := putPreference(t, relaxed.URL, token, body)
+	defer seed.Body.Close()
+	if seed.StatusCode != http.StatusOK {
+		t.Fatalf("seeding PUT status = %d, want %d (body %s)", seed.StatusCode, http.StatusOK, readBody(t, seed))
+	}
+
+	// Read back through a second server over the same repository, under the
+	// restrictive posture.
+	restrictive := newNotificationTestServerOver(t, alwaysAllowRateLimiter{}, identity, repo, notificationdomain.NewDestinationPolicy(false))
+	status, listed := listPreferences(t, restrictive.URL, token)
+	if status != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d", status, http.StatusOK)
+	}
+	decoded := decodePreferenceList(t, listed)
+	if len(decoded.Preferences) != 1 {
+		t.Fatalf("got %d preferences, want 1 — the row was deleted or hidden by the read path", len(decoded.Preferences))
+	}
+	if decoded.Preferences[0].Destination != legacyDestination {
+		t.Errorf("Destination = %q, want %q — the row was rewritten", decoded.Preferences[0].Destination, legacyDestination)
+	}
+	if repo.count() != 1 {
+		t.Errorf("%d preferences stored, want 1", repo.count())
+	}
+
+	// And rewriting it under the restrictive posture is refused, so the row
+	// survives only as it stands: there is no path that quietly re-blesses it.
+	rewrite := putPreference(t, restrictive.URL, token, body)
+	defer rewrite.Body.Close()
+	if rewrite.StatusCode != http.StatusBadRequest {
+		t.Errorf("rewriting PUT status = %d, want %d", rewrite.StatusCode, http.StatusBadRequest)
 	}
 }
 

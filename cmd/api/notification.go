@@ -14,6 +14,7 @@ import (
 	"video-processor/internal/notification/application"
 	"video-processor/internal/notification/domain"
 	"video-processor/internal/notification/infrastructure/postgres"
+	"video-processor/internal/notification/infrastructure/webhook"
 )
 
 // notificationModule wires the Notification bounded context's use cases to
@@ -54,11 +55,25 @@ func setupNotification(ctx context.Context) (*notificationModule, *sql.DB, error
 		return nil, nil, fmt.Errorf("notification: connect to postgres: %w", err)
 	}
 
+	// The same variable and the same parser cmd/notifier reads. One policy
+	// with two readers: this half refuses a destination when it is registered,
+	// the notifier's half refuses the address when it is dialled, and a
+	// deployment whose two processes disagree either stores destinations it
+	// can never deliver to or refuses at dial what it accepted at write time.
+	// A non-boolean value is fatal here for the reason it is fatal there — the
+	// relaxation is a security posture, and neither way of guessing is safe.
+	policy, err := webhook.LoadDestinationPolicyFromEnv()
+	if err != nil {
+		closeDB(db)
+		return nil, nil, err
+	}
+	log.Printf("notification: destination policy: insecure destinations allowed=%t", policy.AllowsInsecure())
+
 	repo := postgres.NewPreferenceRepository(db)
 	clock := systemClock{}
 
 	module := newNotificationModule(
-		application.NewSetPreference(repo, clock),
+		application.NewSetPreference(repo, clock, policy),
 		application.NewListPreferences(repo),
 	)
 	return module, db, nil
@@ -176,6 +191,11 @@ func (m *notificationModule) handleSetPreference(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, notificationErrorResponse{Error: "invalid channel"})
 		case errors.Is(err, domain.ErrInvalidDestination):
 			c.JSON(http.StatusBadRequest, notificationErrorResponse{Error: "invalid destination"})
+		// Refused without naming the rule that caught it. The rules enumerate
+		// this deployment's internal address space, so a caller who could tell
+		// them apart by resubmitting would have been handed a probe.
+		case errors.Is(err, domain.ErrDestinationRefused):
+			c.JSON(http.StatusBadRequest, notificationErrorResponse{Error: "the destination was refused"})
 		case errors.Is(err, domain.ErrInvalidSecret):
 			c.JSON(http.StatusBadRequest, notificationErrorResponse{Error: "invalid signing secret"})
 		case errors.Is(err, domain.ErrSecretRequired):

@@ -38,11 +38,16 @@ type SetPreferenceInput struct {
 type SetPreference struct {
 	preferences domain.PreferenceRepository
 	clock       Clock
+	policy      domain.DestinationPolicy
 }
 
 // NewSetPreference wires the SetPreference use case to its ports.
-func NewSetPreference(preferences domain.PreferenceRepository, clock Clock) *SetPreference {
-	return &SetPreference{preferences: preferences, clock: clock}
+//
+// The policy is a value rather than a port because its zero value is the
+// restrictive posture: a composition root that forgets to pass one refuses
+// insecure destinations instead of accepting everything.
+func NewSetPreference(preferences domain.PreferenceRepository, clock Clock, policy domain.DestinationPolicy) *SetPreference {
+	return &SetPreference{preferences: preferences, clock: clock, policy: policy}
 }
 
 // Execute runs the preference write use case.
@@ -64,6 +69,18 @@ func (uc *SetPreference) Execute(ctx context.Context, input SetPreferenceInput) 
 
 	destination, err := domain.NewDestination(input.Destination)
 	if err != nil {
+		return PreferenceResult{}, err
+	}
+
+	// Judged before anything is written, and judged whatever Enabled says: a
+	// disabled preference still stores a destination, and enabling it later
+	// goes through no validation of its own. The dial-time check in the
+	// delivery client is not made redundant by this one — a name resolves
+	// somewhere else later, and a policy tightened after the row was stored
+	// never revisits it — but without this one a caller can register a
+	// destination that is refused at every delivery, which from the outside
+	// is indistinguishable from one that simply never fires.
+	if err := uc.policy.CheckDestination(destination); err != nil {
 		return PreferenceResult{}, err
 	}
 

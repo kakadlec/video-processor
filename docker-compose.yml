@@ -186,6 +186,14 @@ services:
       # exists to avoid. The API serves normally with the broker down; the
       # relay retries in the background.
       RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
+      # The same relaxation the "notifier" service below sets, and set here
+      # for the same local-stack reason: as of add-notification-webhook-delivery
+      # cmd/api judges a destination when it is registered, so without this
+      # PUT /api/notification-preferences would refuse the only kind of
+      # receiver this stack can host — an "http" container hostname on a
+      # private network. See that service for what relaxing it costs
+      # anywhere else; it is never set in production.
+      NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -351,6 +359,12 @@ services:
       # set, matching the startup requirement — not to be reachable, which
       # cmd/api itself does not require either.
       RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
+      # Mirrors "app" rather than being needed by any test: cmd/api's tests
+      # build their notification module by hand and pass the posture they
+      # mean to exercise, so both postures are covered whatever this says.
+      # It is here because this service is defined as app's environment, and
+      # a difference left in it would be read later as a deliberate one.
+      NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
     depends_on:
       postgres:
         condition: service_healthy
