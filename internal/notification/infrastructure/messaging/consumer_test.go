@@ -214,6 +214,58 @@ func TestConsumer_ShutdownWaitsForTheDeliveryInHand(t *testing.T) {
 	expectDepth(t, conn, topo.WorkQueue, 0, "the held delivery was acknowledged before shutdown completed")
 }
 
+// The other half of the shutdown requirement: what the consumer does with
+// the work it has *not* started. A delivery taken off the channel after the
+// context has ended goes back to the queue rather than to the handler, which
+// is what lets the composition root size its bounded drain against one
+// delivery rather than against however many arrive while it is draining.
+//
+// Driving serve directly, with a context that reports cancellation through
+// Err but never through Done, is what makes this deterministic. Every
+// end-to-end construction leaves the select a coin flip — its cancellation
+// case and its delivery case are both ready, and Go chooses between ready
+// cases at random — so a consumer that had lost this behaviour would still
+// pass most rounds of any number. With Done never ready the delivery case is
+// chosen every time, and what happens next is this rule alone.
+//
+// That context is not one anything outside a test should construct. It is a
+// deliberate contract violation, in exchange for a test whose failure is
+// certain rather than likely.
+func TestConsumer_RequeuesADeliveryTakenAfterTheSignal(t *testing.T) {
+	conn := openTestConn(t)
+	topo := declaredTestTopology(t, conn)
+	publish(t, conn, topo.Exchange, topo.RoutingKeys[0], []byte(`{"job_id":"first"}`))
+
+	consumer := NewConsumer(rabbitmq.Config{URL: testBrokerURL(t)}, topo, "test-notifier", testRequeuePause,
+		func(context.Context, string, []byte) Disposition {
+			t.Error("the handler was entered for a delivery taken after the signal")
+			return Ack
+		})
+
+	served := make(chan bool, 1)
+	go func() {
+		ok, _ := consumer.serve(cancelledWithoutSignal{context.Background()}, openTestConn(t))
+		served <- ok
+	}()
+
+	select {
+	case <-served:
+	case <-time.After(brokerSettleTimeout):
+		t.Fatal("serve did not return after taking a delivery with its context already ended")
+	}
+
+	expectDepth(t, conn, topo.WorkQueue, 1, "a delivery taken after the signal was not returned to the queue")
+}
+
+// cancelledWithoutSignal is cancelled as far as Err is concerned and never
+// as far as Done is concerned. A nil channel blocks forever, so a select
+// that offers Done alongside another ready case takes the other one.
+type cancelledWithoutSignal struct{ context.Context }
+
+func (cancelledWithoutSignal) Done() <-chan struct{} { return nil }
+
+func (cancelledWithoutSignal) Err() error { return context.Canceled }
+
 func testBrokerURL(t *testing.T) string {
 	t.Helper()
 	url := os.Getenv("RABBITMQ_TEST_URL")
