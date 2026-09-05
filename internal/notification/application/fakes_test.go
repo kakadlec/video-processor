@@ -112,6 +112,15 @@ func (r *fakePreferenceRepository) ListByUser(_ context.Context, userID domain.U
 	return views, nil
 }
 
+// FindDeliverable is a deliberate no-op stub. The use cases these fakes
+// serve — ListPreferences and SetPreference — never call it, and a fake that
+// invented preferences to return would let a delivery test pass against
+// something no repository would ever produce. The delivery path brings its
+// own fake when it lands.
+func (r *fakePreferenceRepository) FindDeliverable(_ context.Context, _ domain.UserID, _ domain.EventType) ([]*domain.NotificationPreference, error) {
+	return nil, nil
+}
+
 // fakeClock always returns the same pre-set time, for deterministic assertions.
 type fakeClock struct {
 	now time.Time

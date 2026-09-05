@@ -2,23 +2,56 @@ package postgres_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"video-processor/internal/notification/domain"
 	"video-processor/internal/notification/infrastructure/postgres"
 )
 
 // Migrate's advisory lock exists for the first-time create, so the test has
-// to start from a database where the table is absent. Dropping it is safe
-// here because no other suite in this repository touches this table, and the
-// cleanup re-creates it so a failure mid-test cannot leave the schema missing
-// for whatever runs next.
+// to start from a database where the tables are absent. Dropping them is safe
+// here because no other suite in this repository touches them, and the
+// cleanup re-creates them so a failure mid-test cannot leave the schema
+// missing for whatever runs next.
+//
+// Both tables are dropped, not one. The embedded schema is several
+// statements executed as a single Exec inside the locked transaction, so the
+// serialization either covers all of them or none of them; dropping one
+// would leave the other's first-time create untested and the claim in
+// Migrate's own comment unverified.
+// TestMigrate_CreatesTheDeliveryResolutionIndex pins the index the fenced
+// resolution depends on. The primary key starts with user_id and
+// ResolveDelivery searches by delivery_id, so without this the statement is a
+// sequential scan over a table that grows by one row per notification — a
+// property no functional test would ever fail on, because the results stay
+// correct while the scan gets slower.
+func TestMigrate_CreatesTheDeliveryResolutionIndex(t *testing.T) {
+	db := testDB(t)
+
+	var definition string
+	err := db.QueryRowContext(context.Background(),
+		"SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+		"notification_deliveries", "notification_deliveries_delivery_id_key").Scan(&definition)
+	if err != nil {
+		t.Fatalf("unexpected error reading the index definition: %v", err)
+	}
+	if !strings.Contains(definition, "UNIQUE") {
+		t.Errorf("index is %q, want it UNIQUE: the identifier is minted once per record", definition)
+	}
+	if !strings.Contains(definition, "delivery_id") {
+		t.Errorf("index is %q, want it keyed on delivery_id", definition)
+	}
+}
+
 func TestMigrate_ConcurrentFirstTimeCreatesBothSucceed(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
 
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS notification_preferences"); err != nil {
-		t.Fatalf("unexpected error dropping table: %v", err)
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS notification_preferences, notification_deliveries"); err != nil {
+		t.Fatalf("unexpected error dropping tables: %v", err)
 	}
 	t.Cleanup(func() {
 		// Errorf rather than Fatalf: Fatalf's runtime.Goexit does not belong
@@ -52,14 +85,16 @@ func TestMigrate_ConcurrentFirstTimeCreatesBothSucceed(t *testing.T) {
 		}
 	}
 
-	var tables int
-	if err := db.QueryRowContext(ctx,
-		"SELECT count(*) FROM information_schema.tables WHERE table_name = 'notification_preferences'").
-		Scan(&tables); err != nil {
-		t.Fatalf("unexpected error counting tables: %v", err)
-	}
-	if tables != 1 {
-		t.Fatalf("table count = %d, want 1", tables)
+	for _, table := range []string{"notification_preferences", "notification_deliveries"} {
+		var count int
+		if err := db.QueryRowContext(ctx,
+			"SELECT count(*) FROM information_schema.tables WHERE table_name = $1", table).
+			Scan(&count); err != nil {
+			t.Fatalf("unexpected error counting %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("%s count = %d, want 1", table, count)
+		}
 	}
 }
 
@@ -69,10 +104,20 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
 
+	now := testNow()
 	repo := postgres.NewPreferenceRepository(db)
 	intent := newIntent(t, "user-migrate", completedEventType, withSecret(testSecret))
-	if _, err := repo.Set(ctx, intent, testNow()); err != nil {
+	if _, err := repo.Set(ctx, intent, now); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// A delivery record too: a re-migration that dropped or recreated this
+	// table would lose the deduplication history and let every stored job be
+	// notified a second time.
+	deliveries := postgres.NewDeliveryRepository(db)
+	identity := mustDeliveryIdentity(t, "user-migrate", completedEventType, "job-migrate")
+	if _, outcome, err := deliveries.ClaimDelivery(ctx, identity, now, now.Add(-reclaimBound)); err != nil || outcome != domain.ClaimGranted {
+		t.Fatalf("claim: outcome = %v, err = %v", outcome, err)
 	}
 
 	if err := postgres.Migrate(ctx, db); err != nil {
@@ -85,5 +130,9 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 	if len(views) != 1 {
 		t.Fatalf("len(views) = %d, want 1 — an existing preference must survive a re-migration", len(views))
+	}
+
+	if _, outcome, err := deliveries.ClaimDelivery(ctx, identity, now.Add(time.Second), now.Add(time.Second-reclaimBound)); err != nil || outcome != domain.ClaimHeldByAnother {
+		t.Fatalf("outcome = %v, err = %v, want %v — the delivery record did not survive", outcome, err, domain.ClaimHeldByAnother)
 	}
 }

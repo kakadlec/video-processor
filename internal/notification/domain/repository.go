@@ -55,4 +55,29 @@ type PreferenceRepository interface {
 	// whether one is set, which is what makes PreferenceView's missing
 	// secret field a guarantee rather than a convention.
 	ListByUser(ctx context.Context, userID UserID) ([]PreferenceView, error)
+
+	// FindDeliverable returns the full aggregates a terminal event of
+	// eventType should be delivered through for userID — enabled preferences
+	// only, since a disabled one is a registration the owner has switched off
+	// rather than one to be sent and skipped later.
+	//
+	// This is the one read path permitted to load the stored secret, and the
+	// narrowing is what keeps the rule enforceable. HMAC signing needs the
+	// original bytes, so the value has to be loadable somewhere; what makes it
+	// safe is that the somewhere is singular, named, and on no path that
+	// builds an HTTP response. Every other read projects only whether a secret
+	// is present, which is what makes PreferenceView's missing secret field a
+	// guarantee rather than a convention.
+	//
+	// That no other statement in an implementation loads the column is pinned
+	// by TestNoQueryOutsideFindDeliverableSelectsTheSecret in
+	// internal/notification/infrastructure/postgres. Its complement — that no
+	// path under cmd/api reaches this method, so the composition root that
+	// builds responses cannot call it — lands with the signing function that
+	// consumes what this returns.
+	//
+	// A user with nothing registered for the event yields an empty slice and
+	// no error, for the same reason ListByUser does: not subscribed is an
+	// ordinary state.
+	FindDeliverable(ctx context.Context, userID UserID, eventType EventType) ([]*NotificationPreference, error)
 }

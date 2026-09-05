@@ -103,6 +103,14 @@ func (r *inMemoryPreferenceRepository) ListByUser(_ context.Context, userID noti
 	return views, nil
 }
 
+// FindDeliverable is a deliberate no-op stub: the preference routes never
+// call it, and that they cannot is exactly what this composition root is
+// supposed to guarantee. A fake returning preferences here would give a
+// route test a secret to accidentally render.
+func (r *inMemoryPreferenceRepository) FindDeliverable(_ context.Context, _ notificationdomain.UserID, _ notificationdomain.EventType) ([]*notificationdomain.NotificationPreference, error) {
+	return nil, nil
+}
+
 func (r *inMemoryPreferenceRepository) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

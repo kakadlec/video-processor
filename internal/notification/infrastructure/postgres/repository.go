@@ -17,11 +17,16 @@ var _ domain.PreferenceRepository = (*PreferenceRepository)(nil)
 // any statement runs, so neither branch reads a row first.
 //
 // Both project whether the secret column is non-empty, never the secret
-// itself, so the value is not loadable on any read path — which is what
-// makes domain.PreferenceView's missing secret field a guarantee rather
-// than a convention. The projection is spelled out in the statements below
-// and deliberately not repeated here: gofmt reads a pair of apostrophes in
-// a doc comment as a typographic closing quote and rewrites it.
+// itself — which is what makes domain.PreferenceView's missing secret field
+// a guarantee rather than a convention. The projection is spelled out in the
+// statements below and deliberately not repeated here: gofmt reads a pair of
+// apostrophes in a doc comment as a typographic closing quote and rewrites
+// it.
+//
+// Every statement in this file that builds a PreferenceView does the same.
+// findDeliverablePreferencesQuery is the single exception and the only one
+// permitted to load the value; its own comment says why the exception has to
+// exist and what keeps it singular.
 const (
 	// A secret was submitted: one upsert whose conflict clause overwrites
 	// the stored secret with the submitted one.
@@ -58,6 +63,24 @@ const (
 		  FROM notification_preferences
 		 WHERE user_id = $1
 		 ORDER BY event_type, channel
+	`
+
+	// The one statement in this package that names the secret column in its
+	// projection, and the only one permitted to: HMAC signing needs the
+	// original bytes, so the value has to be loadable somewhere, and what
+	// makes that safe is that the somewhere is singular and named. Adding a
+	// second one fails TestNoQueryOutsideFindDeliverableSelectsTheSecret,
+	// which reads this file rather than running anything — a query that was
+	// never executed is invisible to a runtime test.
+	//
+	// The enabled filter is in the statement rather than in the loop so a
+	// disabled preference's secret is not loaded at all: a value never
+	// fetched cannot be leaked by whatever the caller does next.
+	findDeliverablePreferencesQuery = `
+		SELECT event_type, channel, enabled, destination, secret, created_at, updated_at
+		  FROM notification_preferences
+		 WHERE user_id = $1 AND event_type = $2 AND enabled
+		 ORDER BY channel
 	`
 )
 
@@ -186,4 +209,68 @@ func (r *PreferenceRepository) ListByUser(ctx context.Context, userID domain.Use
 	}
 
 	return views, nil
+}
+
+// FindDeliverable returns the enabled preferences userID has registered for
+// eventType, as full aggregates carrying their signing secret.
+//
+// This is the one read path in this package that loads the secret. Every
+// other query projects only whether one is set; see the port's contract for
+// why the narrowing is what makes that projection a guarantee.
+func (r *PreferenceRepository) FindDeliverable(ctx context.Context, userID domain.UserID, eventType domain.EventType) ([]*domain.NotificationPreference, error) {
+	rows, err := r.db.QueryContext(ctx, findDeliverablePreferencesQuery, userID.String(), eventType.String())
+	if err != nil {
+		return nil, fmt.Errorf("notification: find deliverable preferences: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	preferences := make([]*domain.NotificationPreference, 0)
+	for rows.Next() {
+		var (
+			eventTypeValue   string
+			channelValue     string
+			enabled          bool
+			destinationValue string
+			secretValue      string
+			createdAt        time.Time
+			updatedAt        time.Time
+		)
+		if err := rows.Scan(&eventTypeValue, &channelValue, &enabled, &destinationValue, &secretValue, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("notification: scan deliverable preference: %w", err)
+		}
+
+		// Re-parsed through the domain like every other read, so a row
+		// written by a future generation surfaces as an error rather than
+		// entering the domain as a valid aggregate. The errors below name
+		// the column and never the value, which matters more here than
+		// elsewhere: one of the values is the secret.
+		storedEventType, err := domain.ParseEventType(eventTypeValue)
+		if err != nil {
+			return nil, fmt.Errorf("notification: stored event type is invalid: %w", err)
+		}
+		channel, err := domain.ParseChannel(channelValue)
+		if err != nil {
+			return nil, fmt.Errorf("notification: stored channel is invalid: %w", err)
+		}
+		destination, err := domain.NewDestination(destinationValue)
+		if err != nil {
+			return nil, fmt.Errorf("notification: stored destination is invalid: %w", err)
+		}
+		secret, err := domain.NewSecret(secretValue)
+		if err != nil {
+			return nil, fmt.Errorf("notification: stored secret is invalid: %w", err)
+		}
+
+		preference, err := domain.RestoreNotificationPreference(
+			userID, storedEventType, channel, enabled, destination, secret, createdAt, updatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("notification: restore preference: %w", err)
+		}
+		preferences = append(preferences, preference)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("notification: find deliverable preferences: %w", err)
+	}
+
+	return preferences, nil
 }
