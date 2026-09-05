@@ -31,6 +31,21 @@ var secretProjection = regexp.MustCompile(`(?i)\bsecret\b\s*<>\s*''`)
 
 var bareSecret = regexp.MustCompile(`(?i)\bsecret\b`)
 
+// wildcardTarget matches a projection that expands to every column of some
+// table: "*" alone, "p.*", or either of those among other targets. A wildcard
+// over notification_preferences hands back the secret without ever naming it,
+// which is precisely what the identifier search above cannot see.
+//
+// It is judged without resolving which table the wildcard belongs to, so a
+// wildcard over any table in this package is reported. That is deliberate:
+// deciding otherwise would mean parsing the FROM clause and its aliases, and
+// every statement here names its columns anyway — a wildcard is a thing to
+// rewrite, not a thing to prove harmless.
+//
+// count(*) is not a projection of every column; the star is an argument
+// there, and the "(" preceding it is what tells the two apart.
+var wildcardTarget = regexp.MustCompile(`(?:^|,)\s*(?:[A-Za-z_]\w*\.)?\*\s*(?:,|$)`)
+
 // projectionClauses regexes: everything a statement hands back to Go. A
 // SELECT's target list and a RETURNING clause are the only two ways a value
 // leaves PostgreSQL through this adapter.
@@ -52,6 +67,9 @@ func projectsTheSecret(statement string) bool {
 	}
 
 	for _, clause := range clauses {
+		if wildcardTarget.MatchString(clause) {
+			return true
+		}
 		// Strip the presence projections first, then look for what is left:
 		// "secret <> ''" contains the identifier but yields a boolean, and
 		// "has_secret" is not the column at all.
@@ -168,7 +186,8 @@ func TestNoQueryOutsideFindDeliverableSelectsTheSecret(t *testing.T) {
 			continue
 		}
 		if projectsTheSecret(lit.statement) {
-			t.Errorf("%s projects the secret column; only %s may load it", lit.name, findDeliverableConstName)
+			t.Errorf("%s hands back the secret column, or a wildcard that expands to it; only %s may load it",
+				lit.name, findDeliverableConstName)
 		}
 	}
 }
@@ -188,6 +207,16 @@ func TestProjectsTheSecretDistinguishesReadsFromWrites(t *testing.T) {
 		{"conflict clause assigning the column", "INSERT INTO t (secret) VALUES ($1) ON CONFLICT (user_id) DO UPDATE SET secret = EXCLUDED.secret RETURNING created_at", false},
 		{"select naming the column", "SELECT event_type, secret, created_at FROM notification_preferences WHERE user_id = $1", true},
 		{"returning the column", "UPDATE notification_preferences SET enabled = $1 RETURNING secret", true},
+		// A wildcard yields the secret without naming it, so it is reported
+		// even though no case above would match it.
+		{"wildcard select", "SELECT * FROM notification_preferences WHERE user_id = $1", true},
+		{"qualified wildcard select", "SELECT p.* FROM notification_preferences p WHERE p.user_id = $1", true},
+		{"wildcard among named targets", "SELECT user_id, * FROM notification_preferences", true},
+		{"wildcard in RETURNING", "UPDATE notification_preferences SET enabled = $1 RETURNING *", true},
+		// The star as a function argument is not a projection of every
+		// column, and a rule that could not tell them apart would be one this
+		// package's tests trip over constantly.
+		{"count of all rows", "SELECT count(*) FROM notification_preferences WHERE user_id = $1", false},
 	}
 
 	for _, tt := range tests {

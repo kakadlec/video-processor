@@ -98,6 +98,23 @@ func (r *DeliveryRepository) ClaimDelivery(ctx context.Context, identity domain.
 		return domain.Delivery{}, 0, domain.ErrDeliveryIdentityIncomplete
 	}
 
+	// Checked before the statement runs rather than after it commits.
+	// PostgreSQL accepts Go's zero time, so a claim carrying one would become
+	// durable and only then fail domain.NewClaimedDelivery — handing the
+	// caller an error while it owns a pending row it has no way to know
+	// about. An input this adapter cannot store readably is refused with no
+	// side effect at all.
+	if now.IsZero() {
+		return domain.Delivery{}, 0, domain.ErrDeliveryClaimedAtRequired
+	}
+
+	// Not corrupting, only silently wrong: every claim would be judged fresh,
+	// so no abandoned delivery could ever be taken over and the reclaim path
+	// would look implemented while doing nothing.
+	if staleBefore.IsZero() {
+		return domain.Delivery{}, 0, fmt.Errorf("notification: claim delivery: the reclaim boundary is required")
+	}
+
 	// Both identifiers are minted here rather than by the server, because the
 	// port hands the adapter no identifier to use. NewRandom rather than New:
 	// New panics when the system's entropy source fails, and a claim that
@@ -178,11 +195,33 @@ func (r *DeliveryRepository) classifyRefusal(ctx context.Context, userID, eventT
 // fence let the write through. A false return means this claimant was
 // superseded, not that the statement failed.
 func (r *DeliveryRepository) ResolveDelivery(ctx context.Context, deliveryID domain.DeliveryID, claimToken domain.ClaimToken, status domain.DeliveryStatus, attempts int, reason string, now time.Time) (bool, error) {
-	// Refused rather than written, because the table would otherwise hold a
-	// row whose status and resolved_at disagree — the shape
-	// domain.RestoreDelivery rejects, so it would be unreadable afterwards.
+	// Every check below refuses with an error rather than reporting false,
+	// and the distinction is the point: false is a statement about the fence
+	// — a successor owns the outcome — and a caller told that logs and
+	// acknowledges. None of these inputs mean that.
+	//
+	// A zero identifier or token matches no row, so returning false would
+	// report a caller's bug as an ordinary supersession and lose the
+	// notification silently.
+	if deliveryID.IsZero() {
+		return false, domain.ErrInvalidDeliveryID
+	}
+	if claimToken.IsZero() {
+		return false, domain.ErrInvalidClaimToken
+	}
+
+	// The remaining three would each be *written*, and each produces a row
+	// domain.RestoreDelivery refuses to read back: a status that is not
+	// resolved paired with a resolution time, a negative attempt count, or a
+	// resolved row carrying no resolution time at all.
 	if !status.IsResolved() {
 		return false, fmt.Errorf("notification: resolve delivery: %q is not a resolved status", status)
+	}
+	if attempts < 0 {
+		return false, domain.ErrDeliveryAttemptsInvalid
+	}
+	if now.IsZero() {
+		return false, domain.ErrDeliveryResolvedAtMismatch
 	}
 
 	// NULL rather than the empty string for an outcome that carries no

@@ -17,11 +17,16 @@ var _ domain.PreferenceRepository = (*PreferenceRepository)(nil)
 // any statement runs, so neither branch reads a row first.
 //
 // Both project whether the secret column is non-empty, never the secret
-// itself, so the value is not loadable on any read path — which is what
-// makes domain.PreferenceView's missing secret field a guarantee rather
-// than a convention. The projection is spelled out in the statements below
-// and deliberately not repeated here: gofmt reads a pair of apostrophes in
-// a doc comment as a typographic closing quote and rewrites it.
+// itself — which is what makes domain.PreferenceView's missing secret field
+// a guarantee rather than a convention. The projection is spelled out in the
+// statements below and deliberately not repeated here: gofmt reads a pair of
+// apostrophes in a doc comment as a typographic closing quote and rewrites
+// it.
+//
+// Every statement in this file that builds a PreferenceView does the same.
+// findDeliverablePreferencesQuery is the single exception and the only one
+// permitted to load the value; its own comment says why the exception has to
+// exist and what keeps it singular.
 const (
 	// A secret was submitted: one upsert whose conflict clause overwrites
 	// the stored secret with the submitted one.

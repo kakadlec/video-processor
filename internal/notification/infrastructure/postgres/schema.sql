@@ -60,3 +60,19 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
     -- claim statement its conflict target for free.
     PRIMARY KEY (user_id, event_type, channel, job_id)
 );
+
+-- ResolveDelivery finds its row by delivery_id and claim_token, and the
+-- primary key above starts with user_id, so it cannot serve that lookup:
+-- without this index every resolution scans a table that grows by one row
+-- per notification delivered.
+--
+-- UNIQUE rather than plain, because the identifier is minted once per record
+-- and is what a receiver deduplicates on. A second row carrying the same one
+-- would make both the receiver's deduplication and the fence ambiguous, so
+-- the constraint states an invariant as well as serving the lookup.
+--
+-- A separate statement rather than a column constraint, so it also reaches a
+-- database whose table already exists — CREATE TABLE IF NOT EXISTS would
+-- skip the whole declaration there and silently leave the index out.
+CREATE UNIQUE INDEX IF NOT EXISTS notification_deliveries_delivery_id_key
+    ON notification_deliveries (delivery_id);

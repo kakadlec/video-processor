@@ -378,6 +378,115 @@ func TestResolveDelivery_RefusesANonTerminalStatus(t *testing.T) {
 	}
 }
 
+// TestClaimDelivery_RefusesAnUnstorableClaimWithoutWriting states what
+// separates a refused input from a refused claim: a refused claim is an
+// outcome and leaves a record, while a refused input is an error and leaves
+// nothing. PostgreSQL accepts Go's zero time, so a claim carrying one would
+// otherwise commit and only then fail to be read back — leaving the caller an
+// error and a durable pending row it does not know it owns.
+func TestClaimDelivery_RefusesAnUnstorableClaimWithoutWriting(t *testing.T) {
+	db := testDB(t)
+	repo := postgres.NewDeliveryRepository(db)
+	ctx := context.Background()
+	now := testNow()
+
+	tests := []struct {
+		name        string
+		identity    domain.DeliveryIdentity
+		now         time.Time
+		staleBefore time.Time
+	}{
+		{
+			name:        "an incomplete identity",
+			identity:    domain.DeliveryIdentity{},
+			now:         now,
+			staleBefore: now.Add(-reclaimBound),
+		},
+		{
+			name:        "no claim time",
+			identity:    mustDeliveryIdentity(t, "user-unstorable-1", completedEventType, "job-1"),
+			staleBefore: now.Add(-reclaimBound),
+		},
+		{
+			name:     "no reclaim boundary",
+			identity: mustDeliveryIdentity(t, "user-unstorable-2", completedEventType, "job-1"),
+			now:      now,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := countDeliveries(t, db)
+
+			_, outcome, err := repo.ClaimDelivery(ctx, tt.identity, tt.now, tt.staleBefore)
+			if err == nil {
+				t.Fatal("the claim was accepted")
+			}
+			if outcome == domain.ClaimGranted {
+				t.Fatal("a refused claim reported a grant")
+			}
+			if after := countDeliveries(t, db); after != before {
+				t.Fatalf("the refused claim wrote %d row(s)", after-before)
+			}
+		})
+	}
+}
+
+// TestResolveDelivery_RefusesAnUnstorableOutcome covers the inputs that would
+// either be indistinguishable from a lost fence or store a row nothing can
+// read back. Reporting false for any of them would tell the caller a
+// successor owns the outcome, which is the one thing that makes dropping the
+// notification correct.
+func TestResolveDelivery_RefusesAnUnstorableOutcome(t *testing.T) {
+	db := testDB(t)
+	repo := postgres.NewDeliveryRepository(db)
+	ctx := context.Background()
+	now := testNow()
+	identity := mustDeliveryIdentity(t, "user-unstorable-resolve", completedEventType, "job-1")
+
+	claim, outcome, err := repo.ClaimDelivery(ctx, identity, now, now.Add(-reclaimBound))
+	if err != nil || outcome != domain.ClaimGranted {
+		t.Fatalf("claim: outcome = %v, err = %v", outcome, err)
+	}
+	delivered := mustDeliveryStatus(t, domain.DeliveryStatusDelivered)
+	resolvedAt := now.Add(time.Second)
+
+	tests := []struct {
+		name       string
+		deliveryID domain.DeliveryID
+		claimToken domain.ClaimToken
+		attempts   int
+		now        time.Time
+	}{
+		{"no delivery id", domain.DeliveryID{}, claim.ClaimToken(), 1, resolvedAt},
+		{"no claim token", claim.ID(), domain.ClaimToken{}, 1, resolvedAt},
+		{"a negative attempt count", claim.ID(), claim.ClaimToken(), -1, resolvedAt},
+		{"no resolution time", claim.ID(), claim.ClaimToken(), 1, time.Time{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applied, err := repo.ResolveDelivery(ctx, tt.deliveryID, tt.claimToken, delivered, tt.attempts, "", tt.now)
+			if err == nil {
+				t.Fatal("the resolve was accepted")
+			}
+			if applied {
+				t.Fatal("a refused resolve reported the write as applied")
+			}
+
+			// The claim is still open, so the delivery is still owned by this
+			// claimant rather than silently abandoned.
+			stored := readDelivery(t, db, identity)
+			if stored.status != domain.DeliveryStatusPending {
+				t.Fatalf("stored status = %q, want it left pending", stored.status)
+			}
+			if stored.resolvedAt.Valid {
+				t.Fatal("the refused write stamped a resolution time")
+			}
+		})
+	}
+}
+
 // TestClaimDelivery_ConcurrentClaimsGrantExactlyOne is the guarantee the
 // single statement exists for. Two notifier processes reading "not delivered"
 // separately and both proceeding is the duplicate the record prevents, and

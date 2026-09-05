@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,30 @@ import (
 // serialization either covers all of them or none of them; dropping one
 // would leave the other's first-time create untested and the claim in
 // Migrate's own comment unverified.
+// TestMigrate_CreatesTheDeliveryResolutionIndex pins the index the fenced
+// resolution depends on. The primary key starts with user_id and
+// ResolveDelivery searches by delivery_id, so without this the statement is a
+// sequential scan over a table that grows by one row per notification — a
+// property no functional test would ever fail on, because the results stay
+// correct while the scan gets slower.
+func TestMigrate_CreatesTheDeliveryResolutionIndex(t *testing.T) {
+	db := testDB(t)
+
+	var definition string
+	err := db.QueryRowContext(context.Background(),
+		"SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+		"notification_deliveries", "notification_deliveries_delivery_id_key").Scan(&definition)
+	if err != nil {
+		t.Fatalf("unexpected error reading the index definition: %v", err)
+	}
+	if !strings.Contains(definition, "UNIQUE") {
+		t.Errorf("index is %q, want it UNIQUE: the identifier is minted once per record", definition)
+	}
+	if !strings.Contains(definition, "delivery_id") {
+		t.Errorf("index is %q, want it keyed on delivery_id", definition)
+	}
+}
+
 func TestMigrate_ConcurrentFirstTimeCreatesBothSucceed(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
