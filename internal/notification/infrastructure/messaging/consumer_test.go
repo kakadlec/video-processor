@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -212,6 +214,84 @@ func TestConsumer_ShutdownWaitsForTheDeliveryInHand(t *testing.T) {
 	}
 
 	expectDepth(t, conn, topo.WorkQueue, 0, "the held delivery was acknowledged before shutdown completed")
+}
+
+// The other half of the shutdown requirement: what the consumer does with
+// the work it has *not* started. A delivery waiting to be taken when the
+// signal arrives is returned to the queue instead of being handled, which is
+// what lets the composition root size its bounded drain against one delivery
+// rather than against however many arrive while it is draining.
+//
+// The construction is roundabout because the obvious one cannot work. At
+// prefetch 1 the broker withholds a second message until the first is
+// acknowledged, so publishing two and cancelling proves nothing: the second
+// is still at the broker, not in this client, and no version of this loop
+// would take it. What the check before dispatch actually guards is a
+// delivery already buffered *here* when the context ends — so the round
+// below produces exactly that, by requeueing one message and cancelling
+// during the pause that follows, while the redelivery sits in the client.
+//
+// Repeated because one round proves little: with the check removed, the loop
+// meets a select whose cancellation case and delivery case are both ready,
+// and Go chooses between ready cases at random. A round then catches the
+// removal about a quarter of the time — measured, not derived, since whether
+// the redelivery has reached this client by then is part of the odds. Twelve
+// rounds bring that to roughly ninety-seven in a hundred, at about a third
+// of a second each.
+const roundsPerShutdownRace = 12
+
+func TestConsumer_TakesNoNewDeliveryAfterTheSignal(t *testing.T) {
+	for round := range roundsPerShutdownRace {
+		t.Run(fmt.Sprintf("round %d", round), func(t *testing.T) {
+			takesNoNewDeliveryAfterTheSignal(t)
+		})
+	}
+}
+
+func takesNoNewDeliveryAfterTheSignal(t *testing.T) {
+	t.Helper()
+	conn := openTestConn(t)
+	topo := declaredTestTopology(t, conn)
+
+	// Long enough that the requeued message is certainly back in this client
+	// before the cancellation below, and never waited out: the pause observes
+	// the context, so cancelling ends it at once.
+	const pause = 3 * time.Second
+
+	var calls atomic.Int64
+	requeued := make(chan struct{}, 1)
+	cancel, done := startConsumer(t, topo, pause, func(context.Context, string, []byte) Disposition {
+		if calls.Add(1) == 1 {
+			requeued <- struct{}{}
+			return Requeue
+		}
+		// Only reached by a consumer that took a delivery after the signal.
+		// Acknowledging makes that visible in the queue depth as well as in
+		// the count.
+		return Ack
+	})
+
+	publish(t, conn, topo.Exchange, topo.RoutingKeys[0], []byte(`{"job_id":"first"}`))
+	waitFor(t, requeued, "the handler was never entered")
+
+	// Inside the pause, so the consumer is between deliveries with the
+	// redelivery already waiting for it.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(brokerSettleTimeout):
+		t.Fatal("Run did not return after the pause was cut short")
+	}
+
+	// Fatal rather than Error: once the count is wrong the delivery has been
+	// acknowledged, and the depth assertion below would then poll out its
+	// whole settle window to report the same failure a second time.
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("the handler ran %d times, want 1: a delivery was taken after the signal", got)
+	}
+	expectDepth(t, conn, topo.WorkQueue, 1, "a delivery waiting to be taken was handled after the signal")
 }
 
 func testBrokerURL(t *testing.T) string {
