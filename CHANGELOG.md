@@ -1,5 +1,25 @@
 # Changelog
 
+## [3.0.0](https://github.com/kakadlec/video-processor/compare/v2.0.0...v3.0.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **notification:** PUT /api/notification-preferences now refuses an "http" destination and a destination naming a non-globally-reachable address with 400. Both were accepted before. NOTIFICATION_ALLOW_INSECURE_DESTINATIONS restores the previous behaviour for a local stack; production deployments that registered such a destination must re-register it over https against a publicly reachable host.
+
+### Features
+
+* **notification:** add the delivery record and the secret read path ([#215](https://github.com/kakadlec/video-processor/issues/215)) ([a0bf800](https://github.com/kakadlec/video-processor/commit/a0bf8007b15582a704d88072515c4a6ef8f53923))
+* **notification:** add the NotificationPreference domain ([#207](https://github.com/kakadlec/video-processor/issues/207)) ([03c3d9a](https://github.com/kakadlec/video-processor/commit/03c3d9ac0a2a3ad896c997193870735ea68ae6da))
+* **notification:** add the notifier entrypoint ([#218](https://github.com/kakadlec/video-processor/issues/218)) ([4de6407](https://github.com/kakadlec/video-processor/commit/4de64072fcc9daf819a64bc0d876e78c9de12328))
+* **notification:** add the preference use cases ([#210](https://github.com/kakadlec/video-processor/issues/210)) ([4f1c740](https://github.com/kakadlec/video-processor/commit/4f1c740f208741840bffade16f863cf6c480f75d))
+* **notification:** add the terminal event consumer ([#216](https://github.com/kakadlec/video-processor/issues/216)) ([7e9f793](https://github.com/kakadlec/video-processor/commit/7e9f793728ee4c88274e963b9521314701f8f793))
+* **notification:** add the webhook deliverer and the delivery use case ([#217](https://github.com/kakadlec/video-processor/issues/217)) ([382303e](https://github.com/kakadlec/video-processor/commit/382303e1791ec8f1e7ac807e5ec97c2d173fd9ae))
+* **notification:** add the webhook delivery domain ([#214](https://github.com/kakadlec/video-processor/issues/214)) ([9afb18d](https://github.com/kakadlec/video-processor/commit/9afb18da0c70267c8bc1aefc59532a62bba80541))
+* **notification:** apply the destination policy at write time ([#220](https://github.com/kakadlec/video-processor/issues/220)) ([5a76e3c](https://github.com/kakadlec/video-processor/commit/5a76e3ca9ea33d875fbfbc051e1e32a834ba8b8f))
+* **notification:** expose preference routes on cmd/api ([#211](https://github.com/kakadlec/video-processor/issues/211)) ([fcbe8d9](https://github.com/kakadlec/video-processor/commit/fcbe8d9623f4254b6d2f340599d877f337d9efd2))
+* **notification:** persist notification preferences in PostgreSQL ([#209](https://github.com/kakadlec/video-processor/issues/209)) ([a78520b](https://github.com/kakadlec/video-processor/commit/a78520b86ef1bae5981a68bb1d105cc14d25be1c))
+
 ## [2.0.0](https://github.com/kakadlec/video-processor/compare/v1.0.0...v2.0.0) (2026-09-04)
 
 
