@@ -46,8 +46,15 @@ docker run \
 # ffmpeg, so it reads NO IDENTITY_*, NO VIDEO_* (MinIO included), and no
 # REDIS_ADDR. NOTIFICATION_ALLOW_INSECURE_DESTINATIONS is deliberately not
 # set here: unset is the restrictive default, and setting it in production
-# turns the delivery client into an SSRF primitive
+# turns the delivery client into an SSRF primitive.
+#
+# --stop-timeout is not optional dressing: Docker's default is 10 seconds and
+# the shutdown drain is MaxClaimHold() + 30s (60s at the documented budget),
+# so the default would SIGKILL a delivery in flight and leave its claim to be
+# reclaimed. 90 matches docker-compose.yml's stop_grace_period, and raising a
+# delivery term lengthens the drain and requires raising this too
 docker run \
+  --stop-timeout 90 \
   -e NOTIFICATION_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e RABBITMQ_URL="amqp://user:pass@host:5672/" \
   video-processor /app/notifier
@@ -168,7 +175,7 @@ Two-to-three times, not ten: the same value bounds how long an abandoned claim s
 
 Only three of the seven terms are settable from the environment. The backoff intervals and the resolve-retry terms keep their documented defaults, deliberately — every variable exposed is another way to reach a combination the validator has to refuse, and these are the terms with no operational question attached to them.
 
-The shutdown drain follows from the same arithmetic: `cmd/notifier` waits the maximum claim hold plus a 30-second grace (60s at the defaults) for the delivery in hand to reach a disposition, then closes the pool. **If the drain expires, the bound wins and the pool is not closed** — the handler runs on a context the signal does not cancel, so at that point it is still running and can never be joined, and process exit releases the connections anyway. Nothing is lost that the reclaim bound does not already cover. Give the process more termination grace than its drain: `docker-compose.yml` sets `stop_grace_period: 90s` for exactly this, and raising a delivery term lengthens the drain and requires raising that too.
+The shutdown drain follows from the same arithmetic: `cmd/notifier` waits the maximum claim hold plus a 30-second grace (60s at the defaults) for the delivery in hand to reach a disposition, then closes the pool. **If the drain expires, the bound wins and the pool is not closed** — the handler runs on a context the signal does not cancel, so at that point it is still running and can never be joined, and process exit releases the connections anyway. Nothing is lost that the reclaim bound does not already cover. Give the process more termination grace than its drain: `docker-compose.yml` sets `stop_grace_period: 90s` and the `docker run` command above passes `--stop-timeout 90` for exactly this — Docker's own default is 10 seconds, which is below the drain at every supported budget. Raising a delivery term lengthens the drain and requires raising both.
 
 #### Two signals this design deliberately leaves behind
 

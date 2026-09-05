@@ -53,6 +53,12 @@ export VIDEO_MINIO_ACCESS_KEY="minioadmin"
 export VIDEO_MINIO_SECRET_KEY="minioadmin"
 export VIDEO_MINIO_BUCKET="video-results"
 export RABBITMQ_URL="amqp://video:video@localhost:5672/"
+# Read by cmd/api as well as cmd/notifier — the destination policy is one
+# variable with two readers, and a local receiver is always an http:// or
+# private address. Without it here the API refuses every destination at
+# registration, so the notifier never gets one to deliver. NEVER set it in
+# production.
+export NOTIFICATION_ALLOW_INSECURE_DESTINATIONS="true"
 # VIDEO_MINIO_USE_SSL, VIDEO_MINIO_PUBLIC_ENDPOINT, and
 # VIDEO_MINIO_PUBLIC_USE_SSL are optional and correct unset for this setup:
 # the browser reaches MinIO at the same localhost:9000 the server does, so the
@@ -68,11 +74,10 @@ go run ./cmd/api
 # start the worker. It serves no HTTP and exposes no port.
 go run ./cmd/worker
 
-# In a third shell, start the notifier. It needs only two variables — the
-# Notification DSN and the broker URL — plus the destination relaxation,
-# without which every http:// or private-address destination is refused.
-# It serves no HTTP and exposes no port.
-export NOTIFICATION_ALLOW_INSECURE_DESTINATIONS="true"
+# In a third shell, start the notifier. It needs only three of the exports
+# above — NOTIFICATION_POSTGRES_DSN, RABBITMQ_URL, and the destination
+# relaxation already exported with them. It serves no HTTP and exposes no
+# port.
 go run ./cmd/notifier
 
 # Build binaries
