@@ -255,7 +255,9 @@ Attempts SHALL NOT be conditioned on which status code was observed. The budget 
 
 A failed delivery SHALL NOT change any `VideoJob`, SHALL NOT be visible to the Video Processing context, and SHALL NOT affect what any HTTP route reports about the job.
 
-The attempt count, the backoff between attempts, and the per-attempt timeout SHALL each be configurable, and each SHALL have a documented default, so the budget can be tuned without a code change. Every term SHALL have one, because the maximum time a claimant can hold a claim is computed from all of them and is what the reclaim bound is validated against; a term left undocumented makes that validation unreproducible.
+The attempt count, the backoff between attempts, and the per-attempt timeout SHALL each be injected configuration rather than a constant read where it is used, and each SHALL have a documented default. Every term SHALL have one, because the maximum time a claimant can hold a claim is computed from all of them and is what the reclaim bound is validated against; a term left undocumented makes that validation unreproducible.
+
+The attempt count and the per-attempt timeout SHALL additionally be settable from the environment, so the two terms whose right value depends on endpoints this system does not control can be tuned without a code change. The backoff intervals and the terms of the bounded resolve retries SHALL NOT be, and that asymmetry is deliberate rather than an omission: every term exposed is another way to reach a combination the reclaim bound's startup validation has to refuse, and these are the terms with no operational question attached to them. They remain injected — which is what the tests that drive the budget need — and keep their documented defaults in every deployment.
 
 #### Scenario: A successful delivery is recorded and acknowledged
 

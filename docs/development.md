@@ -28,14 +28,15 @@ apk add --no-cache ffmpeg
 
 Identity, Video Processing, Notification, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
 
-**Running the API alone is not enough to process an upload.** Since the async cutover, `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`. Run both (see below); with the API alone, jobs stay `queued` forever and the status endpoint reports exactly that.
+**Running the API alone is not enough to process an upload.** Since the async cutover, `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`. Run both (see below); with the API alone, jobs stay `queued` forever and the status endpoint reports exactly that. A **third** process, `cmd/notifier`, delivers a finished job's outcome to whatever webhook its owner registered; without it jobs still complete normally and only the announcement is missing.
 
 ```bash
 # Download dependencies
 go mod download
 
 # Start PostgreSQL, Redis, MinIO, and RabbitMQ for the identity, video,
-# notification, idempotency-key, storage, and outbox-relay modules
+# notification, idempotency-key, storage, outbox-relay, and webhook-delivery
+# modules
 docker compose up -d postgres redis minio rabbitmq
 
 # Set required identity, video, notification, Redis, MinIO, and broker
@@ -67,12 +68,22 @@ go run ./cmd/api
 # start the worker. It serves no HTTP and exposes no port.
 go run ./cmd/worker
 
+# In a third shell, start the notifier. It needs only two variables — the
+# Notification DSN and the broker URL — plus the destination relaxation,
+# without which every http:// or private-address destination is refused.
+# It serves no HTTP and exposes no port.
+export NOTIFICATION_ALLOW_INSECURE_DESTINATIONS="true"
+go run ./cmd/notifier
+
 # Build binaries
 go build -o app ./cmd/api
 go build -o worker ./cmd/worker
+go build -o notifier ./cmd/notifier
 ```
 
-`cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` and **no** `NOTIFICATION_*` variables — it makes no access-control decision and resolves no delivery preference, so exporting them anyway is harmless. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
+`cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` and **no** `NOTIFICATION_*` variables — it makes no access-control decision and resolves no delivery preference, so exporting them anyway is harmless.
+
+`cmd/notifier` reads the smallest surface of the three: `RABBITMQ_URL` and `NOTIFICATION_POSTGRES_DSN` required, and optionally `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS`, `NOTIFICATION_WEBHOOK_MAX_ATTEMPTS`, `NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS`, and `NOTIFICATION_DELIVERY_RECLAIM_SECONDS`. It reads **no** `IDENTITY_*`, **no** `VIDEO_*` (MinIO included), and **no** `REDIS_ADDR`. Two local-development notes: without `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS=true` no `http` or private-address destination can be registered *or* dialled, which is every destination a local receiver could have — and `cmd/api` needs that same variable, since the policy is applied at registration too. The last three are validated against one another at startup: a reclaim bound below twice the attempt budget is a fatal configuration error naming both values, not a warning. See [docs/operations.md](operations.md) for the arithmetic. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
 
 `cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **`cmd/api` creates no directory at all** any more: extraction moved to the worker, so the API never touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk: both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which both processes require at startup and the API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running both processes from the same working directory is fine — the API does not use it.
 
@@ -150,14 +161,15 @@ A change whose diff includes a Go module input file (`.go` source, `go.mod`, or 
 ```bash
 docker compose up --build
 # Access the UI by opening http://127.0.0.1:8080 in a browser —
-# identity, video, Redis, MinIO, and RabbitMQ are already configured, and a
-# `worker` service is started alongside `app` from the same image, so uploads
-# are actually processed
+# identity, video, notification, Redis, MinIO, and RabbitMQ are already
+# configured, and `worker` and `notifier` services are started alongside
+# `app` from the same image, so uploads are actually processed and finished
+# jobs are actually announced
 ```
 
 `docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.
 
-> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app`, `worker`, and deployment all use — ships **both** compiled binaries (`/app/app` and `/app/worker`) plus `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000). `ffmpeg` is there for the worker now rather than for the API. The `worker` service is the same image with its command overridden to `/app/worker`.
+> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app`, `worker`, `notifier`, and deployment all use — ships **all three** compiled binaries (`/app/app`, `/app/worker`, `/app/notifier`) plus `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000). `ffmpeg` is there for the worker rather than for the API or the notifier. The `worker` and `notifier` services are the same image with their command overridden to `/app/worker` and `/app/notifier`. The `notifier` service also carries `stop_grace_period: 90s`, longer than its shutdown drain — Compose's 10-second default would `SIGKILL` a delivery still in flight and leave a claim unresolved on every `docker compose stop`.
 >
 > **Bind-mount permissions:** there is no longer a bind-mounted working directory to get wrong. `./uploads` and `./outputs` were both removed once their artifacts moved into MinIO, so the non-root user (UID 1000) writes only to `temp/` inside the container, which the image creates and owns. If you still have a root-owned `uploads/` or `outputs/` in your clone from an older checkout, it is inert — delete it.
 
