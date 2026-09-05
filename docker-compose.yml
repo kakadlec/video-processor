@@ -236,6 +236,56 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  # The third process on the same image: it consumes the terminal-event
+  # queue the worker publishes to and delivers each outcome to the webhook
+  # destinations its owner registered.
+  #
+  # Its environment is the narrowest of the three, and the absences are the
+  # point. No IDENTITY_*, because it authenticates no caller; no
+  # VIDEO_MINIO_*, because it stores and reads no artifact; no REDIS_ADDR,
+  # because it holds no lease and caches nothing. depends_on names postgres
+  # and rabbitmq alone for the same reason, and includes rabbitmq — unlike
+  # "app" — because a notifier with no broker has nothing at all to do, so
+  # there is no availability to protect by starting it early. It still dials
+  # with retry: this only orders startup.
+  notifier:
+    build: .
+    command: ["/app/notifier"]
+    environment:
+      # The same instance and database the "app" service points at — one
+      # PostgreSQL server shared by the bounded contexts, not a connection.
+      # The notifier migrates its own schema at startup, so it can be started
+      # against a database no API has yet touched.
+      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
+      # Set here and NEVER in production. It relaxes the destination policy's
+      # scheme rule and its address rule together: with it, a preference may
+      # name an "http" URL and may resolve to a private address. That is
+      # exactly what a local stack needs — there is no TLS here and a webhook
+      # receiver is a container hostname on this private network — and it is
+      # exactly what turns the delivery client into an SSRF primitive
+      # anywhere else, able to reach 169.254.169.254 and every internal
+      # service reachable from this process. Unset, the default posture is
+      # https-only to globally-reachable unicast.
+      NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
+    # Longer than this process's shutdown drain, which is MaxClaimHold() plus
+    # a 30s grace — 60s at the documented delivery budget. Compose's default
+    # is 10 seconds, so without this `docker compose stop`/`down` would
+    # SIGKILL a delivery still in flight and leave a claim unresolved: the
+    # exact state the join-before-close ordering exists to avoid, produced
+    # routinely by the documented local workflow.
+    #
+    # The coupling is to the budget, not to the number: raising
+    # NOTIFICATION_WEBHOOK_MAX_ATTEMPTS or NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS
+    # on this service lengthens the drain, and this value has to stay above
+    # MaxClaimHold() + 30s for whatever budget is configured here.
+    stop_grace_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
   # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
   # than "app"'s hardened "runtime" stage, which deliberately has neither.
   # `docker compose run --build --rm app-test go test ./... -v` is how the
