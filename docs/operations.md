@@ -191,6 +191,8 @@ Both are consequences of choices made on purpose, so read them as diagnoses rath
    ORDER BY claimed_at;
   ```
 
+  The interval is the **default** reclaim bound. On a deployment that sets `NOTIFICATION_DELIVERY_RECLAIM_SECONDS`, substitute that value: run as written against a longer bound and the query reports claims that are still live, against a shorter one it misses stale rows.
+
   A handful of these after a rough deploy is expected. A steady stream is a sign the Notification database is struggling, not that delivery is broken.
 
 - **A terminal queue that stops draining for up to the reclaim bound is the head-of-line stall of an abandoned claim, not a stuck consumer.** At prefetch 1, a message whose claim is held by another consumer is requeued after a pause and returns to the head of the queue, where the same consumer takes it again. If the holder died without resolving, that repeats until the bound expires and the claim can be granted. Depth stops falling, the consumer looks busy, and nothing is wrong: it clears on its own within the bound. Restarting the notifier does not speed this up — the bound is measured from the abandoned claim's `claimed_at`, not from consumer uptime. A stall materially longer than the bound is a different problem, and the query above is what tells the two apart.
