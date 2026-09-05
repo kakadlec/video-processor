@@ -36,6 +36,12 @@ const (
 // This is deliberately stricter than the identity and video adapters, which
 // take no lock. That is a latent race in those two rather than a reason to
 // copy them.
+//
+// schema.sql holds more than one statement, and PostgreSQL runs a
+// multi-statement string only over the simple query protocol. pgx forces
+// that protocol whenever an Exec carries no arguments, whatever exec mode
+// the DSN configures — so the schema below must stay argument-free, and a
+// parameter introduced into it would break startup rather than one table.
 func Migrate(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

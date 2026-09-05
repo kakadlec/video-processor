@@ -48,8 +48,11 @@ func testDB(t *testing.T) *sql.DB {
 	if err := postgres.Migrate(ctx, db); err != nil {
 		t.Fatalf("unexpected error migrating schema: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "TRUNCATE TABLE notification_preferences"); err != nil {
-		t.Fatalf("unexpected error truncating table: %v", err)
+	// One statement over both tables rather than two: a truncate of related
+	// tables has to name them together the moment either references the
+	// other, and ordering two calls correctly is a detail worth not having.
+	if _, err := db.ExecContext(ctx, "TRUNCATE TABLE notification_preferences, notification_deliveries"); err != nil {
+		t.Fatalf("unexpected error truncating tables: %v", err)
 	}
 
 	return db
