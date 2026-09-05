@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -911,4 +914,83 @@ func TestSetupNotification_UnreachablePostgres_ReturnsError(t *testing.T) {
 	if db != nil {
 		t.Fatalf("expected a nil db on error, got %+v", db)
 	}
+}
+
+// secretLoadingMethod is the one read path permitted to load a stored
+// signing secret.
+const secretLoadingMethod = "FindDeliverable"
+
+// deliveryUseCaseFile is the only file in the Notification application layer
+// allowed to name it.
+const deliveryUseCaseFile = "deliver_notification.go"
+
+// TestTheHTTPCompositionRootDoesNotLoadTheSecret is the assertion that
+// carries the weight of "the secret is read on the delivery path and nowhere
+// else".
+//
+// The invariant it defends used to be absolute — no read path loaded the
+// secret at all — and add-notification-webhook-delivery narrows rather than
+// drops it: exactly one named method may, and nothing this composition root
+// wires may reach it. A source scan rather than a runtime assertion, for the
+// same reason internal/notification/infrastructure/postgres scans its own
+// queries: a call that is never executed is invisible to a test that runs
+// the program.
+//
+// Two halves, because "no path under cmd/api reaches it" is not the same as
+// "no file under cmd/api names it". The first half is the direct call; the
+// second is the indirect one, through the two use cases this root does wire.
+func TestTheHTTPCompositionRootDoesNotLoadTheSecret(t *testing.T) {
+	// Paths are relative to the repository root, not to this package:
+	// TestMain chdirs there so the tests run with the same working directory
+	// the binary does.
+	compositionRoot := namingFiles(t, filepath.Join("cmd", "api"), secretLoadingMethod)
+	if len(compositionRoot) != 0 {
+		t.Errorf("%v under cmd/api name %s: the HTTP composition root must not reach the one read path that loads a stored secret",
+			compositionRoot, secretLoadingMethod)
+	}
+
+	// The use cases cmd/api wires. Only the delivery use case — which this
+	// root does not wire, and cmd/notifier does — may name it.
+	useCases := namingFiles(t, filepath.Join("internal", "notification", "application"), secretLoadingMethod)
+	for _, name := range useCases {
+		if name != deliveryUseCaseFile {
+			t.Errorf("%s names %s: a use case the HTTP composition root wires would then reach a stored secret through it",
+				name, secretLoadingMethod)
+		}
+	}
+	if !slices.Contains(useCases, deliveryUseCaseFile) {
+		t.Fatalf("no file in the notification application layer names %s; this scan is passing vacuously", secretLoadingMethod)
+	}
+}
+
+// namingFiles returns the base names of the non-test .go files directly
+// under dir that contain needle. Test files are excluded deliberately: this
+// very file names the method in its own assertions.
+func namingFiles(t *testing.T, dir, needle string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", dir, err)
+	}
+
+	naming := make([]string, 0)
+	scanned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		scanned++
+		source, err := fs.ReadFile(os.DirFS(dir), entry.Name())
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", filepath.Join(dir, entry.Name()), err)
+		}
+		if strings.Contains(string(source), needle) {
+			naming = append(naming, entry.Name())
+		}
+	}
+	if scanned == 0 {
+		t.Fatalf("no non-test Go file was scanned under %s; the rule this enforces is not being checked", dir)
+	}
+	return naming
 }
