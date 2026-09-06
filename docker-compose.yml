@@ -19,9 +19,19 @@ services:
       # Creates the five databases the "identity" runtime database above
       # does not cover, on first init: a runtime database per bounded
       # context and a test counterpart for each — see the SQL file's own
-      # comment for why the contexts do not share one. Init scripts run
-      # only on an empty data directory, so a volume that predates this
-      # arrangement needs the databases created by hand (docs/operations.md).
+      # comment for why the contexts do not share one.
+      #
+      # Init scripts run only on an empty data directory, so a volume that
+      # predates this arrangement holds identity and identity_test alone
+      # and needs the other four created against the running container:
+      #
+      #   for db in video video_test notification notification_test; do
+      #     docker compose exec -T postgres \
+      #       psql -U identity -d identity -c "CREATE DATABASE $db"
+      #   done
+      #
+      # Not "docker compose down -v" — that removes minio_data and
+      # rabbitmq_data with it, which the volume comments below warn about.
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U identity"]
