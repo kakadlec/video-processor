@@ -17,10 +17,11 @@ Each process SHALL require only the environment configuration it uses, and SHALL
 - **WHEN** `docker compose up --build` runs
 - **THEN** the Identity, Video Processing, and Notification HTTP services each start from the same image, running their own binary with the environment the compose file supplies, each listening on port 8080 inside its own container and publishing none
 
-#### Scenario: Existing deployment commands keep working
+#### Scenario: The documented deployment commands match what the image now contains
 
-- **WHEN** a deployer runs the `docker build`/`docker run` commands documented in `docs/operations.md`, supplying every environment variable those docs list as required for the process being started
-- **THEN** they succeed unmodified and the container behaves as documented: same port, same first-run directory creation, and the same fail-fast behavior for missing configuration
+- **GIVEN** that the HTTP surface is served by three processes behind an ingress rather than by one
+- **WHEN** `docs/operations.md`'s `docker build`/`docker run` commands are followed as written, supplying every environment variable those docs list as required for the process being started
+- **THEN** each command succeeds and the container behaves as documented: the same host port reaches the system through the ingress, the same first-run directory creation happens in the process that needs it, and configuration is still fail-fast. The documentation SHALL be updated as part of the change that renames the binaries, rather than promising that commands naming a binary the image no longer contains still work
 
 #### Scenario: The image's default command names a binary it contains
 
