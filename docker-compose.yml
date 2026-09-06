@@ -233,13 +233,12 @@ services:
     # SKIP LOCKED, and their recovery sweepers are safe by the same
     # conditional-write argument.
     #
-    # "deploy" here is NOT a Swarm deployment descriptor, and this is the one
-    # key of that section this file relies on: `replicas` is honoured by a
-    # plain `docker compose up` outside Swarm (verified), while its siblings
-    # — resources, restart_policy, placement — are silently ignored. Do not
-    # "clean it up" as dead Swarm config; the default concurrency depends on
-    # it. `--scale worker=N` still overrides it in both directions, so
-    # `--scale worker=1` remains the one-flag way back to a single worker.
+    # "deploy" here is not a Swarm deployment descriptor. `replicas` is
+    # honoured by a plain `docker compose up` outside Swarm (verified), and
+    # that is the whole of what this file relies on the section for — so do
+    # not "clean it up" as dead Swarm config, because the default concurrency
+    # depends on it. `--scale worker=N` still overrides it in both directions,
+    # so `--scale worker=1` remains the one-flag way back to a single worker.
     #
     # Only this service is replicated. "app" deliberately stays at one: it
     # publishes 127.0.0.1:8080:8080, so a second replica could not bind the
