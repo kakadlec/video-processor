@@ -1,6 +1,6 @@
 ## Context
 
-Three bounded contexts, three connection strings, three pools, three `Migrate` calls, three `schema.sql` files with no foreign key between them — and, in every environment this project actually runs, one database called `identity` holding all seven tables. `docker-compose.yml` sets six DSNs to it; `.github/workflows/ci.yml` sets three.
+Three bounded contexts, three connection strings, three pools, three `Migrate` calls, three `schema.sql` files with no foreign key between them — and, in every environment this project actually runs, one database called `identity` holding all five tables. `docker-compose.yml` sets six DSNs to it; `.github/workflows/ci.yml` sets three.
 
 The code contract is already right and already written down. `notification-persistence` says a separate variable and a separate pool are what make a context's persistence its own, that pointing them at one server is a permitted deployment decision, and that the code must not be what assumes it. Nothing here changes that contract.
 
@@ -10,7 +10,7 @@ What changes is that the boundary becomes executable. Today a `JOIN` across two 
                        today                          after
   IDENTITY_POSTGRES_DSN  ─┐                  ─▶ identity
   VIDEO_POSTGRES_DSN     ─┼─▶ identity          ─▶ video
-  NOTIFICATION_..._DSN   ─┘   (7 tables)        ─▶ notification
+  NOTIFICATION_..._DSN   ─┘   (5 tables)        ─▶ notification
                                                    one server, three databases
 ```
 
@@ -48,7 +48,9 @@ The cost is that each context's `Migrate` now runs against an empty database rat
 
 `docker-entrypoint-initdb.d` runs only when the data directory is empty. Every developer with an existing `postgres_data` volume — and CI is not one, since it provisions a fresh service each run — would take the change, run `docker compose up`, and get a startup failure naming a database that does not exist. The obvious fix, `docker compose down -v`, is the one this repository's own compose comments warn against: it removes `minio_data` and `rabbitmq_data` too, destroying completed results and queued messages.
 
-So the recovery path ships with the change as two `CREATE DATABASE` statements run against the live container, and it belongs in the finalization documentation rather than being left for each developer to derive from an error message.
+Such a volume holds two of the six databases — `identity`, from the server's `POSTGRES_DB`, and `identity_test`, from today's init script — so the recovery is four `CREATE DATABASE` statements: `video`, `video_test`, `notification`, `notification_test`. Both test databases belong in it. Recovering only the runtime pair restarts the stack and leaves the documented local test command pointing at databases that do not exist, which is a worse failure than the first one because it appears later and looks unrelated.
+
+So the recovery path ships with the change as those four statements run against the live container, and it belongs in the finalization documentation rather than being left for each developer to derive from an error message.
 
 ### 4. The test databases move with the runtime ones
 
@@ -58,7 +60,7 @@ CI matters more than local here: CI is where a cross-context query would otherwi
 
 ## Risks / Trade-offs
 
-- **A developer's next `docker compose up` fails after pulling this change** → Real, and the honest cost of the change. Mitigated by decision 3: the two `CREATE DATABASE` statements are documented, and the failure names the missing database clearly. Not mitigated by trying to create databases from Go, which would require a connection to a database the process does not own.
+- **A developer's next `docker compose up` fails after pulling this change** → Real, and the honest cost of the change. Mitigated by decision 3: the four `CREATE DATABASE` statements — two runtime, two test — are documented, and the failure names the missing database clearly. Not mitigated by trying to create databases from Go, which would require a connection to a database the process does not own.
 - **A latent cross-context query is discovered by this change and fails the suite** → That is the change working, not a regression. There is reason to expect none — no `schema.sql` declares a foreign key and `internal/notification/dependency_rules_test.go` already forbids the import that would make one convenient to write — but the verification step is what settles it, and a finding here is the most valuable outcome this change could have.
 - **Someone later re-converges the DSNs to "simplify" the compose file** → The `ddd-architecture` requirement added by this change makes that a spec violation rather than a tidy-up, and the reason is written where the values live.
 - **Three databases is a step toward per-context servers nobody asked for** → It is not, and the spec text says so: the requirement is about a query being unable to cross, not about physical topology. One server stays explicitly permitted.
