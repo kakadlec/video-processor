@@ -219,6 +219,34 @@ services:
   worker:
     build: .
     command: ["/app/worker"]
+    # Three of them, so the stack this repository documents as its single
+    # command demonstrates concurrent processing rather than requiring a flag
+    # to reveal it. Worker count *is* the concurrency knob and there is no
+    # other: prefetch is 1, so a worker holds exactly one job at a time by
+    # design, and three workers means three extractions at once. Nothing else
+    # here changes to accommodate them — the three share this one definition.
+    #
+    # Three workers cannot both run one job because job pickup is an atomic
+    # conditional UPDATE (... WHERE id = $1 AND status = 'queued'), not
+    # because of the Redis lease, which is liveness for crash recovery and
+    # never mutual exclusion. Their outbox relays step over each other with
+    # SKIP LOCKED, and their recovery sweepers are safe by the same
+    # conditional-write argument.
+    #
+    # "deploy" here is not a Swarm deployment descriptor. `replicas` is
+    # honoured by a plain `docker compose up` outside Swarm (verified), and
+    # that is the whole of what this file relies on the section for — so do
+    # not "clean it up" as dead Swarm config, because the default concurrency
+    # depends on it. `--scale worker=N` still overrides it in both directions,
+    # so `--scale worker=1` remains the one-flag way back to a single worker.
+    #
+    # Only this service is replicated. "app" deliberately stays at one: it
+    # publishes 127.0.0.1:8080:8080, so a second replica could not bind the
+    # host port and half the stack would come up broken. "notifier" stays at
+    # one because video-processing throughput is what this is for, and
+    # delivery is not its bottleneck.
+    deploy:
+      replicas: 3
     environment:
       # Identical to the "app" service's Video Processing configuration —
       # same database, same bucket, same broker. The two processes are two
