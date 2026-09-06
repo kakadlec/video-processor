@@ -17,7 +17,7 @@ The accepted algorithm SHALL remain pinned by name at verification. With a symme
 #### Scenario: A verifier configured with a private key fails to start
 
 - **GIVEN** a service that only verifies tokens
-- **WHEN** it is configured with private-key material, or with no key material at all
+- **WHEN** it is configured with private-key material as its verification material, or with no key material at all
 - **THEN** startup fails with a clear configuration error rather than succeeding with the ability to mint tokens or with no ability to verify them
 
 #### Scenario: Verification survives Identity being down
@@ -44,7 +44,9 @@ The accepted algorithm SHALL remain pinned by name at verification. With a symme
 
 The system SHALL load database and token-signing configuration from the environment or an equivalent explicit configuration source and SHALL fail clearly when identity configuration is partially present, entirely absent, or invalid. There is no supported mode in which the system starts without a fully configured Identity module.
 
-Token-signing configuration is now **per process, and asymmetric**. The Identity HTTP service SHALL require a private key, the matching public key, and a key identifier. Every other service that authenticates callers SHALL require the public key and the key identifier, and SHALL NOT accept a private key. There SHALL be no default, fallback, or embedded key of either kind, and no mode in which a missing key is tolerated by degrading to unauthenticated access.
+Token-signing configuration is now **per process, and asymmetric**. The Identity HTTP service SHALL require a private key, the matching public key, and a key identifier. Every other service that authenticates callers SHALL require the public key and the key identifier, and SHALL NOT accept a private key as verification material. There SHALL be no default, fallback, or embedded key of either kind, and no mode in which a missing key is tolerated by degrading to unauthenticated access.
+
+The Identity service requires the public key despite registering no authenticated route, and SHALL verify at startup that the two halves are one pair. A mismatched pair produces no error anywhere it can be attributed: Identity mints tokens successfully and every other service rejects all of them, which presents as an authentication fault in the services that are behaving correctly.
 
 #### Scenario: Missing signing configuration fails startup
 
@@ -57,6 +59,12 @@ Token-signing configuration is now **per process, and asymmetric**. The Identity
 - **GIVEN** neither `IDENTITY_POSTGRES_DSN` nor the JWT key configuration is set
 - **WHEN** the Identity HTTP composition root starts
 - **THEN** startup fails with a clear configuration error, `/api/auth` routes are never registered, and no video-processing route becomes reachable
+
+#### Scenario: A mismatched key pair fails Identity's startup
+
+- **GIVEN** a private key and a public key that is not its match
+- **WHEN** the Identity HTTP composition root starts
+- **THEN** startup fails with a clear configuration error, rather than starting and issuing tokens that no other service can verify
 
 #### Scenario: A verifying service without a public key fails startup
 

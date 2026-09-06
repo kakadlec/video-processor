@@ -71,7 +71,9 @@ The current `jwtauth.Adapter` holds one `[]byte` and both signs and verifies wit
 
 **Why configuration and not JWKS.** JWKS is the conventional answer and it is the wrong one here. Each verifier would fetch Identity's key set at startup or on cache miss, which makes Identity's availability a precondition for every other service's authorization decision — a synchronous, runtime coupling, reintroduced at exactly the moment the change removes the compile-time one. A public key in the environment gives a property most real microservice deployments do not have: `cmd/video-api` can verify tokens with `cmd/identity-api` down. The cost is that rotation is a coordinated configuration change rather than an automatic refresh, which the `kid` set makes a two-deploy operation (publish both keys, then switch the issuer, then drop the old one) rather than a flag day. JWKS remains the documented alternative if a key set ever has to change without a deploy.
 
-The verifier refuses a private key and refuses an empty set, so a service misconfigured with Identity's full key pair fails at startup rather than starting with minting capability it was not meant to have.
+The verifier refuses a private key and refuses an empty set, so a service misconfigured with Identity's full key pair fails at startup rather than starting with minting capability it was not meant to have. That refusal is a property of the material handed to `NewVerifier`, not of what the process holds: `cmd/identity-api` has a private key in its environment and hands it only to `NewIssuer`.
+
+It also holds the public key, which looks like dead configuration in a service that registers no authenticated route and is why the reason is written here as well as in the spec: startup checks that the two halves are one pair. A mismatched pair is otherwise silent in the one place it could be caught and loud everywhere it cannot be attributed — Identity mints successfully, every other service rejects every token, and the failure appears to belong to the services that are correct.
 
 ### `internal/contracts`, a package with no production code
 
