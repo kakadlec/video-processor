@@ -33,7 +33,7 @@ docker compose up --build
 # are processed at the same time: each worker holds exactly one job at a
 # time by design (prefetch 1), so concurrency is worker count.
 
-# 2b. ALTERNATIVE to step 2 (stop it first, or run this instead): to pick a
+# 3b. ALTERNATIVE to step 3 (stop it first, or run this instead): to pick a
 #     different number of workers — including one, for a single log stream
 #     or a serial trace:
 docker compose up --build --scale worker=1
