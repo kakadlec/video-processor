@@ -169,14 +169,20 @@ docker compose up --build
 # identity, video, notification, Redis, MinIO, and RabbitMQ are already
 # configured, and `worker` and `notifier` services are started alongside
 # `app` from the same image, so uploads are actually processed and finished
-# jobs are actually announced
+# jobs are actually announced.
+#
+# Three workers start by default (docker-compose.yml's `deploy.replicas`),
+# so this stack processes several videos at the same time. Prefetch is 1, so
+# a worker holds exactly one job at a time and concurrent processing is
+# worker count — this is the only knob. Nothing else changes: the workers
+# compete for one queue, each claim is an atomic conditional UPDATE, and a
+# lost claim is rejected rather than run twice.
 
-docker compose up --build --scale worker=3
-# Same stack with three workers. Prefetch is 1, so a worker holds exactly one
-# job at a time and concurrent processing is worker count — this is the only
-# knob. Nothing else changes: the workers compete for one queue, each claim is
-# an atomic conditional UPDATE, and a lost claim is rejected rather than run
-# twice. `--scale notifier=N` works the same way; deliveries are claimed per
+docker compose up --build --scale worker=1
+# The same stack with a different number of workers. `--scale` overrides the
+# default in both directions, so this is how you get a single worker (one log
+# stream, a serial trace) and `--scale worker=5` is how you go higher.
+# `--scale notifier=N` works the same way; deliveries are claimed per
 # (user, event, channel, job) so two notifiers do not double-send.
 ```
 

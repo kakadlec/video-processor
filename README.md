@@ -19,19 +19,20 @@ The API requires identity, video, notification, Redis, MinIO, and broker configu
 git clone https://github.com/kakadlec/video-processor.git
 cd video-processor
 
-# 2. Run the full stack (app + worker + notifier + PostgreSQL + Redis +
-#    MinIO + RabbitMQ, all already configured)
+# 2. Run the full stack (app + three workers + notifier + PostgreSQL +
+#    Redis + MinIO + RabbitMQ, all already configured)
 docker compose up --build
 # Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
 # already wired in — /api/auth/register and /api/auth/login are live.
 # The `worker` and `notifier` services run from the same image with their
-# commands overridden.
+# commands overridden. Three workers start by default, so several videos
+# are processed at the same time: each worker holds exactly one job at a
+# time by design (prefetch 1), so concurrency is worker count.
 
-# 2b. ALTERNATIVE to step 2 (stop it first, or run this instead): to process
-#     several videos concurrently, run more workers. Each holds exactly one
-#     job at a time by design (prefetch 1), so concurrency is worker count —
-#     nothing else has to change:
-docker compose up --build --scale worker=3
+# 2b. ALTERNATIVE to step 2 (stop it first, or run this instead): to pick a
+#     different number of workers — including one, for a single log stream
+#     or a serial trace:
+docker compose up --build --scale worker=1
 
 # 3. Open http://127.0.0.1:8080 in your browser
 # Register/log in, then upload a video file. The upload returns immediately
@@ -46,7 +47,7 @@ docker compose up --build --scale worker=3
 
 Processing is asynchronous as of Phase 6, but the system is not yet complete:
 
-- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Concurrency is worker count: each worker holds exactly one job at a time by design, so processing several videos at once means running several worker processes (`docker compose up --scale worker=3`, or more `go run ./cmd/worker` shells). The default stack starts one.
+- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Concurrency is worker count: each worker holds exactly one job at a time by design, so processing several videos at once means running several worker processes. The default stack starts **three**, so that is what `docker compose up` already does; `--scale worker=<n>` picks a different number in either direction, and running the binary directly means more `go run ./cmd/worker` shells.
 - **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so the worker downloads each source into its own `temp/`, extracts frames there, and builds the zip there, removing all of it before the job finishes. Nothing durable lives on local disk (Phase 5): uploaded source videos go to MinIO too, as **transient** objects whose owner deletes them — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
 - **A source object can leak.** A job never dispatched, a dispatch dead-lettered before any claim, or a worker interrupted after a terminal commit but before best-effort cleanup can leave its source in the bucket. Mid-extraction crashes are recovered by the worker sweeper. Configure the `uploads/`-prefix expiration lifecycle rule; it remains the only exhaustive guarantee. See [docs/operations.md](docs/operations.md).
 - **Webhooks are the only notification channel.** A user who registers a webhook preference through `PUT /api/notification-preferences` is notified when a job completes or fails — `cmd/notifier` consumes the terminal-event queue and delivers a signed request per subscribed outcome. Email is not implemented (Phase 7's `add-notification-email-delivery`), and `channel: "email"` is refused rather than stored. A user who registers nothing still has the page (which polls the job's status URL) and `GET /api/status`; absence of a preference means *not subscribed*, and there is no implicit default.
