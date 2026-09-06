@@ -162,20 +162,42 @@ jobs:
           docker logs minio >&2 || true
           exit 1
 
+      - name: Create the per-context test databases
+        # The Postgres service container above provisions only POSTGRES_DB
+        # ("identity"); a service container has no docker-entrypoint-initdb.d
+        # mount, so the per-context test databases docker-compose.yml creates
+        # from docker/postgres-init/ have to be created here instead.
+        #
+        # Each context's adapter suite gets its own database so a query
+        # naming another context's table fails as an unknown relation on
+        # every pull request, rather than passing against a shared one
+        # (ddd-architecture's "Context Storage Isolation Is Exhibited, Not
+        # Only Permitted"). Run through the same pinned image as the service
+        # so no assumption is made about a psql client on the runner.
+        run: |
+          for db in identity_test video_test notification_test; do
+            docker run --rm --network host \
+              -e PGPASSWORD=identity \
+              postgres:16-alpine \
+              psql -h 127.0.0.1 -U identity -d identity \
+                -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
+          done
+
       - name: Vet
         run: go vet ./...
 
       - name: Test
         env:
-          IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
-          # Same CI Postgres service and database as IDENTITY_POSTGRES_TEST_DSN —
-          # video_jobs/video_job_outbox coexist with identity_users there.
-          VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
-          # Same service and database again. Without it
+          IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity_test?sslmode=disable
+          # The same CI Postgres service, the Video context's own database —
+          # video_jobs/video_job_outbox do not coexist with identity_users,
+          # so a query joining them fails here instead of passing.
+          VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/video_test?sslmode=disable
+          # Same service, its own database again. Without it
           # internal/notification/infrastructure/postgres's suite skips, and
           # with it the adapter's create-with-no-secret refusal — enforced by
           # a row count against a real database — is actually covered.
-          NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/identity?sslmode=disable
+          NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/notification_test?sslmode=disable
           REDIS_TEST_ADDR: localhost:6379
           # cmd/api's composition root now requires this at startup
           # (add-upload-idempotency-keys) — same CI redis service as
