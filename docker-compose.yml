@@ -135,10 +135,9 @@ services:
     build: .
     ports:
       # Loopback-only: an unqualified "8080:8080" binds to all host
-      # interfaces, and the fixed signing key below is repository-visible
-      # — an unqualified publish would let any network peer forge
-      # accepted bearer tokens. There's no legitimate reason this local
-      # dev service needs LAN reachability.
+      # interfaces, exposing a stack whose Postgres and MinIO credentials
+      # are the fixed ones below to any peer on the network. There's no
+      # legitimate reason this local dev service needs LAN reachability.
       - "127.0.0.1:8080:8080"
     environment:
       # Fixed, non-secret local-only defaults — same rationale as the
