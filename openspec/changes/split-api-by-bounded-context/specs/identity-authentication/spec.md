@@ -1,0 +1,81 @@
+## ADDED Requirements
+
+### Requirement: Access tokens are asymmetrically signed and only Identity can mint them
+
+Access tokens SHALL be signed with an asymmetric algorithm (RS256), so that the ability to **issue** a token and the ability to **verify** one are separate capabilities backed by separate key material. The private key SHALL be held by exactly one process — the Identity context's HTTP service — and SHALL NOT be readable configuration for any other process. Every other service SHALL hold only the corresponding public key.
+
+The **verifier's key material SHALL be configured as a set** of key identifier to public key, holding one or more entries, and not as a single key. A single-key verifier cannot be rotated: switching it before the issuer rejects every token already in circulation, and switching the issuer first mints tokens no verifier accepts. Holding both keys through the overlap is the whole purpose of the key identifier, so the set is a set from the outset rather than a later widening — the widening would itself need the window it exists to remove. The issuer's active key identifier is separate configuration, held only by the Identity service; a verifier reads the identifier off the token and is never told which key is current.
+
+The public key SHALL be distributed by configuration rather than fetched from a key-set endpoint. A verifier SHALL be able to accept a valid token while the Identity service is unavailable; making verification depend on a call to Identity would reintroduce, at runtime, the coupling that separating the services removes. Rotation is consequently a coordinated configuration change, and tokens SHALL carry a key identifier (`kid`) from the outset so that a verifier can hold more than one public key and a rotation needs no window in which unidentified tokens are accepted.
+
+The accepted algorithm SHALL remain pinned by name at verification. With a symmetric key this guarded against `alg: none`; with an asymmetric one it additionally guards against a token signed with the public key itself treated as an HMAC secret, since that key is not confidential.
+
+#### Scenario: Only the Identity service can issue a token
+
+- **GIVEN** the deployed HTTP services
+- **WHEN** each one's configuration and build graph are inspected
+- **THEN** only the Identity service is configured with a private key and only it constructs a token issuer; no other service can produce a token that any verifier accepts
+
+#### Scenario: A verifier configured with a private key fails to start
+
+- **GIVEN** a service that only verifies tokens
+- **WHEN** it is configured with private-key material as its verification material, or with no key material at all
+- **THEN** startup fails with a clear configuration error rather than succeeding with the ability to mint tokens or with no ability to verify them
+
+#### Scenario: Verification survives Identity being down
+
+- **GIVEN** a valid, unexpired token and a stopped Identity service
+- **WHEN** the token is presented to a protected route on another service
+- **THEN** the request is authorized, because the public key came from configuration and no call to Identity is made
+
+#### Scenario: A rotation needs no window in which tokens are rejected
+
+- **GIVEN** a verifier configured with two entries — the outgoing key and the incoming one — and an issuer still signing with the outgoing key
+- **WHEN** the issuer is switched to sign with the incoming key
+- **THEN** tokens issued before and after the switch are both accepted, and the outgoing entry can be dropped once every token signed under it has expired
+
+#### Scenario: A token naming an unknown key is rejected indistinguishably
+
+- **GIVEN** a token whose `kid` header names a key the verifier does not hold, or carries no `kid` at all
+- **WHEN** it is presented to a protected route
+- **THEN** the request is rejected with `401 Unauthorized` and the same failure shape every other invalid token produces, disclosing nothing about which key identifiers exist
+
+#### Scenario: A token signed with the public key as an HMAC secret is rejected
+
+- **GIVEN** a token presenting `alg: HS256`, signed using the verifier's public-key material as the HMAC secret
+- **WHEN** it is presented to a protected route
+- **THEN** it is rejected before any key lookup, because the verifier accepts only the pinned asymmetric algorithm
+
+## MODIFIED Requirements
+
+### Requirement: Configuration does not provide insecure defaults
+
+The system SHALL load database and token-signing configuration from the environment or an equivalent explicit configuration source and SHALL fail clearly when identity configuration is partially present, entirely absent, or invalid. There is no supported mode in which the system starts without a fully configured Identity module.
+
+Token-signing configuration is now **per process, and asymmetric**. The Identity HTTP service SHALL require a private key, the matching public key, and a key identifier. Every other service that authenticates callers SHALL require the public key and the key identifier, and SHALL NOT accept a private key as verification material. There SHALL be no default, fallback, or embedded key of either kind, and no mode in which a missing key is tolerated by degrading to unauthenticated access.
+
+The Identity service requires the public key despite registering no authenticated route, and SHALL verify at startup that the two halves are one pair. A mismatched pair produces no error anywhere it can be attributed: Identity mints tokens successfully and every other service rejects all of them, which presents as an authentication fault in the services that are behaving correctly.
+
+#### Scenario: Missing signing configuration fails startup
+
+- **GIVEN** `IDENTITY_POSTGRES_DSN` is set but the required JWT key configuration is absent or invalid, or vice versa
+- **WHEN** the Identity HTTP composition root starts
+- **THEN** startup fails with a clear configuration error and does not use a hard-coded fallback key
+
+#### Scenario: Identity entirely unconfigured fails startup
+
+- **GIVEN** neither `IDENTITY_POSTGRES_DSN` nor the JWT key configuration is set
+- **WHEN** the Identity HTTP composition root starts
+- **THEN** startup fails with a clear configuration error, `/api/auth` routes are never registered, and no video-processing route becomes reachable
+
+#### Scenario: A mismatched key pair fails Identity's startup
+
+- **GIVEN** a private key, an active key identifier, and a verifier key set whose entry under that identifier is not the private key's match
+- **WHEN** the Identity HTTP composition root starts
+- **THEN** startup fails with a clear configuration error, rather than starting and issuing tokens that no other service can verify
+
+#### Scenario: A verifying service without a public key fails startup
+
+- **GIVEN** a service that serves bearer-authenticated routes
+- **WHEN** it starts with no public-key configuration
+- **THEN** startup fails with a clear configuration error and no route is registered, rather than the service starting and rejecting every request at authentication time
