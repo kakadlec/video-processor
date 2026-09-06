@@ -41,7 +41,12 @@ var (
 	// ErrKeyIDRequired is returned when constructing an Issuer without an active key id.
 	ErrKeyIDRequired = fmt.Errorf("identity: %s is required", KeyIDEnv)
 	// ErrPublicKeysRequired is returned when constructing a Verifier over an empty key set.
-	ErrPublicKeysRequired = fmt.Errorf("identity: %s must hold at least one key id to PEM public key entry", PublicKeysEnv)
+	ErrPublicKeysRequired = fmt.Errorf("identity: %s must hold at least one entry mapping a key id to a PEM public key", PublicKeysEnv)
+	// ErrPublicKeyIDRequired is returned when a Verifier key set holds an entry
+	// under an empty key id. NewIssuer refuses to mint under one, so such an
+	// entry can never be selected: the verifier would start and then reject
+	// every token, which is the failure this refusal moves to startup.
+	ErrPublicKeyIDRequired = fmt.Errorf("identity: %s holds an entry under an empty key id; no token can name it", PublicKeysEnv)
 	// ErrPrivateKeyAsVerificationMaterial is returned when a Verifier is handed
 	// a private key. A service configured with the full key pair as its
 	// verification material is one line away from being able to mint tokens, so
@@ -122,6 +127,9 @@ func NewVerifier(publicKeysByKeyID map[string]string) (*Verifier, error) {
 
 	keys := make(map[string]*rsa.PublicKey, len(publicKeysByKeyID))
 	for keyID, publicKeyPEM := range publicKeysByKeyID {
+		if strings.TrimSpace(keyID) == "" {
+			return nil, ErrPublicKeyIDRequired
+		}
 		key, err := parsePublicKey(publicKeyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("identity: %s entry %q: %w", PublicKeysEnv, keyID, err)

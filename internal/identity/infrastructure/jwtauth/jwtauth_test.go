@@ -129,6 +129,20 @@ func TestNewVerifier_RefusesEmptyKeySet(t *testing.T) {
 	}
 }
 
+// An entry under an empty key id can never be selected — NewIssuer refuses to
+// mint under one — so a verifier holding only that entry would start and then
+// reject every token. The refusal moves that failure to startup.
+func TestNewVerifier_RefusesEntryUnderAnEmptyKeyID(t *testing.T) {
+	for name, keyID := range map[string]string{"empty": "", "whitespace": "  "} {
+		t.Run(name, func(t *testing.T) {
+			_, err := jwtauth.NewVerifier(map[string]string{keyID: testKeyPair(t, 0).publicPEM})
+			if !errors.Is(err, jwtauth.ErrPublicKeyIDRequired) {
+				t.Fatalf("error = %v, want %v", err, jwtauth.ErrPublicKeyIDRequired)
+			}
+		})
+	}
+}
+
 // A service handed the full key pair as its verification material is one line
 // away from minting tokens, so it must fail at startup rather than start.
 func TestNewVerifier_RefusesPrivateKeyMaterial(t *testing.T) {
