@@ -40,13 +40,15 @@ go mod download
 docker compose up -d postgres redis minio rabbitmq
 
 # Set required identity, video, notification, Redis, MinIO, and broker
-# configuration. The three DSNs name the same database on purpose: each
-# bounded context owns its own pool and its own tables, and pointing them at
-# one server is a deployment choice, not a shared connection.
+# configuration. The three DSNs name three different databases on the same
+# server: each bounded context owns its own pool, its own tables, and its own
+# database, so a query reaching into another context's tables fails as an
+# unknown relation. Sharing one server is a deployment choice; sharing one
+# database is not one this project makes.
 export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
 export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
-export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
-export NOTIFICATION_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
+export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/video?sslmode=disable"
+export NOTIFICATION_POSTGRES_DSN="postgres://identity:identity@localhost:5432/notification?sslmode=disable"
 export REDIS_ADDR="localhost:6379"
 export VIDEO_MINIO_ENDPOINT="localhost:9000"
 export VIDEO_MINIO_ACCESS_KEY="minioadmin"
@@ -121,13 +123,23 @@ docker compose run --build --rm app-test go test ./... -v
 
 `app-test` builds from the `Dockerfile`'s `test` stage (Go toolchain + `ffmpeg`) and runs `go test` inside it, against the compose-provided PostgreSQL, Redis, and MinIO — no local Go, ffmpeg, or MinIO install required. With result storage now in MinIO, this is the path of least resistance for anyone not already running one. It's a separate service from `app` because `app`'s image (the hardened, deployed build) deliberately has no Go toolchain; see "Docker Workflow" below. `app-test` is gated behind Compose's `test` profile so it never starts as part of a plain `docker compose up`/`up --build` — `docker compose run` targets it explicitly regardless, so the command above needs no extra flag.
 
-The three PostgreSQL adapter suites — `internal/identity/infrastructure/postgres`, `internal/video/infrastructure/postgres`, and `internal/notification/infrastructure/postgres` — otherwise skip (not fail) when their own `IDENTITY_POSTGRES_TEST_DSN` / `VIDEO_POSTGRES_TEST_DSN` / `NOTIFICATION_POSTGRES_TEST_DSN` is unset. All three run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated `identity_test` database on first init (see `docker/postgres-init/create-test-db.sql`), and all three variables are already pointed at it — no manual export needed.
+The three PostgreSQL adapter suites — `internal/identity/infrastructure/postgres`, `internal/video/infrastructure/postgres`, and `internal/notification/infrastructure/postgres` — otherwise skip (not fail) when their own `IDENTITY_POSTGRES_TEST_DSN` / `VIDEO_POSTGRES_TEST_DSN` / `NOTIFICATION_POSTGRES_TEST_DSN` is unset. All three run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated test database per bounded context on first init — `identity_test`, `video_test`, `notification_test` (see `docker/postgres-init/create-context-databases.sql`) — and each variable is already pointed at its own one, no manual export needed.
 
 Notification's is the one most worth reaching for deliberately, because the rule it covers has no in-memory equivalent: "creating a preference without a signing secret is refused" is decided by whether the adapter's `UPDATE … RETURNING` affected a row, so a skipped run exercises none of it while still reporting green. `NOTIFICATION_POSTGRES_DSN` — the *runtime* variable — is a separate thing and is **not** needed to run the suite: no test in `cmd/api` calls `setupNotification` (or `setupIdentity`, or `setupVideo`); every one builds its modules by hand, which is why `TestMain`'s startup gate names neither it nor the other two DSNs.
 
-That database is separate from the runtime `identity` database `IDENTITY_POSTGRES_DSN` uses, so this is safe to run even while `docker compose up --build` is serving real registered users — the test run's `TRUNCATE` only touches `identity_test`.
+Each test database is separate from the runtime database its context uses, so this is safe to run even while `docker compose up --build` is serving real registered users — a `TRUNCATE` in the identity suite touches `identity_test` and no other database, and the same holds for the other two. The separation is per context rather than global for the same reason: a Video adapter test truncating `video_jobs` has no business reaching Notification's rows either.
 
-> **If you already have a `postgres_data` volume from before this change:** the init script that creates `identity_test` only runs against a fresh, empty PostgreSQL data directory. An existing volume won't get the new database, and the command above will fail rather than run the adapter tests. Run `docker compose down -v` once to drop the old volume (this destroys any local Postgres data you had), then `docker compose up --build` recreates it with `identity_test` included.
+> **If you already have a `postgres_data` volume from before the per-context split:** the init script only runs against a fresh, empty PostgreSQL data directory. An existing volume holds `identity` and `identity_test` alone, so the API and the notifier fail to start and the adapter suites fail rather than run. Create the four missing databases against the running container instead:
+>
+> ```bash
+> docker compose up -d postgres
+> for db in video video_test notification notification_test; do
+>   docker compose exec -T postgres \
+>     psql -U identity -d identity -c "CREATE DATABASE $db"
+> done
+> ```
+>
+> Not `docker compose down -v` — that would drop `minio_data` and `rabbitmq_data` along with the Postgres volume, taking every stored result and every queued message with them. The statements above leave existing data alone; each is a no-op error (`already exists`) if you run it twice.
 
 `docker-compose.yml` is the sole documented way to run the application or its tests via Docker **for local development** (container deployment is a separate concern; see [docs/operations.md](operations.md)) — there is no separate plain `docker build`/`docker run` fallback documented for local dev. The `identity`/`identity` Postgres credentials and the app's JWT signing key are fixed, non-secret local-only defaults. `app`'s port is published loopback-only (`127.0.0.1:8080:8080`); note that `postgres`'s port (`5432:5432`, unqualified, matching the pre-existing test-infrastructure setup) is not similarly restricted and is reachable from other machines on the same network unless firewalled.
 

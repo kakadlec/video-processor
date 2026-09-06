@@ -71,17 +71,17 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 
 ## Database Schema and Infrastructure Resources
 
-Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the three binaries to get right.
+Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the three binaries to get right. The one exception is the PostgreSQL databases the DSNs name, which have to exist before a process can migrate into one; `docker compose up` creates them for you.
 
-| Resource | DDL / declaration | Applied by |
-|---|---|---|
-| `identity_users` | [`internal/identity/infrastructure/postgres/schema.sql`](internal/identity/infrastructure/postgres/schema.sql) | `cmd/api` (`setupIdentity`) |
-| `video_jobs`, `video_job_outbox` | [`internal/video/infrastructure/postgres/schema.sql`](internal/video/infrastructure/postgres/schema.sql) | `cmd/api` (`setupVideo`), `cmd/worker` |
-| `notification_preferences`, `notification_deliveries` | [`internal/notification/infrastructure/postgres/schema.sql`](internal/notification/infrastructure/postgres/schema.sql) | `cmd/api` (`setupNotification`), `cmd/notifier` |
-| MinIO bucket (`VIDEO_MINIO_BUCKET`) | `storage.EnsureBucket` | `cmd/api`, `cmd/worker` |
-| RabbitMQ exchanges, queues, bindings, DLQs | `messaging.JobDispatchTopology()`, `TerminalEventsTopology()` | Every producer and consumer, redeclared on **every** dial |
+| Resource | Database | DDL / declaration | Applied by |
+|---|---|---|---|
+| `identity_users` | `identity` | [`internal/identity/infrastructure/postgres/schema.sql`](internal/identity/infrastructure/postgres/schema.sql) | `cmd/api` (`setupIdentity`) |
+| `video_jobs`, `video_job_outbox` | `video` | [`internal/video/infrastructure/postgres/schema.sql`](internal/video/infrastructure/postgres/schema.sql) | `cmd/api` (`setupVideo`), `cmd/worker` |
+| `notification_preferences`, `notification_deliveries` | `notification` | [`internal/notification/infrastructure/postgres/schema.sql`](internal/notification/infrastructure/postgres/schema.sql) | `cmd/api` (`setupNotification`), `cmd/notifier` |
+| MinIO bucket (`VIDEO_MINIO_BUCKET`) | — | `storage.EnsureBucket` | `cmd/api`, `cmd/worker` |
+| RabbitMQ exchanges, queues, bindings, DLQs | — | `messaging.JobDispatchTopology()`, `TerminalEventsTopology()` | Every producer and consumer, redeclared on **every** dial |
 
-The three `schema.sql` files are plain DDL, embedded with `go:embed` and applied idempotently (`CREATE TABLE IF NOT EXISTS`) by each context's `Migrate` — so they can also be run by hand against a database (`psql -f …`) if you want the schema without starting the application. Each bounded context owns its own pool and its own tables; pointing all three DSNs at one server, as `docker-compose.yml` does, is a deployment choice rather than a shared connection. `docker/postgres-init/create-test-db.sql` is unrelated to the runtime schema — it only creates the isolated `identity_test` database the suite truncates.
+The three `schema.sql` files are plain DDL, embedded with `go:embed` and applied idempotently (`CREATE TABLE IF NOT EXISTS`) by each context's `Migrate` — so they can also be run by hand against a database (`psql -f …`) if you want the schema without starting the application. Each bounded context owns its own pool, its own tables, and its own **database**; pointing all three DSNs at one server, as `docker-compose.yml` does, is a deployment choice, and the databases named above are what keeps the boundary enforced by the engine — PostgreSQL has no cross-database query without an extension, so a query reaching from one context into another's tables fails as an unknown relation. The databases themselves are the one thing the processes do *not* create: `docker/postgres-init/create-context-databases.sql` creates them (plus a test counterpart each) on the Compose volume's first init, and is unrelated to the runtime schema — it creates databases, never tables.
 
 ## API
 
