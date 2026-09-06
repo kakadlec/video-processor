@@ -170,6 +170,14 @@ docker compose up --build
 # configured, and `worker` and `notifier` services are started alongside
 # `app` from the same image, so uploads are actually processed and finished
 # jobs are actually announced
+
+docker compose up --build --scale worker=3
+# Same stack with three workers. Prefetch is 1, so a worker holds exactly one
+# job at a time and concurrent processing is worker count — this is the only
+# knob. Nothing else changes: the workers compete for one queue, each claim is
+# an atomic conditional UPDATE, and a lost claim is rejected rather than run
+# twice. `--scale notifier=N` works the same way; deliveries are claimed per
+# (user, event, channel, job) so two notifiers do not double-send.
 ```
 
 `docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.
