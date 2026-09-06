@@ -6,7 +6,7 @@ Processing is asynchronous. `POST /upload` stores the bytes, records the job, an
 
 ### Authentication (Phase 2)
 
-`IDENTITY_POSTGRES_DSN`/`IDENTITY_JWT_SIGNING_KEY` are required at startup, and every step below runs behind bearer-token middleware:
+`IDENTITY_POSTGRES_DSN` and the three `IDENTITY_JWT_*` key variables are required at startup, and every step below runs behind bearer-token middleware:
 
 ```
 Browser                        Go server (cmd/api/main.go / identity.go)     PostgreSQL

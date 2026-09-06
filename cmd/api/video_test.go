@@ -22,7 +22,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 
-	"video-processor/internal/identity/infrastructure/jwtauth"
 	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 	videoapplication "video-processor/internal/video/application"
 	videodomain "video-processor/internal/video/domain"
@@ -572,7 +571,7 @@ func newTestVideoModuleWithBothStorages(t *testing.T) (*videoModule, *inMemoryVi
 // startTestVideoServer wires a real router with a fake identity module (so
 // tests can mint bearer tokens for arbitrary users) and a fake video module
 // backed by an in-memory repository.
-func startTestVideoServer(t *testing.T) (*httptest.Server, jwtauth.Adapter) {
+func startTestVideoServer(t *testing.T) (*httptest.Server, testTokens) {
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
@@ -962,7 +961,7 @@ func newIdempotencyTestVideoModule() (*videoModule, *fakeIdempotencyStore, *inMe
 	return module, store, repo
 }
 
-func startIdempotencyTestServer(t *testing.T) (*httptest.Server, jwtauth.Adapter, *fakeIdempotencyStore) {
+func startIdempotencyTestServer(t *testing.T) (*httptest.Server, testTokens, *fakeIdempotencyStore) {
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store, _ := newIdempotencyTestVideoModule()
@@ -1002,11 +1001,11 @@ func newIdempotencyTestVideoModuleWithRepoAndStorage(repo videodomain.VideoJobRe
 	return module, store
 }
 
-func startIdempotencyTestServerWithRepo(t *testing.T, repo videodomain.VideoJobRepository) (*httptest.Server, jwtauth.Adapter, *fakeIdempotencyStore) {
+func startIdempotencyTestServerWithRepo(t *testing.T, repo videodomain.VideoJobRepository) (*httptest.Server, testTokens, *fakeIdempotencyStore) {
 	return startIdempotencyTestServerWithRepoAndStorage(t, repo, newFakeResultStorage())
 }
 
-func startIdempotencyTestServerWithRepoAndStorage(t *testing.T, repo videodomain.VideoJobRepository, results videodomain.ResultStorage) (*httptest.Server, jwtauth.Adapter, *fakeIdempotencyStore) {
+func startIdempotencyTestServerWithRepoAndStorage(t *testing.T, repo videodomain.VideoJobRepository, results videodomain.ResultStorage) (*httptest.Server, testTokens, *fakeIdempotencyStore) {
 	t.Helper()
 	identity, tokens := newTestIdentityModuleWithTokens(t)
 	module, store := newIdempotencyTestVideoModuleWithRepoAndStorage(repo, results)

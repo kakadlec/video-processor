@@ -135,17 +135,30 @@ services:
     build: .
     ports:
       # Loopback-only: an unqualified "8080:8080" binds to all host
-      # interfaces, and the fixed signing key below is repository-visible
-      # — an unqualified publish would let any network peer forge
-      # accepted bearer tokens. There's no legitimate reason this local
-      # dev service needs LAN reachability.
+      # interfaces, exposing a stack whose Postgres and MinIO credentials
+      # are the fixed ones below to any peer on the network. There's no
+      # legitimate reason this local dev service needs LAN reachability.
       - "127.0.0.1:8080:8080"
     environment:
       # Fixed, non-secret local-only defaults — same rationale as the
       # Postgres credentials above. Never used outside a developer's
       # machine or CI.
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+      # The local RSA key pair is NOT repository material, deliberately unlike
+      # the Postgres credentials above: a committed private key is one copy
+      # away from a deployment, and no reader can tell a development key from
+      # a promoted one by looking at it. `make dev-keys` writes a per-machine
+      # pair into a git-ignored .env, which Compose loads from the project
+      # directory; the :? default turns a missing one into that instruction
+      # instead of a container that starts and rejects every token.
+      # IDENTITY_JWT_PRIVATE_KEY and IDENTITY_JWT_KEY_ID belong to the one
+      # process that mints tokens; IDENTITY_JWT_PUBLIC_KEYS is a JSON object
+      # mapping key id to PEM public key — a set, so a rotation can hold the
+      # outgoing and incoming keys at once — and is read by every service
+      # that verifies.
+      IDENTITY_JWT_PRIVATE_KEY: ${IDENTITY_JWT_PRIVATE_KEY:?run "make dev-keys" to generate a local key pair}
+      IDENTITY_JWT_KEY_ID: ${IDENTITY_JWT_KEY_ID:?run "make dev-keys" to generate a local key pair}
+      IDENTITY_JWT_PUBLIC_KEYS: ${IDENTITY_JWT_PUBLIC_KEYS:?run "make dev-keys" to generate a local key pair}
       # Points at the isolated identity_test database (not the runtime
       # "identity" database above) so `docker compose run app-test go test`
       # can't TRUNCATE data the running app actually uses. Unused by "app"
@@ -354,7 +367,6 @@ services:
       target: test
     environment:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
       # See the "app" service above for why these name the Video context's
       # own databases rather than the IDENTITY_* ones.

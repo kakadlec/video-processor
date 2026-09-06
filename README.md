@@ -12,14 +12,18 @@ A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`,
 
 ## Quickstart
 
-The API requires identity, video, notification, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` and `NOTIFICATION_*` ones. Without it, uploads are accepted and never processed. **The notifier is a third** (`go run ./cmd/notifier`), with the narrowest surface of the three — `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. Without it, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running all three directly. The fastest path with no manual wiring is Docker:
+The API requires identity, video, notification, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`/`IDENTITY_JWT_KEY_ID`/`IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` and `NOTIFICATION_*` ones. Without it, uploads are accepted and never processed. **The notifier is a third** (`go run ./cmd/notifier`), with the narrowest surface of the three — `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. Without it, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running all three directly. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
 git clone https://github.com/kakadlec/video-processor.git
 cd video-processor
 
-# 2. Run the full stack (app + three workers + notifier + PostgreSQL +
+# 2. Generate the local token key pair (once per machine, into a
+#    git-ignored .env — no key material is kept in the repository)
+make dev-keys
+
+# 3. Run the full stack (app + three workers + notifier + PostgreSQL +
 #    Redis + MinIO + RabbitMQ, all already configured)
 docker compose up --build
 # Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
@@ -29,12 +33,12 @@ docker compose up --build
 # are processed at the same time: each worker holds exactly one job at a
 # time by design (prefetch 1), so concurrency is worker count.
 
-# 2b. ALTERNATIVE to step 2 (stop it first, or run this instead): to pick a
+# 3b. ALTERNATIVE to step 3 (stop it first, or run this instead): to pick a
 #     different number of workers — including one, for a single log stream
 #     or a serial trace:
 docker compose up --build --scale worker=1
 
-# 3. Open http://127.0.0.1:8080 in your browser
+# 4. Open http://127.0.0.1:8080 in your browser
 # Register/log in, then upload a video file. The upload returns immediately
 # and the page polls the job's status until it completes, then shows a
 # Download button: clicking it asks the API for a 5-minute URL and the
