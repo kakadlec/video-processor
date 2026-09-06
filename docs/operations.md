@@ -392,7 +392,7 @@ Its lifecycle transitions are logged — started, connection lost, reconnected, 
 
 #### The worker
 
-`cmd/worker` consumes `video.jobs.queued.v2` with a **prefetch of one**: one unacknowledged delivery at a time, because the unit of work is a full `ffmpeg` run and buffering a second delivery would hide it from every other consumer for the duration. Scale out by running more worker processes; there is no concurrency setting to raise.
+`cmd/worker` consumes `video.jobs.queued.v2` with a **prefetch of one**: one unacknowledged delivery at a time, because the unit of work is a full `ffmpeg` run and buffering a second delivery would hide it from every other consumer for the duration. Scale out by running more worker processes; there is no concurrency setting to raise. The local `docker-compose.yml` starts three (`worker`'s `deploy.replicas`, overridable per run with `--scale worker=<n>`); a deployment scales the same way, by process count.
 
 A delivery is acknowledged only after a terminal outcome is confirmed. Cleanup depends on whether this actor applied it; everything without a terminal outcome is rejected without requeue and reaches `video.jobs.dlx`:
 
