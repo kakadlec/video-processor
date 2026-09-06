@@ -19,7 +19,11 @@ The API requires identity, video, notification, Redis, MinIO, and broker configu
 git clone https://github.com/kakadlec/video-processor.git
 cd video-processor
 
-# 2. Run the full stack (app + three workers + notifier + PostgreSQL +
+# 2. Generate the local token key pair (once per machine, into a
+#    git-ignored .env — no key material is kept in the repository)
+make dev-keys
+
+# 3. Run the full stack (app + three workers + notifier + PostgreSQL +
 #    Redis + MinIO + RabbitMQ, all already configured)
 docker compose up --build
 # Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
@@ -34,7 +38,7 @@ docker compose up --build
 #     or a serial trace:
 docker compose up --build --scale worker=1
 
-# 3. Open http://127.0.0.1:8080 in your browser
+# 4. Open http://127.0.0.1:8080 in your browser
 # Register/log in, then upload a video file. The upload returns immediately
 # and the page polls the job's status until it completes, then shows a
 # Download button: clicking it asks the API for a 5-minute URL and the

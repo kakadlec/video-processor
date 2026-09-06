@@ -26,13 +26,18 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity, Video Processing, Notification, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
+Identity, Video Processing, Notification, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`, `IDENTITY_JWT_KEY_ID`, `IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
 
 **Running the API alone is not enough to process an upload.** Since the async cutover, `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`. Run both (see below); with the API alone, jobs stay `queued` forever and the status endpoint reports exactly that. A **third** process, `cmd/notifier`, delivers a finished job's outcome to whatever webhook its owner registered; without it jobs still complete normally and only the announcement is missing.
 
 ```bash
 # Download dependencies
 go mod download
+
+# Once per machine: generate the RSA key pair access tokens are signed and
+# verified with, into a git-ignored .env. Every compose command reads it, so
+# this comes first even when only the dependencies are being started.
+make dev-keys
 
 # Start PostgreSQL, Redis, MinIO, and RabbitMQ for the identity, video,
 # notification, idempotency-key, storage, outbox-relay, and webhook-delivery
@@ -46,7 +51,10 @@ docker compose up -d postgres redis minio rabbitmq
 # unknown relation. Sharing one server is a deployment choice; sharing one
 # database is not one this project makes.
 export IDENTITY_POSTGRES_DSN="postgres://identity:identity@localhost:5432/identity?sslmode=disable"
-export IDENTITY_JWT_SIGNING_KEY="dev-signing-key"
+# Tokens are RS256-signed, so the key material is a pair: the private half and
+# the active key id belong to whatever process mints tokens, the public set to
+# every process that verifies. `make dev-keys` wrote all three into .env.
+set -a && . ./.env && set +a
 export VIDEO_POSTGRES_DSN="postgres://identity:identity@localhost:5432/video?sslmode=disable"
 export NOTIFICATION_POSTGRES_DSN="postgres://identity:identity@localhost:5432/notification?sslmode=disable"
 export REDIS_ADDR="localhost:6379"
@@ -176,6 +184,12 @@ A change whose diff includes a Go module input file (`.go` source, `go.mod`, or 
 ## Docker Workflow
 
 ```bash
+# Once per machine: generate the RSA key pair the stack signs and verifies
+# access tokens with, into a git-ignored .env that Compose reads. No key
+# material lives in the repository, so `docker compose up` fails with this
+# instruction until it has been run. `make dev-keys FORCE=1` replaces it.
+make dev-keys
+
 docker compose up --build
 # Access the UI by opening http://127.0.0.1:8080 in a browser —
 # identity, video, notification, Redis, MinIO, and RabbitMQ are already
