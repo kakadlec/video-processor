@@ -16,9 +16,22 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Creates a second, isolated "identity_test" database on first init
-      # (alongside the "identity" runtime database above) — see the SQL
-      # file's own comment for why the test suite needs its own database.
+      # Creates the five databases the "identity" runtime database above
+      # does not cover, on first init: a runtime database per bounded
+      # context and a test counterpart for each — see the SQL file's own
+      # comment for why the contexts do not share one.
+      #
+      # Init scripts run only on an empty data directory, so a volume that
+      # predates this arrangement holds identity and identity_test alone
+      # and needs the other four created against the running container:
+      #
+      #   for db in video video_test notification notification_test; do
+      #     docker compose exec -T postgres \
+      #       psql -U identity -d identity -c "CREATE DATABASE $db"
+      #   done
+      #
+      # Not "docker compose down -v" — that removes minio_data and
+      # rabbitmq_data with it, which the volume comments below warn about.
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U identity"]
@@ -140,24 +153,24 @@ services:
       # exactly, per this change's approved design (app-test mirrors app's
       # environment; app's own definition is otherwise unchanged).
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
-      # video_jobs/video_job_outbox share the same PostgreSQL instance and
-      # database as identity_users (docs/architecture.md's documented
-      # target) — intentionally identical to the IDENTITY_* values above,
-      # not a separate database. Unused until a video composition root
-      # calls postgres.Open/Migrate (add-videojob-infrastructure is
-      # infra-only; wiring lands in wire-videojob-http-endpoints).
-      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # video_jobs/video_job_outbox live in the Video context's own
+      # "video" database — same PostgreSQL server as identity_users, a
+      # different database. Deliberately not the IDENTITY_* value: a
+      # query joining the two contexts' tables has to fail as an unknown
+      # relation rather than return rows (ddd-architecture's "Context
+      # Storage Isolation Is Exhibited, Not Only Permitted").
+      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
+      VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/video_test?sslmode=disable
       # cmd/api opens a third pool as of add-notification-domain-and-preferences
       # and refuses to start without this, so it is no longer optional. Same
-      # instance and database as the two above — the bounded contexts share a
-      # PostgreSQL server, not a connection.
-      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      # server as the two above, its own database — the bounded contexts
+      # share a PostgreSQL server, not a database and not a connection.
+      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/notification?sslmode=disable
       # Exercises internal/notification/infrastructure/postgres's own test
       # suite against a real instance; without it that suite skips and the
       # adapter's create-with-no-secret refusal — enforced by a row count
       # rather than by any Go branch — goes uncovered.
-      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/notification_test?sslmode=disable
       # Required as of add-upload-idempotency-keys: cmd/api's composition
       # root now opens a Redis client for POST /upload's idempotency
       # mechanism, the first real (non-test-only) consumer of this service.
@@ -251,7 +264,7 @@ services:
       # Identical to the "app" service's Video Processing configuration —
       # same database, same bucket, same broker. The two processes are two
       # halves of one context.
-      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
       REDIS_ADDR: redis:6379
       VIDEO_MINIO_ENDPOINT: minio:9000
       VIDEO_MINIO_ACCESS_KEY: minioadmin
@@ -292,7 +305,7 @@ services:
       # PostgreSQL server shared by the bounded contexts, not a connection.
       # The notifier migrates its own schema at startup, so it can be started
       # against a database no API has yet touched.
-      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/notification?sslmode=disable
       RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
       # Set here and NEVER in production. It relaxes the destination policy's
       # scheme rule and its address rule together: with it, a preference may
@@ -343,20 +356,20 @@ services:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
-      # See the "app" service above for why these are intentionally
-      # identical to the IDENTITY_* values.
-      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      # See the "app" service above for why these name the Video context's
+      # own databases rather than the IDENTITY_* ones.
+      VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
+      VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/video_test?sslmode=disable
       # cmd/api opens a third pool as of add-notification-domain-and-preferences
       # and refuses to start without this, so it is no longer optional. Same
-      # instance and database as the two above — the bounded contexts share a
-      # PostgreSQL server, not a connection.
-      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      # server as the two above, its own database — the bounded contexts
+      # share a PostgreSQL server, not a database and not a connection.
+      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/notification?sslmode=disable
       # Exercises internal/notification/infrastructure/postgres's own test
       # suite against a real instance; without it that suite skips and the
       # adapter's create-with-no-secret refusal — enforced by a row count
       # rather than by any Go branch — goes uncovered.
-      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
+      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/notification_test?sslmode=disable
       # Exercises internal/platform/redis's own test suite against a real
       # instance.
       REDIS_TEST_ADDR: redis:6379
