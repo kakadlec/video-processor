@@ -27,9 +27,10 @@ docker compose up --build
 # The `worker` and `notifier` services run from the same image with their
 # commands overridden.
 
-# 2b. To process several videos concurrently, run more workers. Each holds
-#     exactly one job at a time by design (prefetch 1), so concurrency is
-#     worker count — nothing else has to change:
+# 2b. ALTERNATIVE to step 2 (stop it first, or run this instead): to process
+#     several videos concurrently, run more workers. Each holds exactly one
+#     job at a time by design (prefetch 1), so concurrency is worker count —
+#     nothing else has to change:
 docker compose up --build --scale worker=3
 
 # 3. Open http://127.0.0.1:8080 in your browser
