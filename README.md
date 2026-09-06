@@ -71,7 +71,7 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 
 ## Database Schema and Infrastructure Resources
 
-Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the three binaries to get right. The one exception is the PostgreSQL databases the DSNs name, which have to exist before a process can migrate into one; `docker compose up` creates them for you.
+Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the three binaries to get right. The one exception is the PostgreSQL databases the DSNs name, which have to exist before a process can migrate into one. `docker compose up` creates them on the Postgres volume's **first** initialization; a volume that predates the per-context split keeps whatever it already had, and [docs/development.md](docs/development.md) names the statements that add the rest.
 
 | Resource | Database | DDL / declaration | Applied by |
 |---|---|---|---|

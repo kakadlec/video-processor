@@ -139,7 +139,7 @@ Each test database is separate from the runtime database its context uses, so th
 > done
 > ```
 >
-> Not `docker compose down -v` — that would drop `minio_data` and `rabbitmq_data` along with the Postgres volume, taking every stored result and every queued message with them. The statements above leave existing data alone; each is a no-op error (`already exists`) if you run it twice.
+> Not `docker compose down -v` — that would drop `minio_data` and `rabbitmq_data` along with the Postgres volume, taking every stored result and every queued message with them. The statements above leave existing data alone. A database that already exists makes its own statement print `ERROR: database "video" already exists` and exit non-zero without changing anything, so run the loop under a shell without `set -e` (the default, and what the snippet above assumes) and ignore those errors.
 
 `docker-compose.yml` is the sole documented way to run the application or its tests via Docker **for local development** (container deployment is a separate concern; see [docs/operations.md](operations.md)) — there is no separate plain `docker build`/`docker run` fallback documented for local dev. The `identity`/`identity` Postgres credentials and the app's JWT signing key are fixed, non-secret local-only defaults. `app`'s port is published loopback-only (`127.0.0.1:8080:8080`); note that `postgres`'s port (`5432:5432`, unqualified, matching the pre-existing test-infrastructure setup) is not similarly restricted and is reachable from other machines on the same network unless firewalled.
 
