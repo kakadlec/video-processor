@@ -72,7 +72,7 @@ The package structure SHALL enforce a strict dependency hierarchy so that domain
 
 - **GIVEN** `internal/contracts`, whose sole purpose is to assert that one context's copy of another's integration contract still equals the original
 - **WHEN** its imports are inspected
-- **THEN** it MAY import packages of more than one bounded context, because no composition root imports both any more and the drift it detects is otherwise silent; and this permission SHALL be conditional on the package declaring nothing outside its `_test.go` files apart from a package comment, asserted by a test in the package itself, so that nothing can depend on it and it can never become a shared domain package
+- **THEN** it MAY import packages of more than one bounded context, because no composition root imports both any more and the drift it detects is otherwise silent; and this permission SHALL be conditional on the package declaring nothing outside its `_test.go` files apart from a package comment, and on no other package in the repository importing it — both asserted by a test in the package itself. The first is what makes it undependable, since a package exporting nothing cannot be imported for a symbol; the second closes the blank import the first still permits. Together they keep it from ever becoming a shared domain package
 
 #### Scenario: Composition root is the only DI boundary
 

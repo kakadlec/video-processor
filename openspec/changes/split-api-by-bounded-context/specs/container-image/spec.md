@@ -6,6 +6,8 @@ Hardening the image SHALL NOT change its external contract: the application SHAL
 
 The image now serves **five** processes, and that SHALL NOT change how any of them is configured or reached: each of the three HTTP services SHALL listen on port 8080 inside its own container, while the worker and the notifier SHALL each expose no port at all. Because the three HTTP services share that port number, they SHALL be distinguished by container rather than by port, and the compose stack SHALL publish exactly one host port — the ingress's. Adding a process SHALL NOT make it a prerequisite for any other to start, in either direction — each SHALL start, run, and fail independently.
 
+The image carries five binaries and can default to only one, so its default command SHALL name a binary that exists. Removing or renaming the binary the default command names, without changing it, produces an image that builds and scans clean and exits immediately when run without an explicit command — a failure invisible to the compose stack, which names a command for every service, and visible only in the deployment commands `docs/operations.md` documents. Every process other than the default SHALL be started by naming its binary explicitly, and that SHALL be documented.
+
 The ingress is the first service in the stack built from an image this repository does not produce. That SHALL NOT change what this image contains: the ingress SHALL be the stock upstream image plus a mounted configuration file, and no application binary, key, or credential SHALL be added to it.
 
 Each process SHALL require only the environment configuration it uses, and SHALL fail fast with a clear error when it is missing rather than starting in a degraded mode. The surfaces are deliberately different: the Identity service requires no object-storage, broker, cache, or `ffmpeg` configuration; the worker requires no identity configuration; the notifier requires neither identity nor object-storage configuration nor `ffmpeg`; and the two non-Identity HTTP services require a public key but SHALL be given no private key. Requiring any of the absent ones would misrepresent what the process does. Which variables are required is specified by the capabilities that own them, not by this one.
@@ -19,6 +21,12 @@ Each process SHALL require only the environment configuration it uses, and SHALL
 
 - **WHEN** a deployer runs the `docker build`/`docker run` commands documented in `docs/operations.md`, supplying every environment variable those docs list as required for the process being started
 - **THEN** they succeed unmodified and the container behaves as documented: same port, same first-run directory creation, and the same fail-fast behavior for missing configuration
+
+#### Scenario: The image's default command names a binary it contains
+
+- **GIVEN** the built image
+- **WHEN** it is run with no command argument
+- **THEN** the process named by the image's default command starts and behaves as documented, rather than failing because the binary it names is not present
 
 #### Scenario: The worker service starts from the same image
 

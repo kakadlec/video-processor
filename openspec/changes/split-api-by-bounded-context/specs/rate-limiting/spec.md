@@ -6,6 +6,8 @@ Every HTTP service that serves bearer-authenticated routes SHALL apply a Redis-b
 
 **The budget is one budget, not one per service.** The services share a Redis instance and the same key format, so a user's `RATE_LIMIT_MAX_REQUESTS` per window is their allowance across the whole system. Namespacing the counter per service would silently multiply every user's allowance by the number of services, which is a behavior change and SHALL NOT be introduced as a side effect of how the processes are divided. This is why a service that owns no cache and no idempotency store still requires `REDIS_ADDR`: the limiter is a genuine dependency of its middleware.
 
+**One budget requires one configuration, not merely one counter.** `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` SHALL be configured identically for every service that mounts the limiter, from a single source in the deployment configuration. Sharing the Redis instance and the key format is necessary but not sufficient: the count is shared while the threshold and the window are each service's own, so services configured differently would compare one count against two thresholds, and the window's duration would be fixed by whichever service's request happened to create the key. The effective limit would then depend on which route a user's requests took and in what order — which is not a rate limit anyone can reason about, and would present as an intermittent bug rather than as a misconfiguration.
+
 The middleware pair and its order — bearer authentication, then the limiter — SHALL hold on every group that carries it, in every service. The pair is the invariant; the grouping is not.
 
 Neither static mount appears in that enumeration any more, because neither exists: `/outputs` went when results moved to object storage, `/uploads` when source videos followed. Every handler in the group returns JSON; none streams an artifact.
@@ -33,6 +35,12 @@ The limit governs **requests to this system's HTTP surface**, and after result d
 - **GIVEN** an authenticated user who has exhausted their window against `cmd/video-api`
 - **WHEN** they request `GET /api/notification-preferences`, served by a different process
 - **THEN** the response is `429 Too Many Requests`, because both services count against the same per-user counter
+
+#### Scenario: The limiter configuration is identical across the services
+
+- **GIVEN** the deployed HTTP services that mount the limiter
+- **WHEN** their `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` configuration is inspected
+- **THEN** every one of them holds the same values, supplied from one place, so that the shared counter is compared against one threshold and expires on one window
 
 #### Scenario: Different users are limited independently
 
