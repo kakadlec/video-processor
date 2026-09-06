@@ -3,19 +3,23 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 
 	"video-processor/internal/identity/application"
 	"video-processor/internal/identity/domain"
@@ -83,24 +87,84 @@ func newTestIdentityModule(t *testing.T) *identityModule {
 	return module
 }
 
-// newTestIdentityModuleWithTokens also returns the jwtauth adapter backing
-// the module, so tests can mint tokens (including deliberately expired or
-// mis-signed ones) under the same signing key the module verifies against.
-func newTestIdentityModuleWithTokens(t *testing.T) (*identityModule, jwtauth.Adapter) {
+// testTokens carries an issuer and the verifier over the same key pair, so
+// tests can mint tokens (including deliberately expired or mis-signed ones)
+// under the key the module verifies against. Issuing and verifying are
+// separate types in production; this pairs them for a test's convenience.
+type testTokens struct {
+	issuer   *jwtauth.Issuer
+	verifier *jwtauth.Verifier
+	keys     testKeyPEMs
+}
+
+// Issue mints a token under the issuer half, so a fixture holding a testTokens
+// reads the same as it did when one adapter did both.
+func (tk testTokens) Issue(userID domain.UserID, expiresAt time.Time) (string, error) {
+	return tk.issuer.Issue(userID, expiresAt)
+}
+
+type testKeyPEMs struct {
+	privatePEM string
+	publicPEM  string
+}
+
+const testTokenKeyID = "test-key"
+
+var (
+	testKeyOnce     sync.Once
+	testKeyPEMsOnce testKeyPEMs
+)
+
+// newTestTokens returns an issuer and a verifier over one RSA key pair
+// generated once per test binary — generation is expensive and the key's
+// identity does not vary between tests.
+func newTestTokens(t *testing.T) testTokens {
+	t.Helper()
+
+	testKeyOnce.Do(func() {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			panic(err)
+		}
+		privateDER, err := x509.MarshalPKCS8PrivateKey(key)
+		if err != nil {
+			panic(err)
+		}
+		publicDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+		if err != nil {
+			panic(err)
+		}
+		testKeyPEMsOnce = testKeyPEMs{
+			privatePEM: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})),
+			publicPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: publicDER})),
+		}
+	})
+
+	issuer, err := jwtauth.NewIssuer(testKeyPEMsOnce.privatePEM, testTokenKeyID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	verifier, err := jwtauth.NewVerifier(map[string]string{testTokenKeyID: testKeyPEMsOnce.publicPEM})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return testTokens{issuer: issuer, verifier: verifier, keys: testKeyPEMsOnce}
+}
+
+// newTestIdentityModuleWithTokens also returns the token pair backing the
+// module, so tests can mint tokens under the key the module verifies against.
+func newTestIdentityModuleWithTokens(t *testing.T) (*identityModule, testTokens) {
 	t.Helper()
 
 	repo := newInMemoryUserRepository()
 	ids := idgen.New()
 	passwords := password.New()
-	tokens, err := jwtauth.New("test-only-signing-key-do-not-use-in-production")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	tokens := newTestTokens(t)
 
 	module := newIdentityModule(
 		application.NewRegisterUser(repo, ids, passwords, systemClock{}),
-		application.NewAuthenticateUser(repo, passwords, tokens, systemClock{}),
-		tokens,
+		application.NewAuthenticateUser(repo, passwords, tokens.issuer, systemClock{}),
+		tokens.verifier,
 	)
 	return module, tokens
 }
@@ -375,6 +439,61 @@ func TestRequireBearerAuth_RejectsExpiredToken(t *testing.T) {
 	}
 }
 
+// A token naming a key the verifier does not hold is rejected with the same
+// shape every other invalid token produces, so a caller cannot learn which key
+// ids exist by resubmitting.
+func TestRequireBearerAuth_RejectsTokenNamingAnUnknownKeyID(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := newProtectedTestServer(t, module)
+	defer srv.Close()
+
+	strangerIssuer, err := jwtauth.NewIssuer(tokens.keys.privatePEM, "a-key-id-the-verifier-does-not-hold")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	userID, err := domain.NewUserID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	token, err := strangerIssuer.Issue(userID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+// The public key is not confidential. Without the algorithm pinned by name, a
+// verifier would accept it as an HMAC secret and authorize a token anyone
+// holding the key set could sign.
+func TestRequireBearerAuth_RejectsHS256SignedWithThePublicKey(t *testing.T) {
+	module, tokens := newTestIdentityModuleWithTokens(t)
+	srv := newProtectedTestServer(t, module)
+	defer srv.Close()
+
+	forged := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Subject:   "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	})
+	forged.Header["kid"] = testTokenKeyID
+	token, err := forged.SignedString([]byte(tokens.keys.publicPEM))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := getWithAuthorization(t, srv.URL+"/protected", "Bearer "+token)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
 func TestRequireBearerAuth_AcceptsValidTokenAndSetsUserID(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	srv := newProtectedTestServer(t, module)
@@ -523,7 +642,7 @@ func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 
 // issueTestToken mints a bearer token for a fixed, valid UserID under
 // tokens' signing key, without going through registration/login.
-func issueTestToken(t *testing.T, tokens jwtauth.Adapter, uuid string) (domain.UserID, string) {
+func issueTestToken(t *testing.T, tokens testTokens, uuid string) (domain.UserID, string) {
 	t.Helper()
 	userID, err := domain.NewUserID(uuid)
 	if err != nil {
@@ -655,11 +774,13 @@ func TestStaticUploadsRouteIsGone(t *testing.T) {
 
 func TestSetupIdentity_NeitherConfigured_ReturnsError(t *testing.T) {
 	t.Setenv("IDENTITY_POSTGRES_DSN", "")
-	t.Setenv(identityJWTSigningKeyEnv, "")
+	t.Setenv(jwtauth.PrivateKeyEnv, "")
+	t.Setenv(jwtauth.KeyIDEnv, "")
+	t.Setenv(jwtauth.PublicKeysEnv, "")
 
 	module, db, err := setupIdentity(context.Background())
 	if err == nil {
-		t.Fatal("expected an error when neither IDENTITY_POSTGRES_DSN nor the JWT signing key is set")
+		t.Fatal("expected an error when neither IDENTITY_POSTGRES_DSN nor the JWT key configuration is set")
 	}
 	if !errors.Is(err, postgres.ErrDSNRequired) {
 		t.Fatalf("expected error to wrap postgres.ErrDSNRequired, got: %v", err)
@@ -672,40 +793,67 @@ func TestSetupIdentity_NeitherConfigured_ReturnsError(t *testing.T) {
 	}
 }
 
-func TestSetupIdentity_SigningKeyMissing_ReturnsError(t *testing.T) {
+func TestSetupIdentity_PrivateKeyMissing_ReturnsError(t *testing.T) {
+	tokens := newTestTokens(t)
 	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
-	t.Setenv(identityJWTSigningKeyEnv, "")
+	t.Setenv(jwtauth.PrivateKeyEnv, "")
+	t.Setenv(jwtauth.KeyIDEnv, testTokenKeyID)
+	t.Setenv(jwtauth.PublicKeysEnv, testPublicKeySet(t, tokens))
 
 	_, _, err := setupIdentity(context.Background())
-	if err == nil {
-		t.Fatal("expected an error when IDENTITY_POSTGRES_DSN is set but the JWT signing key is missing")
-	}
-	if !strings.Contains(err.Error(), identityJWTSigningKeyEnv) {
-		t.Fatalf("expected error to mention %s, got: %v", identityJWTSigningKeyEnv, err)
+	if !errors.Is(err, jwtauth.ErrPrivateKeyRequired) {
+		t.Fatalf("error = %v, want %v", err, jwtauth.ErrPrivateKeyRequired)
 	}
 }
 
-func TestSetupIdentity_DSNMissing_ReturnsError(t *testing.T) {
-	t.Setenv("IDENTITY_POSTGRES_DSN", "")
-	t.Setenv(identityJWTSigningKeyEnv, "a-signing-key")
+func TestSetupIdentity_KeyIDMissing_ReturnsError(t *testing.T) {
+	tokens := newTestTokens(t)
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
+	t.Setenv(jwtauth.PrivateKeyEnv, tokens.keys.privatePEM)
+	t.Setenv(jwtauth.KeyIDEnv, "")
+	t.Setenv(jwtauth.PublicKeysEnv, testPublicKeySet(t, tokens))
 
 	_, _, err := setupIdentity(context.Background())
-	if err == nil {
-		t.Fatal("expected an error when the JWT signing key is set but IDENTITY_POSTGRES_DSN is missing")
-	}
-	if !errors.Is(err, postgres.ErrDSNRequired) {
-		t.Fatalf("expected error to wrap postgres.ErrDSNRequired, got: %v", err)
+	if !errors.Is(err, jwtauth.ErrKeyIDRequired) {
+		t.Fatalf("error = %v, want %v", err, jwtauth.ErrKeyIDRequired)
 	}
 }
 
-func TestSetupIdentity_UnreachablePostgres_ReturnsError(t *testing.T) {
-	// A loopback address on a port nothing listens on fails fast (connection
-	// refused) rather than hanging, so this stays a fast unit-style test.
-	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/identity?sslmode=disable&connect_timeout=1")
-	t.Setenv(identityJWTSigningKeyEnv, "a-signing-key")
+func TestSetupIdentity_PublicKeySetMissing_ReturnsError(t *testing.T) {
+	tokens := newTestTokens(t)
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
+	t.Setenv(jwtauth.PrivateKeyEnv, tokens.keys.privatePEM)
+	t.Setenv(jwtauth.KeyIDEnv, testTokenKeyID)
+	t.Setenv(jwtauth.PublicKeysEnv, "")
 
 	_, _, err := setupIdentity(context.Background())
-	if err == nil {
-		t.Fatal("expected an error when configured PostgreSQL is unreachable")
+	if !errors.Is(err, jwtauth.ErrPublicKeysRequired) {
+		t.Fatalf("error = %v, want %v", err, jwtauth.ErrPublicKeysRequired)
 	}
+}
+
+// A mismatched pair is silent in the one place it can be caught and loud
+// everywhere it cannot be attributed, so it has to fail Identity's startup.
+func TestSetupIdentity_MismatchedKeyPair_ReturnsError(t *testing.T) {
+	tokens := newTestTokens(t)
+	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
+	t.Setenv(jwtauth.PrivateKeyEnv, tokens.keys.privatePEM)
+	t.Setenv(jwtauth.KeyIDEnv, "a-key-id-the-public-key-set-does-not-carry")
+	t.Setenv(jwtauth.PublicKeysEnv, testPublicKeySet(t, tokens))
+
+	_, _, err := setupIdentity(context.Background())
+	if !errors.Is(err, jwtauth.ErrKeyPairMismatch) {
+		t.Fatalf("error = %v, want %v", err, jwtauth.ErrKeyPairMismatch)
+	}
+}
+
+// testPublicKeySet renders tokens' public half in the JSON key-id-to-PEM form
+// IDENTITY_JWT_PUBLIC_KEYS carries.
+func testPublicKeySet(t *testing.T, tokens testTokens) string {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]string{testTokenKeyID: tokens.keys.publicPEM})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return string(encoded)
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -20,10 +19,6 @@ import (
 	"video-processor/internal/identity/infrastructure/password"
 	"video-processor/internal/identity/infrastructure/postgres"
 )
-
-// identityJWTSigningKeyEnv is the environment variable holding the JWT
-// signing key, alongside postgres.Config's own IDENTITY_POSTGRES_DSN.
-const identityJWTSigningKeyEnv = "IDENTITY_JWT_SIGNING_KEY"
 
 type systemClock struct{}
 
@@ -46,13 +41,23 @@ func newIdentityModule(registerUser *application.RegisterUser, authenticateUser 
 // startup clearly rather than running with unsafe defaults.
 func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 	pgConfig, pgErr := postgres.LoadConfigFromEnv()
-	signingKey := os.Getenv(identityJWTSigningKeyEnv)
-
 	if pgErr != nil {
 		return nil, nil, fmt.Errorf("identity: %w", pgErr)
 	}
-	if signingKey == "" {
-		return nil, nil, fmt.Errorf("identity: %s environment variable is required", identityJWTSigningKeyEnv)
+
+	issuer, err := jwtauth.LoadIssuerFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	verifier, err := jwtauth.LoadVerifierFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	// Identity holds the public key set only for this check. A mismatched pair
+	// is silent here and loud everywhere it cannot be attributed: Identity
+	// mints successfully and every other service rejects every token it mints.
+	if err := jwtauth.CheckPair(issuer, verifier); err != nil {
+		return nil, nil, err
 	}
 
 	db, err := postgres.Open(pgConfig)
@@ -68,12 +73,6 @@ func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 		return nil, nil, fmt.Errorf("identity: connect to postgres: %w", err)
 	}
 
-	tokens, err := jwtauth.New(signingKey)
-	if err != nil {
-		closeDB(db)
-		return nil, nil, err
-	}
-
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
 	passwords := password.New()
@@ -81,8 +80,8 @@ func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 
 	module := newIdentityModule(
 		application.NewRegisterUser(repo, ids, passwords, clock),
-		application.NewAuthenticateUser(repo, passwords, tokens, clock),
-		tokens,
+		application.NewAuthenticateUser(repo, passwords, issuer, clock),
+		verifier,
 	)
 	return module, db, nil
 }

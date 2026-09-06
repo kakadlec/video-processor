@@ -145,7 +145,47 @@ services:
       # Postgres credentials above. Never used outside a developer's
       # machine or CI.
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+      # Local-only RSA key pair, fixed and repository-visible for the same
+      # reason the Postgres credentials above are: it never leaves a
+      # developer's machine or CI. Never promote it. Regenerate with:
+      #   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out k.pem
+      #   openssl pkey -in k.pem -pubout
+      # IDENTITY_JWT_PRIVATE_KEY and IDENTITY_JWT_KEY_ID belong to the one
+      # process that mints tokens; IDENTITY_JWT_PUBLIC_KEYS is a JSON object
+      # mapping key id to PEM public key — a set, so a rotation can hold the
+      # outgoing and incoming keys at once — and is read by every service
+      # that verifies.
+      IDENTITY_JWT_PRIVATE_KEY: |
+        -----BEGIN PRIVATE KEY-----
+        MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnjG8H5bFl2slD
+        t9X84r0Xubqwzrhfw7TNObq/QO/SWC+WrVOYPU//3CCuAV8Lqwx2grJTb3cHb8/d
+        yjfHXChagbOQvYkabPkQQ9eOQmhmrZkkmHjEdvZlB/LuPdHODEzJczoa+YdlA/Dc
+        DJh75SoVrjQkWJWDlAOCjJhw21fmreXridbEHbNUB+sK5Z5/DHMRtVqh7w8NDdNk
+        HUpxlGOot0pmo6Y6lDcZmkeoEImyjqvTgi/CH1kBr01pHU8pSTRyZ9wNNOdACqR4
+        4IdF9S3QuceOKqQuDUNOgpA1aKnmTW8VpBu3tzbNjR5Ow6aqKYUx3hagxaSyjrS0
+        WmvqsEBVAgMBAAECggEACaBEn8ZHTSQHBKw679rCBOsvielyh9P5XwIWU9ciACp/
+        X2+JWjmJj1hhC0Y6ZPP4lRV4s9j3VHbM0UAFON+3VM3XWHU/O4SvwYq4R2zSzTVj
+        k0nsRFNWYCMXBq+IDoe/4KINYE/eQsQ5chcKKrIVmyXFSqJJQsQ9+GHl/zPm5rKW
+        q6oJZsALt9Jh/W7xCoQlyRwold3M1M5a7lZw3SaigjwtPSgnlRDdyG+g5whDKj7o
+        BYRTlrylITm1Ulgc/Xm/fhZd5h56T3wgcjr3ixViy0vNL5NsmcZcRW1jOOGGLwHJ
+        xh/uxNWUO1mI2T+8IFtJ4Wjs/yG0DurEaDlTc4TDqQKBgQDZnOR8sfe96qQ4VFtR
+        XDpZ274KLQO69GRcb/hSL5EMZKpqA5rUiSE2hk+NcBm5E3wDCJkk7Va33Nz5rh/E
+        VmXlSP8fi47ODQPm9kFXPybtgklYo/sGYI/+cRmGuSyuL7x4S39UmXAGbMb0WdSx
+        K5dY/m+XN+x5sjcpRpjkk5RyvQKBgQDFGrROItfs0eaGJBgUXfnv7Fp/qD4cLydv
+        MI/4+4Y6ZVX8FlCVXvJXU8cxxLWmYcZfidZJbceaB9oOyOpyxCbgar2BCHKeH2X/
+        yxrx8rgppz6uxBHtPFU8laLI16W4eAAO0CWRIgcjQsFbatb3hyS+TFz6xhmpJh9U
+        J0BV3vjpeQKBgAVdqQSqHsHAF2yMJ/RJoea1VGpL0du6Sv88g5MDOUBk+w7CJ/81
+        omwFw9BpAzldEaHBhIU0lP7To19Eu+PLfZe5xRCyEENkbsQzLklIdV1F6SkWYgo2
+        N1a+0zJPPprM8ojE087yOaDu7bj4vhXgTUsUewvvhRU7H8EUzJBWU0LBAoGAXFrq
+        6UHCUyD3FxuKfOCb4COrM+2tTJ97psnmbA/PEUWySHBcSeE3RFvpFhTJ2LAvt0xq
+        r/VUdYQAVLUnxabLYJQjP3ap3hVwQa71bTEBweKvqEwO6k4+0ih7IgiJiioQPOCi
+        +aIsHgWFfERPfaRBPzmgx5BTLcLDIzdRGetkTmECgYEAns9Kr9aJykDYDaWFu40d
+        v05mnd3pT1WwQ6euahOEU3AL6tQXzjzqIJS3TyRJ7hGuAJnSHAuspH8tGpb7EUl6
+        mW6oDG6jkE7SFfVa2HdBA5f/rL35UVfkLE7n1sUAdX6NhN4gIHPgpnpkW1u9wwyB
+        i3WEgmrvP7vf3MeVoGG+7/E=
+        -----END PRIVATE KEY-----
+      IDENTITY_JWT_KEY_ID: local-dev-2026-09
+      IDENTITY_JWT_PUBLIC_KEYS: '{"local-dev-2026-09": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp4xvB+WxZdrJQ7fV/OK9\nF7m6sM64X8O0zTm6v0Dv0lgvlq1TmD1P/9wgrgFfC6sMdoKyU293B2/P3co3x1wo\nWoGzkL2JGmz5EEPXjkJoZq2ZJJh4xHb2ZQfy7j3RzgxMyXM6GvmHZQPw3AyYe+Uq\nFa40JFiVg5QDgoyYcNtX5q3l64nWxB2zVAfrCuWefwxzEbVaoe8PDQ3TZB1KcZRj\nqLdKZqOmOpQ3GZpHqBCJso6r04Ivwh9ZAa9NaR1PKUk0cmfcDTTnQAqkeOCHRfUt\n0LnHjiqkLg1DToKQNWip5k1vFaQbt7c2zY0eTsOmqimFMd4WoMWkso60tFpr6rBA\nVQIDAQAB\n-----END PUBLIC KEY-----\n"}'
       # Points at the isolated identity_test database (not the runtime
       # "identity" database above) so `docker compose run app-test go test`
       # can't TRUNCATE data the running app actually uses. Unused by "app"
@@ -354,7 +394,47 @@ services:
       target: test
     environment:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      IDENTITY_JWT_SIGNING_KEY: local-dev-signing-key
+      # Local-only RSA key pair, fixed and repository-visible for the same
+      # reason the Postgres credentials above are: it never leaves a
+      # developer's machine or CI. Never promote it. Regenerate with:
+      #   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out k.pem
+      #   openssl pkey -in k.pem -pubout
+      # IDENTITY_JWT_PRIVATE_KEY and IDENTITY_JWT_KEY_ID belong to the one
+      # process that mints tokens; IDENTITY_JWT_PUBLIC_KEYS is a JSON object
+      # mapping key id to PEM public key — a set, so a rotation can hold the
+      # outgoing and incoming keys at once — and is read by every service
+      # that verifies.
+      IDENTITY_JWT_PRIVATE_KEY: |
+        -----BEGIN PRIVATE KEY-----
+        MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCnjG8H5bFl2slD
+        t9X84r0Xubqwzrhfw7TNObq/QO/SWC+WrVOYPU//3CCuAV8Lqwx2grJTb3cHb8/d
+        yjfHXChagbOQvYkabPkQQ9eOQmhmrZkkmHjEdvZlB/LuPdHODEzJczoa+YdlA/Dc
+        DJh75SoVrjQkWJWDlAOCjJhw21fmreXridbEHbNUB+sK5Z5/DHMRtVqh7w8NDdNk
+        HUpxlGOot0pmo6Y6lDcZmkeoEImyjqvTgi/CH1kBr01pHU8pSTRyZ9wNNOdACqR4
+        4IdF9S3QuceOKqQuDUNOgpA1aKnmTW8VpBu3tzbNjR5Ow6aqKYUx3hagxaSyjrS0
+        WmvqsEBVAgMBAAECggEACaBEn8ZHTSQHBKw679rCBOsvielyh9P5XwIWU9ciACp/
+        X2+JWjmJj1hhC0Y6ZPP4lRV4s9j3VHbM0UAFON+3VM3XWHU/O4SvwYq4R2zSzTVj
+        k0nsRFNWYCMXBq+IDoe/4KINYE/eQsQ5chcKKrIVmyXFSqJJQsQ9+GHl/zPm5rKW
+        q6oJZsALt9Jh/W7xCoQlyRwold3M1M5a7lZw3SaigjwtPSgnlRDdyG+g5whDKj7o
+        BYRTlrylITm1Ulgc/Xm/fhZd5h56T3wgcjr3ixViy0vNL5NsmcZcRW1jOOGGLwHJ
+        xh/uxNWUO1mI2T+8IFtJ4Wjs/yG0DurEaDlTc4TDqQKBgQDZnOR8sfe96qQ4VFtR
+        XDpZ274KLQO69GRcb/hSL5EMZKpqA5rUiSE2hk+NcBm5E3wDCJkk7Va33Nz5rh/E
+        VmXlSP8fi47ODQPm9kFXPybtgklYo/sGYI/+cRmGuSyuL7x4S39UmXAGbMb0WdSx
+        K5dY/m+XN+x5sjcpRpjkk5RyvQKBgQDFGrROItfs0eaGJBgUXfnv7Fp/qD4cLydv
+        MI/4+4Y6ZVX8FlCVXvJXU8cxxLWmYcZfidZJbceaB9oOyOpyxCbgar2BCHKeH2X/
+        yxrx8rgppz6uxBHtPFU8laLI16W4eAAO0CWRIgcjQsFbatb3hyS+TFz6xhmpJh9U
+        J0BV3vjpeQKBgAVdqQSqHsHAF2yMJ/RJoea1VGpL0du6Sv88g5MDOUBk+w7CJ/81
+        omwFw9BpAzldEaHBhIU0lP7To19Eu+PLfZe5xRCyEENkbsQzLklIdV1F6SkWYgo2
+        N1a+0zJPPprM8ojE087yOaDu7bj4vhXgTUsUewvvhRU7H8EUzJBWU0LBAoGAXFrq
+        6UHCUyD3FxuKfOCb4COrM+2tTJ97psnmbA/PEUWySHBcSeE3RFvpFhTJ2LAvt0xq
+        r/VUdYQAVLUnxabLYJQjP3ap3hVwQa71bTEBweKvqEwO6k4+0ih7IgiJiioQPOCi
+        +aIsHgWFfERPfaRBPzmgx5BTLcLDIzdRGetkTmECgYEAns9Kr9aJykDYDaWFu40d
+        v05mnd3pT1WwQ6euahOEU3AL6tQXzjzqIJS3TyRJ7hGuAJnSHAuspH8tGpb7EUl6
+        mW6oDG6jkE7SFfVa2HdBA5f/rL35UVfkLE7n1sUAdX6NhN4gIHPgpnpkW1u9wwyB
+        i3WEgmrvP7vf3MeVoGG+7/E=
+        -----END PRIVATE KEY-----
+      IDENTITY_JWT_KEY_ID: local-dev-2026-09
+      IDENTITY_JWT_PUBLIC_KEYS: '{"local-dev-2026-09": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp4xvB+WxZdrJQ7fV/OK9\nF7m6sM64X8O0zTm6v0Dv0lgvlq1TmD1P/9wgrgFfC6sMdoKyU293B2/P3co3x1wo\nWoGzkL2JGmz5EEPXjkJoZq2ZJJh4xHb2ZQfy7j3RzgxMyXM6GvmHZQPw3AyYe+Uq\nFa40JFiVg5QDgoyYcNtX5q3l64nWxB2zVAfrCuWefwxzEbVaoe8PDQ3TZB1KcZRj\nqLdKZqOmOpQ3GZpHqBCJso6r04Ivwh9ZAa9NaR1PKUk0cmfcDTTnQAqkeOCHRfUt\n0LnHjiqkLg1DToKQNWip5k1vFaQbt7c2zY0eTsOmqimFMd4WoMWkso60tFpr6rBA\nVQIDAQAB\n-----END PUBLIC KEY-----\n"}'
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
       # See the "app" service above for why these name the Video context's
       # own databases rather than the IDENTITY_* ones.

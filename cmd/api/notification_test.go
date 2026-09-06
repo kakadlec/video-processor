@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"video-processor/internal/identity/infrastructure/jwtauth"
 	notificationapplication "video-processor/internal/notification/application"
 	notificationdomain "video-processor/internal/notification/domain"
 	notificationmessaging "video-processor/internal/notification/infrastructure/messaging"
@@ -159,7 +158,7 @@ func newNoopNotificationModule() *notificationModule {
 // The video module is nil deliberately: setupRouter only takes method values
 // off it to register routes, none of which any test here calls, and building
 // a real one creates and tears down a MinIO bucket per test for no coverage.
-func newNotificationTestServer(t *testing.T, limiter videoRateLimiter) (*httptest.Server, jwtauth.Adapter, *inMemoryPreferenceRepository) {
+func newNotificationTestServer(t *testing.T, limiter videoRateLimiter) (*httptest.Server, testTokens, *inMemoryPreferenceRepository) {
 	t.Helper()
 
 	identity, tokens := newTestIdentityModuleWithTokens(t)
