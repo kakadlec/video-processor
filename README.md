@@ -1,6 +1,6 @@
 # FIAP X — Video Frame Processor
 
-A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous: an HTTP API (`cmd/api`) accepts and reports, and a worker (`cmd/worker`) does the extraction off a RabbitMQ queue. Built as the code deliverable for a POSTECH/FIAP hackathon.
+A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous across three processes: an HTTP API (`cmd/api`) accepts and reports, a worker (`cmd/worker`) does the extraction off a RabbitMQ queue, and a notifier (`cmd/notifier`) announces each outcome to whatever webhook its owner registered. Built as the code deliverable for a POSTECH/FIAP hackathon.
 
 ## Prerequisites
 
@@ -12,19 +12,26 @@ A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`,
 
 ## Quickstart
 
-The API requires identity, video, notification, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since neither process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` and `NOTIFICATION_*` ones. Without it, uploads are accepted and never processed. See [docs/development.md](docs/development.md) for running both directly. The fastest path with no manual wiring is Docker:
+The API requires identity, video, notification, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_SIGNING_KEY`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` and `NOTIFICATION_*` ones. Without it, uploads are accepted and never processed. **The notifier is a third** (`go run ./cmd/notifier`), with the narrowest surface of the three — `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. Without it, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running all three directly. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
 git clone https://github.com/kakadlec/video-processor.git
 cd video-processor
 
-# 2. Run the full stack (app + worker + PostgreSQL + Redis + MinIO +
-#    RabbitMQ, all already configured)
+# 2. Run the full stack (app + worker + notifier + PostgreSQL + Redis +
+#    MinIO + RabbitMQ, all already configured)
 docker compose up --build
 # Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
 # already wired in — /api/auth/register and /api/auth/login are live.
-# The `worker` service runs from the same image with its command overridden.
+# The `worker` and `notifier` services run from the same image with their
+# commands overridden.
+
+# 2b. ALTERNATIVE to step 2 (stop it first, or run this instead): to process
+#     several videos concurrently, run more workers. Each holds exactly one
+#     job at a time by design (prefetch 1), so concurrency is worker count —
+#     nothing else has to change:
+docker compose up --build --scale worker=3
 
 # 3. Open http://127.0.0.1:8080 in your browser
 # Register/log in, then upload a video file. The upload returns immediately
@@ -39,10 +46,11 @@ docker compose up --build
 
 Processing is asynchronous as of Phase 6, but the system is not yet complete:
 
-- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Scale by running more worker processes — each holds exactly one job at a time by design.
+- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Concurrency is worker count: each worker holds exactly one job at a time by design, so processing several videos at once means running several worker processes (`docker compose up --scale worker=3`, or more `go run ./cmd/worker` shells). The default stack starts one.
 - **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so the worker downloads each source into its own `temp/`, extracts frames there, and builds the zip there, removing all of it before the job finishes. Nothing durable lives on local disk (Phase 5): uploaded source videos go to MinIO too, as **transient** objects whose owner deletes them — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
 - **A source object can leak.** A job never dispatched, a dispatch dead-lettered before any claim, or a worker interrupted after a terminal commit but before best-effort cleanup can leave its source in the bucket. Mid-extraction crashes are recovered by the worker sweeper. Configure the `uploads/`-prefix expiration lifecycle rule; it remains the only exhaustive guarantee. See [docs/operations.md](docs/operations.md).
-- **No notifications are delivered yet.** Users must stay on the page (which polls the job's status URL) or poll `GET /api/status` to find out when processing completes. Phase 7 is under way: a job's outcome is now recorded and published to a durable queue, and `GET`/`PUT /api/notification-preferences` let a user register a webhook destination and signing secret — but nothing reads that queue and nothing resolves a preference, so registering one delivers nothing until `add-notification-webhook-delivery` ships.
+- **Webhooks are the only notification channel.** A user who registers a webhook preference through `PUT /api/notification-preferences` is notified when a job completes or fails — `cmd/notifier` consumes the terminal-event queue and delivers a signed request per subscribed outcome. Email is not implemented (Phase 7's `add-notification-email-delivery`), and `channel: "email"` is refused rather than stored. A user who registers nothing still has the page (which polls the job's status URL) and `GET /api/status`; absence of a preference means *not subscribed*, and there is no implicit default.
+- **A notifier must be running for anything to be delivered.** Same shape as the worker above: jobs still finish, and `video.jobs.terminal.events.v1` accumulates until a notifier reads it.
 - **Crash recovery is bounded, not immediate.** A worker renews an epoch-scoped Redis lease while extracting. After the lease expires, the sweeper requires two successful missing-lease observations before requeueing; after three recoveries, it fails the job rather than loop forever. Redis outages delay takeover instead of authorizing it.
 
 These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
@@ -60,6 +68,20 @@ These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
 
 For the full project requirements see [docs/project-requirements.pdf](docs/project-requirements.pdf).
 
+## Database Schema and Infrastructure Resources
+
+Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the three binaries to get right.
+
+| Resource | DDL / declaration | Applied by |
+|---|---|---|
+| `identity_users` | [`internal/identity/infrastructure/postgres/schema.sql`](internal/identity/infrastructure/postgres/schema.sql) | `cmd/api` (`setupIdentity`) |
+| `video_jobs`, `video_job_outbox` | [`internal/video/infrastructure/postgres/schema.sql`](internal/video/infrastructure/postgres/schema.sql) | `cmd/api` (`setupVideo`), `cmd/worker` |
+| `notification_preferences`, `notification_deliveries` | [`internal/notification/infrastructure/postgres/schema.sql`](internal/notification/infrastructure/postgres/schema.sql) | `cmd/api` (`setupNotification`), `cmd/notifier` |
+| MinIO bucket (`VIDEO_MINIO_BUCKET`) | `storage.EnsureBucket` | `cmd/api`, `cmd/worker` |
+| RabbitMQ exchanges, queues, bindings, DLQs | `messaging.JobDispatchTopology()`, `TerminalEventsTopology()` | Every producer and consumer, redeclared on **every** dial |
+
+The three `schema.sql` files are plain DDL, embedded with `go:embed` and applied idempotently (`CREATE TABLE IF NOT EXISTS`) by each context's `Migrate` — so they can also be run by hand against a database (`psql -f …`) if you want the schema without starting the application. Each bounded context owns its own pool and its own tables; pointing all three DSNs at one server, as `docker-compose.yml` does, is a deployment choice rather than a shared connection. `docker/postgres-init/create-test-db.sql` is unrelated to the runtime schema — it only creates the isolated `identity_test` database the suite truncates.
+
 ## API
 
 | Method | Path | Description |
@@ -72,7 +94,7 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 | `GET` | `/download/:filename` | Issue a 5-minute presigned URL for a processed ZIP: `200 {"url", "expires_at"}`, not the archive itself. Owner-only; follow the returned URL (no `Authorization` header) to fetch the bytes from MinIO |
 | `GET` | `/api/status` | List processed ZIPs with metadata; scoped to the caller's own uploads |
 | `GET` | `/api/notification-preferences` | List the caller's own delivery preferences; `has_secret` instead of the signing secret, which no route ever returns. An empty set is `200` with an empty array |
-| `PUT` | `/api/notification-preferences` | Register or update one preference, named by `event_type` + `channel` in the body. `secret` is required to create one and optional to update one. Owner-only; a `user_id` in the body is ignored. **Nothing consumes these yet** — see Current Limitations |
+| `PUT` | `/api/notification-preferences` | Register or update one preference, named by `event_type` + `channel` in the body. `secret` is required to create one and optional to update one. Owner-only; a `user_id` in the body is ignored. `cmd/notifier` resolves each terminal event against these; a destination it could never dial is refused here rather than stored |
 
 ## Tech Stack
 
@@ -80,7 +102,8 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 - **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12
 - **Frame extraction:** `ffmpeg` (via `exec.CommandContext`, in `cmd/worker`)
 - **Identity, job, and notification-preference persistence:** PostgreSQL (via `pgx`), including a transactional outbox
-- **Job dispatch and terminal events:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — dispatch outbox relay in `cmd/api`, consumer in `cmd/worker`, and a second outbox relay in `cmd/worker` publishing each job's `completed`/`failed` outcome (no consumer yet)
+- **Job dispatch and terminal events:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — dispatch outbox relay in `cmd/api`, consumer in `cmd/worker`, a second outbox relay in `cmd/worker` publishing each job's `completed`/`failed` outcome, and the consumer for that terminal stream in `cmd/notifier`
+- **Webhook delivery:** HMAC-SHA256 signatures over `<timestamp>.<body>`, per-delivery claim records in PostgreSQL, and a destination policy applied both at registration and at dial time (`cmd/notifier`)
 - **Object storage:** MinIO / S3-compatible (via [`minio-go`](https://github.com/minio/minio-go)) for source videos and ZIP results
 - **Idempotency, rate limiting, status cache, worker leases:** Redis (via [`go-redis`](https://github.com/redis/go-redis))
 - **Password hashing:** bcrypt
