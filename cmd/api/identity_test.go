@@ -27,12 +27,6 @@ import (
 	"video-processor/internal/identity/infrastructure/jwtauth"
 )
 
-func newTestIdentityModule(t *testing.T) *identityModule {
-	t.Helper()
-	module, _ := newTestIdentityModuleWithTokens(t)
-	return module
-}
-
 // testTokens carries an issuer and the verifier over the same key pair, so
 // tests can mint tokens (including deliberately expired or mis-signed ones)
 // under the key the module verifies against. Issuing and verifying are

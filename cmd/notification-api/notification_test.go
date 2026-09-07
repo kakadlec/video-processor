@@ -127,13 +127,9 @@ const notificationPreferencesPath = "/api/notification-preferences"
 
 const testWebhookSecret = "test-only-signing-secret"
 
-func newTestNotificationModule(repo notificationdomain.PreferenceRepository) *notificationModule {
-	return newTestNotificationModuleWithPolicy(repo, notificationdomain.NewDestinationPolicy(false))
-}
-
-// newTestNotificationModuleWithPolicy is the variant the destination-policy
-// tests use. The restrictive posture is the default above so that every
-// other test in this file keeps exercising what production runs under.
+// newTestNotificationModuleWithPolicy takes the policy explicitly, and every
+// caller but the destination-policy tests passes the restrictive posture, so
+// the rest of this file keeps exercising what production runs under.
 func newTestNotificationModuleWithPolicy(repo notificationdomain.PreferenceRepository, policy notificationdomain.DestinationPolicy) *notificationModule {
 	return newNotificationModule(
 		notificationapplication.NewSetPreference(repo, systemClock{}, policy),
