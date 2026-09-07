@@ -8,12 +8,14 @@ Every request below enters through the nginx gateway, which is the only process 
 
 ### Authentication (Phase 2)
 
-`IDENTITY_POSTGRES_DSN` and the three `IDENTITY_JWT_*` key variables are required at startup, and every step below runs behind bearer-token middleware:
+`cmd/identity-api` requires `IDENTITY_POSTGRES_DSN` and all three `IDENTITY_JWT_*` variables at startup; a service that only *verifies* requires `IDENTITY_JWT_PUBLIC_KEYS` alone. Every step after login runs behind bearer-token middleware.
+
+**Two services appear in this diagram**, and the transition matters: the two `/api/auth/*` calls are answered by `cmd/identity-api`, while `POST /upload` — same origin, same token — is routed by the gateway to `cmd/video-api`, which verifies the token with the public key set and never talks to Identity to do it. The middle column is labelled per step for that reason.
 
 ```
-Browser                        cmd/identity-api (identity.go)                PostgreSQL
+Browser                   (service, per step — see above)               PostgreSQL
   │                                     │                                 │
-  │  POST /api/auth/register            │                                 │
+  │  POST /api/auth/register            │  ── cmd/identity-api below ── │
   │  { email, password }                │                                 │
   │────────────────────────────────────►│  Hash password (bcrypt)         │
   │                                     │  Persist user                   │
@@ -28,7 +30,7 @@ Browser                        cmd/identity-api (identity.go)                Pos
   │◄────────────────────────────────────│                                 │
   │  200 { access_token, expires_at }    │                                 │
   │                                     │                                 │
-  │  POST /upload                       │                                 │
+  │  POST /upload                       │  ── cmd/video-api from here ── │
   │  Authorization: Bearer <token>      │                                 │
   │────────────────────────────────────►│  Verify token → UserID          │
   │                                     │  (401 and stop here if invalid) │
