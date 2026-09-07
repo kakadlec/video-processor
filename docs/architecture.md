@@ -375,7 +375,7 @@ video-processor/
     platform/
       redis/          # Shared Redis connection adapter (implemented, Phase 4) — Config/Open/Ping/Close, wired into the HTTP services by add-upload-idempotency-keys
       ratelimit/      # Redis-backed fixed-window rate Limiter (implemented, Phase 4 — add-rate-limiting-middleware), wired into each HTTP service's own rateLimitMiddleware on every authenticated route
-      rabbitmq/       # Shared AMQP connection adapter (implemented, Phase 6 — add-rabbitmq-infrastructure) — Config/Open/Ping/Close plus a generic Topology descriptor and DeclareTopology; names no exchange or queue of its own. Its one caller is the outbox relay (add-videojob-source-key-and-outbox-relay), which owns the connection cmd/video-api opens
+      rabbitmq/       # Shared AMQP connection adapter (implemented, Phase 6 — add-rabbitmq-infrastructure) — Config/Open/Ping/Close plus a generic Topology descriptor and DeclareTopology; names no exchange or queue of its own. Four connection loops call it — cmd/video-api's dispatch relay, cmd/worker's consumer and its terminal relay, and cmd/notifier's consumer — each owning the connection its own process opens
     identity/                        # Implemented (Phase 2); wired into cmd/identity-api, and its verifier half into every service that authenticates
       domain/         # User aggregate, value objects, repository/password/token ports
       application/    # Use cases: RegisterUser, AuthenticateUser
