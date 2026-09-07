@@ -72,9 +72,9 @@ type PreferenceRepository interface {
 	// That no other statement in an implementation loads the column is pinned
 	// by TestNoQueryOutsideFindDeliverableSelectsTheSecret in
 	// internal/notification/infrastructure/postgres. Its complement — that no
-	// path under cmd/api reaches this method, so the composition root that
-	// builds responses cannot call it — lands with the signing function that
-	// consumes what this returns.
+	// path under cmd/notification-api reaches this method, so the composition
+	// root that builds responses cannot call it — lands with the signing
+	// function that consumes what this returns.
 	//
 	// A user with nothing registered for the event yields an empty slice and
 	// no error, for the same reason ListByUser does: not subscribed is an

@@ -28,8 +28,9 @@ const signaturePrefix = "sha256="
 // PreferenceRepository.Set calls Reveal on a secret its own caller handed it
 // in the same call, in order to write it to the column, and that write path
 // is required and stays. What is asserted — by TestOnlyTheSignerRevealsAStoredSecret
-// here, and by cmd/api's TestTheHTTPCompositionRootDoesNotLoadTheSecret —
-// is that nothing else reads one back.
+// here, and by cmd/notification-api's
+// TestTheHTTPCompositionRootDoesNotLoadTheSecret — is that nothing else
+// reads one back.
 func sign(secret domain.Secret, timestamp string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret.Reveal()))
 	mac.Write([]byte(timestamp))
