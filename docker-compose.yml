@@ -144,6 +144,7 @@ services:
     depends_on:
       - app
       - identity-api
+      - notification-api
     healthcheck:
       # Asks nginx whether its own configuration is loadable. Deliberately not
       # a request through to "app": the gateway is healthy when it can serve,
@@ -181,6 +182,48 @@ services:
     # after SIGTERM by default, so without this the graceful window the
     # process asks for cannot be honoured and an in-flight registration is
     # killed mid-transaction.
+    stop_grace_period: 45s
+
+  # The Notification context's own HTTP process: the preference routes, and
+  # nothing else. It holds a verifier and no private key — there is no code
+  # path in this binary that can construct an issuer — and no video database,
+  # no bucket and no broker.
+  #
+  # REDIS_ADDR is here because the routes are rate limited, not because this
+  # service caches anything: the limiter's counter is shared with every other
+  # HTTP service, so the budget stays one budget per user across the system.
+  notification-api:
+    build: .
+    command: ["/app/notification-api"]
+    environment:
+      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/notification?sslmode=disable
+      # Verification material only. The private half lives on identity-api
+      # and nowhere else.
+      IDENTITY_JWT_PUBLIC_KEYS: ${IDENTITY_JWT_PUBLIC_KEYS:?run "make dev-keys" to generate a local key pair}
+      # The limiter's backing store, shared with every other service that
+      # mounts the middleware. RATE_LIMIT_MAX_REQUESTS and
+      # RATE_LIMIT_WINDOW_SECONDS are left unset here and everywhere else, so
+      # every service holds one threshold and one window from one source —
+      # the code default. Setting them on one service alone would compare a
+      # shared count against two thresholds.
+      REDIS_ADDR: redis:6379
+      # The same relaxation the "notifier" service below sets, and set here
+      # for the same local-stack reason: this half of the destination policy
+      # judges a destination when it is registered, so without it PUT
+      # /api/notification-preferences would refuse the only kind of receiver
+      # this stack can host — an "http" container hostname on a private
+      # network. One policy, two readers: a deployment whose two processes
+      # disagree either stores destinations it can never deliver to or
+      # refuses at dial what it accepted at write time. Never set in
+      # production; see the notifier for what it costs there.
+      NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Same reason as identity-api above: Compose's 10s default would SIGKILL
+    # this process well inside the 30s graceful window it asks for.
     stop_grace_period: 45s
 
   # Runs the same Dockerfile used for deployment, built to its default
@@ -221,16 +264,6 @@ services:
       # Storage Isolation Is Exhibited, Not Only Permitted").
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/video_test?sslmode=disable
-      # cmd/api opens a third pool as of add-notification-domain-and-preferences
-      # and refuses to start without this, so it is no longer optional. Same
-      # server as the two above, its own database — the bounded contexts
-      # share a PostgreSQL server, not a database and not a connection.
-      NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/notification?sslmode=disable
-      # Exercises internal/notification/infrastructure/postgres's own test
-      # suite against a real instance; without it that suite skips and the
-      # adapter's create-with-no-secret refusal — enforced by a row count
-      # rather than by any Go branch — goes uncovered.
-      NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/notification_test?sslmode=disable
       # Required as of add-upload-idempotency-keys: cmd/api's composition
       # root now opens a Redis client for POST /upload's idempotency
       # mechanism, the first real (non-test-only) consumer of this service.
@@ -259,14 +292,6 @@ services:
       # exists to avoid. The API serves normally with the broker down; the
       # relay retries in the background.
       RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
-      # The same relaxation the "notifier" service below sets, and set here
-      # for the same local-stack reason: as of add-notification-webhook-delivery
-      # cmd/api judges a destination when it is registered, so without this
-      # PUT /api/notification-preferences would refuse the only kind of
-      # receiver this stack can host — an "http" container hostname on a
-      # private network. See that service for what relaxing it costs
-      # anywhere else; it is never set in production.
-      NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -423,10 +448,10 @@ services:
       # own databases rather than the IDENTITY_* ones.
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/video_test?sslmode=disable
-      # cmd/api opens a third pool as of add-notification-domain-and-preferences
-      # and refuses to start without this, so it is no longer optional. Same
-      # server as the two above, its own database — the bounded contexts
-      # share a PostgreSQL server, not a database and not a connection.
+      # Mirrors the "notification-api" service above, which requires it at
+      # startup. Same server as the two above, its own database — the bounded
+      # contexts share a PostgreSQL server, not a database and not a
+      # connection.
       NOTIFICATION_POSTGRES_DSN: postgres://identity:identity@postgres:5432/notification?sslmode=disable
       # Exercises internal/notification/infrastructure/postgres's own test
       # suite against a real instance; without it that suite skips and the
@@ -463,11 +488,11 @@ services:
       # set, matching the startup requirement — not to be reachable, which
       # cmd/api itself does not require either.
       RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
-      # Mirrors "app" rather than being needed by any test: cmd/api's tests
-      # build their notification module by hand and pass the posture they
-      # mean to exercise, so both postures are covered whatever this says.
-      # It is here because this service is defined as app's environment, and
-      # a difference left in it would be read later as a deliberate one.
+      # Mirrors "notification-api" rather than being needed by any test:
+      # cmd/notification-api's tests build their module by hand and pass the
+      # posture they mean to exercise, so both postures are covered whatever
+      # this says. It is here because a difference left in it would be read
+      # later as a deliberate one.
       NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
     depends_on:
       postgres:
