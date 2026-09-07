@@ -143,6 +143,7 @@ services:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - app
+      - identity-api
     healthcheck:
       # Asks nginx whether its own configuration is loadable. Deliberately not
       # a request through to "app": the gateway is healthy when it can serve,
@@ -152,6 +153,30 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # The Identity context's own HTTP process: the only one that holds a
+  # private key and the only one that can mint a token. Its configuration
+  # surface is the whole point — four variables, all Identity's own. No
+  # Redis, no MinIO, no broker, no ffmpeg, and no port: the gateway routes
+  # /api/auth/ here.
+  identity-api:
+    build: .
+    command: ["/app/identity-api"]
+    environment:
+      IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      # See the "app" service below for why this key pair is generated rather
+      # than committed. This is the one service whose environment carries the
+      # private half.
+      IDENTITY_JWT_PRIVATE_KEY: ${IDENTITY_JWT_PRIVATE_KEY:?run "make dev-keys" to generate a local key pair}
+      IDENTITY_JWT_KEY_ID: ${IDENTITY_JWT_KEY_ID:?run "make dev-keys" to generate a local key pair}
+      # Required despite this service registering no authenticated route: it
+      # checks at startup that the public half it is given matches the private
+      # one it signs with. A mismatched pair fails nowhere it can be
+      # attributed otherwise.
+      IDENTITY_JWT_PUBLIC_KEYS: ${IDENTITY_JWT_PUBLIC_KEYS:?run "make dev-keys" to generate a local key pair}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # Runs the same Dockerfile used for deployment, built to its default
   # "runtime" target (hardened, non-root, no Go toolchain — see the
@@ -167,7 +192,11 @@ services:
       # Fixed, non-secret local-only defaults — same rationale as the
       # Postgres credentials above. Never used outside a developer's
       # machine or CI.
-      IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
+      # No IDENTITY_POSTGRES_DSN and no private key. This process verifies
+      # tokens and administers no account, so the identity database and the
+      # ability to mint are both absent rather than merely unused — a
+      # dependency a process does not use should not be reachable from it.
+      #
       # The local RSA key pair is NOT repository material, deliberately unlike
       # the Postgres credentials above: a committed private key is one copy
       # away from a deployment, and no reader can tell a development key from
@@ -175,13 +204,9 @@ services:
       # pair into a git-ignored .env, which Compose loads from the project
       # directory; the :? default turns a missing one into that instruction
       # instead of a container that starts and rejects every token.
-      # IDENTITY_JWT_PRIVATE_KEY and IDENTITY_JWT_KEY_ID belong to the one
-      # process that mints tokens; IDENTITY_JWT_PUBLIC_KEYS is a JSON object
-      # mapping key id to PEM public key — a set, so a rotation can hold the
-      # outgoing and incoming keys at once — and is read by every service
-      # that verifies.
-      IDENTITY_JWT_PRIVATE_KEY: ${IDENTITY_JWT_PRIVATE_KEY:?run "make dev-keys" to generate a local key pair}
-      IDENTITY_JWT_KEY_ID: ${IDENTITY_JWT_KEY_ID:?run "make dev-keys" to generate a local key pair}
+      # IDENTITY_JWT_PUBLIC_KEYS is a JSON object mapping key id to PEM public
+      # key — a set, so a rotation can hold the outgoing and incoming keys at
+      # once — and is read by every service that verifies.
       IDENTITY_JWT_PUBLIC_KEYS: ${IDENTITY_JWT_PUBLIC_KEYS:?run "make dev-keys" to generate a local key pair}
       # Points at the isolated identity_test database (not the runtime
       # "identity" database above) so `docker compose run app-test go test`

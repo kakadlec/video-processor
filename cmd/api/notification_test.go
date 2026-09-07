@@ -244,30 +244,24 @@ func validPreferenceBody() map[string]any {
 }
 
 // 5.1
-func TestNotificationPreferences_RegisterLoginThenUseBothRoutes(t *testing.T) {
-	srv, _, _ := newNotificationTestServer(t, alwaysAllowRateLimiter{})
+//
+// Registering and logging in left this process with cmd/identity-api, so the
+// flow this test names starts one step later: it mints the token the way a
+// caller would hold one after logging in elsewhere. What it still asserts is
+// what it always asserted — that both preference routes work for the same
+// authenticated subject, one after the other.
+func TestNotificationPreferences_TokenHolderUsesBothRoutes(t *testing.T) {
+	srv, tokens, _ := newNotificationTestServer(t, alwaysAllowRateLimiter{})
 
-	registerTestAccount(t, srv.URL, "prefs-flow@example.com", "correct-horse-battery")
+	_, accessToken := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
-	loginResp := postJSON(t, srv.URL+"/api/auth/login", authenticateUserRequest{
-		Email:    "prefs-flow@example.com",
-		Password: "correct-horse-battery",
-	})
-	if loginResp.StatusCode != http.StatusOK {
-		t.Fatalf("login status = %d, want %d", loginResp.StatusCode, http.StatusOK)
-	}
-	var login authenticateUserResponse
-	if err := json.Unmarshal(readBody(t, loginResp), &login); err != nil {
-		t.Fatalf("unexpected error decoding login response: %v", err)
-	}
-
-	writeResp := putPreference(t, srv.URL, login.AccessToken, validPreferenceBody())
+	writeResp := putPreference(t, srv.URL, accessToken, validPreferenceBody())
 	if writeResp.StatusCode != http.StatusOK {
 		t.Fatalf("PUT status = %d, want %d (body %s)", writeResp.StatusCode, http.StatusOK, readBody(t, writeResp))
 	}
 	writeResp.Body.Close()
 
-	status, body := listPreferences(t, srv.URL, login.AccessToken)
+	status, body := listPreferences(t, srv.URL, accessToken)
 	if status != http.StatusOK {
 		t.Fatalf("GET status = %d, want %d", status, http.StatusOK)
 	}

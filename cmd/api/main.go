@@ -36,7 +36,7 @@ var webFS embed.FS
 func main() {
 	ctx := context.Background()
 
-	identity, identityDB, err := setupIdentity(ctx)
+	identity, err := setupIdentity()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -122,7 +122,6 @@ func main() {
 	relayDone.Wait()
 
 	closeDB(videoDB)
-	closeDB(identityDB)
 	// Appended rather than inserted into the sequence above, which is
 	// ordered against the relay. Nothing borrows this pool for a whole
 	// operation — there is no notification relay and no goroutine holding
@@ -193,8 +192,6 @@ func setupRouter(identity *identityModule, video *videoModule, notification *not
 	notificationRoutes.Use(identity.requireBearerAuth())
 	notificationRoutes.Use(rateLimitMiddleware(limiter))
 	notification.registerRoutes(notificationRoutes)
-
-	identity.registerRoutes(r)
 
 	return r
 }
