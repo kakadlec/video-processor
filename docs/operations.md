@@ -197,7 +197,7 @@ Their `VIDEO_` prefix marks them as the Video Processing context's own configura
 
 #### Access tokens, key material, and rotation
 
-Access tokens are **RS256** as of `split-api-by-bounded-context`. The single `IDENTITY_JWT_SIGNING_KEY` HMAC secret that preceded it is **gone**, replaced by three variables: `IDENTITY_JWT_PRIVATE_KEY` and `IDENTITY_JWT_KEY_ID`, read only by `cmd/identity-api`, and `IDENTITY_JWT_PUBLIC_KEYS`, read by every process that verifies. A deployment still carrying the old variable will not start; there is no fallback path and no dual-mode.
+Access tokens are **RS256** as of `split-api-by-bounded-context`. The single `IDENTITY_JWT_SIGNING_KEY` HMAC secret that preceded it is **gone**, replaced by three variables: `IDENTITY_JWT_PRIVATE_KEY` and `IDENTITY_JWT_KEY_ID`, read only by `cmd/identity-api`, and `IDENTITY_JWT_PUBLIC_KEYS`, read by every process that verifies. A deployment still configured with only the old variable will not start — not because the old one is rejected (nothing reads it any more, so it is simply inert) but because the new ones are required and absent. There is no fallback path and no dual-mode.
 
 The change is not cosmetic. Three services cannot share one HMAC secret without giving Video Processing and Notification the ability to **mint** tokens, which is a privilege neither has any reason to hold. With an asymmetric pair, the two verifying services hold material that can only check a signature — and `NewVerifier` refuses a private-key PEM outright, so a private key handed to the wrong service stops that service at startup rather than quietly upgrading it.
 
