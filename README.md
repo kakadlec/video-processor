@@ -12,7 +12,7 @@ A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`,
 
 ## Quickstart
 
-Each of the five processes requires only the configuration it uses and refuses to start without it — `cmd/identity-api` the four `IDENTITY_*` variables, `cmd/video-api` the public key set plus `VIDEO_POSTGRES_DSN`/`REDIS_ADDR`/`VIDEO_MINIO_*`/`RABBITMQ_URL`, `cmd/notification-api` the public key set plus `NOTIFICATION_POSTGRES_DSN`/`REDIS_ADDR`, `cmd/worker` the Video Processing set without any identity variable, and `cmd/notifier` just `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. Without the worker, uploads are accepted and never processed; without the notifier, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running them directly — note that the three HTTP services all listen on `:8080`, so running them side by side on one host means giving each its own port. The fastest path with no manual wiring is Docker:
+Each of the five processes requires only the configuration it uses and refuses to start without it — `cmd/identity-api` the four `IDENTITY_*` variables, `cmd/video-api` the public key set plus `VIDEO_POSTGRES_DSN`/`REDIS_ADDR`/`VIDEO_MINIO_*`/`RABBITMQ_URL`, `cmd/notification-api` the public key set plus `NOTIFICATION_POSTGRES_DSN`/`REDIS_ADDR`, `cmd/worker` the Video Processing set without any identity variable, and `cmd/notifier` just `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. Without the worker, uploads are accepted and never processed; without the notifier, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running them directly — with one caveat: the three HTTP services each hardcode `:8080` and read no `PORT` variable, so a bare `go run` supports **one HTTP service at a time** per host. Running them together means containers or separate hosts, which is what Compose does. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
@@ -30,8 +30,8 @@ docker compose up --build
 # publishes a host port. It routes /api/auth/ to identity-api,
 # /api/notification-preferences to notification-api, and everything else to
 # video-api, so the split is invisible from the browser.
-# All six application containers run from the same image with their commands
-# overridden. Three workers start by default, so several videos are
+# Seven application containers — the three HTTP services, three workers and
+# the notifier — all run from the same image with their commands overridden. Three workers start by default, so several videos are
 # processed at the same time: each worker holds exactly one job at a time by
 # design (prefetch 1), so concurrency is worker count.
 

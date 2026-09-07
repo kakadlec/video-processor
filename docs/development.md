@@ -36,7 +36,7 @@ There are **five** `go run` targets, one per composition root, and each requires
 | `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | nothing — no HTTP, no port |
 | `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL` | nothing — no HTTP, no port |
 
-**All three HTTP services listen on `:8080`**, so running more than one of them directly on a host means giving each its own port or its own container. In the compose stack each has its own container and the gateway is the only thing publishing a port; locally, the simplest path is `docker compose up --build` rather than five `go run`s (see "Docker Workflow" below). What follows is the manual route, run one service at a time.
+**All three HTTP services hardcode `:8080` and read no `PORT` variable**, so a bare `go run` supports **one HTTP service at a time** on a host — there is no supported port override, and running them together needs one container or host each. In the compose stack each has its own container and the gateway is the only thing publishing a port, which is why `docker compose up --build` is the simplest local path (see "Docker Workflow" below). What follows is the manual route: pick the HTTP service you need, plus the worker and the notifier, which listen on nothing and can always run alongside it.
 
 `RABBITMQ_URL` is the odd one out among the required variables: it must be *set*, but the broker behind it does not have to be up — the outbox relay and the consumers each dial in their own goroutine and retry, so a service starts and serves every route regardless.
 
@@ -91,20 +91,21 @@ export NOTIFICATION_ALLOW_INSECURE_DESTINATIONS="true"
 # Start the Video API (listens on :8080) — the frontend and the upload flow
 go run ./cmd/video-api
 
-# In a second shell, the Identity API. It also listens on :8080, so give it
-# its own port or run it on another host; without it nothing can obtain a
-# token. It reads the IDENTITY_* exports and nothing else.
+# The Identity API — without it nothing can obtain a token. It also binds
+# :8080 with no way to change that, so stop the Video API first or run this
+# on another host or in a container. It reads the IDENTITY_* exports only.
 go run ./cmd/identity-api
 
-# In a third shell, the Notification API — the preference routes. Also :8080.
+# The Notification API — the preference routes. Also :8080, same constraint.
 # It reads IDENTITY_JWT_PUBLIC_KEYS, NOTIFICATION_POSTGRES_DSN and REDIS_ADDR.
 go run ./cmd/notification-api
 
-# In a fourth shell, with the same exports minus the IDENTITY_* and
-# NOTIFICATION_* ones, start the worker. It serves no HTTP and exposes no port.
+# In a second shell — the worker binds nothing, so it runs alongside any of
+# the three above. Same exports minus the IDENTITY_* and NOTIFICATION_* ones.
+# It serves no HTTP and exposes no port.
 go run ./cmd/worker
 
-# In a fifth shell, start the notifier. It needs only three of the exports
+# In a third shell, start the notifier. It needs only three of the exports
 # above — NOTIFICATION_POSTGRES_DSN, RABBITMQ_URL, and the destination
 # relaxation already exported with them. It serves no HTTP and exposes no
 # port.

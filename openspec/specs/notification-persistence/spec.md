@@ -8,7 +8,7 @@ Defines how the Notification bounded context persists its own state: the connect
 
 The Notification context SHALL read its connection string from `NOTIFICATION_POSTGRES_DSN` and SHALL NOT read, share, or fall back to `IDENTITY_POSTGRES_DSN` or `VIDEO_POSTGRES_DSN`. The variable SHALL be required at the startup of **every process that uses the context** — `cmd/notification-api` and `cmd/notifier` alike: when it is absent, startup SHALL fail with a clear error naming the variable rather than starting a process that cannot serve a preference request or resolve an event.
 
-The requirement is generalized rather than rewritten. It was scoped to `cmd/notification-api` because that was the only process holding the pool; the notifier holds one for the same reason and SHALL fail the same way. `cmd/worker` reads none of them and is unaffected.
+The requirement is generalized rather than rewritten. It was scoped to the single HTTP API that then served every context, because that was the only process holding the pool; the notifier holds one for the same reason and SHALL fail the same way. `cmd/worker` reads none of them and is unaffected.
 
 A separate variable and a separate pool are what make the context's persistence its own. Which physical server the value points at is a deployment decision — pointing all three at one server is permitted and is what local development does — but the code SHALL NOT be the thing that assumes it.
 

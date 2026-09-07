@@ -151,8 +151,8 @@ Every `.owner` sidecar symbol SHALL be deleted from the codebase — the write, 
 
 #### Scenario: No uploads directory is created at startup
 
-- **WHEN** `cmd/video-api` starts
-- **THEN** it creates `temp/` only, and creates neither `uploads/` nor `outputs/`
+- **WHEN** `cmd/worker` starts
+- **THEN** it creates `temp/` only, and creates neither `uploads/` nor `outputs/` — and `cmd/video-api` creates no directory at all
 
 #### Scenario: The uploads route no longer exists
 

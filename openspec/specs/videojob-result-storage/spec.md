@@ -245,8 +245,8 @@ The sidecar helpers no longer remain in the codebase for any directory. They sur
 
 #### Scenario: No outputs directory is created at startup
 
-- **WHEN** `cmd/video-api` starts
-- **THEN** it creates `temp/`, and does not create `outputs/`
+- **WHEN** `cmd/worker` starts
+- **THEN** it creates `temp/`, and does not create `outputs/` — and `cmd/video-api` creates no directory at all
 
 #### Scenario: The outputs route no longer exists
 

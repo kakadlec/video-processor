@@ -261,7 +261,7 @@ The repository SHALL have a monorepo topology with `cmd/identity-api`, `cmd/vide
 
 The event consumers sharpen rather than change the rule. `cmd/notifier` consumes an integration event that the Video Processing context emits, which is the sanctioned crossing; it SHALL obtain the names and payload shapes it needs from its own context's declarations, never by importing the emitting context's packages, and the translation from the event's user identifier to its own `UserID` SHALL happen in its composition root. A composition root MAY import more than one context — that is what makes it a composition root — but the packages under `internal/notification/` SHALL NOT, and that constraint SHALL hold for every package of the context, infrastructure included, not for its `domain` and `application` packages alone.
 
-Since the HTTP tier was split by bounded context, **no composition root actually imports two contexts any more**. That permission stands as written, because it is what makes a composition root one, but the pinning tests that relied on a root exercising it live in `internal/contracts` instead — see the dependency rule above, and `notification-event-consumer` and `notification-preferences` for what they pin.
+Since the HTTP tier was split by bounded context, **no composition root imports both Video Processing and Notification any more**. Each HTTP root imports its own context plus Identity's verifier port and JWT adapter — the middleware cannot authenticate a caller without them, so that crossing is inherent to serving an authenticated route rather than incidental — but no root links the Video and Notification copies of the terminal contract at the same time. That permission stands as written, because it is what makes a composition root one, but the pinning tests that relied on a root linking both of those contexts live in `internal/contracts` instead — see the dependency rule above, and `notification-event-consumer` and `notification-preferences` for what they pin.
 
 #### Scenario: The video API and the worker share domain and application packages
 
@@ -278,8 +278,14 @@ Since the HTTP tier was split by bounded context, **no composition root actually
 #### Scenario: No HTTP composition root serves more than one context
 
 - **GIVEN** the three HTTP entrypoints
-- **WHEN** each one's imports are inspected
-- **THEN** none imports the `domain` or `application` packages of a bounded context other than its own, and `cmd/identity-api` links no object-storage, broker, or `ffmpeg`-invoking package at all
+- **WHEN** each one's routes and imports are inspected
+- **THEN** each registers the routes of exactly one bounded context, and imports no other context's `domain` or `application` packages **except Identity's token-verification port and its JWT adapter**, which every authenticated route needs by construction and which carry no other context's behaviour; `cmd/identity-api` additionally links no object-storage, broker, or `ffmpeg`-invoking package at all
+
+#### Scenario: No composition root links both Video Processing and Notification
+
+- **GIVEN** the five entrypoints
+- **WHEN** each one's build graph is inspected
+- **THEN** none contains packages of both the Video Processing and the Notification context, which is why the pins that compare their copies of the terminal contract cannot live in any of them
 
 #### Scenario: cmd/notifier wires only the Notification context
 
