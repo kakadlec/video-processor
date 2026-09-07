@@ -125,6 +125,34 @@ services:
       timeout: 10s
       retries: 10
 
+  # The single ingress. Everything a client reaches, it reaches here: the
+  # gateway is the only service that publishes a host port, and the
+  # application services publish none. It routes nothing selectively yet —
+  # while the API is one process there is one rule — but the hop exists and
+  # is proven transparent before anything depends on it being selective.
+  gateway:
+    image: nginx:1.29-alpine
+    ports:
+      # Loopback-only: an unqualified "8080:8080" binds to all host
+      # interfaces, exposing a stack whose Postgres and MinIO credentials
+      # are fixed and repository-visible to any peer on the network. There's
+      # no legitimate reason this local dev service needs LAN reachability.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Replaces the image's own nginx.conf, read-only.
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    healthcheck:
+      # Asks nginx whether its own configuration is loadable. Deliberately not
+      # a request through to "app": the gateway is healthy when it can serve,
+      # and tying its health to a backend's would make an unrelated service's
+      # restart look like an ingress failure.
+      test: ["CMD", "nginx", "-t"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Runs the same Dockerfile used for deployment, built to its default
   # "runtime" target (hardened, non-root, no Go toolchain — see the
   # Dockerfile's own comments). `docker compose up --build` gives a full
@@ -133,12 +161,8 @@ services:
   # image has no Go toolchain to run `go test` with.
   app:
     build: .
-    ports:
-      # Loopback-only: an unqualified "8080:8080" binds to all host
-      # interfaces, exposing a stack whose Postgres and MinIO credentials
-      # are the fixed ones below to any peer on the network. There's no
-      # legitimate reason this local dev service needs LAN reachability.
-      - "127.0.0.1:8080:8080"
+    # No ports. The gateway is the only service that publishes one, which is
+    # also what lets this service be scaled without a host-port collision.
     environment:
       # Fixed, non-secret local-only defaults — same rationale as the
       # Postgres credentials above. Never used outside a developer's
