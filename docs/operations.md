@@ -10,9 +10,16 @@ The application is **five** Go processes built from one image: `cmd/identity-api
 # Build
 docker build -t video-processor .
 
+# One user-defined network. The gateway resolves its upstreams by container
+# name through Docker's embedded DNS at 127.0.0.11, which only exists on a
+# user-defined network — on the default bridge the names would not resolve
+# and every route would 502
+docker network create video-processor-net
+
 # Run the Identity API — the only process that holds a private key and so the
-# only one that can mint a token. No Redis, no MinIO, no broker
-docker run -p 8081:8080 \
+# only one that can mint a token. No Redis, no MinIO, no broker. No published
+# port: the gateway is the only thing a client reaches
+docker run -d --name identity-api --network video-processor-net \
   -e IDENTITY_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e IDENTITY_JWT_PRIVATE_KEY="$(cat identity-private-key.pem)" \
   -e IDENTITY_JWT_KEY_ID="2026-09" \
@@ -24,7 +31,7 @@ docker run -p 8081:8080 \
 # code path in this binary that constructs an issuer, and a private key handed
 # to it as IDENTITY_JWT_PUBLIC_KEYS is refused at startup rather than quietly
 # accepted
-docker run -p 8080:8080 \
+docker run -d --name video-api --network video-processor-net \
   -e IDENTITY_JWT_PUBLIC_KEYS='{"2026-09":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}' \
   -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/video?sslmode=disable" \
   -e REDIS_ADDR="host:6379" \
@@ -38,11 +45,20 @@ docker run -p 8080:8080 \
 # Run the Notification API — the preference routes and nothing else: a
 # verifier, its own DSN, and Redis for the rate-limit counter it shares with
 # the other HTTP services. No video database, no bucket, no broker
-docker run -p 8082:8080 \
+docker run -d --name notification-api --network video-processor-net \
   -e IDENTITY_JWT_PUBLIC_KEYS='{"2026-09":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}' \
   -e NOTIFICATION_POSTGRES_DSN="postgres://user:pass@host:5432/notification?sslmode=disable" \
   -e REDIS_ADDR="host:6379" \
   video-processor /app/notification-api
+
+# Run the gateway — the ONLY published port, and not optional. The three
+# services above are one origin to a client: the embedded frontend calls
+# /api/auth/* and /api/notification-preferences same-origin, so publishing
+# any one service directly would answer 404 for the paths the other two own.
+# The container names above are the upstreams nginx.conf names
+docker run -d --name gateway --network video-processor-net -p 8080:8080 \
+  -v "$PWD/docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+  nginx:1.29-alpine
 
 # Run the worker — same image, different command, no port, and NO IDENTITY_*
 # or NOTIFICATION_* variables: it makes no access-control decision and
