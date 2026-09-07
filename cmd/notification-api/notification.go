@@ -17,6 +17,20 @@ import (
 	"video-processor/internal/notification/infrastructure/webhook"
 )
 
+// systemClock is this process's production Clock.
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+// closeDB closes db, logging any failure — used on setup-failure paths where
+// a different, more relevant error is already being returned to the caller,
+// and on the shutdown path where there is nobody left to return one to.
+func closeDB(db *sql.DB) {
+	if err := db.Close(); err != nil {
+		log.Printf("notification: close postgres: %v", err)
+	}
+}
+
 // notificationModule wires the Notification bounded context's use cases to
 // the HTTP layer.
 type notificationModule struct {
@@ -29,24 +43,25 @@ func newNotificationModule(setPreference *application.SetPreference, listPrefere
 }
 
 // setupNotification builds the production Notification module from
-// environment configuration. Like Identity and Video, every piece is
-// required: a missing NOTIFICATION_POSTGRES_DSN fails startup clearly rather
-// than leaving a route that answers 500 on every call.
+// environment configuration. Every piece is required: a missing
+// NOTIFICATION_POSTGRES_DSN fails startup clearly rather than leaving a
+// route that answers 500 on every call.
 //
-// The pool is this context's own even though it points at the same database
-// as the other two: the bounded contexts share an instance, not a
-// connection, and nothing here may reach a table another context owns.
+// The pool is this context's own, and it is now the only one this process
+// opens: the Identity and Video databases are not merely unread here, they
+// are absent from the configuration surface entirely.
 //
-// Every variable is read before any I/O, matching setupVideo and
-// cmd/notifier: a value this process will refuse to start on should refuse
-// before a migration has taken the advisory lock and created a table.
+// Every variable is read before any I/O, matching cmd/notifier: a value this
+// process will refuse to start on should refuse before a migration has taken
+// the advisory lock and created a table.
 //
 // The destination policy comes from the same variable and the same parser
 // cmd/notifier reads. One policy with two readers: this half refuses a
 // destination when it is registered, the notifier's half refuses the address
 // when it is dialled, and a deployment whose two processes disagree either
 // stores destinations it can never deliver to or refuses at dial what it
-// accepted at write time.
+// accepted at write time. The two readers are separately deployable
+// processes now, which is the case the single-parser rule was written for.
 func setupNotification(ctx context.Context) (*notificationModule, *sql.DB, error) {
 	pgConfig, err := postgres.LoadConfigFromEnv()
 	if err != nil {

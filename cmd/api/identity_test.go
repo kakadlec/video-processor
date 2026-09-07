@@ -9,11 +9,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,12 +26,6 @@ import (
 	"video-processor/internal/identity/domain"
 	"video-processor/internal/identity/infrastructure/jwtauth"
 )
-
-func newTestIdentityModule(t *testing.T) *identityModule {
-	t.Helper()
-	module, _ := newTestIdentityModuleWithTokens(t)
-	return module
-}
 
 // testTokens carries an issuer and the verifier over the same key pair, so
 // tests can mint tokens (including deliberately expired or mis-signed ones)
@@ -342,7 +338,7 @@ func uploadWithAuth(t *testing.T, baseURL, token, videoPath, filename string) *h
 
 func TestVideoRoutes_PublicGetRoot(t *testing.T) {
 	module, _ := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/")
@@ -358,7 +354,7 @@ func TestVideoRoutes_PublicGetRoot(t *testing.T) {
 
 func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 	module, _ := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	getCases := []string{
@@ -385,7 +381,7 @@ func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
 func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(module, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -432,7 +428,7 @@ func issueTestToken(t *testing.T, tokens testTokens, uuid string) (domain.UserID
 func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(module, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -456,7 +452,7 @@ func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
 func TestArtifactOwnership_StatusScopedToOwner(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(module, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -512,7 +508,7 @@ func containsFilename(files []struct {
 func TestArtifactOwnership_StaticOutputsRouteIsGone(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(module, video, newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, video, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -532,7 +528,7 @@ func TestArtifactOwnership_StaticOutputsRouteIsGone(t *testing.T) {
 // answers there at all.
 func TestStaticUploadsRouteIsGone(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(module, newTestVideoModule(t), alwaysAllowRateLimiter{}))
 	defer srv.Close()
 
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -558,7 +554,7 @@ func TestOnlyTheIdentityServiceConstructsATokenIssuer(t *testing.T) {
 	constructors := []string{"jwtauth.NewIssuer", "jwtauth.LoadIssuerFromEnv"}
 
 	for _, constructor := range constructors {
-		for _, root := range []string{"api", "worker", "notifier"} {
+		for _, root := range []string{"api", "notification-api", "worker", "notifier"} {
 			if naming := namingFiles(t, filepath.Join("cmd", root), constructor); len(naming) != 0 {
 				t.Errorf("%v under cmd/%s name %s: only the Identity service may hold the ability to mint a token",
 					naming, root, constructor)
@@ -646,4 +642,36 @@ func testPublicKeySet(t *testing.T, tokens testTokens) string {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return string(encoded)
+}
+
+// namingFiles returns the base names of the non-test .go files directly
+// under dir that contain needle. Test files are excluded deliberately: this
+// very file names the method in its own assertions.
+func namingFiles(t *testing.T, dir, needle string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", dir, err)
+	}
+
+	naming := make([]string, 0)
+	scanned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		scanned++
+		source, err := fs.ReadFile(os.DirFS(dir), entry.Name())
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", filepath.Join(dir, entry.Name()), err)
+		}
+		if strings.Contains(string(source), needle) {
+			naming = append(naming, entry.Name())
+		}
+	}
+	if scanned == 0 {
+		t.Fatalf("no non-test Go file was scanned under %s; the rule this enforces is not being checked", dir)
+	}
+	return naming
 }

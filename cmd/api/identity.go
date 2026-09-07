@@ -15,8 +15,8 @@ import (
 
 // systemClock is the production Clock for every module in this process. It
 // lived here when Identity was the only context that needed one; the Video
-// and Notification modules use it too, which is why it stays behind while
-// the rest of Identity's account handling leaves.
+// module uses it too, which is why it stays behind while the rest of
+// Identity's account handling leaves.
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now() }
