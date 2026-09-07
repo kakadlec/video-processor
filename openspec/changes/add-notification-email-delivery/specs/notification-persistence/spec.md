@@ -6,6 +6,8 @@ The context SHALL expose exactly one repository operation that loads the stored 
 
 This is a narrowing of the existing rule, not a relaxation of it. HMAC signing requires the original bytes, so the value has to be loadable somewhere; what makes it safe is that the somewhere is singular, named, and provably not on any path that builds an HTTP response. The read used by the preference routes SHALL remain unable to load it, so the response types those routes build still cannot carry a value that was never fetched.
 
+That one operation SHALL narrow further: its projection SHALL yield a secret only for a row whose channel signs, and SHALL yield none for any other row, decided in the statement rather than after the value has been scanned. A preference on a non-signing channel may carry a stored secret, because a write submitting one stores it whatever the channel; a value selected and scanned has entered the process whether or not anything reads it next, so declining to *use* it is not the same guarantee as declining to *load* it.
+
 That the secret-loading operation has no caller in the Notification context's HTTP service SHALL be enforced by a test rather than by convention. That service is the only HTTP process that links this package at all after the HTTP tier was split by bounded context, so the test's subject is narrower than it was, and for the other HTTP services the property holds by construction rather than by inspection.
 
 #### Scenario: The preference read still cannot load a secret
@@ -24,6 +26,12 @@ That the secret-loading operation has no caller in the Notification context's HT
 - **GIVEN** an enabled preference on a channel that does not sign, stored with no secret
 - **WHEN** the delivery path loads it
 - **THEN** it receives the full preference and no error, rather than failing because the stored secret is empty
+
+#### Scenario: The delivery read yields no secret for a non-signing channel that stored one
+
+- **GIVEN** an enabled preference on a channel that does not sign which nonetheless carries a stored secret
+- **WHEN** the delivery path loads it
+- **THEN** the statement yields no secret value for that row, so none is scanned into the process, and the preference is still restored
 
 #### Scenario: The Notification HTTP service does not call the secret-loading operation
 

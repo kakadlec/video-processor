@@ -8,6 +8,8 @@ It SHALL require exactly the configuration it uses — the Notification context'
 
 A separate process rather than a goroutine inside an existing one is required for the reason `videojob-terminal-events` gives for placing the terminal relay in the worker, applied to the other direction: an outbound request to a third party must not share a lifecycle with serving HTTP requests, nor with the worker's single-extraction-at-a-time shape. They scale on different axes.
 
+One event SHALL be able to resolve to one preference per channel, and the handler SHALL process them one after another, so handling a single message can consume one full claim-hold budget **per channel** rather than one in total. The bounded drain that shutdown waits on SHALL therefore be sized from the number of channels in the closed set, not from a single claim hold. Leaving it at one hold would make the drain expire during work that is proceeding normally and within budget, turning the skipped pool close from the exceptional path into the ordinary one.
+
 It SHALL compose one delivery implementation per channel in the closed channel set and select between them on the preference's own channel. That selection SHALL live in the composition root: the use case that claims, attempts and resolves a delivery SHALL hold a single outbound port and SHALL NOT branch on the channel, so a second channel does not reach the code that holds the claim and the fence. The composition SHALL be exhaustive over the channel set at startup, so a channel with no implementation is a startup failure rather than a delivery-time one.
 
 Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bounded backoff and SHALL redial when the connection or channel is lost.
@@ -41,3 +43,9 @@ Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bo
 - **GIVEN** one event resolving to preferences on two different channels
 - **WHEN** the deliveries are attempted
 - **THEN** each is attempted by the implementation composed for its own channel, and the use case that claims and resolves them holds one outbound port and does not name a channel
+
+#### Scenario: The drain covers a message that delivers on every channel
+
+- **GIVEN** one event resolving to a preference on every channel in the set, each taking its full budget
+- **WHEN** shutdown is signalled while that message is being handled
+- **THEN** the drain waits long enough for all of them to reach a disposition, rather than expiring while bounded work is still proceeding

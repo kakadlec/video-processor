@@ -27,7 +27,11 @@ The enrolment boundary, the claim that precedes any attempt, the claim token tha
 
 ### Requirement: An Email Destination Is Validated as an Address, and the Validation Is a Contract
 
-An `email` preference's destination SHALL be validated as a single addr-spec e-mail address. The validation SHALL reject a value carrying a display name, angle brackets, comment syntax, or any form whose canonical rendering is not byte-identical to what was submitted; it SHALL reject a value containing a carriage return, a line feed, or a NUL byte; and it SHALL bound the value's length. A rejected address SHALL be answered with `400` at registration and SHALL NOT be stored.
+An `email` preference's destination SHALL be validated as a single addr-spec e-mail address. The validation SHALL reject a value carrying a display name, angle brackets, comment syntax, or any form whose canonical rendering is not byte-identical to what was submitted; it SHALL reject a value containing a carriage return, a line feed, or a NUL byte; and it SHALL reject a value longer than **254 bytes**, the longest reverse-path or forward-path an SMTP server is required to accept.
+
+The address SHALL be **ASCII only**: a value containing a byte outside US-ASCII, in either the local part or the domain, SHALL be rejected. This is a property of the transport rather than a preference. An internationalized address requires the sending client to negotiate the SMTPUTF8 extension, and the client this system sends with does not; accepting one at registration would store an address the adapter can never put in an envelope, which is precisely the stored-and-never-honoured outcome the closed channel set exists to prevent. A deployment that later adopts an SMTPUTF8-capable transport may relax this rule, and SHALL do so in the same change rather than ahead of it.
+
+A rejected address SHALL be answered with `400` at registration and SHALL NOT be stored.
 
 This is a contract rather than an implementation detail because it decides what a caller sees and because the failure it prevents is header injection: an SMTP message is a header block, and a destination containing a line break that reached a header would let a registrant add recipients, headers, or a body of their own. Rejecting at registration is the same argument this specification's sibling makes for applying the destination policy at write time and for rejecting a NUL in a signing secret — a value that can never be delivered SHALL fail where its owner can read the error.
 
@@ -43,6 +47,12 @@ The adapter SHALL NOT interpolate any user-supplied string into a message header
 
 - **GIVEN** an authenticated user
 - **WHEN** they register an `email` preference whose destination is of the form `Name <user@example.com>`
+- **THEN** the request is rejected with `400` and no preference is stored
+
+#### Scenario: A non-ASCII or over-long address is rejected
+
+- **GIVEN** an authenticated user
+- **WHEN** they register an `email` preference whose destination contains a byte outside US-ASCII, or whose destination exceeds 254 bytes
 - **THEN** the request is rejected with `400` and no preference is stored
 
 #### Scenario: A plain address is accepted
@@ -73,7 +83,9 @@ This SHALL NOT be implemented as a skipped check. The branch SHALL be taken on t
 
 The delivered message SHALL be built from the Notification context's own representation of the outcome — the event type, the job identifier, when it occurred, and that outcome's own fields — and SHALL NOT be the Video Processing wire payload forwarded. It SHALL be `text/plain`, and SHALL carry no HTML, attachment, or remote reference.
 
-It SHALL carry no signature. HMAC signing is the webhook channel's mechanism, and an `email` preference carries no secret to sign with; the delivery path SHALL NOT read a secret for an `email` preference and SHALL NOT require one to exist.
+It SHALL carry no signature. HMAC signing is the webhook channel's mechanism, and an `email` preference carries no secret to sign with; the delivery path SHALL NOT require one to exist.
+
+The delivery read SHALL NOT load a stored secret for a preference on a channel that does not sign — not merely decline to use one it loaded. An `email` preference may carry a secret, since a write submitting one stores it, and a value that is selected and scanned has entered the process whether or not anything reads it afterwards. `notification-persistence` states the projection rule this depends on.
 
 The message SHALL carry the delivery identifier in a header a receiver can deduplicate on, giving an e-mail receiver the same stable handle the webhook channel gives in its delivery header. The sender address SHALL come from this deployment's configuration and SHALL NOT be derived from the recipient or from any user-supplied value.
 
@@ -87,8 +99,9 @@ The message SHALL NOT contain a credential of any kind, and SHALL NOT contain th
 
 #### Scenario: No secret is loaded for an email preference
 
-- **WHEN** an `email` preference is delivered to
-- **THEN** no signing secret is read, and delivery succeeds for a preference that has none
+- **GIVEN** an `email` preference that carries a stored secret
+- **WHEN** it is loaded for delivery
+- **THEN** the query returns no secret value for that row, nothing in the process holds one, and delivery proceeds
 
 #### Scenario: The delivery identifier is carried for deduplication
 

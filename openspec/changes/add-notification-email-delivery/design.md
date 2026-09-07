@@ -28,7 +28,7 @@ The address the e-mail is delivered to is the preference's own user-supplied `De
 - Open the `Channel` set to `email` and make a preference on it storable, loadable, and deliverable end to end.
 - Reuse the existing trigger, enrolment boundary, claim, fence, budget and recorded outcome without modification, so the second channel inherits every guarantee the first one established rather than restating them.
 - Keep the three invariants that must become channel-conditional conditional in exactly one place each, and make the conditioning visible in the type system or the schema rather than in a comment.
-- Introduce no new binary, no new consumer, no new queue, no new table, no new column, and no new budget term.
+- Introduce no new binary, no new consumer, no new queue, no new table, no new column, and no new budget term. The shutdown drain is the one existing quantity that does change, and only in how many claim holds it allows for (decision 11).
 - Let a contributor observe a delivered message with `docker compose up --build` and nothing else.
 
 **Non-Goals:**
@@ -81,6 +81,8 @@ The address the e-mail is delivered to is the preference's own user-supplied `De
 
 *Why `NewSecret` keeps rejecting `""`:* the empty string is not a secret, and every other caller is right to refuse it. What changes is that the e-mail branch does not call it.
 
+*And the projection narrows with it.* `findDeliverablePreferencesQuery` selects `secret` for every row. A write submitting a secret stores it whatever the channel, so an `email` row can carry one, and a value that is selected and scanned has entered the process whether or not anything reads it next. The statement therefore yields a secret only for a row whose channel signs — decided in SQL, not after the scan. Declining to *use* a loaded secret is a weaker guarantee than declining to *load* it, and this capability's whole posture on the secret is built on the stronger one.
+
 ### 5. Address validation is a contract, because header injection is the threat
 
 `email` destinations are validated with `net/mail`'s `ParseAddress`, and then further constrained: the parsed address must equal the submitted string (no display name, no angle brackets, no comment syntax), the value must contain no CR, LF or NUL, and its length is bounded.
@@ -94,6 +96,8 @@ The address the e-mail is delivered to is the preference's own user-supplied `De
 No new module dependency. The connection is opened with a `net.Dialer` carrying the per-attempt deadline and handed to `smtp.NewClient`, rather than using `smtp.SendMail`, which offers no timeout at all.
 
 *Why:* the feature set needed — EHLO, STARTTLS, PLAIN auth, one recipient, one body — is exactly what `net/smtp` covers, and every added module is a `govulncheck` surface the project gates every PR on. `net/smtp` is frozen to new features, which is a real limitation and is recorded in Risks; the `Deliverer` port is what makes replacing it later a change confined to one package.
+
+**The dialer's timeout is not the attempt's bound, and assuming it is would break decision 7.** `net.Dialer` bounds only connection establishment. Once `smtp.NewClient` owns the connection, the server greeting, EHLO, STARTTLS, AUTH, MAIL, RCPT, DATA and QUIT are blocking reads and writes that observe no context — a relay that accepts the TCP connection and then stops responding would hold the attempt open indefinitely, past the per-attempt timeout, past `MaxClaimHold()`, and past the reclaim bound that was validated against it. The adapter therefore sets an **absolute deadline on the connection itself** covering the whole conversation, derived from the same per-attempt timeout, and closes the connection when the context is cancelled so a blocked read returns. The deadline, not the dialer, is what makes the arithmetic in decision 7 true.
 
 ### 7. One per-attempt timeout for every channel — no new budget terms
 
@@ -123,7 +127,17 @@ For a webhook, a recorded `delivered` means the receiver answered 2xx. For e-mai
 
 *Why record it as `delivered` anyway:* it is the strongest statement this system can truthfully make, it is what the claim needs in order to resolve, and inventing a third status would imply a bounce-processing capability that is an explicit non-goal. The spec states the meaning so an operator reading the table is not misled.
 
-### 11. The constraint migration is a guarded statement inside the existing advisory-locked `Migrate`
+### 11. The shutdown drain is sized per channel, because one message can now consume more than one budget
+
+`DeliverNotification` processes a message's preferences one after another. The triple `(UserID, EventType, Channel)` means at most one preference per channel per event, so with one channel a message consumed at most one claim-hold budget and the drain — `MaxClaimHold() + 30s` — covered it exactly. With two channels a message can consume two, sequentially. The drain becomes the channel count times `MaxClaimHold()`, plus the same grace.
+
+*Why this is not optional:* the drain expiring is a defined path — the handler is still running on its `context.WithoutCancel`, the pool close is skipped, process exit releases the connections and a later consumer reclaims the unresolved claim. That is an acceptable exceptional outcome and an unacceptable ordinary one. Leaving the drain at one hold would make it fire during work that is proceeding normally and within budget.
+
+*What does **not** change:* `Validate()`'s floor on the reclaim bound. That bound is per claim, and each claim is fenced independently, so a second channel's claim does not extend the first's hold. Only the wait for the whole message changes.
+
+*Alternative considered:* delivering a message's preferences concurrently, which would keep the drain at one hold. Rejected: it multiplies the connections one message holds, and the sequential shape is what makes the disposition table — one verdict for the message — straightforward to reason about.
+
+### 12. The constraint migration is a guarded statement inside the existing advisory-locked `Migrate`
 
 `internal/notification`'s `Migrate` already takes `pg_advisory_xact_lock` and runs its statements in one transaction. The constraint swap is added there, guarded on `pg_constraint` so it is a no-op once applied and safe to re-execute on every startup — the pattern `internal/video`'s schema already uses for statements that must reach a database whose table exists.
 
@@ -138,6 +152,8 @@ For a webhook, a recorded `delivered` means the receiver answered 2xx. For e-mai
 - **`net/smtp` is frozen to new features** → What the adapter needs is stable and covered. The `Deliverer` port confines a future replacement to one package, exactly as it would confine a change of HTTP client.
 - **A bounce is invisible, so `delivered` overstates what is known** → Stated in the capability rather than left to inference (decision 10). An operator reading `notification_deliveries` is told what the status means.
 - **A failure to reach the relay is a failure for every e-mail preference at once, unlike a webhook failure which is one endpoint** → It is still bounded by the same attempt budget and recorded per preference, so the blast radius is visible in the delivery table rather than silent. It does not affect webhook preferences for the same event: they are separate claims and separate attempts.
+- **A relay that accepts the connection and then stalls would exceed the per-attempt bound** → Decision 6: an absolute deadline on the connection covering the whole conversation, not just the dial, plus closing it on cancellation. Without it `MaxClaimHold()` is not an upper bound and the reclaim-bound validation is decorative.
+- **A non-ASCII address is registrable but unsendable, because `net/smtp` does not negotiate SMTPUTF8** → Registration refuses non-ASCII addresses and bounds the value at 254 bytes, so the stored-and-never-honoured outcome is refused where its owner can see it. Named in the capability as a transport property, so adopting an SMTPUTF8-capable client and relaxing the rule stay one change.
 - **Widening the CHECK on a live table takes a lock** → It runs inside the advisory-locked transaction two replicas already serialise on, the table is small, and the statement is guarded so it executes at most once.
 
 ## Migration Plan
