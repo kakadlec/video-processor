@@ -1,4 +1,4 @@
-package main
+package contracts_test
 
 import (
 	"context"
@@ -18,18 +18,12 @@ import (
 	videopostgres "video-processor/internal/video/infrastructure/postgres"
 )
 
-// What is left in this file is the cross-context pin tests and the fixtures
-// they need. The preference routes and their suite moved to
-// cmd/notification-api with the Notification module; these did not follow,
-// because they are about neither service's routes — they assert that the two
-// contexts' independently-declared literals still agree, which only a package
-// importing both can see. cmd/api is that package until internal/contracts
-// takes the role over.
-
-// 5.11 pins the literals internal/notification/domain deliberately declares
+// Pins the literals internal/notification/domain deliberately declares
 // itself rather than importing, the dependency rules having forbidden the
-// import. cmd/api is the composition root and the only package that
-// legitimately sees both contexts, so this is where the two can be compared.
+// import. No composition root imports two contexts any more, so there is no
+// process left that could compare them; this test-only package is where the
+// two can still be seen at once, on the terms doc.go states.
+//
 // Without it a rename or a generation bump on one side would drift silently:
 // a delivery consumer would resolve every terminal event against an event
 // type no stored preference names. In the spirit of
@@ -90,9 +84,11 @@ func TestNotificationTerminalTopologyMatchesTheEmittedTopology(t *testing.T) {
 // error at all. A notifier reading such a message would announce job "" and
 // link to no artifact.
 //
-// Skipped rather than failed without VIDEO_POSTGRES_TEST_DSN: cmd/api's
-// TestMain gates ffmpeg, MinIO, and the broker URL, and this is the one test
-// in the package that needs a database.
+// Skipped rather than failed without VIDEO_POSTGRES_TEST_DSN. This package
+// has no TestMain and needs none: it is the only test here that touches a
+// database, and every other assertion in it compares values that are always
+// available. Failing hard would make a whole class of contract pin
+// unrunnable on a machine with no PostgreSQL, to gate one test.
 func TestNotificationTerminalMessagesDecodeTheEmittedPayloads(t *testing.T) {
 	db := videoPinTestDB(t)
 	ctx := context.Background()

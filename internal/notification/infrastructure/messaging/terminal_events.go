@@ -17,9 +17,9 @@ import (
 // renamed on the producer's side decodes here as its zero value, so a
 // notification would be sent naming job "" or carrying no artifact key at
 // all, and the decode would return no error.
-// TestNotificationTerminalMessagesDecodeTheEmittedPayloads in cmd/api is what
-// pins them, against the bytes the producer actually stores rather than
-// against a fixture written from this file.
+// TestNotificationTerminalMessagesDecodeTheEmittedPayloads in
+// internal/contracts is what pins them, against the bytes the producer
+// actually stores rather than against a fixture written from this file.
 type JobCompletedMessage struct {
 	Type       string    `json:"type"`
 	JobID      string    `json:"job_id"`

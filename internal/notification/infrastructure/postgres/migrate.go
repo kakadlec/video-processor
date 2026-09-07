@@ -29,8 +29,8 @@ const (
 // CREATE TABLE IF NOT EXISTS is idempotent once the table exists, but it
 // does not serialize two *first-time* creates: two replicas starting
 // together can both find the table absent, and one then fails on a catalog
-// uniqueness violation — which at cmd/api startup means a replica that
-// refuses to boot. The lock makes the second one wait and then find the
+// uniqueness violation — which at cmd/notification-api or cmd/notifier
+// startup means a replica that refuses to boot. The lock makes the second one wait and then find the
 // table present.
 //
 // This is deliberately stricter than the identity and video adapters, which

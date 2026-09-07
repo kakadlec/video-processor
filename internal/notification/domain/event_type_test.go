@@ -47,9 +47,9 @@ func TestParseEventType(t *testing.T) {
 
 func TestEventTypeConstantValues(t *testing.T) {
 	// These literals are the wire contract with the Video Processing
-	// context, which declares its own copies. cmd/api pins the two against
-	// each other; this pins ours against the string itself, so a rename
-	// here cannot pass by editing both sides of that comparison.
+	// context, which declares its own copies. internal/contracts pins the
+	// two against each other; this pins ours against the string itself, so a
+	// rename here cannot pass by editing both sides of that comparison.
 	if domain.EventTypeVideoJobCompleted != "video_job.completed.v1" {
 		t.Fatalf("EventTypeVideoJobCompleted = %q", domain.EventTypeVideoJobCompleted)
 	}

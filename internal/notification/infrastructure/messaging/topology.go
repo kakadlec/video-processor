@@ -9,11 +9,11 @@
 // event is handled, which is the same reason the domain declares its own
 // UserID and its own copies of the two event-type strings.
 //
-// Copying is only safe while the copy is pinned, and it is: cmd/api is the
-// one composition root that legitimately imports both contexts, and
+// Copying is only safe while the copy is pinned, and it is: no composition
+// root imports both contexts any more, so
 // TestNotificationTerminalTopologyMatchesTheEmittedTopology and
-// TestNotificationTerminalMessagesDecodeTheEmittedPayloads there fail if
-// either side drifts. Without them the drift would be silent in both
+// TestNotificationTerminalMessagesDecodeTheEmittedPayloads live in
+// internal/contracts and fail if either side drifts. Without them the drift would be silent in both
 // directions — a renamed exchange leaves this consumer bound to a queue
 // nothing publishes to, and a renamed payload field decodes as a zero value.
 package messaging
@@ -54,8 +54,8 @@ const (
 // The routing keys are the domain's event-type constants rather than fresh
 // literals of this package's own. They are the same two strings, and writing
 // them twice inside one context would put a drift beyond the reach of the
-// pin: cmd/api compares the domain's copies with the ones Video Processing
-// emits, so a literal here that disagreed with the domain would bind the
+// pin: internal/contracts compares the domain's copies with the ones Video
+// Processing emits, so a literal here that disagreed with the domain would bind the
 // queue under a key no stored preference is ever resolved against, and
 // nothing would report it.
 func TerminalEventsTopology() rabbitmq.Topology {

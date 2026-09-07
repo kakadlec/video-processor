@@ -14,12 +14,13 @@ var ErrInvalidEventType = errors.New("notification: invalid event type")
 // Processing internals is a rule about imports and it holds at rest, not
 // only while an event is being handled.
 //
-// The duplication is pinned rather than left loose. cmd/api is the
-// composition root and the only package that legitimately sees both
-// contexts, so TestNotificationEventTypesMatchTheEmittedTerminalEventTypes
-// lives there and fails if either side is renamed or re-versioned alone.
-// Without it the drift would be silent: a consumer would resolve every
-// delivered event against an event type no stored preference names.
+// The duplication is pinned rather than left loose. No composition root
+// imports both contexts any more, so
+// TestNotificationEventTypesMatchTheEmittedTerminalEventTypes lives in
+// internal/contracts — the test-only package that exists to see both — and
+// fails if either side is renamed or re-versioned alone. Without it the
+// drift would be silent: a consumer would resolve every delivered event
+// against an event type no stored preference names.
 const (
 	EventTypeVideoJobCompleted = "video_job.completed.v1"
 	EventTypeVideoJobFailed    = "video_job.failed.v1"

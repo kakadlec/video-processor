@@ -10,8 +10,9 @@ import (
 
 // EnvAllowInsecureDestinations names the variable that relaxes the
 // destination policy. One variable, and one parser for it, read by both
-// composition roots: cmd/api judges a destination when it is registered and
-// cmd/notifier judges the address when it is dialled, and a deployment where
+// composition roots: cmd/notification-api judges a destination when it is
+// registered and cmd/notifier judges the address when it is dialled, and a
+// deployment where
 // those two disagree either stores destinations it can never deliver to or
 // refuses at dial what it accepted at write time.
 const EnvAllowInsecureDestinations = "NOTIFICATION_ALLOW_INSECURE_DESTINATIONS"
