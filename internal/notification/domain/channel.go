@@ -33,6 +33,20 @@ func ParseChannel(raw string) (Channel, error) {
 	}
 }
 
+// AllChannels returns the closed set, as parsed values.
+//
+// It exists so a composition root can be exhaustive over the set rather than
+// listing the channels it happens to remember: a channel added above with no
+// delivery implementation composed for it is then a startup failure, not a
+// delivery-time one, which is the same argument the set being closed makes
+// in the first place — a preference the system stores and never acts on is
+// indistinguishable to its owner from one that works.
+//
+// A fresh slice each call, so no caller can edit the set for every other.
+func AllChannels() []Channel {
+	return []Channel{{value: ChannelWebhook}, {value: ChannelEmail}}
+}
+
 // String returns the channel's canonical representation.
 func (c Channel) String() string {
 	return c.value

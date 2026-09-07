@@ -31,6 +31,7 @@ import (
 	notificationdomain "video-processor/internal/notification/domain"
 	notificationmessaging "video-processor/internal/notification/infrastructure/messaging"
 	notificationpostgres "video-processor/internal/notification/infrastructure/postgres"
+	notificationsmtp "video-processor/internal/notification/infrastructure/smtp"
 	notificationwebhook "video-processor/internal/notification/infrastructure/webhook"
 	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 )
@@ -39,12 +40,14 @@ import (
 const consumerTag = "notification-notifier"
 
 // drainGrace is what the shutdown drain allows on top of the longest a
-// claimant may legitimately hold a claim.
+// claimant may legitimately hold this message's claims.
 //
 // The drain is that hold plus this rather than a round constant, so that
 // lowering a delivery term shortens the wait with it. The grace covers what
 // the budget does not: the broker round trip that acknowledges the delivery
-// once the outcome is recorded.
+// once the outcome is recorded. It is added once for the message rather than
+// once per channel, because there is one acknowledgement however many
+// preferences the message resolved to.
 const drainGrace = 30 * time.Second
 
 // The delivery budget's operator-tunable terms.
@@ -113,15 +116,40 @@ type notifierDeps struct {
 	deliver *notificationapplication.DeliverNotification
 }
 
-// drainTimeout is how long shutdown waits for the delivery in hand.
+// drainTimeout is how long shutdown waits for the message in hand.
 //
-// The sum cannot overflow, and that is an invariant setupNotifier holds
-// rather than a property of this struct: it validates the configuration
-// before any notifierDeps exists, and Validate refuses any configuration
-// whose hold does not leave room for twice itself — so the hold this adds to
-// is at most half the representable range.
+// One claim hold per channel, not one in total. The triple that identifies a
+// preference allows one per channel per event type, and DeliverNotification
+// handles a message's preferences one after another, so a single delivery
+// can legitimately consume the whole budget once for each channel. Sizing
+// this from a single hold would make the drain expire during work that is
+// proceeding normally and within budget — turning the skipped pool close
+// from the exceptional path into the ordinary one.
+//
+// It is derived from the closed channel set rather than written as a
+// constant, so a channel added there moves this with it.
+//
+// Note what does not change: Validate's floor on the reclaim bound. That
+// bound is per claim, and each claim is fenced independently, so a second
+// channel's claim does not extend the first one's hold.
+//
+// The arithmetic saturates rather than wrapping, for the reason MaxClaimHold
+// itself does: a wrapped total is negative and would invert every comparison
+// it feeds, here turning the drain into no wait at all.
 func (d *notifierDeps) drainTimeout() time.Duration {
-	return d.config.MaxClaimHold() + drainGrace
+	hold := d.config.MaxClaimHold()
+
+	total := time.Duration(0)
+	for range notificationdomain.AllChannels() {
+		if total > math.MaxInt64-hold {
+			return math.MaxInt64
+		}
+		total += hold
+	}
+	if total > math.MaxInt64-drainGrace {
+		return math.MaxInt64
+	}
+	return total + drainGrace
 }
 
 // setupNotifier builds the Notification context's dependencies.
@@ -151,6 +179,17 @@ func setupNotifier(ctx context.Context) (*notifierDeps, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Required, like every other channel's send configuration: a notifier
+	// that cannot send by e-mail is one whose e-mail preferences are stored
+	// and silently never honoured, which is the outcome the closed channel
+	// set exists to prevent. Read here with the rest of the configuration
+	// and before any I/O, so a missing variable is reported as a missing
+	// variable rather than as a failure to reach something this process was
+	// never told how to reach.
+	smtpConfig, err := notificationsmtp.LoadConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
 
 	config, err := loadDeliveryConfig()
 	if err != nil {
@@ -172,11 +211,20 @@ func setupNotifier(ctx context.Context) (*notifierDeps, error) {
 
 	log.Printf("notification: notifier: destination policy: insecure destinations allowed=%t", policy.AllowsInsecure())
 
-	// The transport's timeout is the configured one, not a constant of its
-	// own. MaxClaimHold — and with it the reclaim bound the whole claim
-	// protocol is sized against — is arithmetic over config.Timeout, so a
-	// client bounded by anything else makes that arithmetic a lie.
-	deliverer := notificationwebhook.NewClient(policy, config.Timeout)
+	// Both transports take the configured timeout, not a constant of their
+	// own and not one each. MaxClaimHold — and with it the reclaim bound the
+	// whole claim protocol is sized against — is arithmetic over
+	// config.Timeout, so a client bounded by anything else makes that
+	// arithmetic a lie, and a per-channel bound would make the hold a
+	// maximum across channels that the validator cannot reproduce.
+	deliverer, err := newChannelDeliverer(map[string]notificationdomain.Deliverer{
+		notificationdomain.ChannelWebhook: notificationwebhook.NewClient(policy, config.Timeout),
+		notificationdomain.ChannelEmail:   notificationsmtp.NewClient(smtpConfig, config.Timeout),
+	})
+	if err != nil {
+		closeDB(db)
+		return nil, err
+	}
 
 	return &notifierDeps{
 		rabbit: rabbitConfig,

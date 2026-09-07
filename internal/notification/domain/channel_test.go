@@ -105,3 +105,43 @@ func TestChannel_ZeroValueDoesNotSign(t *testing.T) {
 		t.Fatal("zero-value Channel should not report Signs() == true")
 	}
 }
+
+// AllChannels is what a composition root is exhaustive over, so it has to
+// equal the set ParseChannel accepts rather than a list maintained beside
+// it. Both directions: every value it returns parses, and every accepted
+// value appears in it.
+func TestAllChannels_EqualsTheAcceptedSet(t *testing.T) {
+	all := domain.AllChannels()
+
+	seen := make(map[string]bool, len(all))
+	for _, channel := range all {
+		if channel.IsZero() {
+			t.Fatal("AllChannels returned a zero-value Channel")
+		}
+		if _, err := domain.ParseChannel(channel.String()); err != nil {
+			t.Fatalf("AllChannels returned %q, which ParseChannel refuses", channel)
+		}
+		if seen[channel.String()] {
+			t.Fatalf("AllChannels returned %q twice", channel)
+		}
+		seen[channel.String()] = true
+	}
+
+	for _, accepted := range []string{domain.ChannelWebhook, domain.ChannelEmail} {
+		if !seen[accepted] {
+			t.Fatalf("AllChannels omits %q, which ParseChannel accepts", accepted)
+		}
+	}
+}
+
+// A caller editing the returned slice must not edit it for the next one.
+func TestAllChannels_ReturnsAFreshSlice(t *testing.T) {
+	first := domain.AllChannels()
+	first[0] = domain.Channel{}
+
+	for _, channel := range domain.AllChannels() {
+		if channel.IsZero() {
+			t.Fatal("AllChannels shares its backing array between calls")
+		}
+	}
+}
