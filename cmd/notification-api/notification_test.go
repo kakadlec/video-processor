@@ -667,8 +667,8 @@ const deliveryUseCaseFile = "deliver_notification.go"
 // deliveryUseCaseConstructor is how that file would be reached from a
 // composition root. Naming the constructor is not the same check as naming
 // the repository method: a wiring line calls the former and never mentions
-// the latter, so a scan for the method alone would report a clean cmd/api
-// that in fact builds the use case that loads secrets.
+// the latter, so a scan for the method alone would report a clean composition
+// root that in fact builds the use case that loads secrets.
 const deliveryUseCaseConstructor = "NewDeliverNotification"
 
 // TestTheHTTPCompositionRootDoesNotLoadTheSecret is the assertion that
@@ -683,9 +683,17 @@ const deliveryUseCaseConstructor = "NewDeliverNotification"
 // queries: a call that is never executed is invisible to a test that runs
 // the program.
 //
-// Two halves, because "no path under cmd/api reaches it" is not the same as
-// "no file under cmd/notification-api names it". The first half is the direct call; the
-// second is the indirect one, through the two use cases this root does wire.
+// Re-targeted here from cmd/api, and the claim is strictly stronger for the
+// move: the Identity and Video services no longer link the Notification
+// context's repository at all, so for them the property is enforced by the
+// build rather than by a test. This is the one HTTP service left that could
+// reach the operation, which is why the assertion follows the routes rather
+// than staying behind.
+//
+// Two halves, because "no file under cmd/notification-api names the method"
+// is not the same as "no path under cmd/notification-api reaches it". The
+// first half is the direct call; the second is the indirect one, through the
+// use cases this root does wire.
 func TestTheHTTPCompositionRootDoesNotLoadTheSecret(t *testing.T) {
 	// Paths are relative to the repository root, not to this package:
 	// TestMain chdirs there so the tests run with the same working directory

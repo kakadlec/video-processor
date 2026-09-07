@@ -103,12 +103,11 @@ func newTestAuthenticatorWithTokens(t *testing.T) (*authenticator, testTokens) {
 	return newAuthenticator(tokens.verifier), tokens
 }
 
-// newTestAuthenticatorWithTokens also returns the token pair backing the
-// module, so tests can mint tokens under the key the module verifies against.
-// This process no longer issues one over HTTP: a fixture that needs a token
-// mints it here, with the test private key, which is both the only way left
-// and the more honest one — obtaining it from /api/auth/login tested
-
+// newProtectedTestServer mounts requireBearerAuth over a single probe route
+// that echoes the UserID the middleware stored, so the assertions below can
+// tell "the request was let through" from "the right subject was carried
+// into the handler" — a middleware that authorized correctly but wrote
+// nothing to the context would otherwise pass every status-code check.
 func newProtectedTestServer(t *testing.T, module *authenticator) *httptest.Server {
 	t.Helper()
 	router := gin.New()
