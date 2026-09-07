@@ -1,10 +1,7 @@
 package main
 
 import (
-	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -12,78 +9,46 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"video-processor/internal/identity/application"
 	"video-processor/internal/identity/domain"
-	"video-processor/internal/identity/infrastructure/idgen"
 	"video-processor/internal/identity/infrastructure/jwtauth"
-	"video-processor/internal/identity/infrastructure/password"
-	"video-processor/internal/identity/infrastructure/postgres"
 )
 
+// systemClock is the production Clock for every module in this process. It
+// lived here when Identity was the only context that needed one; the Video
+// and Notification modules use it too, which is why it stays behind while
+// the rest of Identity's account handling leaves.
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now() }
 
-// identityModule wires the Identity bounded context's use cases to the HTTP layer.
+// identityModule is what is left of the Identity bounded context in this
+// process: a token verifier and the middleware over it. Registering and
+// logging in moved to cmd/identity-api, and with them the private key, the
+// user repository and the pool behind it — this process authenticates
+// callers, it does not administer accounts.
 type identityModule struct {
-	registerUser     *application.RegisterUser
-	authenticateUser *application.AuthenticateUser
-	tokens           domain.TokenVerifier
+	tokens domain.TokenVerifier
 }
 
-func newIdentityModule(registerUser *application.RegisterUser, authenticateUser *application.AuthenticateUser, tokens domain.TokenVerifier) *identityModule {
-	return &identityModule{registerUser: registerUser, authenticateUser: authenticateUser, tokens: tokens}
+func newIdentityModule(tokens domain.TokenVerifier) *identityModule {
+	return &identityModule{tokens: tokens}
 }
 
-// setupIdentity builds the production Identity module from environment
-// configuration. Identity configuration is always required: any missing or
-// invalid piece — including both variables being entirely absent — fails
-// startup clearly rather than running with unsafe defaults.
-func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
-	pgConfig, pgErr := postgres.LoadConfigFromEnv()
-	if pgErr != nil {
-		return nil, nil, fmt.Errorf("identity: %w", pgErr)
-	}
-
-	issuer, err := jwtauth.LoadIssuerFromEnv()
-	if err != nil {
-		return nil, nil, err
-	}
+// setupIdentity builds this process's Identity module from environment
+// configuration. It loads a verifier and nothing else: there is no code path
+// in this binary that can construct an issuer, so no private key can give it
+// the ability to mint a token. That is the first place the issuer/verifier
+// split earns its keep.
+//
+// The public key set is still required, and its absence is still fatal —
+// a service that starts and then rejects every request is worse than one
+// that refuses to start.
+func setupIdentity() (*identityModule, error) {
 	verifier, err := jwtauth.LoadVerifierFromEnv()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	// Identity holds the public key set only for this check. A mismatched pair
-	// is silent here and loud everywhere it cannot be attributed: Identity
-	// mints successfully and every other service rejects every token it mints.
-	if err := jwtauth.CheckPair(issuer, verifier); err != nil {
-		return nil, nil, err
-	}
-
-	db, err := postgres.Open(pgConfig)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := postgres.Migrate(ctx, db); err != nil {
-		closeDB(db)
-		return nil, nil, err
-	}
-	if err := db.PingContext(ctx); err != nil {
-		closeDB(db)
-		return nil, nil, fmt.Errorf("identity: connect to postgres: %w", err)
-	}
-
-	ids := idgen.New()
-	repo := postgres.NewRepository(db, ids)
-	passwords := password.New()
-	clock := systemClock{}
-
-	module := newIdentityModule(
-		application.NewRegisterUser(repo, ids, passwords, clock),
-		application.NewAuthenticateUser(repo, passwords, issuer, clock),
-		verifier,
-	)
-	return module, db, nil
+	return newIdentityModule(verifier), nil
 }
 
 // closeDB closes db, logging any failure — used on setup-failure paths where
@@ -92,12 +57,6 @@ func closeDB(db *sql.DB) {
 	if err := db.Close(); err != nil {
 		log.Printf("identity: close postgres: %v", err)
 	}
-}
-
-func (m *identityModule) registerRoutes(router *gin.Engine) {
-	auth := router.Group("/api/auth")
-	auth.POST("/register", m.handleRegister)
-	auth.POST("/login", m.handleLogin)
 }
 
 // authenticatedUserIDKey is the gin context key under which requireBearerAuth
@@ -145,85 +104,6 @@ func authenticatedUserID(c *gin.Context) (domain.UserID, bool) {
 	return userID, ok
 }
 
-type registerUserRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
-type registerUserResponse struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-type authenticateUserRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
-type authenticateUserResponse struct {
-	AccessToken string    `json:"access_token"`
-	ExpiresAt   time.Time `json:"expires_at"`
-}
-
 type identityErrorResponse struct {
 	Error string `json:"error"`
-}
-
-func (m *identityModule) handleRegister(c *gin.Context) {
-	var req registerUserRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, identityErrorResponse{Error: "invalid request body"})
-		return
-	}
-
-	result, err := m.registerUser.Execute(c.Request.Context(), application.RegisterUserInput{
-		Email:    req.Email,
-		Password: req.Password,
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrInvalidEmail), errors.Is(err, application.ErrPasswordTooShort):
-			c.JSON(http.StatusBadRequest, identityErrorResponse{Error: "invalid email or password"})
-		case errors.Is(err, domain.ErrUserAlreadyExists):
-			c.JSON(http.StatusConflict, identityErrorResponse{Error: "an account with this email already exists"})
-		default:
-			log.Printf("register user: %v", err)
-			c.JSON(http.StatusInternalServerError, identityErrorResponse{Error: "internal server error"})
-		}
-		return
-	}
-
-	c.JSON(http.StatusCreated, registerUserResponse{
-		ID:        result.UserID,
-		Email:     result.Email,
-		CreatedAt: result.CreatedAt,
-	})
-}
-
-func (m *identityModule) handleLogin(c *gin.Context) {
-	var req authenticateUserRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, identityErrorResponse{Error: "invalid request body"})
-		return
-	}
-
-	result, err := m.authenticateUser.Execute(c.Request.Context(), application.AuthenticateUserInput{
-		Email:    req.Email,
-		Password: req.Password,
-	})
-	if err != nil {
-		if errors.Is(err, application.ErrAuthenticationFailed) {
-			c.JSON(http.StatusUnauthorized, identityErrorResponse{Error: "invalid email or password"})
-			return
-		}
-		log.Printf("authenticate user: %v", err)
-		c.JSON(http.StatusInternalServerError, identityErrorResponse{Error: "internal server error"})
-		return
-	}
-
-	c.JSON(http.StatusOK, authenticateUserResponse{
-		AccessToken: result.AccessToken,
-		ExpiresAt:   result.ExpiresAt,
-	})
 }

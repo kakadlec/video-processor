@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -14,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -21,65 +21,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 
-	"video-processor/internal/identity/application"
 	"video-processor/internal/identity/domain"
-	"video-processor/internal/identity/infrastructure/idgen"
 	"video-processor/internal/identity/infrastructure/jwtauth"
-	"video-processor/internal/identity/infrastructure/password"
-	"video-processor/internal/identity/infrastructure/postgres"
 )
-
-// inMemoryUserRepository is a fake domain.UserRepository so these HTTP tests
-// don't need a live PostgreSQL instance. The rest of the module (password
-// hashing, JWT issuance, ID generation) uses the real infrastructure
-// adapters, since none of them perform I/O.
-type inMemoryUserRepository struct {
-	mu      sync.Mutex
-	byID    map[string]*domain.User
-	byEmail map[string]*domain.User
-}
-
-func newInMemoryUserRepository() *inMemoryUserRepository {
-	return &inMemoryUserRepository{
-		byID:    make(map[string]*domain.User),
-		byEmail: make(map[string]*domain.User),
-	}
-}
-
-func (r *inMemoryUserRepository) Create(_ context.Context, user *domain.User) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	key := user.Email().NormalizedForLookup()
-	if _, exists := r.byEmail[key]; exists {
-		return domain.ErrUserAlreadyExists
-	}
-	r.byID[user.ID().String()] = user
-	r.byEmail[key] = user
-	return nil
-}
-
-func (r *inMemoryUserRepository) FindByID(_ context.Context, id domain.UserID) (*domain.User, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	user, ok := r.byID[id.String()]
-	if !ok {
-		return nil, domain.ErrUserNotFound
-	}
-	return user, nil
-}
-
-func (r *inMemoryUserRepository) FindByNormalizedEmail(_ context.Context, normalizedEmail string) (*domain.User, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	user, ok := r.byEmail[normalizedEmail]
-	if !ok {
-		return nil, domain.ErrUserNotFound
-	}
-	return user, nil
-}
 
 func newTestIdentityModule(t *testing.T) *identityModule {
 	t.Helper()
@@ -153,184 +97,14 @@ func newTestTokens(t *testing.T) testTokens {
 
 // newTestIdentityModuleWithTokens also returns the token pair backing the
 // module, so tests can mint tokens under the key the module verifies against.
+// This process no longer issues one over HTTP: a fixture that needs a token
+// mints it here, with the test private key, which is both the only way left
+// and the more honest one — obtaining it from /api/auth/login tested
+// Identity's route a second time inside another context's suite.
 func newTestIdentityModuleWithTokens(t *testing.T) (*identityModule, testTokens) {
 	t.Helper()
-
-	repo := newInMemoryUserRepository()
-	ids := idgen.New()
-	passwords := password.New()
 	tokens := newTestTokens(t)
-
-	module := newIdentityModule(
-		application.NewRegisterUser(repo, ids, passwords, systemClock{}),
-		application.NewAuthenticateUser(repo, passwords, tokens.issuer, systemClock{}),
-		tokens.verifier,
-	)
-	return module, tokens
-}
-
-func postJSON(t *testing.T, url string, payload any) *http.Response {
-	t.Helper()
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("unexpected error marshaling request: %v", err)
-	}
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	return resp
-}
-
-func registerTestAccount(t *testing.T, baseURL, email, password string) {
-	t.Helper()
-	resp := postJSON(t, baseURL+"/api/auth/register", registerUserRequest{Email: email, Password: password})
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("registration status = %d, want %d", resp.StatusCode, http.StatusCreated)
-	}
-}
-
-func TestHandleRegister_Success(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "User@Example.com", Password: "correct-horse"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
-	}
-
-	var got registerUserResponse
-	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
-		t.Fatalf("unexpected error decoding response: %v", err)
-	}
-	if got.Email != "User@example.com" {
-		t.Fatalf("Email = %q, want %q", got.Email, "User@example.com")
-	}
-	if got.ID == "" {
-		t.Fatal("expected a non-empty user id")
-	}
-}
-
-func TestHandleRegister_InvalidEmail(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "not-an-email", Password: "correct-horse"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestHandleRegister_PasswordTooShort(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "user@example.com", Password: "short"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestHandleRegister_DuplicateEmail(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")
-
-	resp := postJSON(t, srv.URL+"/api/auth/register", registerUserRequest{Email: "USER@EXAMPLE.COM", Password: "another-password"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("duplicate registration status = %d, want %d", resp.StatusCode, http.StatusConflict)
-	}
-}
-
-func TestHandleRegister_MalformedBody(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	resp, err := http.Post(srv.URL+"/api/auth/register", "application/json", bytes.NewReader([]byte("not json")))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
-}
-
-func TestHandleLogin_Success(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")
-
-	resp := postJSON(t, srv.URL+"/api/auth/login", authenticateUserRequest{Email: "User@Example.com", Password: "correct-horse"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var got authenticateUserResponse
-	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
-		t.Fatalf("unexpected error decoding response: %v", err)
-	}
-	if got.AccessToken == "" {
-		t.Fatal("expected a non-empty access token")
-	}
-	if !got.ExpiresAt.After(time.Now()) {
-		t.Fatalf("ExpiresAt = %v, want a time in the future", got.ExpiresAt)
-	}
-}
-
-func TestHandleLogin_UnknownEmail(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	resp := postJSON(t, srv.URL+"/api/auth/login", authenticateUserRequest{Email: "nobody@example.com", Password: "correct-horse"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
-	}
-}
-
-func TestHandleLogin_WrongPassword(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")
-
-	resp := postJSON(t, srv.URL+"/api/auth/login", authenticateUserRequest{Email: "user@example.com", Password: "wrong-password"})
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
-	}
-}
-
-func TestHandleLogin_MalformedBody(t *testing.T) {
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newTestVideoModule(t), newNoopNotificationModule(), alwaysAllowRateLimiter{}))
-	defer srv.Close()
-
-	resp, err := http.Post(srv.URL+"/api/auth/login", "application/json", bytes.NewReader([]byte("not json")))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
-	}
+	return newIdentityModule(tokens.verifier), tokens
 }
 
 func newProtectedTestServer(t *testing.T, module *identityModule) *httptest.Server {
@@ -772,78 +546,94 @@ func TestStaticUploadsRouteIsGone(t *testing.T) {
 	}
 }
 
-func TestSetupIdentity_NeitherConfigured_ReturnsError(t *testing.T) {
-	t.Setenv("IDENTITY_POSTGRES_DSN", "")
-	t.Setenv(jwtauth.PrivateKeyEnv, "")
-	t.Setenv(jwtauth.KeyIDEnv, "")
+// The merged spec says only the Identity service can mint a token, and the
+// property that makes it true is that no other binary contains a call able
+// to construct an issuer. That is a claim about source, not about behaviour,
+// so nothing but a scan can hold it: a future change wiring an issuer here
+// for convenience would pass every other test in this package.
+//
+// Same shape as TestTheHTTPCompositionRootDoesNotLoadTheSecret, and the same
+// reason — one privilege, one process, pinned where it could quietly spread.
+func TestOnlyTheIdentityServiceConstructsATokenIssuer(t *testing.T) {
+	constructors := []string{"jwtauth.NewIssuer", "jwtauth.LoadIssuerFromEnv"}
+
+	for _, constructor := range constructors {
+		for _, root := range []string{"api", "worker", "notifier"} {
+			if naming := namingFiles(t, filepath.Join("cmd", root), constructor); len(naming) != 0 {
+				t.Errorf("%v under cmd/%s name %s: only the Identity service may hold the ability to mint a token",
+					naming, root, constructor)
+			}
+		}
+	}
+
+	// One of the two, not each: the Identity service reaches the constructor
+	// through the environment loader, and a scan requiring both names would
+	// fail on the wrapper it is fine not to call directly. What has to hold
+	// is that the capability is reachable there and nowhere else — a run
+	// where it is reachable nowhere would pass every assertion above while
+	// pinning nothing.
+	reachable := false
+	for _, constructor := range constructors {
+		if naming := namingFiles(t, filepath.Join("cmd", "identity-api"), constructor); len(naming) != 0 {
+			reachable = true
+		}
+	}
+	if !reachable {
+		t.Fatalf("no non-test file under cmd/identity-api names any of %v; this scan is passing vacuously", constructors)
+	}
+}
+
+// The three cases this process can still fail on are the verifier's. The
+// private-key, key-id and mismatched-pair cases moved to cmd/identity-api
+// with the issuer they are about, and the DSN case moved with the pool: this
+// binary reads neither.
+func TestSetupIdentity_PublicKeySetMissing_ReturnsError(t *testing.T) {
 	t.Setenv(jwtauth.PublicKeysEnv, "")
 
-	module, db, err := setupIdentity(context.Background())
-	if err == nil {
-		t.Fatal("expected an error when neither IDENTITY_POSTGRES_DSN nor the JWT key configuration is set")
-	}
-	if !errors.Is(err, postgres.ErrDSNRequired) {
-		t.Fatalf("expected error to wrap postgres.ErrDSNRequired, got: %v", err)
+	module, err := setupIdentity()
+	if !errors.Is(err, jwtauth.ErrPublicKeysRequired) {
+		t.Fatalf("error = %v, want %v", err, jwtauth.ErrPublicKeysRequired)
 	}
 	if module != nil {
 		t.Fatalf("expected a nil module on error, got %+v", module)
 	}
-	if db != nil {
-		t.Fatalf("expected a nil db on error, got %+v", db)
+}
+
+func TestSetupIdentity_MalformedPublicKeySet_ReturnsError(t *testing.T) {
+	t.Setenv(jwtauth.PublicKeysEnv, "not json")
+
+	if _, err := setupIdentity(); err == nil {
+		t.Fatal("expected an error for a malformed public key set")
 	}
 }
 
-func TestSetupIdentity_PrivateKeyMissing_ReturnsError(t *testing.T) {
+// A private key is not verification material, and a process handed the full
+// pair as its key set is one line away from being able to mint. This binary
+// has no such line, and it still refuses to start.
+func TestSetupIdentity_PrivateKeyAsVerificationMaterial_ReturnsError(t *testing.T) {
 	tokens := newTestTokens(t)
-	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
-	t.Setenv(jwtauth.PrivateKeyEnv, "")
-	t.Setenv(jwtauth.KeyIDEnv, testTokenKeyID)
+	encoded, err := json.Marshal(map[string]string{testTokenKeyID: tokens.keys.privatePEM})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	t.Setenv(jwtauth.PublicKeysEnv, string(encoded))
+
+	if _, err := setupIdentity(); !errors.Is(err, jwtauth.ErrPrivateKeyAsVerificationMaterial) {
+		t.Fatalf("error = %v, want %v", err, jwtauth.ErrPrivateKeyAsVerificationMaterial)
+	}
+}
+
+func TestSetupIdentity_LoadsAVerifier(t *testing.T) {
+	tokens := newTestTokens(t)
 	t.Setenv(jwtauth.PublicKeysEnv, testPublicKeySet(t, tokens))
 
-	_, _, err := setupIdentity(context.Background())
-	if !errors.Is(err, jwtauth.ErrPrivateKeyRequired) {
-		t.Fatalf("error = %v, want %v", err, jwtauth.ErrPrivateKeyRequired)
+	module, err := setupIdentity()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-}
-
-func TestSetupIdentity_KeyIDMissing_ReturnsError(t *testing.T) {
-	tokens := newTestTokens(t)
-	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
-	t.Setenv(jwtauth.PrivateKeyEnv, tokens.keys.privatePEM)
-	t.Setenv(jwtauth.KeyIDEnv, "")
-	t.Setenv(jwtauth.PublicKeysEnv, testPublicKeySet(t, tokens))
-
-	_, _, err := setupIdentity(context.Background())
-	if !errors.Is(err, jwtauth.ErrKeyIDRequired) {
-		t.Fatalf("error = %v, want %v", err, jwtauth.ErrKeyIDRequired)
-	}
-}
-
-func TestSetupIdentity_PublicKeySetMissing_ReturnsError(t *testing.T) {
-	tokens := newTestTokens(t)
-	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
-	t.Setenv(jwtauth.PrivateKeyEnv, tokens.keys.privatePEM)
-	t.Setenv(jwtauth.KeyIDEnv, testTokenKeyID)
-	t.Setenv(jwtauth.PublicKeysEnv, "")
-
-	_, _, err := setupIdentity(context.Background())
-	if !errors.Is(err, jwtauth.ErrPublicKeysRequired) {
-		t.Fatalf("error = %v, want %v", err, jwtauth.ErrPublicKeysRequired)
-	}
-}
-
-// A mismatched pair is silent in the one place it can be caught and loud
-// everywhere it cannot be attributed, so it has to fail Identity's startup.
-func TestSetupIdentity_MismatchedKeyPair_ReturnsError(t *testing.T) {
-	tokens := newTestTokens(t)
-	t.Setenv("IDENTITY_POSTGRES_DSN", "postgres://user:pass@localhost:5432/identity")
-	t.Setenv(jwtauth.PrivateKeyEnv, tokens.keys.privatePEM)
-	t.Setenv(jwtauth.KeyIDEnv, "a-key-id-the-public-key-set-does-not-carry")
-	t.Setenv(jwtauth.PublicKeysEnv, testPublicKeySet(t, tokens))
-
-	_, _, err := setupIdentity(context.Background())
-	if !errors.Is(err, jwtauth.ErrKeyPairMismatch) {
-		t.Fatalf("error = %v, want %v", err, jwtauth.ErrKeyPairMismatch)
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	if _, err := module.tokens.Verify(token); err != nil {
+		t.Fatalf("the loaded verifier rejected a token minted under its own key: %v", err)
 	}
 }
 

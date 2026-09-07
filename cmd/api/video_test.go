@@ -858,6 +858,23 @@ func createTestVideoJob(t *testing.T, baseURL, token, originalFilename string) v
 	return result
 }
 
+// postJSON posts without an Authorization header. It moved here from
+// identity_test.go with the last caller that needs it: this process no longer
+// serves a route that takes an unauthenticated JSON body except by mistake,
+// which is what the test below asserts.
+func postJSON(t *testing.T, url string, payload any) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("unexpected error marshaling request: %v", err)
+	}
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return resp
+}
+
 func postJSONWithAuthorization(t *testing.T, url, authorizationHeader string, payload any) *http.Response {
 	t.Helper()
 	body, err := json.Marshal(payload)
