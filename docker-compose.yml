@@ -177,6 +177,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Longer than main.go's 30s shutdownTimeout. Compose sends SIGKILL 10s
+    # after SIGTERM by default, so without this the graceful window the
+    # process asks for cannot be honoured and an in-flight registration is
+    # killed mid-transaction.
+    stop_grace_period: 45s
 
   # Runs the same Dockerfile used for deployment, built to its default
   # "runtime" target (hardened, non-root, no Go toolchain — see the
@@ -208,13 +213,6 @@ services:
       # key — a set, so a rotation can hold the outgoing and incoming keys at
       # once — and is read by every service that verifies.
       IDENTITY_JWT_PUBLIC_KEYS: ${IDENTITY_JWT_PUBLIC_KEYS:?run "make dev-keys" to generate a local key pair}
-      # Points at the isolated identity_test database (not the runtime
-      # "identity" database above) so `docker compose run app-test go test`
-      # can't TRUNCATE data the running app actually uses. Unused by "app"
-      # itself (it never runs tests) but kept here to match "app-test"
-      # exactly, per this change's approved design (app-test mirrors app's
-      # environment; app's own definition is otherwise unchanged).
-      IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
       # video_jobs/video_job_outbox live in the Video context's own
       # "video" database — same PostgreSQL server as identity_users, a
       # different database. Deliberately not the IDENTITY_* value: a
@@ -276,6 +274,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # Same reason as identity-api above, and it matters more here: shutdown
+    # joins the outbox relay, which holds a database transaction while it
+    # runs. The 10s default would SIGKILL it mid-claim.
+    stop_grace_period: 45s
 
   # The other half of the cutover: same image as "app", different binary.
   # POST /upload now only queues a job, so without this service running,

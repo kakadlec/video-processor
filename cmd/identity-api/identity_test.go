@@ -26,7 +26,7 @@ import (
 )
 
 // No TestMain. These tests drive this service's own router over an in-memory
-// user repository and never open a database, so a IDENTITY_POSTGRES_TEST_DSN
+// user repository and never open a database, so an IDENTITY_POSTGRES_TEST_DSN
 // gate would guard nothing — the real adapter is covered by
 // internal/identity/infrastructure/postgres's own suite. The ffmpeg and
 // VIDEO_MINIO_* gates cmd/api's TestMain enforces are gone with the

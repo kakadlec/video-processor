@@ -45,7 +45,7 @@ func main() {
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
-	fmt.Println("🔐 Identity API iniciada na porta 8080")
+	fmt.Println("🔐 Identity API listening on port 8080")
 
 	serverFailed := make(chan error, 1)
 	go func() {
