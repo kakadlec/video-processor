@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the HTTP-layer contract for `POST /api/video-jobs`, `GET /api/video-jobs/:id`, and `GET /api/video-jobs` — routes, request/response shapes, bearer-auth and ownership enforcement, and error-status mapping — wrapping the `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs` use cases defined in `videojob-lifecycle`. This capability owns only the `cmd/api` HTTP surface; the use cases it calls, and the pure `JobStatus` transition logic, remain `videojob-lifecycle`'s responsibility. No code path reachable from these endpoints triggers processing — see the "Jobs Created Through This API Have No Processing Trigger" requirement below. `GET /api/video-jobs/:id` does, however, now carry a second role: it is the status channel a `POST /upload` acknowledgement names, so a client polls it to learn an outcome the submission no longer returns.
+Define the HTTP-layer contract for `POST /api/video-jobs`, `GET /api/video-jobs/:id`, and `GET /api/video-jobs` — routes, request/response shapes, bearer-auth and ownership enforcement, and error-status mapping — wrapping the `CreateVideoJob`, `GetJobStatus`, and `ListUserJobs` use cases defined in `videojob-lifecycle`. This capability owns only the `cmd/video-api` HTTP surface; the use cases it calls, and the pure `JobStatus` transition logic, remain `videojob-lifecycle`'s responsibility. No code path reachable from these endpoints triggers processing — see the "Jobs Created Through This API Have No Processing Trigger" requirement below. `GET /api/video-jobs/:id` does, however, now carry a second role: it is the status channel a `POST /upload` acknowledgement names, so a client polls it to learn an outcome the submission no longer returns.
 
 ## Requirements
 

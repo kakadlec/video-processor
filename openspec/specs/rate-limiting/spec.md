@@ -2,13 +2,17 @@
 
 ## Purpose
 
-Define the Redis-backed, per-authenticated-user request rate limiter applied to every route in `cmd/api`'s `videoRoutes` group: threshold/window configuration, the fixed-window counting algorithm's observable behavior, the `429`/`Retry-After` rejection contract, and the fail-open behavior when the Redis-backed check itself is unavailable. This is the second Phase 4 feature (of idempotency keys, rate limiting, status cache) to consume `internal/platform/redis` (`redis-infrastructure`), implementing the "Rate limiting rejects excess requests" behavior `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement already documents at the target-state level.
-
+Define the Redis-backed, per-authenticated-user request rate limiter applied to every authenticated route across the HTTP services that mount it: threshold/window configuration, the fixed-window counting algorithm's observable behavior, the `429`/`Retry-After` rejection contract, and the fail-open behavior when the Redis-backed check itself is unavailable. This is the second Phase 4 feature (of idempotency keys, rate limiting, status cache) to consume `internal/platform/redis` (`redis-infrastructure`), implementing the "Rate limiting rejects excess requests" behavior `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement already documents at the target-state level.
 ## Requirements
-
 ### Requirement: Authenticated Video Routes Are Rate Limited Per User
 
-`cmd/api` SHALL apply a Redis-backed, per-authenticated-user request rate limit to every route in the `videoRoutes` group (everything gated by `identity.requireBearerAuth()`: `POST /upload`, `POST /api/video-jobs`, `GET /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /download/:filename`, and `GET /api/status`). A request that exceeds the configured limit within the current window SHALL be rejected with `429 Too Many Requests` before any handler-specific logic (including `ffmpeg` invocation) runs. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, `/`, static assets) are out of scope.
+Every HTTP service that serves bearer-authenticated routes SHALL apply a Redis-backed, per-authenticated-user request rate limit to all of them. `cmd/video-api` applies it to everything gated by `requireBearerAuth()` (`POST /upload`, `POST /api/video-jobs`, `GET /api/video-jobs`, `GET /api/video-jobs/:id`, `GET /download/:filename`, and `GET /api/status`); `cmd/notification-api` applies it to `GET` and `PUT /api/notification-preferences`. A request that exceeds the configured limit within the current window SHALL be rejected with `429 Too Many Requests` before any handler-specific logic (including `ffmpeg` invocation) runs. Unauthenticated routes (`/api/auth/register`, `/api/auth/login`, `/`, static assets) are out of scope, and `cmd/identity-api` mounts no limiter at all — it serves no route with an authenticated user to key on.
+
+**The budget is one budget, not one per service.** The services share a Redis instance and the same key format, so a user's `RATE_LIMIT_MAX_REQUESTS` per window is their allowance across the whole system. Namespacing the counter per service would silently multiply every user's allowance by the number of services, which is a behavior change and SHALL NOT be introduced as a side effect of how the processes are divided. This is why a service that owns no cache and no idempotency store still requires `REDIS_ADDR`: the limiter is a genuine dependency of its middleware.
+
+**One budget requires one configuration, not merely one counter.** `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` SHALL be configured identically for every service that mounts the limiter, from a single source in the deployment configuration. Sharing the Redis instance and the key format is necessary but not sufficient: the count is shared while the threshold and the window are each service's own, so services configured differently would compare one count against two thresholds, and the window's duration would be fixed by whichever service's request happened to create the key. The effective limit would then depend on which route a user's requests took and in what order — which is not a rate limit anyone can reason about, and would present as an intermittent bug rather than as a misconfiguration.
+
+The middleware pair and its order — bearer authentication, then the limiter — SHALL hold on every group that carries it, in every service. The pair is the invariant; the grouping is not.
 
 Neither static mount appears in that enumeration any more, because neither exists: `/outputs` went when results moved to object storage, `/uploads` when source videos followed. Every handler in the group returns JSON; none streams an artifact.
 
@@ -16,19 +20,31 @@ Neither static mount appears in that enumeration any more, because neither exist
 
 A `429` returned to a poller SHALL be treated as a back-off signal, not as a job failure. The client SHALL lengthen its interval, honour `Retry-After`, and continue polling; it SHALL NOT report the job as failed, and SHALL NOT retry sooner than the header directs. A job's outcome is what the status endpoint reports when it answers, and a throttled poll has reported nothing.
 
-The limit governs **requests to this API**, and after result downloads became presigned URLs that is narrower than it may read. `GET /download/:filename` issues a URL and is limited; the transfer that URL authorizes happens between the client and the storage service, which this middleware does not sit in front of. A caller held to `RATE_LIMIT_MAX_REQUESTS` issuances per window can still begin that many transfers, and each transfer's bandwidth is unbounded by anything specified here. Bounding artifact egress is an object-storage concern, and no requirement in this capability SHALL be read as constraining it.
+The limit governs **requests to this system's HTTP surface**, and after result downloads became presigned URLs that is narrower than it may read. `GET /download/:filename` issues a URL and is limited; the transfer that URL authorizes happens between the client and the storage service, which this middleware does not sit in front of. A caller held to `RATE_LIMIT_MAX_REQUESTS` issuances per window can still begin that many transfers, and each transfer's bandwidth is unbounded by anything specified here. Bounding artifact egress is an object-storage concern, and no requirement in this capability SHALL be read as constraining it.
 
 #### Scenario: Request within the limit succeeds
 
 - **GIVEN** an authenticated user who has made fewer requests than `RATE_LIMIT_MAX_REQUESTS` within the current window
-- **WHEN** they make another request to any route in `videoRoutes`
+- **WHEN** they make another request to any bearer-authenticated route on any service
 - **THEN** the request proceeds to its handler normally, with no `429`
 
 #### Scenario: Request exceeding the limit is rejected
 
 - **GIVEN** an authenticated user who has already made `RATE_LIMIT_MAX_REQUESTS` requests within the current window
-- **WHEN** they make one more request to any route in `videoRoutes`
+- **WHEN** they make one more request to any bearer-authenticated route on any service
 - **THEN** the response is `429 Too Many Requests` with an English-language JSON error body and a `Retry-After` header giving a strictly positive number of whole seconds until the window resets, and no handler-specific logic runs
+
+#### Scenario: The budget is shared across the HTTP services
+
+- **GIVEN** an authenticated user who has exhausted their window against `cmd/video-api`
+- **WHEN** they request `GET /api/notification-preferences`, served by a different process
+- **THEN** the response is `429 Too Many Requests`, because both services count against the same per-user counter
+
+#### Scenario: The limiter configuration is identical across the services
+
+- **GIVEN** the deployed HTTP services that mount the limiter
+- **WHEN** their `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` configuration is inspected
+- **THEN** every one of them holds the same values, supplied from one place, so that the shared counter is compared against one threshold and expires on one window
 
 #### Scenario: Different users are limited independently
 
@@ -108,12 +124,12 @@ The limit governs **requests to this API**, and after result downloads became pr
 
 ### Requirement: Limiter Failure Fails Open Within A Bounded Latency
 
-If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Redis error) rather than returning a normal allow/deny result, `cmd/api`'s rate-limit middleware SHALL allow the request to proceed (fail open) and log the error, rather than rejecting an otherwise-valid request due to an unrelated infrastructure hiccup. The middleware SHALL bound how long it waits on the `Allow` call with a short, fixed per-request timeout, and the shared Redis client SHALL be configured (`ContextTimeoutEnabled: true`) to actually honor that timeout — a passed context has no effect on go-redis v9's real command I/O without it (`baseClient.context()` substitutes `context.Background()` otherwise) — so a Redis outage degrades to "fail open quickly" rather than "every authenticated request stalls for the client's own default timeout before proceeding."
+If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Redis error) rather than returning a normal allow/deny result, the rate-limit middleware in every service that mounts it SHALL allow the request to proceed (fail open) and log the error, rather than rejecting an otherwise-valid request due to an unrelated infrastructure hiccup. The middleware SHALL bound how long it waits on the `Allow` call with a short, fixed per-request timeout, and the shared Redis client SHALL be configured (`ContextTimeoutEnabled: true`) to actually honor that timeout — a passed context has no effect on go-redis v9's real command I/O without it (`baseClient.context()` substitutes `context.Background()` otherwise) — so a Redis outage degrades to "fail open quickly" rather than "every authenticated request stalls for the client's own default timeout before proceeding."
 
 #### Scenario: Redis error does not block the request
 
 - **GIVEN** the Redis client used by the rate limiter returns an error (e.g. connection failure) when `Allow` is called
-- **WHEN** an authenticated user makes a request to a rate-limited route
+- **WHEN** an authenticated user makes a request to a rate-limited route on any service that mounts the middleware
 - **THEN** the request proceeds to its handler as if the rate limit check had passed, and the error is logged
 
 #### Scenario: An unresponsive Redis does not stall the request past the bounded timeout
@@ -121,3 +137,4 @@ If `internal/platform/ratelimit.Limiter.Allow` itself fails (e.g. a transient Re
 - **GIVEN** the Redis client used by the rate limiter neither succeeds nor errors within the middleware's configured timeout (e.g. a network partition where connections hang rather than fail fast)
 - **WHEN** an authenticated user makes a request to a rate-limited route
 - **THEN** the middleware's `Allow` call is bounded by that timeout, after which the request proceeds to its handler (fail open) rather than hanging indefinitely — verified against a real (non-fake) Redis client, using a genuinely in-flight blocking command, not only a fake that honors `ctx.Done()` by construction
+

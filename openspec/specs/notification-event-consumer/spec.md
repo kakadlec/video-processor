@@ -3,16 +3,14 @@
 ## Purpose
 
 Defines the process that reads a video job's terminal outcome off the broker and turns it into a delivery: which entrypoint it is and what configuration it may require, how it obtains the topology and message shapes without importing the context that publishes them, the rule that decides what each message is entitled to — acknowledge, dead-letter, or requeue — and how it shuts down without abandoning the delivery in hand. What is delivered, how it is claimed, signed, and bounded, is `notification-webhook-delivery`'s; the durable record behind the claim is `notification-persistence`'s.
-
 ## Requirements
-
 ### Requirement: Delivery Runs in Its Own Entrypoint, Requiring Only Its Own Configuration
 
-The Notification context's event consumer SHALL be a third entrypoint, `cmd/notifier`, built from the same source tree and shipped in the same image as `cmd/api` and `cmd/worker`, and started as that image with a different command. It SHALL listen on no port.
+The Notification context's event consumer SHALL be its own entrypoint, `cmd/notifier`, built from the same source tree and shipped in the same image as the three HTTP services and `cmd/worker`, and started as that image with a different command. It SHALL listen on no port.
 
 It SHALL require exactly the configuration it uses — the Notification context's own PostgreSQL DSN and the broker URL — and SHALL fail fast with an error naming a missing variable rather than starting in a degraded mode. It SHALL NOT require identity configuration, object-storage configuration, Redis, or `ffmpeg`: it authenticates no caller, stores no artifact, holds no lease, and runs no extraction. Requiring any of them would misrepresent what the process does.
 
-A separate process rather than a goroutine inside an existing one is required for the reason `videojob-terminal-events` gives for placing the terminal relay in the worker, applied to the other direction: an outbound request to a third party must not share a lifecycle with serving HTTP requests, nor with the worker's single-extraction-at-a-time shape. The three processes scale on different axes.
+A separate process rather than a goroutine inside an existing one is required for the reason `videojob-terminal-events` gives for placing the terminal relay in the worker, applied to the other direction: an outbound request to a third party must not share a lifecycle with serving HTTP requests, nor with the worker's single-extraction-at-a-time shape. They scale on different axes.
 
 Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bounded backoff and SHALL redial when the connection or channel is lost.
 
@@ -34,11 +32,11 @@ Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bo
 - **WHEN** `cmd/notifier` starts
 - **THEN** it starts, retries the dial with backoff, and begins consuming once the broker returns
 
-#### Scenario: Each of the three processes starts without the others
+#### Scenario: Each of the processes starts without the others
 
 - **GIVEN** the built image
-- **WHEN** any one of the API, the worker, and the notifier is started alone with its own configuration
-- **THEN** it starts and operates without the other two running
+- **WHEN** any one of the three HTTP services, the worker, and the notifier is started alone with its own configuration
+- **THEN** it starts and operates without any of the others running
 
 ### Requirement: The Consumer Declares the Terminal Topology From the Context's Own Copy of the Names
 
@@ -46,7 +44,7 @@ The consumer SHALL declare the terminal-event topology on every dial, exactly as
 
 The names it declares, and the message structures it decodes, SHALL be declared by the Notification context itself. The context SHALL NOT import any package of the Video Processing context to obtain them. `ddd-architecture` forbids that import as a property of the build, not merely of the moment an event is handled, which is the same reason the context already declares its own `UserID` and its own copies of the two event-type strings.
 
-That duplication SHALL be pinned by a test in a composition root that legitimately imports both contexts, asserting the copied topology names and the copied payload field names equal the ones the Video Processing context publishes. An unpinned copy cannot drift detectably: a renamed exchange would leave the consumer bound to a queue nothing publishes to, and a renamed payload field would decode as its zero value.
+That duplication SHALL be pinned by a test in `internal/contracts`, the test-only package `ddd-architecture` permits to import both contexts, asserting the copied topology names and the copied payload field names equal the ones the Video Processing context publishes. The pin previously lived in a composition root that imported both; splitting the HTTP tier by bounded context left no such root, and the pin is relocated rather than weakened — its permission to cross contexts is now conditional on the package declaring nothing outside its test files. An unpinned copy cannot drift detectably: a renamed exchange would leave the consumer bound to a queue nothing publishes to, and a renamed payload field would decode as its zero value.
 
 The dependency rule SHALL be enforced across **every** package of the Notification context, including its infrastructure packages, rather than across its domain and application packages alone. The infrastructure package that holds the copy is precisely where the temptation to import the original lives.
 
@@ -65,6 +63,11 @@ The dependency rule SHALL be enforced across **every** package of the Notificati
 
 - **WHEN** a payload the Video Processing context writes is decoded by the Notification context's message type
 - **THEN** every field it carries is populated, and none decodes as a zero value because of a name mismatch
+
+#### Scenario: The pinning package holds no production code
+
+- **WHEN** `internal/contracts` is inspected
+- **THEN** it declares nothing outside its `_test.go` files apart from a package comment, and no other package imports it
 
 #### Scenario: No Notification package imports Video Processing
 
@@ -151,7 +154,7 @@ A message that cannot be decoded SHALL NOT be requeued: redelivering it produces
 
 On a termination signal the consumer SHALL stop taking new deliveries, SHALL wait — under a bounded drain — for the delivery in hand to reach a disposition, and SHALL close the database pool that delivery borrows only after that wait has succeeded. The handler SHALL run on a context that shutdown does not cancel, so a signal does not abort an outbound request mid-flight or prevent an outcome from being recorded.
 
-This is the ordering `cmd/api` and `cmd/worker` already hold, for the same reason: closing a handle underneath an operation that borrows it turns a resolvable state into an aborted one. A delivery interrupted after its claim but before its outcome is recorded is exactly the case the reclaim period exists to repair, and shutdown SHALL NOT be a routine way of producing it.
+This is the ordering `cmd/video-api` and `cmd/worker` already hold, for the same reason: closing a handle underneath an operation that borrows it turns a resolvable state into an aborted one. A delivery interrupted after its claim but before its outcome is recorded is exactly the case the reclaim period exists to repair, and shutdown SHALL NOT be a routine way of producing it.
 
 The two rules meet when the drain expires, and the resolution SHALL be stated rather than left to the implementation: at that point the handler is still running on its detached context, so it can never be joined, and "close only after the join" and "exit at the bound" cannot both be honoured. **The bound SHALL win.** The process SHALL exit without an orderly close of the pool, and this SHALL be a named exception to the ordering above rather than a violation of it. Nothing is lost by it that the reclaim bound does not already cover: an unresolved claim left by an aborted process is precisely the state a later consumer reclaims, and a pool closed by process exit releases the same connections the server would reclaim on the closed socket. Skipping the close is chosen over extending the wait because an unbounded wait turns one hung destination into a process that never terminates.
 
@@ -172,3 +175,4 @@ The two rules meet when the drain expires, and the resolution SHALL be stated ra
 - **GIVEN** a delivery that does not finish within the drain bound
 - **WHEN** the bound elapses
 - **THEN** the process exits rather than hanging, the orderly pool close is skipped rather than waited on, and the unresolved claim is reclaimable by a later consumer
+

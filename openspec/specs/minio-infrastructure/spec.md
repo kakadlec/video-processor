@@ -194,7 +194,7 @@ It SHALL NOT extend that tolerance to a bucket owned by a different account. In 
 
 This capability's tests SHALL exercise `Open`, `Ping`, and `EnsureBucket` against a real MinIO instance rather than a mock, configured through `VIDEO_MINIO_TEST_ENDPOINT`, `VIDEO_MINIO_TEST_ACCESS_KEY`, `VIDEO_MINIO_TEST_SECRET_KEY`, and `VIDEO_MINIO_TEST_BUCKET`. The test bucket SHALL be distinct from the runtime `VIDEO_MINIO_BUCKET`, so a test that creates or deletes buckets cannot disturb a locally running application's artifacts. When those variables are unset **this package's** tests SHALL skip with a clear message rather than fail.
 
-That skip is scoped to this package. It previously carried the further claim that `go test ./...` therefore still passes on a machine with no MinIO available, which is no longer true and is corrected here rather than left standing: `cmd/api`'s `TestMain` requires MinIO the same way it already requires `ffmpeg`, exiting non-zero with a clear message when the configuration is absent. That is deliberate — `POST /upload` stores its result in a bucket, `GET /api/status` reads that object's size and modification time back from one, and `GET /download/:filename` confirms the object exists there before issuing a URL for it, so a suite that skipped those silently would report green while covering none of its own core behavior.
+That skip is scoped to this package. It previously carried the further claim that `go test ./...` therefore still passes on a machine with no MinIO available, which is no longer true and is corrected here rather than left standing: `cmd/video-api`'s `TestMain` requires MinIO the same way it already requires `ffmpeg`, exiting non-zero with a clear message when the configuration is absent. That is deliberate — `POST /upload` stores its result in a bucket, `GET /api/status` reads that object's size and modification time back from one, and `GET /download/:filename` confirms the object exists there before issuing a URL for it, so a suite that skipped those silently would report green while covering none of its own core behavior.
 
 Any test that creates a bucket SHALL remove it, and its objects, when it finishes — including when it fails. The local MinIO service keeps its data in a named volume, so a bucket left behind accumulates across every later run.
 
@@ -213,7 +213,7 @@ Any test that creates a bucket SHALL remove it, and its objects, when it finishe
 #### Scenario: The application's own test suite requires MinIO rather than skipping
 
 - **GIVEN** the runtime `VIDEO_MINIO_*` variables are unset
-- **WHEN** `cmd/api`'s test suite starts
+- **WHEN** `cmd/video-api`'s test suite starts
 - **THEN** it exits non-zero with a message naming what is missing and pointing at the Docker fallback, rather than skipping the tests that exercise result storage
 
 #### Scenario: A test that creates a bucket leaves nothing behind

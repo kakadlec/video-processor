@@ -3,21 +3,19 @@
 ## Purpose
 
 Defines how the Notification bounded context persists its own state: the connection string it requires at startup, the shape and uniqueness of the stored preference, how its schema is created, and where its connection pool sits in the API's shutdown sequence.
-
 ## Requirements
-
 ### Requirement: Notification Owns Its Own PostgreSQL Configuration
 
-The Notification context SHALL read its connection string from `NOTIFICATION_POSTGRES_DSN` and SHALL NOT read, share, or fall back to `IDENTITY_POSTGRES_DSN` or `VIDEO_POSTGRES_DSN`. The variable SHALL be required at the startup of **every process that uses the context** — `cmd/api` and `cmd/notifier` alike: when it is absent, startup SHALL fail with a clear error naming the variable rather than starting a process that cannot serve a preference request or resolve an event.
+The Notification context SHALL read its connection string from `NOTIFICATION_POSTGRES_DSN` and SHALL NOT read, share, or fall back to `IDENTITY_POSTGRES_DSN` or `VIDEO_POSTGRES_DSN`. The variable SHALL be required at the startup of **every process that uses the context** — `cmd/notification-api` and `cmd/notifier` alike: when it is absent, startup SHALL fail with a clear error naming the variable rather than starting a process that cannot serve a preference request or resolve an event.
 
-The requirement is generalized rather than rewritten. It was scoped to `cmd/api` because that was the only process holding the pool; the notifier holds one for the same reason and SHALL fail the same way. `cmd/worker` reads none of them and is unaffected.
+The requirement is generalized rather than rewritten. It was scoped to the single HTTP API that then served every context, because that was the only process holding the pool; the notifier holds one for the same reason and SHALL fail the same way. `cmd/worker` reads none of them and is unaffected.
 
 A separate variable and a separate pool are what make the context's persistence its own. Which physical server the value points at is a deployment decision — pointing all three at one server is permitted and is what local development does — but the code SHALL NOT be the thing that assumes it.
 
 #### Scenario: Startup fails when the DSN is absent
 
 - **GIVEN** `NOTIFICATION_POSTGRES_DSN` is not set
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/notification-api` starts
 - **THEN** startup fails with an error naming `NOTIFICATION_POSTGRES_DSN`, and no HTTP listener is opened
 
 #### Scenario: The notifier fails the same way
@@ -40,7 +38,7 @@ A separate variable and a separate pool are what make the context's persistence 
 
 ### Requirement: The Schema Is Created Idempotently at Startup
 
-The Notification context SHALL create its own storage at startup **in every process that uses it** — `cmd/api` and `cmd/notifier` alike — and doing so SHALL be safe to repeat on every start and across concurrent replicas and processes. It SHALL NOT create, alter, or drop any table owned by another context.
+The Notification context SHALL create its own storage at startup **in every process that uses it** — `cmd/notification-api` and `cmd/notifier` alike — and doing so SHALL be safe to repeat on every start and across concurrent replicas and processes. It SHALL NOT create, alter, or drop any table owned by another context.
 
 Both processes migrate for the same reason both sides of the terminal topology declare it: neither process's startup may depend on the other's having run first. A notifier started against a database no API has yet touched SHALL create what it needs rather than fail, and the serialization that already protects two replicas racing to a first-time create SHALL cover this case unchanged.
 
@@ -58,7 +56,7 @@ Both processes migrate for the same reason both sides of the terminal topology d
 
 #### Scenario: The notifier migrates without the API having started
 
-- **GIVEN** a database where the Notification schema does not yet exist and no `cmd/api` process has run against it
+- **GIVEN** a database where the Notification schema does not yet exist and no `cmd/notification-api` process has run against it
 - **WHEN** `cmd/notifier` starts
 - **THEN** it creates the schema and begins consuming
 
@@ -88,11 +86,11 @@ Enforcing the invariant in the schema is what keeps a second API replica from cr
 
 ### Requirement: The Notification Pool Participates in Ordered Shutdown
 
-`cmd/api`'s shutdown SHALL close the Notification connection pool alongside the pools it already closes, and SHALL do so only after the HTTP server has stopped and any goroutine holding a database connection has been joined. A close failure SHALL be logged and SHALL NOT prevent the remaining shutdown steps from running.
+`cmd/notification-api`'s shutdown SHALL close the Notification connection pool alongside the other connections it closes, and SHALL do so only after the HTTP server has stopped and any goroutine holding a database connection has been joined. A close failure SHALL be logged and SHALL NOT prevent the remaining shutdown steps from running.
 
 #### Scenario: The pool closes after the server stops
 
-- **GIVEN** `cmd/api` is running and receives a termination signal
+- **GIVEN** `cmd/notification-api` is running and receives a termination signal
 - **WHEN** it shuts down
 - **THEN** the HTTP server stops accepting requests and in-flight work is resolved before the Notification pool is closed
 
@@ -171,7 +169,7 @@ The context SHALL expose exactly one repository operation that loads the stored 
 
 This is a narrowing of the existing rule, not a relaxation of it. HMAC signing requires the original bytes, so the value has to be loadable somewhere; what makes it safe is that the somewhere is singular, named, and provably not on any path that builds an HTTP response. The read used by the preference routes SHALL remain unable to load it, so the response types those routes build still cannot carry a value that was never fetched.
 
-That the secret-loading operation has no caller in the HTTP composition root SHALL be enforced by a test rather than by convention.
+That the secret-loading operation has no caller in the Notification context's HTTP service SHALL be enforced by a test rather than by convention. That service is the only HTTP process that links this package at all after the HTTP tier was split by bounded context, so the test's subject is narrower than it was, and for the other HTTP services the property holds by construction rather than by inspection.
 
 #### Scenario: The preference read still cannot load a secret
 
@@ -184,7 +182,8 @@ That the secret-loading operation has no caller in the HTTP composition root SHA
 - **WHEN** the delivery path loads it
 - **THEN** it receives the full preference, secret included, and can compute a signature with it
 
-#### Scenario: The HTTP composition root does not call the secret-loading operation
+#### Scenario: The Notification HTTP service does not call the secret-loading operation
 
-- **WHEN** the HTTP composition root's sources are inspected
+- **WHEN** the sources of the Notification context's HTTP service are inspected
 - **THEN** none of them calls the secret-loading operation
+

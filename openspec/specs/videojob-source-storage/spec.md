@@ -29,7 +29,7 @@ This requirement constrains the **inbound** path only, observed while the reques
 
 A source object's key SHALL be `uploads/<uploadID>_<original-filename>`, where `uploadID` is generated per request and is independent of the `VideoJobID`. The `uploads/` prefix is permitted **only** because no HTTP route turns a source key into a URL path segment.
 
-This is the deliberate opposite of `videojob-result-storage`'s flat `frames_<jobID>.zip` keys, which must contain no `/` because `cmd/api/web/app.js` uses a result key verbatim as `GET /download/:filename`'s single path segment. Any future change that exposes source objects over HTTP SHALL remove this prefix in the same change, or the route will not match.
+This is the deliberate opposite of `videojob-result-storage`'s flat `frames_<jobID>.zip` keys, which must contain no `/` because `cmd/video-api/web/app.js` uses a result key verbatim as `GET /download/:filename`'s single path segment. Any future change that exposes source objects over HTTP SHALL remove this prefix in the same change, or the route will not match.
 
 #### Scenario: A source key carries the uploads prefix
 
@@ -151,8 +151,8 @@ Every `.owner` sidecar symbol SHALL be deleted from the codebase — the write, 
 
 #### Scenario: No uploads directory is created at startup
 
-- **WHEN** `cmd/api` starts
-- **THEN** it creates `temp/` only, and creates neither `uploads/` nor `outputs/`
+- **WHEN** `cmd/worker` starts
+- **THEN** it creates `temp/` only, and creates neither `uploads/` nor `outputs/` — and `cmd/video-api` creates no directory at all
 
 #### Scenario: The uploads route no longer exists
 
@@ -170,7 +170,7 @@ This capability's adapter tests SHALL exercise `Put`, `Get`, and `Delete` agains
 
 Every test that provisions a bucket SHALL remove that bucket and its objects when it finishes, including on failure, since the local MinIO service stores its data in a named volume.
 
-`cmd/api`'s own tests SHALL continue to require MinIO rather than skip, as `videojob-result-storage` already specifies — with the upload path now storing to a bucket as well, a silently-skipped suite would cover even less than before.
+`cmd/video-api`'s own tests SHALL continue to require MinIO rather than skip, as `videojob-result-storage` already specifies — with the upload path now storing to a bucket as well, a silently-skipped suite would cover even less than before.
 
 #### Scenario: Adapter tests skip without a configured instance
 

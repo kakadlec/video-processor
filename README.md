@@ -1,6 +1,6 @@
 # FIAP X — Video Frame Processor
 
-A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous across three processes: an HTTP API (`cmd/api`) accepts and reports, a worker (`cmd/worker`) does the extraction off a RabbitMQ queue, and a notifier (`cmd/notifier`) announces each outcome to whatever webhook its owner registered. Built as the code deliverable for a POSTECH/FIAP hackathon.
+A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous across five processes behind an nginx gateway: one HTTP service per bounded context — `cmd/identity-api` (accounts and tokens), `cmd/video-api` (upload, status, download, and the frontend) and `cmd/notification-api` (delivery preferences) — plus a worker (`cmd/worker`) that does the extraction off a RabbitMQ queue and a notifier (`cmd/notifier`) that announces each outcome to whatever webhook its owner registered. The gateway is the only process that publishes a host port, so a client still sees one origin. Built as the code deliverable for a POSTECH/FIAP hackathon.
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`,
 
 ## Quickstart
 
-The API requires identity, video, notification, Redis, MinIO, and broker configuration (`IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`/`IDENTITY_JWT_KEY_ID`/`IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, `VIDEO_MINIO_ENDPOINT`/`_ACCESS_KEY`/`_SECRET_KEY`/`_BUCKET`, `RABBITMQ_URL`) to start — `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. **The worker is a second process** (`go run ./cmd/worker`) with a smaller surface: the same variables minus the `IDENTITY_*` and `NOTIFICATION_*` ones. Without it, uploads are accepted and never processed. **The notifier is a third** (`go run ./cmd/notifier`), with the narrowest surface of the three — `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. Without it, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running all three directly. The fastest path with no manual wiring is Docker:
+Each of the five processes requires only the configuration it uses and refuses to start without it — `cmd/identity-api` the four `IDENTITY_*` variables, `cmd/video-api` the public key set plus `VIDEO_POSTGRES_DSN`/`REDIS_ADDR`/`VIDEO_MINIO_*`/`RABBITMQ_URL`, `cmd/notification-api` the public key set plus `NOTIFICATION_POSTGRES_DSN`/`REDIS_ADDR`, `cmd/worker` the Video Processing set without any identity variable, and `cmd/notifier` just `NOTIFICATION_POSTGRES_DSN` and `RABBITMQ_URL`. `RABBITMQ_URL` only has to be *set*, since no process dials the broker from a request path. Without the worker, uploads are accepted and never processed; without the notifier, jobs still finish and nothing is announced. See [docs/development.md](docs/development.md) for running them directly — with one caveat: the three HTTP services each hardcode `:8080` and read no `PORT` variable, so a bare `go run` supports **one HTTP service at a time** per host. Running them together means containers or separate hosts, which is what Compose does. The fastest path with no manual wiring is Docker:
 
 ```bash
 # 1. Clone and enter the repo
@@ -23,15 +23,17 @@ cd video-processor
 #    git-ignored .env — no key material is kept in the repository)
 make dev-keys
 
-# 3. Run the full stack (app + three workers + notifier + PostgreSQL +
-#    Redis + MinIO + RabbitMQ, all already configured)
+# 3. Run the full stack (gateway + three HTTP services + three workers +
+#    notifier + PostgreSQL + Redis + MinIO + RabbitMQ, all configured)
 docker compose up --build
-# Server starts on http://127.0.0.1:8080, with PostgreSQL-backed identity
-# already wired in — /api/auth/register and /api/auth/login are live.
-# The `worker` and `notifier` services run from the same image with their
-# commands overridden. Three workers start by default, so several videos
-# are processed at the same time: each worker holds exactly one job at a
-# time by design (prefetch 1), so concurrency is worker count.
+# The gateway listens on http://127.0.0.1:8080 and is the only service that
+# publishes a host port. It routes /api/auth/ to identity-api,
+# /api/notification-preferences to notification-api, and everything else to
+# video-api, so the split is invisible from the browser.
+# Seven application containers — the three HTTP services, three workers and
+# the notifier — all run from the same image with their commands overridden. Three workers start by default, so several videos are
+# processed at the same time: each worker holds exactly one job at a time by
+# design (prefetch 1), so concurrency is worker count.
 
 # 3b. ALTERNATIVE to step 3 (stop it first, or run this instead): to pick a
 #     different number of workers — including one, for a single log stream
@@ -41,7 +43,7 @@ docker compose up --build --scale worker=1
 # 4. Open http://127.0.0.1:8080 in your browser
 # Register/log in, then upload a video file. The upload returns immediately
 # and the page polls the job's status until it completes, then shows a
-# Download button: clicking it asks the API for a 5-minute URL and the
+# Download button: clicking it asks the Video API for a 5-minute URL and the
 # browser fetches the ZIP from MinIO directly.
 ```
 
@@ -51,7 +53,7 @@ docker compose up --build --scale worker=1
 
 Processing is asynchronous as of Phase 6, but the system is not yet complete:
 
-- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the API alone, jobs sit in `queued` indefinitely. Concurrency is worker count: each worker holds exactly one job at a time by design, so processing several videos at once means running several worker processes. The default stack starts **three**, so that is what `docker compose up` already does; `--scale worker=<n>` picks a different number in either direction, and running the binary directly means more `go run ./cmd/worker` shells.
+- **A worker must be running for anything to be processed.** `POST /upload` answers `202` whether or not one is; with the HTTP services alone, jobs sit in `queued` indefinitely. Concurrency is worker count: each worker holds exactly one job at a time by design, so processing several videos at once means running several worker processes. The default stack starts **three**, so that is what `docker compose up` already does; `--scale worker=<n>` picks a different number in either direction, and running the binary directly means more `go run ./cmd/worker` shells.
 - **Frame extraction still needs local scratch** — `ffmpeg` reads and writes files, so the worker downloads each source into its own `temp/`, extracts frames there, and builds the zip there, removing all of it before the job finishes. Nothing durable lives on local disk (Phase 5): uploaded source videos go to MinIO too, as **transient** objects whose owner deletes them — the processed ZIP is the one durable artifact, so a result survives its container and any instance can serve it.
 - **A source object can leak.** A job never dispatched, a dispatch dead-lettered before any claim, or a worker interrupted after a terminal commit but before best-effort cleanup can leave its source in the bucket. Mid-extraction crashes are recovered by the worker sweeper. Configure the `uploads/`-prefix expiration lifecycle rule; it remains the only exhaustive guarantee. See [docs/operations.md](docs/operations.md).
 - **Webhooks are the only notification channel.** A user who registers a webhook preference through `PUT /api/notification-preferences` is notified when a job completes or fails — `cmd/notifier` consumes the terminal-event queue and delivers a signed request per subscribed outcome. Email is not implemented (Phase 7's `add-notification-email-delivery`), and `channel: "email"` is refused rather than stored. A user who registers nothing still has the page (which polls the job's status URL) and `GET /api/status`; absence of a preference means *not subscribed*, and there is no implicit default.
@@ -75,14 +77,14 @@ For the full project requirements see [docs/project-requirements.pdf](docs/proje
 
 ## Database Schema and Infrastructure Resources
 
-Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the three binaries to get right. The one exception is the PostgreSQL databases the DSNs name, which have to exist before a process can migrate into one. `docker compose up` creates them on the Postgres volume's **first** initialization; a volume that predates the per-context split keeps whatever it already had, and [docs/development.md](docs/development.md) names the statements that add the rest.
+Every resource this system needs is created by the processes themselves at startup — there is no runbook step to forget and no ordering between the five binaries to get right. The one exception is the PostgreSQL databases the DSNs name, which have to exist before a process can migrate into one. `docker compose up` creates them on the Postgres volume's **first** initialization; a volume that predates the per-context split keeps whatever it already had, and [docs/development.md](docs/development.md) names the statements that add the rest.
 
 | Resource | Database | DDL / declaration | Applied by |
 |---|---|---|---|
-| `identity_users` | `identity` | [`internal/identity/infrastructure/postgres/schema.sql`](internal/identity/infrastructure/postgres/schema.sql) | `cmd/api` (`setupIdentity`) |
-| `video_jobs`, `video_job_outbox` | `video` | [`internal/video/infrastructure/postgres/schema.sql`](internal/video/infrastructure/postgres/schema.sql) | `cmd/api` (`setupVideo`), `cmd/worker` |
-| `notification_preferences`, `notification_deliveries` | `notification` | [`internal/notification/infrastructure/postgres/schema.sql`](internal/notification/infrastructure/postgres/schema.sql) | `cmd/api` (`setupNotification`), `cmd/notifier` |
-| MinIO bucket (`VIDEO_MINIO_BUCKET`) | — | `storage.EnsureBucket` | `cmd/api`, `cmd/worker` |
+| `identity_users` | `identity` | [`internal/identity/infrastructure/postgres/schema.sql`](internal/identity/infrastructure/postgres/schema.sql) | `cmd/identity-api` (`setupIdentity`) |
+| `video_jobs`, `video_job_outbox` | `video` | [`internal/video/infrastructure/postgres/schema.sql`](internal/video/infrastructure/postgres/schema.sql) | `cmd/video-api` (`setupVideo`), `cmd/worker` |
+| `notification_preferences`, `notification_deliveries` | `notification` | [`internal/notification/infrastructure/postgres/schema.sql`](internal/notification/infrastructure/postgres/schema.sql) | `cmd/notification-api` (`setupNotification`), `cmd/notifier` |
+| MinIO bucket (`VIDEO_MINIO_BUCKET`) | — | `storage.EnsureBucket` | `cmd/video-api`, `cmd/worker` |
 | RabbitMQ exchanges, queues, bindings, DLQs | — | `messaging.JobDispatchTopology()`, `TerminalEventsTopology()` | Every producer and consumer, redeclared on **every** dial |
 
 The three `schema.sql` files are plain DDL, embedded with `go:embed` and applied idempotently (`CREATE TABLE IF NOT EXISTS`) by each context's `Migrate` — so they can also be run by hand against a database (`psql -f …`) if you want the schema without starting the application. Each bounded context owns its own pool, its own tables, and its own **database**; pointing all three DSNs at one server, as `docker-compose.yml` does, is a deployment choice, and the databases named above are what keeps the boundary enforced by the engine — PostgreSQL has no cross-database query without an extension, so a query reaching from one context into another's tables fails as an unknown relation. The databases themselves are the one thing the processes do *not* create: `docker/postgres-init/create-context-databases.sql` creates them (plus a test counterpart each) on the Compose volume's first init, and is unrelated to the runtime schema — it creates databases, never tables.
@@ -104,10 +106,12 @@ The three `schema.sql` files are plain DDL, embedded with `go:embed` and applied
 ## Tech Stack
 
 - **Language:** Go 1.27
-- **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12
+- **HTTP framework:** [Gin](https://github.com/gin-gonic/gin) v1.12, one router per HTTP service
+- **Ingress:** nginx (stock image plus a mounted configuration file), routing by path prefix to the three HTTP services
+- **Access tokens:** RS256 (via [`golang-jwt`](https://github.com/golang-jwt/jwt)) — the private key held by `cmd/identity-api` alone, the public half distributed to verifiers as a `kid`-keyed set through configuration
 - **Frame extraction:** `ffmpeg` (via `exec.CommandContext`, in `cmd/worker`)
 - **Identity, job, and notification-preference persistence:** PostgreSQL (via `pgx`), including a transactional outbox
-- **Job dispatch and terminal events:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — dispatch outbox relay in `cmd/api`, consumer in `cmd/worker`, a second outbox relay in `cmd/worker` publishing each job's `completed`/`failed` outcome, and the consumer for that terminal stream in `cmd/notifier`
+- **Job dispatch and terminal events:** RabbitMQ (via [`amqp091-go`](https://github.com/rabbitmq/amqp091-go)) — dispatch outbox relay in `cmd/video-api`, consumer in `cmd/worker`, a second outbox relay in `cmd/worker` publishing each job's `completed`/`failed` outcome, and the consumer for that terminal stream in `cmd/notifier`
 - **Webhook delivery:** HMAC-SHA256 signatures over `<timestamp>.<body>`, per-delivery claim records in PostgreSQL, and a destination policy applied both at registration and at dial time (`cmd/notifier`)
 - **Object storage:** MinIO / S3-compatible (via [`minio-go`](https://github.com/minio/minio-go)) for source videos and ZIP results
 - **Idempotency, rate limiting, status cache, worker leases:** Redis (via [`go-redis`](https://github.com/redis/go-redis))

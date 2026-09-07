@@ -3,9 +3,7 @@
 ## Purpose
 
 Defines how a user tells the system where and how it should announce the end of one of their video jobs: what identifies a notification preference, which event types and channels are accepted, how the webhook destination and its signing secret are registered and protected, and what an absent preference means to the consumer that will read these rows.
-
 ## Requirements
-
 ### Requirement: A Preference Is Identified By User, Event Type, and Channel
 
 A notification preference SHALL be identified by exactly three values: the owning user, the event type it reacts to, and the channel it delivers through. At most one preference SHALL exist for a given triple. Both the event type and the channel SHALL be drawn from a closed set; a value outside either set SHALL be rejected as a client error and SHALL NOT be stored.
@@ -32,7 +30,9 @@ The accepted event types SHALL be `video_job.completed.v1` and `video_job.failed
 
 ### Requirement: The Recognized Event Types Equal the Emitted Terminal Event Types
 
-The event-type values this capability accepts SHALL be exactly the values the Video Processing context publishes for a completed and a failed job. The Notification context SHALL NOT import any Video Processing package to obtain them — it declares its own constants — so the equality SHALL be asserted by an automated test in the composition root, which legitimately sees both contexts.
+The event-type values this capability accepts SHALL be exactly the values the Video Processing context publishes for a completed and a failed job. The Notification context SHALL NOT import any Video Processing package to obtain them — it declares its own constants — so the equality SHALL be asserted by an automated test in `internal/contracts`, the test-only package that exists to see both contexts.
+
+That package replaces the composition root the assertion used to live in. Since the HTTP tier was split by bounded context, no process imports both contexts, so there is no root left to host it; the drift it guards against is unchanged, and `ddd-architecture` grants that package the cross-context import on the condition that it declares nothing outside its test files.
 
 Without that assertion the two independently-declared literals can drift with nothing failing, and a consumer would then resolve every delivered event against an event type no stored preference names — a silent total delivery failure rather than a build error.
 
@@ -40,7 +40,7 @@ Without that assertion the two independently-declared literals can drift with no
 
 - **GIVEN** the Notification context declares its accepted event types and the Video Processing context declares the event types it writes to its outbox
 - **WHEN** the test suite runs
-- **THEN** a test in the composition root asserts each Notification event-type constant is equal to the corresponding Video Processing constant, and fails if either is renamed or re-versioned alone
+- **THEN** a test in `internal/contracts` asserts each Notification event-type constant is equal to the corresponding Video Processing constant, and fails if either is renamed or re-versioned alone
 
 ### Requirement: A Webhook Preference Carries a Destination and a Signing Secret
 
@@ -96,7 +96,9 @@ The signing secret SHALL be treated as a credential. No response body SHALL cont
 
 The secret cannot be stored as a one-way hash the way a password is, because signing a delivery requires the original bytes. Non-disclosure is therefore the whole of its protection, and it SHALL hold on every path rather than on the read route alone.
 
-Exactly one path SHALL load the value: the delivery path, through the single named repository operation `notification-persistence` requires, whose only consumer computes a signature with it. This is a narrowing of the rule rather than an exception carved out of it — the value has to be loadable somewhere for a signature to exist at all, and what keeps non-disclosure true is that the somewhere is singular, named, and provably absent from the HTTP composition root. The routes' own read SHALL remain unable to load it.
+Exactly one path SHALL load the value: the delivery path, through the single named repository operation `notification-persistence` requires, whose only consumer computes a signature with it. This is a narrowing of the rule rather than an exception carved out of it — the value has to be loadable somewhere for a signature to exist at all, and what keeps non-disclosure true is that the somewhere is singular, named, and provably absent from the Notification context's HTTP service. The routes' own read SHALL remain unable to load it.
+
+The claim is now stronger than it was when one process served every context: the other HTTP services do not link the Notification context's repository at all, so for them the property is enforced by the build rather than by a test. The test SHALL be retained and re-targeted at the one HTTP service that could reach the operation.
 
 #### Scenario: Reading a preference reports only that a secret exists
 
@@ -112,8 +114,13 @@ Exactly one path SHALL load the value: the delivery path, through the single nam
 
 #### Scenario: The delivery path is the only one that loads it
 
-- **WHEN** the sources of the HTTP composition root are inspected
+- **WHEN** the sources of the Notification context's HTTP service are inspected
 - **THEN** none of them calls the operation that loads the secret, and the operation the routes do call selects no secret column
+
+#### Scenario: No other HTTP service can reach the operation at all
+
+- **WHEN** the build graphs of the Identity and Video Processing HTTP services are inspected
+- **THEN** neither links the Notification context's repository package, so neither can call the secret-loading operation
 
 #### Scenario: A delivery does not log the secret it signed with
 
@@ -212,3 +219,4 @@ It is no longer only an audit field. `notification-webhook-delivery` evaluates e
 - **GIVEN** no preference stored for a triple
 - **WHEN** its owner creates one
 - **THEN** the creation time and the updated-at time are both stamped from the same instant
+

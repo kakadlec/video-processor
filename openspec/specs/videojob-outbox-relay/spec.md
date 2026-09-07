@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the transactional-outbox relay that carries the current job-dispatch generation's events from PostgreSQL to the AMQP broker: how it claims unpublished rows without two replicas dispatching the same one, why the claim, the publish, and the `published_at` stamp commit together, what counts as proof that a message actually reached a queue, how the claim's `event_type` filter is what keeps one dispatch generation from crossing into another, and how the relay's connection is owned and stopped inside `cmd/api`.
+Define the transactional-outbox relay that carries the current job-dispatch generation's events from PostgreSQL to the AMQP broker: how it claims unpublished rows without two replicas dispatching the same one, why the claim, the publish, and the `published_at` stamp commit together, what counts as proof that a message actually reached a queue, how the claim's `event_type` filter is what keeps one dispatch generation from crossing into another, and how the relay's connection is owned and stopped inside `cmd/video-api`.
 
 The relay is the only thing in this system that publishes to `videojob-messaging`'s job-dispatch topology, and it is deliberately in no request path: `POST /upload` records the dispatch in the same transaction that queues the job (`videojob-persistence`) and returns without touching the broker. The row is the durable record; the relay is what turns it into a message. `cmd/worker` is what consumes those messages — see `videojob-worker` — so a message this relay publishes is now a live trigger rather than an inert side effect.
 
@@ -12,7 +12,7 @@ The mechanism this capability defines now has a second instance: `videojob-termi
 
 ### Requirement: The Relay Carries Unpublished Outbox Rows to the Broker
 
-A relay SHALL run inside `cmd/api`, periodically claiming unpublished `video_job_outbox` rows of the current job-dispatch generation's event type, publishing each to the job-dispatch topology, and marking the published ones. It SHALL be composed of an `OutboxRepository` in `internal/video/infrastructure/postgres` and a publisher in `internal/video/infrastructure/messaging`, so that no single infrastructure package depends on both a database driver and an AMQP client.
+A relay SHALL run inside `cmd/video-api`, periodically claiming unpublished `video_job_outbox` rows of the current job-dispatch generation's event type, publishing each to the job-dispatch topology, and marking the published ones. It SHALL be composed of an `OutboxRepository` in `internal/video/infrastructure/postgres` and a publisher in `internal/video/infrastructure/messaging`, so that no single infrastructure package depends on both a database driver and an AMQP client.
 
 The relay is not in any request path. `POST /upload` neither publishes nor waits on the broker; a message reaches the queue some time after the transaction that recorded it committed.
 
@@ -38,7 +38,7 @@ It keeps internal events off the broker. `video_job_outbox` has accumulated an u
 
 **It isolates dispatch generations, and that is load-bearing during a rolling deploy.** Every replica's relay reads the same `video_job_outbox` table, so a filter shared across generations would let a new replica's relay claim an old replica's row and publish it into the new generation, and an old replica's relay claim a new replica's row and publish it into the old one — where nothing consumes it and the job waits in `queued` forever. Isolating at the exchange cannot help, because the crossing happens before anything is published, and an already-deployed relay cannot be given a new predicate. The current generation's `event_type` SHALL therefore differ from every previous generation's, and a relay SHALL NOT be given a predicate that matches more than its own.
 
-**It keeps two relays off each other's rows.** More than one relay now runs against this table — job dispatch in `cmd/api`, terminal events in `cmd/worker` (`videojob-terminal-events`). Their sets SHALL be disjoint, so neither claims work the other is responsible for and neither's backlog can starve the other's. Concurrency between replicas of the *same* relay remains safe by row locking, unchanged.
+**It keeps two relays off each other's rows.** More than one relay now runs against this table — job dispatch in `cmd/video-api`, terminal events in `cmd/worker` (`videojob-terminal-events`). Their sets SHALL be disjoint, so neither claims work the other is responsible for and neither's backlog can starve the other's. Concurrency between replicas of the *same* relay remains safe by row locking, unchanged.
 
 Each event-type string SHALL be a single constant shared between the insert, the claim, and the routing key, so the writer, the reader, and the broker cannot drift apart into a relay that silently matches nothing. Where a relay claims more than one type, **the routing key SHALL be read from the claimed row's own `event_type`** rather than fixed per relay, so a message can only ever be published under the key naming what it actually is. The test pinning that equality SHALL cover every type a relay publishes, not one literal pair.
 
@@ -76,9 +76,9 @@ Ordering within a claim SHALL remain oldest-first by `occurred_at` across the wh
 
 ### Requirement: Concurrent Relays Do Not Publish the Same Row Twice
 
-The claim SHALL use `SELECT … FOR UPDATE SKIP LOCKED`, so that a second `cmd/api` replica polling at the same moment steps over rows already claimed rather than blocking on them or re-reading them.
+The claim SHALL use `SELECT … FOR UPDATE SKIP LOCKED`, so that a second `cmd/video-api` replica polling at the same moment steps over rows already claimed rather than blocking on them or re-reading them.
 
-This system is being prepared to run multiple `cmd/api` replicas, each running its own relay. The guard is PostgreSQL-side deliberately: it protects the outbox row, not the job, which is different contention from the Redis liveness lease used by worker recovery. Job pickup itself remains a conditional PostgreSQL update and never consults the lease.
+This system is being prepared to run multiple `cmd/video-api` replicas, each running its own relay. The guard is PostgreSQL-side deliberately: it protects the outbox row, not the job, which is different contention from the Redis liveness lease used by worker recovery. Job pickup itself remains a conditional PostgreSQL update and never consults the lease.
 
 #### Scenario: Two concurrent relays split the work
 
@@ -203,20 +203,20 @@ After each successful dial — the first and every re-dial — the relay SHALL c
 
 ### Requirement: The Broker Connection Is the Relay's, Not a Startup Gate
 
-`RABBITMQ_URL` SHALL be required configuration at `cmd/api` startup: an unset value SHALL stop startup, like every other required variable. Broker **reachability** SHALL NOT be a startup gate — the relay SHALL own its connection, dial it in its own goroutine, and retry with backoff on failure or on a connection it loses while running.
+`RABBITMQ_URL` SHALL be required configuration at `cmd/video-api` startup: an unset value SHALL stop startup, like every other required variable. Broker **reachability** SHALL NOT be a startup gate — the relay SHALL own its connection, dial it in its own goroutine, and retry with backoff on failure or on a connection it loses while running.
 
 This is deliberately neither posture already in the codebase. MinIO is fail-closed because a result that cannot be stored cannot be delivered, and that failure is in the request path; the relay is in no request path, so a broker outage delays dispatch and costs nothing else. Redis's fail-open is also the wrong analogy: those features degrade a request by skipping an optimization, and here there is no request to degrade. The relay needs reconnection logic regardless, because an AMQP connection can drop at any time — once that loop exists, a fatal first dial buys nothing that requiring the variable does not already buy, while coupling API availability to broker availability.
 
 #### Scenario: Startup fails with no RABBITMQ_URL
 
 - **GIVEN** `RABBITMQ_URL` is unset
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** it exits with a clear configuration error naming the variable
 
 #### Scenario: The API serves with the broker unreachable
 
 - **GIVEN** `RABBITMQ_URL` is set to an address with no broker listening
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** it starts and serves every route, the relay retries in the background, and no request fails because of the broker
 
 ### Requirement: The Relay Stops With the Process
@@ -225,5 +225,5 @@ The relay SHALL stop on shutdown, finishing or rolling back its in-flight transa
 
 #### Scenario: Shutdown does not strand a claim
 
-- **WHEN** `cmd/api` shuts down while the relay holds a claim
+- **WHEN** `cmd/video-api` shuts down while the relay holds a claim
 - **THEN** the transaction is resolved rather than abandoned, and no row is left marked published without having been delivered

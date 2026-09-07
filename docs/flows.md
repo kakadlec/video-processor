@@ -4,14 +4,18 @@
 
 Processing is asynchronous. `POST /upload` stores the bytes, records the job, and answers `202` with a status URL; a separate process — `cmd/worker` — consumes the dispatch and does the work. The client polls, then downloads.
 
+Every request below enters through the nginx gateway, which is the only process publishing a host port and which routes by path prefix: `/api/auth/` to `cmd/identity-api`, `/api/notification-preferences` to `cmd/notification-api`, and everything else — including the frontend at `/` — to `cmd/video-api`. The gateway is omitted from the diagrams: it forwards the request unchanged, with the body unbuffered, and no flow below depends on it doing anything more.
+
 ### Authentication (Phase 2)
 
-`IDENTITY_POSTGRES_DSN` and the three `IDENTITY_JWT_*` key variables are required at startup, and every step below runs behind bearer-token middleware:
+`cmd/identity-api` requires `IDENTITY_POSTGRES_DSN` and all three `IDENTITY_JWT_*` variables at startup; a service that only *verifies* requires `IDENTITY_JWT_PUBLIC_KEYS` alone. Every step after login runs behind bearer-token middleware.
+
+**Two services appear in this diagram**, and the transition matters: the two `/api/auth/*` calls are answered by `cmd/identity-api`, while `POST /upload` — same origin, same token — is routed by the gateway to `cmd/video-api`, which verifies the token with the public key set and never talks to Identity to do it. The middle column is labelled per step for that reason.
 
 ```
-Browser                        Go server (cmd/api/main.go / identity.go)     PostgreSQL
+Browser                   (service, per step — see above)               PostgreSQL
   │                                     │                                 │
-  │  POST /api/auth/register            │                                 │
+  │  POST /api/auth/register            │  ── cmd/identity-api below ── │
   │  { email, password }                │                                 │
   │────────────────────────────────────►│  Hash password (bcrypt)         │
   │                                     │  Persist user                   │
@@ -26,7 +30,7 @@ Browser                        Go server (cmd/api/main.go / identity.go)     Pos
   │◄────────────────────────────────────│                                 │
   │  200 { access_token, expires_at }    │                                 │
   │                                     │                                 │
-  │  POST /upload                       │                                 │
+  │  POST /upload                       │  ── cmd/video-api from here ── │
   │  Authorization: Bearer <token>      │                                 │
   │────────────────────────────────────►│  Verify token → UserID          │
   │                                     │  (401 and stop here if invalid) │
@@ -34,12 +38,12 @@ Browser                        Go server (cmd/api/main.go / identity.go)     Pos
 ```
 The diagram below continues the `POST /upload` request from where the previous one left off (after the bearer token check passes) and omits the `Authorization` header for brevity — in practice every request to `/upload`, `/api/video-jobs/:id`, `/download/:filename`, and `/api/status` carries a valid bearer token; there is no unauthenticated mode.
 
-### Submission — `POST /upload` (`cmd/api`, in-request)
+### Submission — `POST /upload` (`cmd/video-api`, in-request)
 
 Nothing is extracted here. The request stores the bytes, records the job, and acknowledges.
 
 ```
-Browser              cmd/api/video.go       internal/video/application   MinIO bucket
+Browser           cmd/video-api/video.go    internal/video/application   MinIO bucket
   │                        │                          │                    │
   │  POST /upload           │                          │                   │
   │  (multipart)            │                          │                   │
@@ -147,7 +151,7 @@ A sibling sweeper scans bounded batches of `processing` rows every 60 seconds. A
 ### Polling and download
 
 ```
-Browser              cmd/api/video.go                             MinIO bucket
+Browser           cmd/video-api/video.go                          MinIO bucket
   │                        │                                          │
   │  GET <status_url>       │   = GET /api/video-jobs/<job_id>         │
   │  (2s, backing off to 10s)                                          │
@@ -177,12 +181,12 @@ The `ffmpeg` invocation and zip packaging themselves run inside `internal/video/
 
 **Key characteristics (current):**
 - `POST /upload` returns `202` as soon as the job is `queued`. The status code acknowledges the **submission**, not the work — a client must not read success from it. There is no frame count, result key, or download URL in that body, because none exists yet.
-- **Uploads are not processed unless at least one worker is running.** With `cmd/api` alone, jobs accumulate in `queued` and the API reports exactly that.
+- **Uploads are not processed unless at least one worker is running.** With the HTTP services alone, jobs accumulate in `queued` and the status route reports exactly that.
 - Content-hash idempotency: identical bytes uploaded twice by the same user reuse the first request's `VideoJob` rather than running `ffmpeg` again (Phase 4, `add-upload-idempotency-keys`) — see `docs/architecture.md`'s Request pipeline section and `openspec/specs/upload-idempotency/spec.md`. `REDIS_ADDR` is required at startup for this. A duplicate is answered with the **same** `202` shape naming the existing job, whatever state that job is in, so a client needs no duplicate branch and learns the difference on its first poll.
 - **Clearing a failed job's key belongs to whichever worker applied the failure**, not the handler — either the consumer or the abandonment sweeper. The key is rebuilt from the job's `UserID` and persisted `content_hash`, and deleted only if it still names that job. Fenced and already-present outcomes clear nothing; the reservation token is never persisted.
 - Dispatch is **at-least-once**, and `queued → processing` is an atomic conditional PostgreSQL claim (`WHERE id = $1 AND status = 'queued' RETURNING lease_epoch`). Of two consumers handed the same message exactly one wins. Worker death after the claim is recovered separately: an epoch-scoped Redis lease supplies liveness, the sweeper advances the PostgreSQL epoch and re-dispatches, and terminal writes from the previous holder are fenced.
 - The client learns everything through `GET /api/video-jobs/:id`, polling from 2 s and backing off to a 10 s ceiling. Those polls share one per-user rate-limit budget with the submission and the download issuance, which is why the interval is chosen against the default 60/60s rather than for responsiveness. A `429` is a back-off signal, not a job failure.
-- Nothing the client uploads touches local disk on the way in, and `cmd/api` has no `temp/` directory at all any more. The only local copy is the one `ProcessVideoJob` downloads for `ffmpeg`, on the **worker's** filesystem, removed on every path (Phase 5, `migrate-upload-storage-to-minio`).
+- Nothing the client uploads touches local disk on the way in, and no HTTP service has a `temp/` directory at all. The only local copy is the one `ProcessVideoJob` downloads for `ffmpeg`, on the **worker's** filesystem, removed on every path (Phase 5, `migrate-upload-storage-to-minio`).
 - The source object belongs to the request until its job commits as `queued`; afterwards only a consumer that applied a terminal result or the sweeper that applied abandonment deletes it. Fenced runs delete nothing. Jobs never dispatched and best-effort cleanup failures can still leak, so the bucket's `uploads/`-prefix expiration rule remains the only exhaustive reclamation guarantee. See `docs/operations.md`.
 - Authentication (Phase 2) is required on every step of the path; artifact ownership is derived only from the authenticated `UserID`, never from caller-supplied fields, and always from the `VideoJob` row. `cmd/worker` makes **no** access-control decision — it acts on an internal dispatch, never on behalf of a caller — and holds no Identity configuration. A job identifier alone grants nothing.
 - The download is a two-step exchange, not a proxied stream (Phase 5, `add-presigned-download-urls`). `GET /download/:filename` authorizes and issues; the client redeems the issued URL against MinIO with no `Authorization` header. Entitlement is evaluated **only** at issuance, since the URL carries no identity — nothing re-checks ownership when it is redeemed, and nothing can withdraw it before its five minutes are up. The `Stat` before signing is not optional: signing is offline and succeeds for a key holding no object, so without it a missing object would surface as MinIO's own `404` instead of this endpoint's byte-identical one.
@@ -215,7 +219,7 @@ GET /api/video-jobs?offset=0&limit=20
 **This is not the upload flow above, even though it shares the same `VideoJob` aggregate:**
 - `POST /api/video-jobs` takes a JSON filename string, not a multipart video file — no file content is ever accepted or stored.
 - No code path reachable from these three routes triggers processing: `handleCreateVideoJob`/`handleGetVideoJobStatus`/`handleListVideoJobs` never call `EnqueueVideoJob`/`StartProcessing`/`CompleteJob`/`FailJob`, so every job created via `POST /api/video-jobs` stays `status: "pending"` forever.
-- The frontend (`cmd/api/web/app.js`) does not call `POST /api/video-jobs` or `GET /api/video-jobs`. It does call `GET /api/video-jobs/:id` — see below.
+- The frontend (`cmd/video-api/web/app.js`) does not call `POST /api/video-jobs` or `GET /api/video-jobs`. It does call `GET /api/video-jobs/:id` — see below.
 - Deliberately not named `/jobs`. **No `/jobs` endpoint was ever introduced**, and the asynchronous cutover did not add one: `POST /upload` is the async submission endpoint, because it is the endpoint that receives the bytes. `POST /api/video-jobs` takes a filename with no source key, and `VideoJob.Enqueue` rejects a job without one, so it still has nothing to enqueue.
 - A `pending` status here does **not** mean "waiting for a worker". A job awaiting a worker is `queued`; `pending` means it was never dispatched at all.
 
@@ -229,7 +233,7 @@ See `openspec/specs/videojob-http-api/spec.md` for the full contract, `openspec/
 
 ## Frontend Interaction Sequences
 
-### Current (`cmd/api/web/index.html`, `cmd/api/web/styles.css`, `cmd/api/web/app.js`, served via `go:embed`)
+### Current (`cmd/video-api/web/index.html`, `cmd/video-api/web/styles.css`, `cmd/video-api/web/app.js`, served via `go:embed`)
 
 ```
 Page load
@@ -271,7 +275,7 @@ User submits upload form
           └─► clear the stored token, prompt to log in again
 ```
 
-`cmd/api/web/index.html`, `cmd/api/web/styles.css`, and `cmd/api/web/app.js` are embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
+`cmd/video-api/web/index.html`, `cmd/video-api/web/styles.css`, and `cmd/video-api/web/app.js` are embedded into the binary via `go:embed` and served at `GET /`, `GET /styles.css`, and `GET /app.js` respectively. There is no separate build step. The login/register panel is always present and must be used to obtain a bearer token before uploads or status/download requests succeed.
 
 ---
 

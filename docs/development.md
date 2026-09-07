@@ -6,7 +6,7 @@
 |---|---|---|
 | Go | 1.27+ | Build and test the application |
 | ffmpeg | any recent | Frame extraction; must be on `PATH` |
-| MinIO | any recent | Result storage; `cmd/api` requires `VIDEO_MINIO_*` at startup, and its tests require it too |
+| MinIO | any recent | Source and result storage; `cmd/video-api` and `cmd/worker` require `VIDEO_MINIO_*` at startup, and the Video API's tests require it too |
 | RabbitMQ | any recent | `RABBITMQ_URL` must be **set** to run the app or the suite, but the broker does not have to be reachable — the outbox relay owns the connection and retries in its own goroutine. Needed for real coverage of `internal/platform/rabbitmq` and `internal/video/infrastructure/messaging`, whose tests use `RABBITMQ_TEST_URL` and skip cleanly when it is unset |
 | Docker | any recent | Alternative if Go/ffmpeg/MinIO/RabbitMQ are not installed locally — `docker compose` provides all of them |
 | git | any | Source control |
@@ -26,9 +26,21 @@ apk add --no-cache ffmpeg
 
 ## Running Locally
 
-Identity, Video Processing, Notification, Redis, MinIO, and broker configuration are all required at startup — the server refuses to start unless `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`, `IDENTITY_JWT_KEY_ID`, `IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*` variables, and `RABBITMQ_URL` are set (see [docs/operations.md](operations.md) for every variable, required and optional). `RABBITMQ_URL` is the odd one out: it must be *set*, but the broker behind it does not have to be up — the outbox relay dials it in its own goroutine and retries, so the server starts and serves every route regardless. Start PostgreSQL, Redis, MinIO, and RabbitMQ (`docker compose up -d postgres redis minio rabbitmq`) and export them before `go run ./cmd/api`.
+There are **five** `go run` targets, one per composition root, and each requires only the configuration it uses. Every one of them fails to start when something it needs is missing rather than degrading:
 
-**Running the API alone is not enough to process an upload.** Since the async cutover, `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`. Run both (see below); with the API alone, jobs stay `queued` forever and the status endpoint reports exactly that. A **third** process, `cmd/notifier`, delivers a finished job's outcome to whatever webhook its owner registered; without it jobs still complete normally and only the announcement is missing.
+| Target | Requires | Serves |
+|---|---|---|
+| `go run ./cmd/identity-api` | `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`, `IDENTITY_JWT_KEY_ID`, `IDENTITY_JWT_PUBLIC_KEYS` | `POST /api/auth/register`, `POST /api/auth/login` on `:8080` |
+| `go run ./cmd/video-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | the frontend, `POST /upload`, `GET /download/:filename`, `GET /api/status`, `/api/video-jobs` on `:8080` |
+| `go run ./cmd/notification-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR` | `GET`/`PUT /api/notification-preferences` on `:8080` |
+| `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | nothing — no HTTP, no port |
+| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL` | nothing — no HTTP, no port |
+
+**All three HTTP services hardcode `:8080` and read no `PORT` variable**, so a bare `go run` supports **one HTTP service at a time** on a host — there is no supported port override, and running them together needs one container or host each. In the compose stack each has its own container and the gateway is the only thing publishing a port, which is why `docker compose up --build` is the simplest local path (see "Docker Workflow" below). What follows is the manual route: pick the HTTP service you need, plus the worker and the notifier, which listen on nothing and can always run alongside it.
+
+`RABBITMQ_URL` is the odd one out among the required variables: it must be *set*, but the broker behind it does not have to be up — the outbox relay and the consumers each dial in their own goroutine and retry, so a service starts and serves every route regardless.
+
+**Running one service is not enough to process an upload.** `POST /upload` answers `202` and the job waits on the queue for `cmd/worker`; without a worker, jobs stay `queued` forever and the status endpoint reports exactly that. Without `cmd/notifier`, jobs still complete normally and only the announcement is missing. And without `cmd/identity-api` there is no way to obtain a token in the first place — though a token already issued keeps working while it is down, which is the point of distributing the public key by configuration.
 
 ```bash
 # Download dependencies
@@ -63,11 +75,11 @@ export VIDEO_MINIO_ACCESS_KEY="minioadmin"
 export VIDEO_MINIO_SECRET_KEY="minioadmin"
 export VIDEO_MINIO_BUCKET="video-results"
 export RABBITMQ_URL="amqp://video:video@localhost:5672/"
-# Read by cmd/api as well as cmd/notifier — the destination policy is one
-# variable with two readers, and a local receiver is always an http:// or
-# private address. Without it here the API refuses every destination at
-# registration, so the notifier never gets one to deliver. NEVER set it in
-# production.
+# Read by cmd/notification-api as well as cmd/notifier — the destination
+# policy is one variable with two readers, and a local receiver is always an
+# http:// or private address. Without it the Notification API refuses every
+# destination at registration, so the notifier never gets one to deliver.
+# NEVER set it in production.
 export NOTIFICATION_ALLOW_INSECURE_DESTINATIONS="true"
 # VIDEO_MINIO_USE_SSL, VIDEO_MINIO_PUBLIC_ENDPOINT, and
 # VIDEO_MINIO_PUBLIC_USE_SSL are optional and correct unset for this setup:
@@ -76,12 +88,21 @@ export NOTIFICATION_ALLOW_INSECURE_DESTINATIONS="true"
 # is not true inside Docker Compose, where the server uses minio:9000 and the
 # compose file sets VIDEO_MINIO_PUBLIC_ENDPOINT to the published port instead.
 
-# Start the API (listens on :8080)
-go run ./cmd/api
+# Start the Video API (listens on :8080) — the frontend and the upload flow
+go run ./cmd/video-api
 
-# In a second shell, with the same exports minus the IDENTITY_* and
-# NOTIFICATION_* ones,
-# start the worker. It serves no HTTP and exposes no port.
+# The Identity API — without it nothing can obtain a token. It also binds
+# :8080 with no way to change that, so stop the Video API first or run this
+# on another host or in a container. It reads the IDENTITY_* exports only.
+go run ./cmd/identity-api
+
+# The Notification API — the preference routes. Also :8080, same constraint.
+# It reads IDENTITY_JWT_PUBLIC_KEYS, NOTIFICATION_POSTGRES_DSN and REDIS_ADDR.
+go run ./cmd/notification-api
+
+# In a second shell — the worker binds nothing, so it runs alongside any of
+# the three above. Same exports minus the IDENTITY_* and NOTIFICATION_* ones.
+# It serves no HTTP and exposes no port.
 go run ./cmd/worker
 
 # In a third shell, start the notifier. It needs only three of the exports
@@ -91,22 +112,24 @@ go run ./cmd/worker
 go run ./cmd/notifier
 
 # Build binaries
-go build -o app ./cmd/api
+go build -o identity-api ./cmd/identity-api
+go build -o video-api ./cmd/video-api
+go build -o notification-api ./cmd/notification-api
 go build -o worker ./cmd/worker
 go build -o notifier ./cmd/notifier
 ```
 
 `cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` and **no** `NOTIFICATION_*` variables — it makes no access-control decision and resolves no delivery preference, so exporting them anyway is harmless.
 
-`cmd/notifier` reads the smallest surface of the three: `RABBITMQ_URL` and `NOTIFICATION_POSTGRES_DSN` required, and optionally `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS`, `NOTIFICATION_WEBHOOK_MAX_ATTEMPTS`, `NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS`, and `NOTIFICATION_DELIVERY_RECLAIM_SECONDS`. It reads **no** `IDENTITY_*`, **no** `VIDEO_*` (MinIO included), and **no** `REDIS_ADDR`. Two local-development notes: without `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS=true` no `http` or private-address destination can be registered *or* dialled, which is every destination a local receiver could have — and `cmd/api` needs that same variable, since the policy is applied at registration too. The last three are validated against one another at startup: a reclaim bound below twice the attempt budget is a fatal configuration error naming both values, not a warning. See [docs/operations.md](operations.md) for the arithmetic. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
+`cmd/notifier` reads the smallest surface of the five: `RABBITMQ_URL` and `NOTIFICATION_POSTGRES_DSN` required, and optionally `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS`, `NOTIFICATION_WEBHOOK_MAX_ATTEMPTS`, `NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS`, and `NOTIFICATION_DELIVERY_RECLAIM_SECONDS`. It reads **no** `IDENTITY_*`, **no** `VIDEO_*` (MinIO included), and **no** `REDIS_ADDR`. Two local-development notes: without `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS=true` no `http` or private-address destination can be registered *or* dialled, which is every destination a local receiver could have — and `cmd/notification-api` needs that same variable, since the policy is applied at registration too. The last three are validated against one another at startup: a reclaim bound below twice the attempt budget is a fatal configuration error naming both values, not a warning. See [docs/operations.md](operations.md) for the arithmetic. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
 
-`cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **`cmd/api` creates no directory at all** any more: extraction moved to the worker, so the API never touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk: both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which both processes require at startup and the API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running both processes from the same working directory is fine — the API does not use it.
+`cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **No other process creates a directory at all**: extraction lives in the worker, so nothing else touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk — both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which `cmd/video-api` and `cmd/worker` both require at startup and the Video API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running several processes from the same working directory is fine — only the worker uses it.
 
-To skip the manual wiring entirely, use `docker compose up --build`, which starts the API **and** a `worker` service inside Docker with everything already configured — see "Docker Workflow" below.
+To skip the manual wiring entirely, use `docker compose up --build`, which starts all five services plus the gateway inside Docker with everything already configured — see "Docker Workflow" below.
 
 ## Running Tests
 
-Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, the `VIDEO_MINIO_*` variables must point at a reachable MinIO, and `RABBITMQ_URL` must be **set** — `cmd/api`'s `TestMain` requires the variable because `setupVideo` does, but deliberately does not require a live broker, because `cmd/api` does not either.
+Tests are integration tests that drive the real Gin handlers via `httptest.NewServer`. They execute real `ffmpeg` commands, write real files, and store real objects. `ffmpeg` must be on `PATH`, the `VIDEO_MINIO_*` variables must point at a reachable MinIO, and `RABBITMQ_URL` must be **set** — `cmd/video-api`'s `TestMain` requires the variable because `setupVideo` does, but deliberately does not require a live broker, because `cmd/video-api` does not either. That `TestMain` is the only one of the five that gates on anything: the Identity and Notification suites drive their routers over in-memory repositories and would be refusing to run a suite that needs nothing.
 
 `cmd/worker`'s own suite is the one place a **reachable** broker changes whether real coverage runs rather than only how much: its end-to-end dispatch tests need `RABBITMQ_TEST_URL` alongside PostgreSQL, Redis, and MinIO, and skip cleanly without it, exactly like the messaging package's. Run it through Docker (below) or CI to exercise them.
 
@@ -133,7 +156,7 @@ docker compose run --build --rm app-test go test ./... -v
 
 The three PostgreSQL adapter suites — `internal/identity/infrastructure/postgres`, `internal/video/infrastructure/postgres`, and `internal/notification/infrastructure/postgres` — otherwise skip (not fail) when their own `IDENTITY_POSTGRES_TEST_DSN` / `VIDEO_POSTGRES_TEST_DSN` / `NOTIFICATION_POSTGRES_TEST_DSN` is unset. All three run automatically here: `docker-compose.yml`'s `postgres` service creates an isolated test database per bounded context on first init — `identity_test`, `video_test`, `notification_test` (see `docker/postgres-init/create-context-databases.sql`) — and each variable is already pointed at its own one, no manual export needed.
 
-Notification's is the one most worth reaching for deliberately, because the rule it covers has no in-memory equivalent: "creating a preference without a signing secret is refused" is decided by whether the adapter's `UPDATE … RETURNING` affected a row, so a skipped run exercises none of it while still reporting green. `NOTIFICATION_POSTGRES_DSN` — the *runtime* variable — is a separate thing and is **not** needed to run the suite: no test in `cmd/api` calls `setupNotification` (or `setupIdentity`, or `setupVideo`); every one builds its modules by hand, which is why `TestMain`'s startup gate names neither it nor the other two DSNs.
+Notification's is the one most worth reaching for deliberately, because the rule it covers has no in-memory equivalent: "creating a preference without a signing secret is refused" is decided by whether the adapter's `UPDATE … RETURNING` affected a row, so a skipped run exercises none of it while still reporting green. `NOTIFICATION_POSTGRES_DSN` — the *runtime* variable — is a separate thing and is **not** needed to run the suite: no test in `cmd/notification-api` calls `setupNotification` (nor does any in `cmd/identity-api` call `setupIdentity`, or any in `cmd/video-api` call `setupVideo`); every one builds its modules by hand, which is why no `TestMain`'s startup gate names any of the three DSNs.
 
 Each test database is separate from the runtime database its context uses, so this is safe to run even while `docker compose up --build` is serving real registered users — a `TRUNCATE` in the identity suite touches `identity_test` and no other database, and the same holds for the other two. The separation is per context rather than global for the same reason: a Video adapter test truncating `video_jobs` has no business reaching Notification's rows either.
 
@@ -191,11 +214,14 @@ A change whose diff includes a Go module input file (`.go` source, `go.mod`, or 
 make dev-keys
 
 docker compose up --build
-# Access the UI by opening http://127.0.0.1:8080 in a browser —
-# identity, video, notification, Redis, MinIO, and RabbitMQ are already
-# configured, and `worker` and `notifier` services are started alongside
-# `app` from the same image, so uploads are actually processed and finished
-# jobs are actually announced.
+# Access the UI by opening http://127.0.0.1:8080 in a browser. That port
+# belongs to the `gateway` service, which is the only one that publishes a
+# host port; it routes /api/auth/ to identity-api, /api/notification-
+# preferences to notification-api, and everything else to video-api, so the
+# split is invisible from the browser. Identity, video, notification, Redis,
+# MinIO, and RabbitMQ are already configured, and `worker` and `notifier`
+# are started from the same image, so uploads are actually processed and
+# finished jobs are actually announced.
 #
 # Three workers start by default (docker-compose.yml's `deploy.replicas`),
 # so this stack processes several videos at the same time. Prefetch is 1, so
