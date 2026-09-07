@@ -77,8 +77,8 @@ func (b *OutboxBatch) Messages() []OutboxMessage {
 // isolates dispatch generations during a rolling deploy, since the event type
 // is the only thing separating one generation's rows from another's in this
 // one shared table. And it keeps the two relays that now run against this
-// table — job dispatch in cmd/api, terminal events in cmd/worker — off each
-// other's rows: their sets are disjoint, so neither's backlog can starve the
+// table — job dispatch in cmd/video-api, terminal events in cmd/worker — off
+// each other's rows: their sets are disjoint, so neither's backlog can starve the
 // other's.
 //
 // The set is always explicit and closed. Passing every type, or no filter at

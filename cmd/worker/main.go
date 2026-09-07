@@ -1,8 +1,8 @@
 // Command worker consumes dispatched video jobs and runs the extraction
 // pipeline for each one.
 //
-// It is the asynchronous half of the cutover: cmd/api stores the upload,
-// queues the job, and answers 202, and this process does the work. It has no
+// It is the asynchronous half of the cutover: cmd/video-api stores the
+// upload, queues the job, and answers 202, and this process does the work. It has no
 // HTTP surface, no identity wiring, and no rate limiter, because it never
 // acts on behalf of a caller — it acts on a job named by an internal
 // dispatch. It must not be reachable from outside the deployment.
@@ -92,7 +92,7 @@ func main() {
 	if err := deps.redis.Close(); err != nil {
 		log.Printf("video: worker: close redis: %v", err)
 	}
-	// MinIO is absent for the same reason it is in cmd/api: that adapter
+	// MinIO is absent for the same reason it is in cmd/video-api: that adapter
 	// exposes no teardown.
 }
 
@@ -153,8 +153,8 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 	log.Print("video: worker: shutdown signal received")
 
 	// Joined before returning, and therefore before main closes PostgreSQL
-	// and Redis — the same reasoning as cmd/api's join of its outbox relay.
-	// A sweep holds a transaction while it runs, so tearing the pool down
+	// and Redis — the same reasoning as cmd/video-api's join of its outbox
+	// relay. A sweep holds a transaction while it runs, so tearing the pool down
 	// underneath one would abort a claim instead of resolving it.
 	<-sweeperDone
 
@@ -179,8 +179,8 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 }
 
 // createDirs creates the scratch directory the pipeline downloads into and
-// extracts through. This process is the only one that needs it — cmd/api
-// stopped touching the filesystem when extraction moved here.
+// extracts through. This process is the only one that needs it —
+// cmd/video-api stopped touching the filesystem when extraction moved here.
 func createDirs() error {
 	// Fatal, not logged and shrugged off: every delivery downloads its
 	// source into temp/ and extracts there. A worker without it would
@@ -227,8 +227,9 @@ type workerDeps struct {
 // Fail-fast on everything reachable: PostgreSQL and MinIO are confirmed here,
 // because a worker that cannot read a source or write a result has nothing to
 // contribute and should not sit in the queue consuming jobs it will only
-// fail. The broker is the exception, exactly as in cmd/api: RABBITMQ_URL must
-// be set, but the dial belongs to the consumer's own retry loop.
+// fail. The broker is the exception, exactly as in cmd/video-api:
+// RABBITMQ_URL must be set, but the dial belongs to the consumer's own retry
+// loop.
 func setupWorker(ctx context.Context) (*workerDeps, error) {
 	rabbitConfig, err := platformrabbitmq.LoadConfigFromEnv()
 	if err != nil {

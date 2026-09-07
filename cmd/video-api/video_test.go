@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -175,7 +176,7 @@ func (s *fakeIdempotencyStore) callCounts() (finalize, clear int) {
 	return s.finalizeCalls, s.clearCalls
 }
 
-// alwaysAllowRateLimiter is a fake videoRateLimiter so HTTP tests unrelated
+// alwaysAllowRateLimiter is a fake rateLimiter so HTTP tests unrelated
 // to rate limiting itself don't need a live Redis instance and are
 // unaffected by it, mirroring fakeIdempotencyStore's role for idempotency.
 type alwaysAllowRateLimiter struct{}
@@ -414,9 +415,9 @@ func newTestVideoModuleWithRepo(t *testing.T) (*videoModule, *inMemoryVideoJobRe
 }
 
 // newTestStorages builds both storage adapters against the same real MinIO
-// instance cmd/api itself reads (VIDEO_MINIO_*). TestMain has already proven
-// the configuration loads, so a failure here is a genuine fault rather than
-// an unconfigured machine.
+// instance this service itself reads (VIDEO_MINIO_*). TestMain has already
+// proven the configuration loads, so a failure here is a genuine fault rather
+// than an unconfigured machine.
 //
 // One bucket serves both, as in production, where sources and results are
 // separated only by key prefix. Each test gets its own, drained and removed
@@ -573,9 +574,9 @@ func newTestVideoModuleWithBothStorages(t *testing.T) (*videoModule, *inMemoryVi
 // backed by an in-memory repository.
 func startTestVideoServer(t *testing.T) (*httptest.Server, testTokens) {
 	t.Helper()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens
 }
@@ -980,9 +981,9 @@ func newIdempotencyTestVideoModule() (*videoModule, *fakeIdempotencyStore, *inMe
 
 func startIdempotencyTestServer(t *testing.T) (*httptest.Server, testTokens, *fakeIdempotencyStore) {
 	t.Helper()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, store, _ := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens, store
 }
@@ -1024,9 +1025,9 @@ func startIdempotencyTestServerWithRepo(t *testing.T, repo videodomain.VideoJobR
 
 func startIdempotencyTestServerWithRepoAndStorage(t *testing.T, repo videodomain.VideoJobRepository, results videodomain.ResultStorage) (*httptest.Server, testTokens, *fakeIdempotencyStore) {
 	t.Helper()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, store := newIdempotencyTestVideoModuleWithRepoAndStorage(repo, results)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	return srv, tokens, store
 }
@@ -1125,9 +1126,9 @@ func sha256Hex(content []byte) string {
 // answer with the ordinary acknowledgement, never a second job and never a
 // second dispatch.
 func TestHandleVideoUpload_DuplicateWhileReservationInFlight_ReturnsExistingJob(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, store, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1207,9 +1208,9 @@ func TestHandleVideoUpload_DuplicateWhileReservationInFlight_ReturnsExistingJob(
 // finished job gets the same acknowledgement shape as a fresh submission,
 // naming the original, and the client learns it is done on its first poll.
 func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameJobWithoutCreatingANewOne(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, _, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1249,9 +1250,9 @@ func TestHandleVideoUpload_DuplicateAfterCompletion_ReturnsSameJobWithoutCreatin
 // is the worker's clear — and until that runs, an identical resubmission is
 // still answered with a reference to the failed job.
 func TestHandleVideoUpload_RetryAfterWorkerClearedTheKey_CreatesNewJob(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, _, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1341,9 +1342,9 @@ func TestHandleVideoUpload_ReservationNeverResolves_ReturnsConflict(t *testing.T
 // failure itself, which the acknowledgement has no field for and which the
 // client reads off its first poll instead.
 func TestHandleVideoUpload_DuplicateAfterFailure_ReturnsTheFailedJobBeforeClear(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, _, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1423,9 +1424,9 @@ func TestHandleVideoUpload_CreateVideoJobFailure_ClearsReservationForImmediateRe
 // would with no idempotency layer at all, instead of the old 500 "Failed to
 // check upload idempotency".
 func TestHandleVideoUpload_ReserveError_ProceedsWithoutIdempotencyProtection(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	module, store, repo := newIdempotencyTestVideoModule()
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	store.reserveErr = errors.New("simulated redis outage")
@@ -1679,7 +1680,7 @@ func (s *fakeSourceStorage) count() int {
 // left behind under the uploads/ prefix.
 func startSourceStorageTestServer(t *testing.T) (srv *httptest.Server, token, userID string, module *videoModule, repo *inMemoryVideoJobRepository, inspector bucketInspector) {
 	t.Helper()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 
 	repo = newInMemoryVideoJobRepository()
 	ids := videoidgen.New()
@@ -1697,7 +1698,7 @@ func startSourceStorageTestServer(t *testing.T) (srv *httptest.Server, token, us
 		ids,
 	)
 
-	srv = httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv = httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 	user, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 	return srv, token, user.String(), module, repo, inspector
@@ -1779,8 +1780,8 @@ func newEnqueueTestVideoModule() (*videoModule, *fakeIdempotencyStore, *inMemory
 // nothing and leaving the job to sit there forever.
 func TestHandleVideoUpload_QueuesTheJobThroughTheOutboxWritingPath(t *testing.T) {
 	module, _, repo, _ := newEnqueueTestVideoModule()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1806,8 +1807,8 @@ func TestHandleVideoUpload_QueuesTheJobThroughTheOutboxWritingPath(t *testing.T)
 func TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything(t *testing.T) {
 	module, store, repo, sources := newEnqueueTestVideoModule()
 	repo.enqueueErr = errors.New("outbox write failed")
-	identity, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1856,8 +1857,8 @@ func TestHandleVideoUpload_EnqueueFailure_DoesNotProcessAndReleasesEverything(t 
 // quietly picking the other.
 func TestHandleVideoUpload_QueuesTheJobBeforeFinalizingItsIdempotencyKey(t *testing.T) {
 	module, store, repo, _ := newEnqueueTestVideoModule()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	defer srv.Close()
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
@@ -1881,5 +1882,242 @@ func TestHandleVideoUpload_QueuesTheJobBeforeFinalizingItsIdempotencyKey(t *test
 	}
 	if !store.isFinalized(idemKey) {
 		t.Fatal("expected the key to be finalized once the job was queued")
+	}
+}
+
+// The route-level assertions below came from the file that is now auth_test.go
+// when it also held the Identity module. They are about this service's own
+// routes — what they authenticate is the middleware's effect, not the
+// middleware — so they live with the routes rather than with the copy of the
+// middleware, which carries its own assertions in auth_test.go.
+
+// uploadWithAuth performs a multipart /upload request, attaching an
+// Authorization header only when token is non-empty, so it can exercise both
+// the authenticated and unauthenticated paths through the same helper.
+func uploadWithAuth(t *testing.T, baseURL, token, videoPath, filename string) *http.Response {
+	t.Helper()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("video", filename)
+	if err != nil {
+		t.Fatalf("failed to create form file: %v", err)
+	}
+	file, err := os.Open(videoPath)
+	if err != nil {
+		t.Fatalf("failed to open test video: %v", err)
+	}
+	defer file.Close()
+	if _, err := io.Copy(part, file); err != nil {
+		t.Fatalf("failed to copy video into form: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/upload", body)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	return resp
+}
+
+func TestVideoRoutes_PublicGetRoot(t *testing.T) {
+	auth, _ := newTestAuthenticatorWithTokens(t)
+	srv := httptest.NewServer(setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestVideoRoutes_RejectUnauthenticatedRequests(t *testing.T) {
+	auth, _ := newTestAuthenticatorWithTokens(t)
+	srv := httptest.NewServer(setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	getCases := []string{
+		"/api/status",
+		"/download/whatever.zip",
+	}
+	for _, path := range getCases {
+		resp := getWithAuthorization(t, srv.URL+path, "")
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET %s without token: status = %d, want %d", path, resp.StatusCode, http.StatusUnauthorized)
+		}
+	}
+
+	fakeVideo := generateUndecodableVideo(t, "unauthenticated.mp4")
+	resp := uploadWithAuth(t, srv.URL, "", fakeVideo, "test.mp4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("POST /upload without token: status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+func TestVideoRoutes_FullFlowWithValidToken(t *testing.T) {
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	videoPath := generateTestVideo(t, 1)
+	uploadResp := uploadWithAuth(t, srv.URL, token, videoPath, "test-video.mp4")
+	defer uploadResp.Body.Close()
+	if uploadResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("authenticated upload status = %d, want %d", uploadResp.StatusCode, http.StatusAccepted)
+	}
+
+	statusResp := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+token)
+	defer statusResp.Body.Close()
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated /api/status status = %d, want %d", statusResp.StatusCode, http.StatusOK)
+	}
+
+	// The upload's own job is only queued, so this route has nothing of its
+	// to hand back yet — a seeded completed job is what makes the download
+	// leg of the flow reachable at all.
+	key := seedCompletedJob(t, video, userID.String())
+	downloadResp := getWithAuthorization(t, srv.URL+"/download/"+key, "Bearer "+token)
+	defer downloadResp.Body.Close()
+	if downloadResp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated download status = %d, want %d", downloadResp.StatusCode, http.StatusOK)
+	}
+}
+
+func TestArtifactOwnership_DownloadRejectsNonOwner(t *testing.T) {
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	zipFilename := seedCompletedJob(t, video, userA.String())
+
+	ownResp := getWithAuthorization(t, srv.URL+"/download/"+zipFilename, "Bearer "+tokenA)
+	defer ownResp.Body.Close()
+	if ownResp.StatusCode != http.StatusOK {
+		t.Fatalf("owner download status = %d, want %d", ownResp.StatusCode, http.StatusOK)
+	}
+
+	otherResp := getWithAuthorization(t, srv.URL+"/download/"+zipFilename, "Bearer "+tokenB)
+	defer otherResp.Body.Close()
+	if otherResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("non-owner download status = %d, want %d", otherResp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestArtifactOwnership_StatusScopedToOwner(t *testing.T) {
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	_, tokenB := issueTestToken(t, tokens, "550e8400-e29b-41d4-a716-446655440000")
+
+	zipFilename := seedCompletedJob(t, video, userA.String())
+
+	statusA := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+tokenA)
+	defer statusA.Body.Close()
+	var resultA struct {
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(statusA.Body).Decode(&resultA); err != nil {
+		t.Fatalf("unexpected error decoding status response: %v", err)
+	}
+	if !containsFilename(resultA.Files, zipFilename) {
+		t.Fatalf("expected owner's /api/status to include %q, got %+v", zipFilename, resultA.Files)
+	}
+
+	statusB := getWithAuthorization(t, srv.URL+"/api/status", "Bearer "+tokenB)
+	defer statusB.Body.Close()
+	var resultB struct {
+		Files []struct {
+			Filename string `json:"filename"`
+		} `json:"files"`
+	}
+	if err := json.NewDecoder(statusB.Body).Decode(&resultB); err != nil {
+		t.Fatalf("unexpected error decoding status response: %v", err)
+	}
+	if containsFilename(resultB.Files, zipFilename) {
+		t.Fatalf("expected non-owner's /api/status to exclude %q, got %+v", zipFilename, resultB.Files)
+	}
+}
+
+func containsFilename(files []struct {
+	Filename string `json:"filename"`
+}, filename string) bool {
+	for _, f := range files {
+		if f.Filename == filename {
+			return true
+		}
+	}
+	return false
+}
+
+// TestArtifactOwnership_StaticOutputsRouteIsGone replaces the ownership test
+// that used to cover the /outputs static mount. That mount served the same
+// bytes as GET /download/:filename under a parallel ownership check, and it
+// is removed now that results live in object storage — so the property to
+// guard is that no route answers there at all, for the owner or anyone else.
+func TestArtifactOwnership_StaticOutputsRouteIsGone(t *testing.T) {
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	video := newTestVideoModule(t)
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+	zipFilename := seedCompletedJob(t, video, userA.String())
+
+	resp := getWithAuthorization(t, srv.URL+"/outputs/"+zipFilename, "Bearer "+tokenA)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /outputs/<key> status = %d, want %d — the static outputs mount must no longer exist", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// TestStaticUploadsRouteIsGone replaces the two ownership tests that covered
+// the /uploads static mount and its sidecar files. Source videos are objects
+// now, deleted before their own request finishes, so there is nothing to
+// serve and no sidecar to leak — the property to guard is that no route
+// answers there at all.
+func TestStaticUploadsRouteIsGone(t *testing.T) {
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	srv := httptest.NewServer(setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{}))
+	defer srv.Close()
+
+	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+
+	for _, path := range []string{"/uploads/whatever.mp4", "/uploads/fake-artifact.mp4.owner"} {
+		resp := getWithAuthorization(t, srv.URL+path, "Bearer "+token)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want %d — the static uploads mount must no longer exist", path, resp.StatusCode, http.StatusNotFound)
+		}
 	}
 }

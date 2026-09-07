@@ -9,8 +9,8 @@
 // Redis nor ffmpeg. Requiring any of them would misrepresent what this
 // process does.
 //
-// A separate process rather than a goroutine in cmd/api or cmd/worker: an
-// outbound request to a third party must share a lifecycle with neither
+// A separate process rather than a goroutine in cmd/video-api or cmd/worker:
+// an outbound request to a third party must share a lifecycle with neither
 // serving HTTP nor the worker's one-extraction-at-a-time shape. The three
 // scale on different axes.
 package main
@@ -268,8 +268,8 @@ func positiveSecondsFromEnv(name string, fallback time.Duration) (time.Duration,
 // flight to reach a disposition, and closes the database pool only if that
 // wait succeeded.
 //
-// The close lives here rather than in main, which is where cmd/api and
-// cmd/worker put theirs, because here it is conditional on how the wait
+// The close lives here rather than in main, which is where cmd/video-api
+// and cmd/worker put theirs, because here it is conditional on how the wait
 // ended and this is the only place that is known. What it consumes with is a
 // parameter for the same reason the drain is one: a test cannot wait out the
 // production drain, and the branch below that matters most is reached only

@@ -9,7 +9,7 @@ import (
 // TestMain fixes the working directory and gates nothing. go test sets the
 // working directory to this package's own, while the source scans in
 // notification_test.go name paths from the repository root — the same reason
-// cmd/api chdirs.
+// cmd/video-api chdirs.
 //
 // There is deliberately no prerequisite gate. No test in this package opens a
 // PostgreSQL pool or reaches Redis: the routes are exercised over an

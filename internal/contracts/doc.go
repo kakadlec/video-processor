@@ -1,10 +1,10 @@
 // Package contracts holds the cross-context integration pins: the assertions
 // that one bounded context's copy of another's integration contract still
 // equals the original. It exists because there is nowhere else left to put
-// them. Those assertions used to live in cmd/api, which imported every
-// context because it served every context's routes; since the HTTP tier was
-// split, no composition root imports two contexts, and a drift between the
-// two copies would be silent everywhere.
+// them. Those assertions used to live in cmd/api — since split away and gone
+// — which imported every context because it served every context's routes.
+// Now that the HTTP tier is split, no composition root imports two contexts,
+// and a drift between the two copies would be silent everywhere.
 //
 // ddd-architecture grants this package the cross-context import it forbids
 // everywhere else, and the permission is conditional: this package declares

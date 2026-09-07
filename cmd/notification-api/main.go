@@ -86,7 +86,7 @@ func main() {
 	}
 
 	// Shutdown, then close both connections, and there is no ordering
-	// constraint hiding in that: unlike cmd/api's sequence, nothing here
+	// constraint hiding in that: unlike cmd/video-api's sequence, nothing here
 	// borrows either for a whole operation. There is no relay and no
 	// background goroutine holding a transaction, so once Shutdown has
 	// returned, every statement this process will ever run has finished.
@@ -150,7 +150,7 @@ func setupRouter(auth *authenticator, notification *notificationModule, limiter 
 	// its order are the invariant — the limiter keys on the authenticated
 	// subject, so it has nothing to key on ahead of the middleware that
 	// establishes one. cmd/api stated this across two groups serving two
-	// contexts; this service carries it alone.
+	// contexts before it was split away; this service carries it alone.
 	notificationRoutes := r.Group("/")
 	notificationRoutes.Use(auth.requireBearerAuth())
 	notificationRoutes.Use(rateLimitMiddleware(limiter))

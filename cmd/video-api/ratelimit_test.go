@@ -16,9 +16,9 @@ import (
 	"video-processor/internal/identity/domain"
 )
 
-// fakeVideoRateLimiter is a scriptable videoRateLimiter for exercising
+// fakeRateLimiter is a scriptable rateLimiter for exercising
 // rateLimitMiddleware without a live Redis instance.
-type fakeVideoRateLimiter struct {
+type fakeRateLimiter struct {
 	mu         sync.Mutex
 	allow      bool
 	retryAfter time.Duration
@@ -35,7 +35,7 @@ type fakeVideoRateLimiter struct {
 	calls             []string
 }
 
-func (f *fakeVideoRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
+func (f *fakeRateLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, key)
 	block := f.blockUntilCtxDone
@@ -48,7 +48,7 @@ func (f *fakeVideoRateLimiter) Allow(ctx context.Context, key string) (bool, tim
 	return f.allow, f.retryAfter, f.err
 }
 
-func (f *fakeVideoRateLimiter) callCount() int {
+func (f *fakeRateLimiter) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
@@ -61,7 +61,7 @@ func (f *fakeVideoRateLimiter) callCount() int {
 // the value requireBearerAuth would have stored, so tests don't need a real
 // bearer token; a zero UserID simulates an unauthenticated request (nothing
 // injected), exercising the middleware's own authenticatedUserID(c) check.
-func newRateLimitTestRouter(limiter videoRateLimiter, authUserID domain.UserID, injectAuth bool) (*httptest.Server, *int32) {
+func newRateLimitTestRouter(limiter rateLimiter, authUserID domain.UserID, injectAuth bool) (*httptest.Server, *int32) {
 	var handlerCalls int32
 
 	gin.SetMode(gin.TestMode)
@@ -92,7 +92,7 @@ func testUserID(t *testing.T, uuid string) domain.UserID {
 }
 
 func TestRateLimitMiddleware_AllowedRequestReachesHandler(t *testing.T) {
-	limiter := &fakeVideoRateLimiter{allow: true}
+	limiter := &fakeRateLimiter{allow: true}
 	srv, handlerCalls := newRateLimitTestRouter(limiter, testUserID(t, "3fa85f64-5717-4562-b3fc-2c963f66afa6"), true)
 	t.Cleanup(srv.Close)
 
@@ -114,7 +114,7 @@ func TestRateLimitMiddleware_AllowedRequestReachesHandler(t *testing.T) {
 }
 
 func TestRateLimitMiddleware_DeniedRequestReturns429AndNeverReachesHandler(t *testing.T) {
-	limiter := &fakeVideoRateLimiter{allow: false, retryAfter: 42 * time.Second}
+	limiter := &fakeRateLimiter{allow: false, retryAfter: 42 * time.Second}
 	srv, handlerCalls := newRateLimitTestRouter(limiter, testUserID(t, "3fa85f64-5717-4562-b3fc-2c963f66afa6"), true)
 	t.Cleanup(srv.Close)
 
@@ -145,7 +145,7 @@ func TestRateLimitMiddleware_DeniedRequestReturns429AndNeverReachesHandler(t *te
 }
 
 func TestRateLimitMiddleware_LimiterErrorFailsOpenAndReachesHandler(t *testing.T) {
-	limiter := &fakeVideoRateLimiter{err: errors.New("redis unreachable")}
+	limiter := &fakeRateLimiter{err: errors.New("redis unreachable")}
 	srv, handlerCalls := newRateLimitTestRouter(limiter, testUserID(t, "3fa85f64-5717-4562-b3fc-2c963f66afa6"), true)
 	t.Cleanup(srv.Close)
 
@@ -164,7 +164,7 @@ func TestRateLimitMiddleware_LimiterErrorFailsOpenAndReachesHandler(t *testing.T
 }
 
 func TestRateLimitMiddleware_UnresponsiveLimiterFailsOpenWithinBoundedTimeout(t *testing.T) {
-	limiter := &fakeVideoRateLimiter{blockUntilCtxDone: true}
+	limiter := &fakeRateLimiter{blockUntilCtxDone: true}
 	srv, handlerCalls := newRateLimitTestRouter(limiter, testUserID(t, "3fa85f64-5717-4562-b3fc-2c963f66afa6"), true)
 	t.Cleanup(srv.Close)
 
@@ -188,7 +188,7 @@ func TestRateLimitMiddleware_UnresponsiveLimiterFailsOpenWithinBoundedTimeout(t 
 }
 
 func TestRateLimitMiddleware_UnauthenticatedRequestNeverInvokesLimiter(t *testing.T) {
-	limiter := &fakeVideoRateLimiter{allow: true}
+	limiter := &fakeRateLimiter{allow: true}
 	// injectAuth=false: nothing sets authenticatedUserIDKey, simulating a
 	// request the identity layer never authenticated (or a route outside
 	// videoRoutes, which never runs requireBearerAuth in the first place).
@@ -210,7 +210,7 @@ func TestRateLimitMiddleware_UnauthenticatedRequestNeverInvokesLimiter(t *testin
 }
 
 func TestRateLimitMiddleware_KeysDifferentUsersIndependently(t *testing.T) {
-	limiter := &fakeVideoRateLimiter{allow: true}
+	limiter := &fakeRateLimiter{allow: true}
 	srvA, _ := newRateLimitTestRouter(limiter, testUserID(t, "3fa85f64-5717-4562-b3fc-2c963f66afa6"), true)
 	t.Cleanup(srvA.Close)
 	srvB, _ := newRateLimitTestRouter(limiter, testUserID(t, "4fa85f64-5717-4562-b3fc-2c963f66afa7"), true)

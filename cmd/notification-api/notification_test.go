@@ -115,8 +115,9 @@ func (r *inMemoryPreferenceRepository) count() int {
 
 // alwaysAllowRateLimiter is a fake rateLimiter so the tests that are not
 // about rate limiting don't need a live Redis instance and are unaffected by
-// it. Carried from cmd/api/video_test.go, where the preference suite used to
-// borrow it; the limiter's own behaviour is covered by ratelimit_test.go.
+// it. Carried from cmd/video-api/video_test.go, where the preference suite
+// used to borrow it; the limiter's own behaviour is covered by
+// ratelimit_test.go.
 type alwaysAllowRateLimiter struct{}
 
 func (alwaysAllowRateLimiter) Allow(context.Context, string) (bool, time.Duration, error) {
@@ -683,7 +684,8 @@ const deliveryUseCaseConstructor = "NewDeliverNotification"
 // queries: a call that is never executed is invisible to a test that runs
 // the program.
 //
-// Re-targeted here from cmd/api, and the claim is strictly stronger for the
+// Re-targeted here from cmd/api before it was split away, and the claim is
+// strictly stronger for the
 // move: the Identity and Video services no longer link the Notification
 // context's repository at all, so for them the property is enforced by the
 // build rather than by a test. This is the one HTTP service left that could

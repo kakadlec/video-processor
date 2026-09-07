@@ -16,9 +16,9 @@ import (
 	"video-processor/internal/identity/domain"
 )
 
-// This file is a copy of cmd/api's, carried with the middleware rather than
-// moved: every service that holds a copy of rateLimitMiddleware holds the
-// tests that can catch that copy regressing. The preference suite's own
+// This file is a copy of cmd/video-api's, carried with the middleware rather
+// than moved: every service that holds a copy of rateLimitMiddleware holds
+// the tests that can catch that copy regressing. The preference suite's own
 // fixture is an always-allow fake, so without this file a regression in this
 // service's middleware would pass every other test in the repository.
 //

@@ -47,16 +47,16 @@ func TestMain(m *testing.M) {
 	// RABBITMQ_URL is required to be set, and deliberately not required to
 	// be reachable: setupVideo loads the config but never dials, so a suite
 	// that demanded a live broker would assert a stronger contract than
-	// cmd/api actually has. The relay's behavior against a real broker is
+	// this service actually has. The relay's behavior against a real broker is
 	// covered by internal/video/infrastructure/messaging's own tests.
 	if _, err := platformrabbitmq.LoadConfigFromEnv(); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v — integration tests require it to be set; see CLAUDE.md for the Docker fallback.\n", err)
 		os.Exit(1)
 	}
 	// go test sets the working directory to this package's own directory
-	// (cmd/api), while the app resolves every relative path against the
+	// (cmd/video-api), while the app resolves every relative path against the
 	// repo root — chdir so tests see the same layout the running binary
-	// does, not a shadow copy under cmd/api.
+	// does, not a shadow copy under cmd/video-api.
 	if err := os.Chdir("../.."); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: failed to chdir to repo root: %v\n", err)
 		os.Exit(1)
@@ -112,9 +112,9 @@ const testStatusUserID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 // has to reach past the HTTP surface and drive the job there itself.
 func startTestServerWithModule(t *testing.T) (*httptest.Server, string, *videoModule) {
 	t.Helper()
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -384,9 +384,9 @@ func TestUpload_ValidVideo_QueuesTheJobAndAnswers202(t *testing.T) {
 // tell "no such artifact" from "someone else's artifact" from "not a key at
 // all". Comparing status codes alone would pass even if the bodies differed.
 func TestDownload_EveryRejectionIsByteIdentical(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -532,11 +532,11 @@ func TestDownload_MissingObjectIsRejectedLikeEveryOtherCase(t *testing.T) {
 // endpoint and the bucket, so they are exactly the ones that must render as
 // the same opaque rejection as a malformed key.
 func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	repo := newInMemoryVideoJobRepository()
 	results := newFakeResultStorage()
 	module, _ := newIdempotencyTestVideoModuleWithRepoAndStorage(repo, results)
-	srv := httptest.NewServer(setupRouter(identity, module, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, module, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userID, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -592,9 +592,9 @@ func TestDownload_StorageFailuresAreRejectedLikeEveryOtherCase(t *testing.T) {
 // comparison: it is not enough that a rejection looks like the others, it
 // must also not have minted anything the caller could use.
 func TestDownload_NonOwnerReceivesNoGrant(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
+	auth, tokens := newTestAuthenticatorWithTokens(t)
 	video := newTestVideoModule(t)
-	srv := httptest.NewServer(setupRouter(identity, video, alwaysAllowRateLimiter{}))
+	srv := httptest.NewServer(setupRouter(auth, video, alwaysAllowRateLimiter{}))
 	t.Cleanup(srv.Close)
 
 	userA, tokenA := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -722,8 +722,8 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // asserts on bytes actually consumed from the request body instead — the
 // discriminating signal.
 func TestUpload_LargeInvalidExtension_RejectsWithoutReadingFullBody(t *testing.T) {
-	identity, tokens := newTestIdentityModuleWithTokens(t)
-	router := setupRouter(identity, newTestVideoModule(t), alwaysAllowRateLimiter{})
+	auth, tokens := newTestAuthenticatorWithTokens(t)
+	router := setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{})
 	_, token := issueTestToken(t, tokens, "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 
 	var headerBuf bytes.Buffer

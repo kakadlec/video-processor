@@ -1,6 +1,6 @@
 // Package ffmpeg implements domain.FrameExtractor by shelling out to the
 // ffmpeg binary, replacing the extraction logic that used to live inline in
-// cmd/api/main.go.
+// cmd/video-api/main.go.
 package ffmpeg
 
 import (
@@ -21,7 +21,8 @@ const tempDirName = "temp"
 
 // ErrFfmpegExecFailed, ErrNoFramesExtracted, and ErrZipCreationFailed
 // classify ExtractFrames' failure modes so a caller can map each to its own
-// user-facing message (e.g. cmd/api/video.go's handleVideoUpload) instead of
+// user-facing message (e.g. cmd/video-api/video.go's handleVideoUpload)
+// instead of
 // exposing this package's own (English, per the repo's language policy)
 // error text directly.
 var (

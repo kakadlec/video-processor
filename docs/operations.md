@@ -2,7 +2,7 @@
 
 ## Current Deployment
 
-The application is **two** Go processes built from one image: `cmd/api` (the HTTP surface) and `cmd/worker` (the frame-extraction consumer and recovery sweeper). Neither is a prerequisite for the other to start, and neither switches behaviour on a mode flag — the image's default command runs the API, and the worker is started by overriding it (`/app/worker`). There is no orchestration. External services are PostgreSQL for authoritative identity and video-job state; Redis for upload idempotency, per-user rate limiting, the non-authoritative status cache, and worker leases; MinIO for source videos and results; and RabbitMQ for dispatch. Every service needs environment-specific configuration — the per-process surface is below.
+The application is **five** Go processes built from one image: `cmd/identity-api`, `cmd/video-api` and `cmd/notification-api` (one HTTP service per bounded context, behind a gateway), `cmd/worker` (the frame-extraction consumer and recovery sweeper), and `cmd/notifier` (webhook delivery). None is a prerequisite for another to start, and none switches behaviour on a mode flag — the image's default command runs the Video API, and every other process is started by overriding it (`/app/identity-api`, `/app/notification-api`, `/app/worker`, `/app/notifier`). There is no orchestration. External services are PostgreSQL for authoritative identity and video-job state; Redis for upload idempotency, per-user rate limiting, the non-authoritative status cache, and worker leases; MinIO for source videos and results; and RabbitMQ for dispatch. Every service needs environment-specific configuration — the per-process surface is below.
 
 ### Docker
 
@@ -10,16 +10,23 @@ The application is **two** Go processes built from one image: `cmd/api` (the HTT
 # Build
 docker build -t video-processor .
 
-# Run the API (identity, video, notification, Redis, MinIO, and RabbitMQ configuration are all
-# required — see Environment Variables below; the container exits at startup if
-# any is missing)
-docker run -p 8080:8080 \
+# Run the Identity API — the only process that holds a private key and so the
+# only one that can mint a token. No Redis, no MinIO, no broker
+docker run -p 8081:8080 \
   -e IDENTITY_POSTGRES_DSN="postgres://user:pass@host:5432/identity?sslmode=disable" \
   -e IDENTITY_JWT_PRIVATE_KEY="$(cat identity-private-key.pem)" \
   -e IDENTITY_JWT_KEY_ID="2026-09" \
   -e IDENTITY_JWT_PUBLIC_KEYS='{"2026-09":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}' \
+  video-processor /app/identity-api
+
+# Run the Video API — the image's default command, and the service that serves
+# the embedded frontend. It verifies tokens and cannot mint one: there is no
+# code path in this binary that constructs an issuer, and a private key handed
+# to it as IDENTITY_JWT_PUBLIC_KEYS is refused at startup rather than quietly
+# accepted
+docker run -p 8080:8080 \
+  -e IDENTITY_JWT_PUBLIC_KEYS='{"2026-09":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}' \
   -e VIDEO_POSTGRES_DSN="postgres://user:pass@host:5432/video?sslmode=disable" \
-  -e NOTIFICATION_POSTGRES_DSN="postgres://user:pass@host:5432/notification?sslmode=disable" \
   -e REDIS_ADDR="host:6379" \
   -e VIDEO_MINIO_ENDPOINT="host:9000" \
   -e VIDEO_MINIO_ACCESS_KEY="minio-access-key" \
@@ -27,6 +34,15 @@ docker run -p 8080:8080 \
   -e VIDEO_MINIO_BUCKET="video-results" \
   -e RABBITMQ_URL="amqp://user:pass@host:5672/" \
   video-processor
+
+# Run the Notification API — the preference routes and nothing else: a
+# verifier, its own DSN, and Redis for the rate-limit counter it shares with
+# the other HTTP services. No video database, no bucket, no broker
+docker run -p 8082:8080 \
+  -e IDENTITY_JWT_PUBLIC_KEYS='{"2026-09":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}' \
+  -e NOTIFICATION_POSTGRES_DSN="postgres://user:pass@host:5432/notification?sslmode=disable" \
+  -e REDIS_ADDR="host:6379" \
+  video-processor /app/notification-api
 
 # Run the worker — same image, different command, no port, and NO IDENTITY_*
 # or NOTIFICATION_* variables: it makes no access-control decision and
@@ -43,7 +59,7 @@ docker run \
   video-processor /app/worker
 
 # Run the notifier — same image again, no port, and the narrowest surface of
-# the three: only the Notification context's own DSN and the broker URL. It
+# them all: only the Notification context's own DSN and the broker URL. It
 # authenticates no caller, stores no artifact, holds no lease, and runs no
 # ffmpeg, so it reads NO IDENTITY_*, NO VIDEO_* (MinIO included), and no
 # REDIS_ADDR. NOTIFICATION_ALLOW_INSECURE_DESTINATIONS is deliberately not
@@ -66,7 +82,7 @@ docker run \
 
 **Uploads are not processed unless at least one worker is running.** With the API alone, `POST /upload` still answers `202` and the job sits in `queued` forever — the submission succeeds because it was accepted, not because it was done. Run at least one worker in every environment where uploads are expected to complete. Scale by adding worker processes, not by raising a concurrency setting: prefetch is one by design, so a worker holds exactly one job at a time.
 
-The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.27-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships **all three** binaries (`/app/app`, `/app/worker`, `/app/notifier`) and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). `ffmpeg` is there for the worker rather than for the API or the notifier, and stays for that reason. One image for three processes is deliberate: they share every `internal/` package, so separate images would create a way for the halves of one deploy to be built from different commits of the same domain code. See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
+The Dockerfile is a multi-stage build. The default (final) stage — used by the command above — compiles a static binary in a `golang:1.27-alpine` builder stage (dependencies resolved read-only from the committed `go.sum`), then ships **all five** binaries (`/app/identity-api`, `/app/video-api`, `/app/notification-api`, `/app/worker`, `/app/notifier`) and `ffmpeg` in a minimal `alpine` runtime stage with no Go toolchain or source tree, running as a fixed non-root user (UID 1000). `ffmpeg` is there for the worker rather than for any HTTP service or the notifier, and stays for that reason. One image for five processes is deliberate: they share every `internal/` package, so separate images would create a way for the halves of one deploy to be built from different commits of the same domain code. See [docs/development.md](development.md) for the additional `test` stage used to run the suite via Docker.
 
 > **Fenced-worker cutover and rollback:** when crossing the version boundary between pre-fence workers and this fenced generation, drain every pre-fence worker before starting any recovery sweeper. Those workers set no lease and do not honor `lease_epoch`, so overlap can let an unconditional terminal write overwrite a successor. A rollback across that same boundary must first stop every fenced worker and sweeper before any pre-fence worker starts. `cmd/worker` waits up to five minutes on SIGTERM; configure more than five minutes of termination grace, with additional margin for the sweeper join and final resource shutdown and verify the departing generation has exited before scaling the other one up. The additive `lease_epoch` column may remain during rollback.
 >
