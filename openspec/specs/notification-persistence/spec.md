@@ -3,9 +3,7 @@
 ## Purpose
 
 Defines how the Notification bounded context persists its own state: the connection string it requires at startup, the shape and uniqueness of the stored preference, how its schema is created, and where its connection pool sits in the API's shutdown sequence.
-
 ## Requirements
-
 ### Requirement: Notification Owns Its Own PostgreSQL Configuration
 
 The Notification context SHALL read its connection string from `NOTIFICATION_POSTGRES_DSN` and SHALL NOT read, share, or fall back to `IDENTITY_POSTGRES_DSN` or `VIDEO_POSTGRES_DSN`. The variable SHALL be required at the startup of **every process that uses the context** — `cmd/notification-api` and `cmd/notifier` alike: when it is absent, startup SHALL fail with a clear error naming the variable rather than starting a process that cannot serve a preference request or resolve an event.
@@ -171,7 +169,7 @@ The context SHALL expose exactly one repository operation that loads the stored 
 
 This is a narrowing of the existing rule, not a relaxation of it. HMAC signing requires the original bytes, so the value has to be loadable somewhere; what makes it safe is that the somewhere is singular, named, and provably not on any path that builds an HTTP response. The read used by the preference routes SHALL remain unable to load it, so the response types those routes build still cannot carry a value that was never fetched.
 
-That the secret-loading operation has no caller in the HTTP composition root SHALL be enforced by a test rather than by convention.
+That the secret-loading operation has no caller in the Notification context's HTTP service SHALL be enforced by a test rather than by convention. That service is the only HTTP process that links this package at all after the HTTP tier was split by bounded context, so the test's subject is narrower than it was, and for the other HTTP services the property holds by construction rather than by inspection.
 
 #### Scenario: The preference read still cannot load a secret
 
@@ -184,7 +182,8 @@ That the secret-loading operation has no caller in the HTTP composition root SHA
 - **WHEN** the delivery path loads it
 - **THEN** it receives the full preference, secret included, and can compute a signature with it
 
-#### Scenario: The HTTP composition root does not call the secret-loading operation
+#### Scenario: The Notification HTTP service does not call the secret-loading operation
 
-- **WHEN** the HTTP composition root's sources are inspected
+- **WHEN** the sources of the Notification context's HTTP service are inspected
 - **THEN** none of them calls the secret-loading operation
+
