@@ -8,11 +8,11 @@ Defines the process that reads a video job's terminal outcome off the broker and
 
 ### Requirement: Delivery Runs in Its Own Entrypoint, Requiring Only Its Own Configuration
 
-The Notification context's event consumer SHALL be a third entrypoint, `cmd/notifier`, built from the same source tree and shipped in the same image as `cmd/api` and `cmd/worker`, and started as that image with a different command. It SHALL listen on no port.
+The Notification context's event consumer SHALL be its own entrypoint, `cmd/notifier`, built from the same source tree and shipped in the same image as the three HTTP services and `cmd/worker`, and started as that image with a different command. It SHALL listen on no port.
 
 It SHALL require exactly the configuration it uses — the Notification context's own PostgreSQL DSN and the broker URL — and SHALL fail fast with an error naming a missing variable rather than starting in a degraded mode. It SHALL NOT require identity configuration, object-storage configuration, Redis, or `ffmpeg`: it authenticates no caller, stores no artifact, holds no lease, and runs no extraction. Requiring any of them would misrepresent what the process does.
 
-A separate process rather than a goroutine inside an existing one is required for the reason `videojob-terminal-events` gives for placing the terminal relay in the worker, applied to the other direction: an outbound request to a third party must not share a lifecycle with serving HTTP requests, nor with the worker's single-extraction-at-a-time shape. The three processes scale on different axes.
+A separate process rather than a goroutine inside an existing one is required for the reason `videojob-terminal-events` gives for placing the terminal relay in the worker, applied to the other direction: an outbound request to a third party must not share a lifecycle with serving HTTP requests, nor with the worker's single-extraction-at-a-time shape. They scale on different axes.
 
 Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bounded backoff and SHALL redial when the connection or channel is lost.
 
@@ -34,11 +34,11 @@ Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bo
 - **WHEN** `cmd/notifier` starts
 - **THEN** it starts, retries the dial with backoff, and begins consuming once the broker returns
 
-#### Scenario: Each of the three processes starts without the others
+#### Scenario: Each of the processes starts without the others
 
 - **GIVEN** the built image
-- **WHEN** any one of the API, the worker, and the notifier is started alone with its own configuration
-- **THEN** it starts and operates without the other two running
+- **WHEN** any one of the three HTTP services, the worker, and the notifier is started alone with its own configuration
+- **THEN** it starts and operates without any of the others running
 
 ### Requirement: The Consumer Declares the Terminal Topology From the Context's Own Copy of the Names
 
@@ -151,7 +151,7 @@ A message that cannot be decoded SHALL NOT be requeued: redelivering it produces
 
 On a termination signal the consumer SHALL stop taking new deliveries, SHALL wait — under a bounded drain — for the delivery in hand to reach a disposition, and SHALL close the database pool that delivery borrows only after that wait has succeeded. The handler SHALL run on a context that shutdown does not cancel, so a signal does not abort an outbound request mid-flight or prevent an outcome from being recorded.
 
-This is the ordering `cmd/api` and `cmd/worker` already hold, for the same reason: closing a handle underneath an operation that borrows it turns a resolvable state into an aborted one. A delivery interrupted after its claim but before its outcome is recorded is exactly the case the reclaim period exists to repair, and shutdown SHALL NOT be a routine way of producing it.
+This is the ordering `cmd/video-api` and `cmd/worker` already hold, for the same reason: closing a handle underneath an operation that borrows it turns a resolvable state into an aborted one. A delivery interrupted after its claim but before its outcome is recorded is exactly the case the reclaim period exists to repair, and shutdown SHALL NOT be a routine way of producing it.
 
 The two rules meet when the drain expires, and the resolution SHALL be stated rather than left to the implementation: at that point the handler is still running on its detached context, so it can never be joined, and "close only after the join" and "exit at the bound" cannot both be honoured. **The bound SHALL win.** The process SHALL exit without an orderly close of the pool, and this SHALL be a named exception to the ordering above rather than a violation of it. Nothing is lost by it that the reclaim bound does not already cover: an unresolved claim left by an aborted process is precisely the state a later consumer reclaims, and a pool closed by process exit releases the same connections the server would reclaim on the closed socket. Skipping the close is chosen over extending the wait because an unbounded wait turns one hung destination into a process that never terminates.
 

@@ -180,7 +180,7 @@ A publish outside confirm mode returns nothing to the publisher: AMQP's `basic.p
 
 A fake proves nothing about the two behaviors this package exists to get right: that a handshake against a real broker succeeds or fails as reported, and that a redeclaration with the arguments it declares is accepted while a conflicting one is not. Both are broker-enforced, and a test double would assert only that the package calls the functions the test double was written to expect.
 
-The skip is scoped to this package, and it is not the posture `cmd/api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. `cmd/api` now opens an AMQP connection, so its own `TestMain` requires `RABBITMQ_URL` to be **set**, alongside `ffmpeg` and the `VIDEO_MINIO_*` variables — but it does not require a reachable broker, because `cmd/api` does not either: the connection belongs to the outbox relay, which dials it in its own goroutine and retries rather than blocking startup. A `TestMain` demanding a live broker would assert a stronger contract than the code has.
+The skip is scoped to this package, and it is not the posture `cmd/video-api`'s `TestMain` takes for `ffmpeg` and MinIO — that one exits non-zero, because those back behavior the suite would otherwise report green while covering none of. `cmd/video-api` now opens an AMQP connection, so its own `TestMain` requires `RABBITMQ_URL` to be **set**, alongside `ffmpeg` and the `VIDEO_MINIO_*` variables — but it does not require a reachable broker, because `cmd/video-api` does not either: the connection belongs to the outbox relay, which dials it in its own goroutine and retries rather than blocking startup. A `TestMain` demanding a live broker would assert a stronger contract than the code has.
 
 The guarantee that survives from before a composition root opened a connection is the narrow one, stated in the scenario below: the variable is required at startup, a reachable broker is not. `cmd/worker` still does not exist and still opens nothing.
 
@@ -200,8 +200,8 @@ Tests SHALL exercise the exported `DeclareTopology` itself, passing descriptors 
 - **WHEN** it finishes, whether it passed or failed
 - **THEN** none of the entities it declared remains on the broker
 
-#### Scenario: cmd/api requires the variable but not a reachable broker
+#### Scenario: cmd/video-api requires the variable but not a reachable broker
 
 - **GIVEN** `RABBITMQ_URL` is set to an address with no broker listening
-- **WHEN** `cmd/api` starts, or its test suite runs
+- **WHEN** `cmd/video-api` starts, or its test suite runs
 - **THEN** it starts and serves every route, and the suite runs — the relay retries in the background and no request or test depends on the broker being up

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the Redis-backed, per-authenticated-user request rate limiter applied to every route in `cmd/api`'s `videoRoutes` group: threshold/window configuration, the fixed-window counting algorithm's observable behavior, the `429`/`Retry-After` rejection contract, and the fail-open behavior when the Redis-backed check itself is unavailable. This is the second Phase 4 feature (of idempotency keys, rate limiting, status cache) to consume `internal/platform/redis` (`redis-infrastructure`), implementing the "Rate limiting rejects excess requests" behavior `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement already documents at the target-state level.
+Define the Redis-backed, per-authenticated-user request rate limiter applied to every authenticated route across the HTTP services that mount it: threshold/window configuration, the fixed-window counting algorithm's observable behavior, the `429`/`Retry-After` rejection contract, and the fail-open behavior when the Redis-backed check itself is unavailable. This is the second Phase 4 feature (of idempotency keys, rate limiting, status cache) to consume `internal/platform/redis` (`redis-infrastructure`), implementing the "Rate limiting rejects excess requests" behavior `ddd-architecture`'s "Redis Responsibilities Are Additive" requirement already documents at the target-state level.
 
 ## Requirements
 

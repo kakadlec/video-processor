@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define how a `VideoJob`'s result artifact — the zip of extracted frames — is stored, authorized, and handed back. It covers the `ResultStorage` domain port and its MinIO adapter, the object key convention, the fail-closed startup wiring that makes the bucket a hard dependency of `cmd/api`, and the two HTTP endpoints through which a stored result is reached (`GET /download/:filename`, which authorizes and issues a bounded URL the client redeems against object storage, and `GET /api/status`, which lists them). Neither returns the artifact's bytes: since presigned issuance replaced proxied streaming, no response from this API carries a result.
+Define how a `VideoJob`'s result artifact — the zip of extracted frames — is stored, authorized, and handed back. It covers the `ResultStorage` domain port and its MinIO adapter, the object key convention, the fail-closed startup wiring that makes the bucket a hard dependency of `cmd/video-api`, and the two HTTP endpoints through which a stored result is reached (`GET /download/:filename`, which authorizes and issues a bounded URL the client redeems against object storage, and `GET /api/status`, which lists them). Neither returns the artifact's bytes: since presigned issuance replaced proxied streaming, no response from this API carries a result.
 
 Connection plumbing for MinIO — configuration, client construction, health check, bucket provisioning — belongs to `minio-infrastructure`; this capability builds on it. The extraction that produces the zip belongs to `videojob-execution`, and the aggregate's own `StorageKey`/status invariants to `ddd-architecture`.
 
@@ -57,7 +57,7 @@ The wrapped error itself MAY carry the client's own text, and does: that is what
 #### Scenario: No reader-returning operation remains on the port
 
 - **WHEN** the `ResultStorage` port is inspected
-- **THEN** it declares no operation returning an `io.Reader`, `io.ReadCloser`, or equivalent stream over a stored artifact, and no handler streams result bytes through `cmd/api`
+- **THEN** it declares no operation returning an `io.Reader`, `io.ReadCloser`, or equivalent stream over a stored artifact, and no handler streams result bytes through `cmd/video-api`
 
 ### Requirement: The Result Object Key Is Derived From The VideoJobID And Contains No Path Separator
 
@@ -107,7 +107,7 @@ The local zip SHALL be written under `temp/`, not `outputs/`; no directory named
 
 ### Requirement: MinIO Configuration Is Required At Application Startup
 
-`cmd/api` SHALL, during `setupVideo`, load the MinIO configuration, construct the client, confirm connectivity with a real round trip, and ensure the configured bucket exists — failing fatally and refusing to start if any of the four steps fails.
+`cmd/video-api` SHALL, during `setupVideo`, load the MinIO configuration, construct the client, confirm connectivity with a real round trip, and ensure the configured bucket exists — failing fatally and refusing to start if any of the four steps fails.
 
 Startup SHALL use `minio-infrastructure`'s existing `LoadConfigFromEnv` unchanged, and therefore inherits its contract exactly: `VIDEO_MINIO_ENDPOINT`, `VIDEO_MINIO_ACCESS_KEY`, `VIDEO_MINIO_SECRET_KEY`, and `VIDEO_MINIO_BUCKET` are required, while `VIDEO_MINIO_USE_SSL` remains **optional** — unset means `false`, and a present-but-unparseable value is still an error. What changes here is only *when* that loader runs: it becomes a startup precondition rather than something no composition root calls. This capability SHALL NOT make `VIDEO_MINIO_USE_SSL` mandatory; doing so would require modifying the configuration contract, the loader, and its tests, none of which are in this change's scope.
 
@@ -116,25 +116,25 @@ This posture is fail-closed, deliberately unlike every Redis-backed feature in t
 #### Scenario: A missing MinIO variable prevents startup
 
 - **GIVEN** any of the four required `VIDEO_MINIO_*` variables is unset or empty
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** it exits with an error naming the missing variable, and does not begin serving requests
 
 #### Scenario: VIDEO_MINIO_USE_SSL stays optional
 
 - **GIVEN** the four required variables are set and `VIDEO_MINIO_USE_SSL` is unset
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** it starts normally with TLS disabled, exactly as `minio-infrastructure` already specifies for that variable
 
 #### Scenario: An unreachable MinIO endpoint prevents startup
 
 - **GIVEN** every `VIDEO_MINIO_*` variable is set but the endpoint is unreachable
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** it exits with an error, rather than starting and failing on the first upload
 
 #### Scenario: The bucket is provisioned at startup
 
 - **GIVEN** a reachable MinIO instance whose configured bucket does not yet exist
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** the bucket is created and the server starts serving requests
 
 ### Requirement: Result Download Is Authorized From The VideoJob Row
@@ -245,7 +245,7 @@ The sidecar helpers no longer remain in the codebase for any directory. They sur
 
 #### Scenario: No outputs directory is created at startup
 
-- **WHEN** `cmd/api` starts
+- **WHEN** `cmd/video-api` starts
 - **THEN** it creates `temp/`, and does not create `outputs/`
 
 #### Scenario: The outputs route no longer exists
@@ -269,7 +269,7 @@ This capability's adapter tests SHALL exercise storing, stating, and presigning 
 
 Presigning SHALL be verified by **following the issued URL against that instance and comparing bytes**, never by inspecting the URL alone. A signed URL is structurally well-formed whether or not the storage service will honor it, so assertions on its host, path, or parameters cannot establish that it works.
 
-`cmd/api`'s own tests, which exercise `POST /upload` end to end, SHALL run against a real bucket and SHALL NOT skip when it is unconfigured: that suite requires MinIO the way it already requires `ffmpeg`, failing loudly instead, since a silently-skipped suite would report green while covering none of the behavior this capability adds. `docker-compose.yml`'s `app-test` service and CI's test step SHALL supply the configuration those tests need.
+`cmd/video-api`'s own tests, which exercise `POST /upload` end to end, SHALL run against a real bucket and SHALL NOT skip when it is unconfigured: that suite requires MinIO the way it already requires `ffmpeg`, failing loudly instead, since a silently-skipped suite would report green while covering none of the behavior this capability adds. `docker-compose.yml`'s `app-test` service and CI's test step SHALL supply the configuration those tests need.
 
 Every test that provisions a bucket SHALL remove that bucket and its objects when it finishes, including on failure — the local MinIO service stores its data in a named volume, so anything left behind accumulates across later runs.
 
@@ -282,13 +282,13 @@ Every test that provisions a bucket SHALL remove that bucket and its objects whe
 #### Scenario: The application's test suite fails rather than skipping without MinIO
 
 - **GIVEN** the runtime `VIDEO_MINIO_*` variables are unset
-- **WHEN** `cmd/api`'s test suite starts
+- **WHEN** `cmd/video-api`'s test suite starts
 - **THEN** it exits non-zero with a message naming what is missing, rather than skipping its result-storage coverage
 
 #### Scenario: The end-to-end upload path is exercised against a real bucket
 
 - **GIVEN** a configured MinIO instance
-- **WHEN** `cmd/api`'s upload tests run
+- **WHEN** `cmd/video-api`'s upload tests run
 - **THEN** they upload a real video, and assert the result is retrievable by following the URL `GET /download/:filename` issues for it, and that it is listed by `GET /api/status`
 
 ### Requirement: A Presigned Result URL Grants Bounded, Single-Object, Non-Revocable Access

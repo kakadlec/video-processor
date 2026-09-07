@@ -149,9 +149,9 @@ The topology SHALL be declared on every dial, by every process that connects to 
 
 ### Requirement: The Terminal Relay Runs in the Process That Writes the Rows
 
-The relay carrying terminal events SHALL run in `cmd/worker`, which is the process that writes them — through its own terminal writes and through its recovery sweeper's abandonment write. It SHALL own its broker connection, dial with bounded backoff, and redeclare its topology after every dial, exactly as `cmd/api`'s dispatch relay does; broker reachability SHALL NOT become a startup gate for the worker.
+The relay carrying terminal events SHALL run in `cmd/worker`, which is the process that writes them — through its own terminal writes and through its recovery sweeper's abandonment write. It SHALL own its broker connection, dial with bounded backoff, and redeclare its topology after every dial, exactly as `cmd/video-api`'s dispatch relay does; broker reachability SHALL NOT become a startup gate for the worker.
 
-Placing it in `cmd/api` instead SHALL be treated as rejected rather than merely unchosen: it would work, because the outbox table is shared and `FOR UPDATE SKIP LOCKED` makes concurrent relays safe, but it would make the announcement of a job's outcome depend on an API replica being up — a dependency the outcome itself does not have.
+Placing it in `cmd/video-api` instead SHALL be treated as rejected rather than merely unchosen: it would work, because the outbox table is shared and `FOR UPDATE SKIP LOCKED` makes concurrent relays safe, but it would make the announcement of a job's outcome depend on an API replica being up — a dependency the outcome itself does not have.
 
 The two relays SHALL claim disjoint event-type sets, so running both adds no contention on the same rows and no duplicate dispatch.
 

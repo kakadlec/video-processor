@@ -2,12 +2,12 @@
 
 ## Purpose
 
-Define the build and runtime requirements for the repository's `Dockerfile`: a multi-stage build with deterministic, fail-closed dependency resolution, a non-root runtime user, and a minimal runtime image with no Go toolchain that carries both entrypoints (`cmd/api` and `cmd/worker`) so one image can be started as either process — while preserving the container's external contract for `docker-compose.yml`'s local-development `app` and `worker` services and the deployment commands in `docs/operations.md`.
+Define the build and runtime requirements for the repository's `Dockerfile`: a multi-stage build with deterministic, fail-closed dependency resolution, a non-root runtime user, and a minimal runtime image with no Go toolchain that carries every entrypoint (`cmd/identity-api`, `cmd/video-api`, `cmd/notification-api`, `cmd/worker` and `cmd/notifier`) so one image can be started as any of them — while preserving the container's external contract for `docker-compose.yml`'s local-development services and the deployment commands in `docs/operations.md`.
 
 ## Requirements
 
 ### Requirement: Multi-Stage Image Build
-The repository's `Dockerfile` SHALL use a multi-stage build: a builder stage that compiles the application and a separate runtime stage that contains no Go toolchain or source tree. The builder SHALL compile **all three** entrypoints — `cmd/api`, `cmd/worker`, and `cmd/notifier` — and the runtime stage SHALL carry all three binaries and `ffmpeg`, so one image can be started as any of the three processes. `ffmpeg` is required by the worker rather than by the API or the notifier, and SHALL remain present for that reason. Dependency resolution in the builder SHALL run in a read-only mode (e.g. `go mod download` under `-mod=readonly`) that verifies against the committed `go.sum` and fails the build on any mismatch or missing entry, rather than a mode that can add to or rewrite `go.mod`/`go.sum` (e.g. `go mod tidy`, or bare `go mod download` without `-mod=readonly`).
+The repository's `Dockerfile` SHALL use a multi-stage build: a builder stage that compiles the application and a separate runtime stage that contains no Go toolchain or source tree. The builder SHALL compile **all five** entrypoints — `cmd/identity-api`, `cmd/video-api`, `cmd/notification-api`, `cmd/worker`, and `cmd/notifier` — and the runtime stage SHALL carry all five binaries and `ffmpeg`, so one image can be started as any of the five processes. `ffmpeg` is required by the worker rather than by any HTTP service or the notifier, and SHALL remain present for that reason. Dependency resolution in the builder SHALL run in a read-only mode (e.g. `go mod download` under `-mod=readonly`) that verifies against the committed `go.sum` and fails the build on any mismatch or missing entry, rather than a mode that can add to or rewrite `go.mod`/`go.sum` (e.g. `go mod tidy`, or bare `go mod download` without `-mod=readonly`).
 
 The third binary joins the image rather than getting one of its own for the reason the second did: the three share every `internal/` package, and separate images would create a way for the halves of one deploy to be built from different commits of the same domain code.
 
@@ -15,9 +15,9 @@ The third binary joins the image rather than getting one of its own for the reas
 - **WHEN** the runtime stage's image is built
 - **THEN** it does not contain the `go` binary or the application's source tree — only the compiled binaries, `ffmpeg`, and their runtime dependencies
 
-#### Scenario: All three entrypoints are built and present
+#### Scenario: All five entrypoints are built and present
 - **WHEN** the runtime image is built
-- **THEN** it contains an executable for `cmd/api`, one for `cmd/worker`, and one for `cmd/notifier`, each runnable on its own, and none requires either of the others to be running in the same container
+- **THEN** it contains an executable for each of `cmd/identity-api`, `cmd/video-api`, `cmd/notification-api`, `cmd/worker` and `cmd/notifier`, each runnable on its own, and none requires any of the others to be running in the same container
 
 #### Scenario: Build resolves dependencies deterministically
 - **WHEN** the builder stage runs
@@ -29,7 +29,7 @@ The third binary joins the image rather than getting one of its own for the reas
 
 #### Scenario: The test stage alone is not sufficient to run the suite
 - **WHEN** that image runs `go test ./...`
-- **THEN** it additionally requires the reachable backing services the suite depends on — PostgreSQL, Redis, and a MinIO instance configured through `VIDEO_MINIO_*` — which `docker-compose.yml`'s `app-test` service supplies; the image contents alone do not satisfy `cmd/api`'s integration tests
+- **THEN** it additionally requires the reachable backing services the suite depends on — PostgreSQL, Redis, and a MinIO instance configured through `VIDEO_MINIO_*` — which `docker-compose.yml`'s `app-test` service supplies; the image contents alone do not satisfy `cmd/video-api`'s integration tests
 
 ### Requirement: Non-Root Runtime User
 
