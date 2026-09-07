@@ -40,7 +40,9 @@ Enforcing it in the schema is what keeps the invariant true of the table rather 
 
 A write SHALL continue to resolve in a single atomic statement that reads no row beforehand, for every case: a submitted secret, an omitted secret on a channel that signs, and an omitted secret on a channel that does not. The third case SHALL be a create, and the second SHALL remain the refusal that reports that a secret is required.
 
-The stored value for a preference created with no secret SHALL be the empty string rather than a null, and the statement that writes it SHALL name the column rather than omit it, because the column is non-nullable with no default and an omitted column would write a null the constraint does not govern.
+The stored value for a preference created with no secret SHALL be the empty string rather than a null, and the statement that writes it SHALL name the column in the row it inserts rather than omit it, because the column is non-nullable with no default and an omitted column would write a null the constraint does not govern.
+
+That same statement SHALL NOT write the secret column on its conflict branch. A write omitting the secret preserves the stored one, and that guarantee SHALL hold on every channel, including one whose deliveries are not signed: a stored secret SHALL NOT be replaced with an empty value by a later write that simply did not submit one.
 
 The change to the constraint SHALL be applied by the context's existing startup migration, SHALL be safe to re-execute on every start and across concurrent replicas, and SHALL require no backfill: every row stored before it is on the channel that signs and already satisfies it.
 
@@ -59,3 +61,9 @@ The change to the constraint SHALL be applied by the context's existing startup 
 - **GIVEN** a database holding preferences written before the constraint became conditional
 - **WHEN** the migration runs, twice and from two processes at once
 - **THEN** it succeeds every time, every existing row is left unchanged, and none is rewritten
+
+#### Scenario: A secret-less write does not clear a stored secret
+
+- **GIVEN** a stored preference on a channel that does not sign, which nonetheless carries a secret
+- **WHEN** its owner writes it again submitting no secret
+- **THEN** the stored secret is preserved rather than replaced with an empty value
