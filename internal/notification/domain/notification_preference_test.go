@@ -182,8 +182,10 @@ func TestRestoreNotificationPreference(t *testing.T) {
 		{"missing event type", parts.userID, domain.EventType{}, parts.channel, parts.destination, parts.secret, parts.at, updated, domain.ErrPreferenceEventTypeRequired},
 		{"missing channel", parts.userID, parts.eventType, domain.Channel{}, parts.destination, parts.secret, parts.at, updated, domain.ErrPreferenceChannelRequired},
 		{"missing destination", parts.userID, parts.eventType, parts.channel, domain.Destination{}, parts.secret, parts.at, updated, domain.ErrPreferenceDestinationRequired},
-		// A stored preference always carries a secret; that is the whole
-		// difference between it and a write intent.
+		// A stored preference on a channel that signs always carries a
+		// secret; that is the whole difference between it and a write
+		// intent. parts.channel is the webhook channel, so this row is the
+		// signing case; the two tests below cover the other one.
 		{"missing secret", parts.userID, parts.eventType, parts.channel, parts.destination, domain.Secret{}, parts.at, updated, domain.ErrInvalidSecret},
 		{"missing created at", parts.userID, parts.eventType, parts.channel, parts.destination, parts.secret, time.Time{}, updated, domain.ErrPreferenceTimestampsRequired},
 		{"missing updated at", parts.userID, parts.eventType, parts.channel, parts.destination, parts.secret, parts.at, time.Time{}, domain.ErrPreferenceTimestampsRequired},
@@ -287,5 +289,62 @@ func TestPreferenceView_CarriesNoSecret(t *testing.T) {
 	}
 	if !view.HasSecret {
 		t.Fatal("HasSecret did not round-trip")
+	}
+}
+
+// The invariant follows Channel.Signs rather than naming a channel, so a
+// preference on a channel with no signature to compute restores without a
+// secret. Without this the row could be written and then never loaded, and
+// the failure would arrive as a repository error on the delivery path — one
+// the disposition table requeues, so a single such row would block the queue
+// at prefetch 1 rather than failing where anyone would see it.
+func TestRestoreNotificationPreference_DoesNotRequireASecretOnANonSigningChannel(t *testing.T) {
+	parts := validParts(t)
+
+	channel, err := domain.ParseChannel(domain.ChannelEmail)
+	if err != nil {
+		t.Fatalf("ParseChannel(email) = %v", err)
+	}
+	destination, err := domain.NewDestinationFor(channel, "user@example.test")
+	if err != nil {
+		t.Fatalf("NewDestinationFor(email) = %v", err)
+	}
+
+	preference, err := domain.RestoreNotificationPreference(
+		parts.userID, parts.eventType, channel, true, destination, domain.Secret{}, parts.at, parts.at)
+	if err != nil {
+		t.Fatalf("RestoreNotificationPreference on a non-signing channel = %v, want it accepted", err)
+	}
+	if !preference.Secret().IsZero() {
+		t.Fatal("a preference restored without a secret should carry none")
+	}
+	if preference.Channel().Signs() {
+		t.Fatal("the email channel should not report Signs() == true")
+	}
+}
+
+// The complement: a stored secret on a non-signing channel is kept rather
+// than refused. A write submitting one stores it whatever the channel, so
+// refusing to restore such a row would make it unloadable — the same failure
+// this change exists to avoid, arriving from the other direction.
+func TestRestoreNotificationPreference_KeepsASecretOnANonSigningChannel(t *testing.T) {
+	parts := validParts(t)
+
+	channel, err := domain.ParseChannel(domain.ChannelEmail)
+	if err != nil {
+		t.Fatalf("ParseChannel(email) = %v", err)
+	}
+	destination, err := domain.NewDestinationFor(channel, "user@example.test")
+	if err != nil {
+		t.Fatalf("NewDestinationFor(email) = %v", err)
+	}
+
+	preference, err := domain.RestoreNotificationPreference(
+		parts.userID, parts.eventType, channel, true, destination, parts.secret, parts.at, parts.at)
+	if err != nil {
+		t.Fatalf("RestoreNotificationPreference = %v", err)
+	}
+	if preference.Secret().IsZero() {
+		t.Fatal("a stored secret should be kept on a non-signing channel, not dropped")
 	}
 }

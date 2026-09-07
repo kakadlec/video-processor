@@ -188,9 +188,33 @@ func TestSetPreferenceRejectsInvalidInput(t *testing.T) {
 			wantErr: domain.ErrInvalidEventType,
 		},
 		{
-			name:    "email channel",
-			mutate:  func(in *application.SetPreferenceInput) { in.Channel = "email" },
+			name:    "unrecognized channel",
+			mutate:  func(in *application.SetPreferenceInput) { in.Channel = "sms" },
 			wantErr: domain.ErrInvalidChannel,
+		},
+		// Each channel's destination rule refuses the other channel's value,
+		// which is what the channel-aware constructor buys: a URL registered
+		// for e-mail would be an address nothing could put in an envelope.
+		{
+			name: "email channel with a URL destination",
+			mutate: func(in *application.SetPreferenceInput) {
+				in.Channel = domain.ChannelEmail
+				in.Destination = "https://hooks.example.test/video-jobs"
+			},
+			wantErr: domain.ErrInvalidDestination,
+		},
+		{
+			name:    "webhook channel with an address destination",
+			mutate:  func(in *application.SetPreferenceInput) { in.Destination = "user@example.test" },
+			wantErr: domain.ErrInvalidDestination,
+		},
+		{
+			name: "email channel with an injected header",
+			mutate: func(in *application.SetPreferenceInput) {
+				in.Channel = domain.ChannelEmail
+				in.Destination = "user@example.test\r\nBcc: someone@elsewhere.test"
+			},
+			wantErr: domain.ErrInvalidDestination,
 		},
 		{
 			name:    "relative destination",
@@ -310,5 +334,70 @@ func TestSetPreferenceAcceptsInsecureDestinationsUnderTheRelaxation(t *testing.T
 				t.Errorf("Destination = %q, want %q", result.Destination, destination)
 			}
 		})
+	}
+}
+
+// The destination policy judges a connection target the caller supplied, and
+// an e-mail address is not one — delivery opens a connection to the relay
+// this deployment configures, never to the stored value. So a domain part
+// that would be refused outright as a webhook host is stored here, under the
+// default (restrictive) policy.
+func TestSetPreferenceDoesNotApplyTheDestinationPolicyToAnEmailAddress(t *testing.T) {
+	for _, address := range []string{
+		"user@localhost",
+		"user@169.254.169.254",
+		"user@[10.0.0.1]",
+	} {
+		t.Run(address, func(t *testing.T) {
+			repo := newFakePreferenceRepository()
+			input := validSetInput()
+			input.Channel = domain.ChannelEmail
+			input.Destination = address
+
+			result, err := newSetPreference(repo).Execute(context.Background(), input)
+			if err != nil {
+				t.Fatalf("Execute() error = %v, want the preference stored", err)
+			}
+			if result.Destination != address {
+				t.Fatalf("stored destination = %q, want %q", result.Destination, address)
+			}
+			if repo.setCalls != 1 {
+				t.Fatalf("repository Set called %d times, want 1", repo.setCalls)
+			}
+		})
+	}
+}
+
+// The complement, and the reason the branch is a narrowing rather than a
+// hole: the same policy still refuses the same shapes where the destination
+// really is dialled.
+func TestSetPreferenceStillAppliesTheDestinationPolicyToAWebhookURL(t *testing.T) {
+	repo := newFakePreferenceRepository()
+	input := validSetInput()
+	input.Destination = "https://169.254.169.254/latest/meta-data/"
+
+	if _, err := newSetPreference(repo).Execute(context.Background(), input); !errors.Is(err, domain.ErrDestinationRefused) {
+		t.Fatalf("Execute() error = %v, want ErrDestinationRefused", err)
+	}
+	if repo.setCalls != 0 {
+		t.Fatalf("repository Set called %d times, want 0", repo.setCalls)
+	}
+}
+
+func TestSetPreferenceStoresAnEmailPreference(t *testing.T) {
+	repo := newFakePreferenceRepository()
+	input := validSetInput()
+	input.Channel = domain.ChannelEmail
+	input.Destination = "user@example.test"
+
+	result, err := newSetPreference(repo).Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.Channel != domain.ChannelEmail {
+		t.Fatalf("stored channel = %q, want %q", result.Channel, domain.ChannelEmail)
+	}
+	if result.Destination != "user@example.test" {
+		t.Fatalf("stored destination = %q", result.Destination)
 	}
 }
