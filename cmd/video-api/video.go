@@ -31,6 +31,22 @@ import (
 	videostorage "video-processor/internal/video/infrastructure/storage"
 )
 
+// systemClock is the production Clock for this process's Video module. It
+// lived in the Identity module's file while one process served both
+// contexts; it comes here with the only module that still asks for one.
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+// closeDB closes db, logging any failure — used on setup-failure paths where
+// a different, more relevant error is already being returned to the caller,
+// and on shutdown, where nothing is left to return it to.
+func closeDB(db *sql.DB) {
+	if err := db.Close(); err != nil {
+		log.Printf("video: close postgres: %v", err)
+	}
+}
+
 // Bounds for the wait-and-retry loop handleVideoUpload runs against
 // idempotency.Lookup after a failed Reserve — see add-upload-idempotency-keys'
 // design.md Decision 2a. Named constants so the adapter test suite's own
@@ -42,8 +58,9 @@ const (
 )
 
 // videoPostgresDSNEnv is the environment variable holding the Video
-// Processing PostgreSQL connection string, alongside identity's own
-// IDENTITY_POSTGRES_DSN.
+// Processing PostgreSQL connection string. It is the only DSN this process
+// reads: IDENTITY_POSTGRES_DSN belongs to cmd/identity-api and
+// NOTIFICATION_POSTGRES_DSN to cmd/notification-api.
 const videoPostgresDSNEnv = "VIDEO_POSTGRES_DSN"
 
 const (
@@ -99,9 +116,9 @@ func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatu
 }
 
 // setupVideo builds the production Video Processing module from environment
-// configuration, mirroring setupIdentity's fail-clearly-on-misconfiguration
-// posture. VIDEO_POSTGRES_DSN, REDIS_ADDR, and RABBITMQ_URL are always
-// required. The opened *redis.Client is also returned so callers (main's
+// configuration, mirroring setupAuthenticator's fail-clearly-on-
+// misconfiguration posture. VIDEO_POSTGRES_DSN, REDIS_ADDR, and RABBITMQ_URL
+// are always required. The opened *redis.Client is also returned so callers (main's
 // rate-limiter wiring) can reuse the same connection instead of opening a
 // second one, and so is the outbox relay, which main owns the lifetime of.
 func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, error) {

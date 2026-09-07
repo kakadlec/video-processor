@@ -36,7 +36,7 @@ var webFS embed.FS
 func main() {
 	ctx := context.Background()
 
-	identity, err := setupIdentity()
+	auth, err := setupAuthenticator()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func main() {
 	}
 	limiter := platformratelimit.NewLimiter(redisClient, rateLimitConfig)
 
-	r := setupRouter(identity, video, limiter)
+	r := setupRouter(auth, video, limiter)
 
 	// Signal-aware rather than log.Fatal(r.Run(...)): that exits through
 	// os.Exit, which runs no deferred call and waits for nothing, so the
@@ -134,7 +134,7 @@ func serveEmbeddedFile(c *gin.Context, path, contentType string) {
 	c.Data(200, contentType, data)
 }
 
-func setupRouter(identity *identityModule, video *videoModule, limiter videoRateLimiter) *gin.Engine {
+func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter) *gin.Engine {
 	r := gin.Default()
 
 	r.Use(func(c *gin.Context) {
@@ -164,7 +164,7 @@ func setupRouter(identity *identityModule, video *videoModule, limiter videoRate
 	// artifacts. All of them require a valid bearer token and are subject to
 	// per-user rate limiting.
 	videoRoutes := r.Group("/")
-	videoRoutes.Use(identity.requireBearerAuth())
+	videoRoutes.Use(auth.requireBearerAuth())
 	videoRoutes.Use(rateLimitMiddleware(limiter))
 
 	// No static mount remains. Source videos and result artifacts are both

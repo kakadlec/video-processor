@@ -44,7 +44,7 @@ import (
 // directory is a relative path, so without this the downloaded sources and
 // extracted frames would land under cmd/worker/ instead, inside the tree.
 //
-// Unlike cmd/api's TestMain it gates on nothing. Every test here skips
+// Unlike cmd/video-api's TestMain it gates on nothing. Every test here skips
 // cleanly when the infrastructure it needs is absent, matching the adapter
 // packages; task 10.1 is what confirms they reported PASS rather than SKIP.
 func TestMain(m *testing.M) {

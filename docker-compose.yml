@@ -47,7 +47,7 @@ services:
     image: redis:7-alpine
     ports:
       # Loopback-only: this instance is unauthenticated, same rationale as
-      # the "app" service's port binding below.
+      # the "video-api" service's port binding through the gateway below.
       - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -71,7 +71,7 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      # Loopback-only: same rationale as the redis and app services above.
+      # Loopback-only: same rationale as the redis service above.
       # 9000 is the S3 API, 9001 the web console.
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
@@ -115,7 +115,7 @@ services:
       RABBITMQ_DEFAULT_USER: video
       RABBITMQ_DEFAULT_PASS: video
     ports:
-      # Loopback-only: same rationale as the redis, minio, and app services.
+      # Loopback-only: same rationale as the redis and minio services above.
       - "127.0.0.1:5672:5672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
@@ -127,9 +127,9 @@ services:
 
   # The single ingress. Everything a client reaches, it reaches here: the
   # gateway is the only service that publishes a host port, and the
-  # application services publish none. It routes nothing selectively yet —
-  # while the API is one process there is one rule — but the hop exists and
-  # is proven transparent before anything depends on it being selective.
+  # application services publish none. One rule per HTTP service: /api/auth/
+  # to identity-api, /api/notification-preferences to notification-api, and
+  # everything else to video-api, which serves the frontend at the root.
   gateway:
     image: nginx:1.29-alpine
     ports:
@@ -142,12 +142,12 @@ services:
       # Replaces the image's own nginx.conf, read-only.
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - app
       - identity-api
+      - video-api
       - notification-api
     healthcheck:
       # Asks nginx whether its own configuration is loadable. Deliberately not
-      # a request through to "app": the gateway is healthy when it can serve,
+      # a request through to a backend: the gateway is healthy when it can serve,
       # and tying its health to a backend's would make an unrelated service's
       # restart look like an ingress failure.
       test: ["CMD", "nginx", "-t"]
@@ -165,7 +165,7 @@ services:
     command: ["/app/identity-api"]
     environment:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
-      # See the "app" service below for why this key pair is generated rather
+      # See the "video-api" service below for why this key pair is generated rather
       # than committed. This is the one service whose environment carries the
       # private half.
       IDENTITY_JWT_PRIVATE_KEY: ${IDENTITY_JWT_PRIVATE_KEY:?run "make dev-keys" to generate a local key pair}
@@ -226,16 +226,20 @@ services:
     # this process well inside the 30s graceful window it asks for.
     stop_grace_period: 45s
 
-  # Runs the same Dockerfile used for deployment, built to its default
+  # The Video Processing context's own HTTP process: POST /upload, the
+  # download and status routes, the job-lifecycle API, the embedded frontend,
+  # and the dispatch outbox relay. It is the gateway's default route, so it
+  # holds every path the two services above do not name.
+  #
+  # It runs the same Dockerfile used for deployment, built to its default
   # "runtime" target (hardened, non-root, no Go toolchain — see the
-  # Dockerfile's own comments). `docker compose up --build` gives a full
-  # stack (app + Postgres) with identity already wired in. Running the
-  # test suite uses the separate "app-test" service below, since this
-  # image has no Go toolchain to run `go test` with.
-  app:
+  # Dockerfile's own comments). Running the test suite uses the separate
+  # "app-test" service below, since this image has no Go toolchain to run
+  # `go test` with.
+  video-api:
     build: .
-    # No ports. The gateway is the only service that publishes one, which is
-    # also what lets this service be scaled without a host-port collision.
+    command: ["/app/video-api"]
+    # No ports. The gateway is the only service that publishes one.
     environment:
       # Fixed, non-secret local-only defaults — same rationale as the
       # Postgres credentials above. Never used outside a developer's
@@ -264,11 +268,11 @@ services:
       # Storage Isolation Is Exhibited, Not Only Permitted").
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/video_test?sslmode=disable
-      # Required as of add-upload-idempotency-keys: cmd/api's composition
-      # root now opens a Redis client for POST /upload's idempotency
-      # mechanism, the first real (non-test-only) consumer of this service.
+      # Required as of add-upload-idempotency-keys: this service's
+      # composition root opens a Redis client for POST /upload's idempotency
+      # mechanism, and the rate limiter shares it.
       REDIS_ADDR: redis:6379
-      # Required as of migrate-result-storage-to-minio: cmd/api opens a
+      # Required as of migrate-result-storage-to-minio: this service opens a
       # MinIO client at startup, pings it, and ensures the bucket, failing
       # fatally if any step fails. Fail-closed, unlike the Redis-backed
       # features above — a result that cannot be stored cannot be delivered,
@@ -285,7 +289,7 @@ services:
       # published port the developer's browser actually reaches. The server
       # never dials this address.
       VIDEO_MINIO_PUBLIC_ENDPOINT: 127.0.0.1:9000
-      # Required as of add-videojob-source-key-and-outbox-relay: cmd/api
+      # Required as of add-videojob-source-key-and-outbox-relay: this service
       # loads this at startup and exits without it. Deliberately absent from
       # depends_on below — a service_healthy condition would make broker
       # reachability a startup gate, which is exactly the coupling the relay
@@ -304,7 +308,8 @@ services:
     # runs. The 10s default would SIGKILL it mid-claim.
     stop_grace_period: 45s
 
-  # The other half of the cutover: same image as "app", different binary.
+  # The other half of the cutover: same image as "video-api", different
+  # binary.
   # POST /upload now only queues a job, so without this service running,
   # nothing ever moves one out of "queued".
   #
@@ -313,7 +318,7 @@ services:
   # behalf of a caller, so it needs no signing key and no way in from
   # outside; the only thing that can give it work is the broker.
   #
-  # depends_on includes rabbitmq, unlike "app". The API serves fine with the
+  # depends_on includes rabbitmq, unlike "video-api". The API serves fine with the
   # broker down — its relay retries in the background — but a worker with no
   # broker has nothing at all to do, so there is no availability to protect
   # by starting it early. It still dials with retry: this only orders
@@ -342,15 +347,15 @@ services:
     # depends on it. `--scale worker=N` still overrides it in both directions,
     # so `--scale worker=1` remains the one-flag way back to a single worker.
     #
-    # Only this service is replicated. "app" deliberately stays at one: it
-    # publishes 127.0.0.1:8080:8080, so a second replica could not bind the
-    # host port and half the stack would come up broken. "notifier" stays at
-    # one because video-processing throughput is what this is for, and
-    # delivery is not its bottleneck.
+    # Only this service is replicated. The three HTTP services deliberately
+    # stay at one each: nothing about this stack needs a second replica of
+    # any of them, and the gateway resolves one name per service. "notifier"
+    # stays at one because video-processing throughput is what this is for,
+    # and delivery is not its bottleneck.
     deploy:
       replicas: 3
     environment:
-      # Identical to the "app" service's Video Processing configuration —
+      # Identical to the "video-api" service's Video Processing configuration —
       # same database, same bucket, same broker. The two processes are two
       # halves of one context.
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
@@ -383,14 +388,15 @@ services:
   # VIDEO_MINIO_*, because it stores and reads no artifact; no REDIS_ADDR,
   # because it holds no lease and caches nothing. depends_on names postgres
   # and rabbitmq alone for the same reason, and includes rabbitmq — unlike
-  # "app" — because a notifier with no broker has nothing at all to do, so
+  # "video-api" — because a notifier with no broker has nothing at all to do, so
   # there is no availability to protect by starting it early. It still dials
   # with retry: this only orders startup.
   notifier:
     build: .
     command: ["/app/notifier"]
     environment:
-      # The same instance and database the "app" service points at — one
+      # The same instance and database the "notification-api" service points
+      # at — one
       # PostgreSQL server shared by the bounded contexts, not a connection.
       # The notifier migrates its own schema at startup, so it can be started
       # against a database no API has yet touched.
@@ -425,7 +431,8 @@ services:
         condition: service_healthy
 
   # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
-  # than "app"'s hardened "runtime" stage, which deliberately has neither.
+  # than the runtime services' hardened "runtime" stage, which deliberately
+  # has neither.
   # `docker compose run --build --rm app-test go test ./... -v` is how the
   # suite runs via Docker going forward (docs/development.md is updated in
   # a follow-up docs PR, per this repo's PR-separation rule).
@@ -444,7 +451,7 @@ services:
     environment:
       IDENTITY_POSTGRES_DSN: postgres://identity:identity@postgres:5432/identity?sslmode=disable
       IDENTITY_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/identity_test?sslmode=disable
-      # See the "app" service above for why these name the Video context's
+      # See the "video-api" service above for why these name the Video context's
       # own databases rather than the IDENTITY_* ones.
       VIDEO_POSTGRES_DSN: postgres://identity:identity@postgres:5432/video?sslmode=disable
       VIDEO_POSTGRES_TEST_DSN: postgres://identity:identity@postgres:5432/video_test?sslmode=disable
@@ -461,8 +468,8 @@ services:
       # Exercises internal/platform/redis's own test suite against a real
       # instance.
       REDIS_TEST_ADDR: redis:6379
-      # See the "app" service above — cmd/api's composition root now
-      # requires this at startup, matching app's own value.
+      # See the "video-api" service above — its composition root requires this
+      # at startup, and this value matches it.
       REDIS_ADDR: redis:6379
       # Exercises internal/video/infrastructure/storage's own test suite
       # against a real instance. The test bucket is separate from the runtime
@@ -472,8 +479,8 @@ services:
       VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
       VIDEO_MINIO_TEST_SECRET_KEY: minioadmin
       VIDEO_MINIO_TEST_BUCKET: video-test
-      # See the "app" service above. cmd/api's own tests read these: its
-      # TestMain requires MinIO the same way it requires ffmpeg, since
+      # See the "video-api" service above. cmd/video-api's own tests read
+      # these: its TestMain requires MinIO the same way it requires ffmpeg, since
       # POST /upload stores its result in a bucket and GET /download and
       # GET /api/status read it back from one.
       VIDEO_MINIO_ENDPOINT: minio:9000
@@ -484,9 +491,9 @@ services:
       # internal/video/infrastructure/messaging's own test suites against a
       # real broker.
       RABBITMQ_TEST_URL: amqp://video:video@rabbitmq:5672/
-      # See the "app" service above. cmd/api's TestMain requires this to be
-      # set, matching the startup requirement — not to be reachable, which
-      # cmd/api itself does not require either.
+      # See the "video-api" service above. cmd/video-api's TestMain requires
+      # this to be set, matching the startup requirement — not to be
+      # reachable, which cmd/video-api itself does not require either.
       RABBITMQ_URL: amqp://video:video@rabbitmq:5672/
       # Mirrors "notification-api" rather than being needed by any test:
       # cmd/notification-api's tests build their module by hand and pass the

@@ -29,7 +29,7 @@ import (
 // user repository and never open a database, so an IDENTITY_POSTGRES_TEST_DSN
 // gate would guard nothing — the real adapter is covered by
 // internal/identity/infrastructure/postgres's own suite. The ffmpeg and
-// VIDEO_MINIO_* gates cmd/api's TestMain enforces are gone with the
+// VIDEO_MINIO_* gates cmd/video-api's TestMain enforces are gone with the
 // dependencies: this binary has neither.
 
 // inMemoryUserRepository is a fake domain.UserRepository so these HTTP tests
@@ -149,9 +149,9 @@ func newTestTokens(t *testing.T) testTokens {
 }
 
 // newTestIdentityModuleWithTokens also returns the token pair, so a test can
-// verify what the login route minted. Unlike cmd/api's, this module holds no
-// verifier — this service registers no authenticated route — so the pair is
-// returned rather than wired in.
+// verify what the login route minted. Unlike cmd/video-api's, this module
+// holds no verifier — this service registers no authenticated route — so the
+// pair is returned rather than wired in.
 func newTestIdentityModuleWithTokens(t *testing.T) (*identityModule, testTokens) {
 	t.Helper()
 

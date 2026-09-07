@@ -71,7 +71,7 @@ func main() {
 	}
 
 	// Shutdown then close, and there is no ordering constraint hiding in
-	// that: unlike cmd/api's sequence, nothing here borrows the pool for a
+	// that: unlike cmd/video-api's sequence, nothing here borrows the pool for a
 	// whole operation. There is no relay and no background goroutine holding
 	// a transaction, so once Shutdown has returned, every statement this
 	// process will ever run has finished.
@@ -99,8 +99,8 @@ func setupRouter(identity *identityModule) *gin.Engine {
 		c.Next()
 	})
 
-	// No bearer-auth group and no rate limiter, matching what cmd/api does
-	// for these two routes today: they are how a caller obtains a token, so
+	// No bearer-auth group and no rate limiter, matching what the single API
+	// did for these two routes: they are how a caller obtains a token, so
 	// requiring one would be circular.
 	identity.registerRoutes(r)
 

@@ -9,11 +9,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// videoRateLimiter is the subset of *ratelimit.Limiter's behavior
+// rateLimiter is the subset of *ratelimit.Limiter's behavior
 // rateLimitMiddleware depends on, so tests can substitute an in-memory fake
 // instead of requiring a live Redis instance — mirroring how videoModule
 // depends on videodomain.IdempotencyStore rather than a concrete store.
-type videoRateLimiter interface {
+type rateLimiter interface {
 	Allow(ctx context.Context, key string) (allowed bool, retryAfter time.Duration, err error)
 }
 
@@ -28,7 +28,12 @@ const rateLimitCheckTimeout = 300 * time.Millisecond
 // rateLimitMiddleware rejects a request with 429 once the authenticated
 // caller has exceeded limiter's configured rate. It must run behind
 // requireBearerAuth, which guarantees authenticatedUserID(c) is populated.
-func rateLimitMiddleware(limiter videoRateLimiter) gin.HandlerFunc {
+//
+// The key format is shared with every other service that mounts this
+// middleware, deliberately: the budget is one budget per user across the
+// whole system, and namespacing the counter per service would silently
+// multiply every user's allowance by the number of services.
+func rateLimitMiddleware(limiter rateLimiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID, ok := authenticatedUserID(c)
 		if !ok {

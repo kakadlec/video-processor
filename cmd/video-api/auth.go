@@ -17,11 +17,11 @@ import (
 //
 // This is a copy of the middleware each HTTP service carries rather than an
 // import, because a package main cannot be imported. The duplication is
-// transient by construction and ends as one copy per HTTP service, exactly as
-// rateLimitMiddleware already is one thin gin wrapper per composition root
-// over the shared internal/platform/ratelimit. The security-carrying half —
-// algorithm pinning, kid lookup, indistinguishable rejection — stays single,
-// in internal/identity/infrastructure/jwtauth.
+// transient by construction and ends as one copy per HTTP service, exactly
+// as rateLimitMiddleware already is one thin gin wrapper per composition
+// root over the shared internal/platform/ratelimit. The security-carrying
+// half — algorithm pinning, kid lookup, indistinguishable rejection — stays
+// single, in internal/identity/infrastructure/jwtauth.
 type authenticator struct {
 	tokens domain.TokenVerifier
 }

@@ -41,8 +41,9 @@ type outboxClaimer interface {
 
 // Relay carries one closed set of outbox event types to the broker.
 //
-// Two of them run: the dispatch relay in cmd/api carries video_job.queued.v2,
-// and the terminal relay in cmd/worker carries the two terminal events. Their
+// Two of them run: the dispatch relay in cmd/video-api carries
+// video_job.queued.v2, and the terminal relay in cmd/worker carries the two
+// terminal events. Their
 // sets are disjoint, which is what makes running both against the one
 // video_job_outbox table free of contention — neither claims the other's rows
 // and neither's backlog can starve the other's.

@@ -11,8 +11,8 @@
 *.exe
 # One entry per composition root: `go build ./cmd/<name>` with no -o writes
 # the binary here, named after the directory.
-/app
 /identity-api
+/video-api
 /notification-api
 /worker
 /notifier

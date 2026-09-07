@@ -53,7 +53,7 @@ func (k StorageKey) Equal(other StorageKey) bool {
 // single path segment; a "/" percent-encodes to %2F, which is decoded back
 // into the request path and stops that route parameter from matching. Any
 // attempt to organize the bucket with per-user or per-date prefixes has to
-// change cmd/api/web/app.js in the same breath.
+// change cmd/video-api/web/app.js in the same breath.
 const (
 	resultKeyPrefix = "frames_"
 	resultKeySuffix = ".zip"

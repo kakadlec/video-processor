@@ -199,9 +199,9 @@ jobs:
           # a row count against a real database — is actually covered.
           NOTIFICATION_POSTGRES_TEST_DSN: postgres://identity:identity@localhost:5432/notification_test?sslmode=disable
           REDIS_TEST_ADDR: localhost:6379
-          # cmd/api's composition root now requires this at startup
-          # (add-upload-idempotency-keys) — same CI redis service as
-          # REDIS_TEST_ADDR above.
+          # cmd/video-api's composition root requires this at startup
+          # (add-upload-idempotency-keys), and cmd/notification-api's for the
+          # rate limiter — same CI redis service as REDIS_TEST_ADDR above.
           REDIS_ADDR: localhost:6379
           # Exercises internal/video/infrastructure/storage's own tests
           # against the MinIO container started above.
@@ -209,8 +209,8 @@ jobs:
           VIDEO_MINIO_TEST_ACCESS_KEY: minioadmin
           VIDEO_MINIO_TEST_SECRET_KEY: minioadmin
           VIDEO_MINIO_TEST_BUCKET: video-test
-          # cmd/api's tests read the runtime variables, not the TEST_ ones:
-          # its TestMain requires MinIO the same way it requires ffmpeg.
+          # cmd/video-api's tests read the runtime variables, not the TEST_
+          # ones: its TestMain requires MinIO the same way it requires ffmpeg.
           # Same instance as above, a different bucket — the adapter tests
           # create and delete buckets.
           VIDEO_MINIO_ENDPOINT: 127.0.0.1:9000
@@ -222,8 +222,8 @@ jobs:
           # port; the broker still sees the connection arriving from the
           # bridge, which is why this is the "video" account and not guest.
           RABBITMQ_TEST_URL: amqp://video:video@localhost:5672/
-          # cmd/api's TestMain requires this to be set, matching the startup
-          # requirement it now has. Reachability is not required.
+          # cmd/video-api's TestMain requires this to be set, matching the
+          # startup requirement it has. Reachability is not required.
           RABBITMQ_URL: amqp://video:video@localhost:5672/
         run: go test ./... -v
 
