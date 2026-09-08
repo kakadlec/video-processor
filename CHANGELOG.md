@@ -1,5 +1,24 @@
 # Changelog
 
+## [4.0.0](https://github.com/kakadlec/video-processor/compare/v3.0.0...v4.0.0) (2026-09-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* the image no longer contains /app/app. A deployment that runs that path must run /app/video-api instead, which is also the image's new default command.
+* IDENTITY_JWT_SIGNING_KEY is removed and replaced by IDENTITY_JWT_PRIVATE_KEY and IDENTITY_JWT_KEY_ID, read only by the process that mints tokens, and IDENTITY_JWT_PUBLIC_KEYS, a JSON object mapping key id to PEM public key read by every process that verifies. Tokens issued under the old symmetric key stop verifying at deploy; there is no dual-verification window, because carrying an HMAC verifier forward would keep the minting capability this removes. Users log in again.
+
+### Features
+
+* deliver notifications by e-mail ([#240](https://github.com/kakadlec/video-processor/issues/240)) ([25d27d0](https://github.com/kakadlec/video-processor/commit/25d27d02e7d5816d6f8bf734e29f7d1d379a9b20))
+* extract cmd/identity-api and route /api/auth/ to it ([#233](https://github.com/kakadlec/video-processor/issues/233)) ([a1122e8](https://github.com/kakadlec/video-processor/commit/a1122e81be5e4541bf7977006ea219baad700217))
+* extract cmd/notification-api and route the preference paths to it ([#234](https://github.com/kakadlec/video-processor/issues/234)) ([141dd32](https://github.com/kakadlec/video-processor/commit/141dd3238736cd5b10b5b809a8bed2821e871755))
+* extract cmd/video-api and retire cmd/api ([#236](https://github.com/kakadlec/video-processor/issues/236)) ([e26d1b1](https://github.com/kakadlec/video-processor/commit/e26d1b15b2e0028ce988b1182f2eda949c0a2811))
+* give each bounded context its own database ([#229](https://github.com/kakadlec/video-processor/issues/229)) ([41ef09b](https://github.com/kakadlec/video-processor/commit/41ef09b49e60dbf8f578a6cbb2510abbcdc5f17f))
+* put an nginx gateway in front of the API ([#232](https://github.com/kakadlec/video-processor/issues/232)) ([f2f9d72](https://github.com/kakadlec/video-processor/commit/f2f9d7291a46ed372d6a354a96288045cb21fa03))
+* run three video workers in the default compose stack ([#224](https://github.com/kakadlec/video-processor/issues/224)) ([58daebd](https://github.com/kakadlec/video-processor/commit/58daebd53e40fbe811e246f595b6999be3fac8a3))
+* sign access tokens with RS256 and split issuing from verifying ([#231](https://github.com/kakadlec/video-processor/issues/231)) ([38e0139](https://github.com/kakadlec/video-processor/commit/38e01390c01d0f2b282f17d5391120bc39aaad42))
+
 ## [3.0.0](https://github.com/kakadlec/video-processor/compare/v2.0.0...v3.0.0) (2026-09-05)
 
 
