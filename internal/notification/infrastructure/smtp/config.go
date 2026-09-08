@@ -78,7 +78,13 @@ func LoadConfigFromEnv() (Config, error) {
 	if config.Addr == "" {
 		return Config{}, fmt.Errorf("notification: %s is required", EnvAddr)
 	}
-	if _, _, err := net.SplitHostPort(config.Addr); err != nil {
+	// Both halves checked, not only that the value splits. SplitHostPort
+	// accepts "mail:" and ":1025" — each names no endpoint, and each would
+	// pass startup and then fail every delivery as a transport error, which
+	// is exactly the late failure validating configuration here exists to
+	// prevent.
+	host, port, err := net.SplitHostPort(config.Addr)
+	if err != nil || host == "" || port == "" {
 		return Config{}, fmt.Errorf("notification: %s must be host:port, got %q", EnvAddr, config.Addr)
 	}
 	if config.From == "" {

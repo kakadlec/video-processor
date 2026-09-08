@@ -483,3 +483,106 @@ func TestNothingInThisPackageReadsTheSigningSecret(t *testing.T) {
 		t.Fatal("no sources were checked; the scan is not reaching this package")
 	}
 }
+
+// The credentialed path, end to end and over a verified session: the client
+// upgrades, authenticates only after the upgrade, and the message is
+// accepted. Without this the suite covered only the refusal, so a regression
+// that broke authentication after a successful STARTTLS would have stayed
+// green.
+func TestClient_AuthenticatesOnlyAfterUpgradingAndDelivers(t *testing.T) {
+	relay, roots := newTLSRelay(t)
+	client := newTestClient(t, relay.addr, true)
+	client.rootCAs = roots
+
+	err := client.Deliver(context.Background(),
+		newTestPreference(t, testRecipient, ""), completedEvent(t, 7), deliveryID(t, "delivery-1"))
+	if err != nil {
+		t.Fatalf("Deliver() error = %v", err)
+	}
+
+	if !relay.sawUpgrade() {
+		t.Fatal("the conversation did not run over TLS")
+	}
+	if !relay.sawAuthAfterUpgrade() {
+		t.Fatal("AUTH did not arrive after the upgrade")
+	}
+	if relay.message() == "" {
+		t.Fatal("the relay accepted no message")
+	}
+	if !strings.Contains(decodedBody(t, relay.message()), "job-1") {
+		t.Error("the delivered body does not name the job")
+	}
+}
+
+// The upgrade is verified, not merely attempted: a relay whose certificate
+// this client does not trust fails the attempt rather than falling back to
+// plaintext.
+func TestClient_RefusesARelayItCannotVerify(t *testing.T) {
+	relay, _ := newTLSRelay(t)
+	client := newTestClient(t, relay.addr, true)
+	// No roots configured, so the generated certificate is untrusted.
+
+	err := client.Deliver(context.Background(),
+		newTestPreference(t, testRecipient, ""), completedEvent(t, 1), deliveryID(t, "delivery-1"))
+	if err == nil {
+		t.Fatal("Deliver() succeeded against a relay it could not verify")
+	}
+	if relay.message() != "" {
+		t.Fatal("a message was delivered over an unverified session")
+	}
+}
+
+// A job identifier arrives inside a consumed message and its value object
+// enforces only non-emptiness, deliberately. A payload carrying CRLF there
+// would otherwise end the header block and let its author write headers of
+// their own, so the message builder refuses before a byte is sent.
+func TestClient_RefusesAJobIdentifierThatCannotGoInAHeader(t *testing.T) {
+	relay := startFakeRelay(t, &fakeRelay{})
+	client := newTestClient(t, relay.addr, false)
+
+	jobID, err := domain.NewJobID("job-1\r\nBcc: someone@elsewhere.test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	event, err := domain.NewCompletedEvent(jobID, userID(t, "user-1"), testOccurredAt, 1, "frames.zip")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	err = client.Deliver(context.Background(), newTestPreference(t, testRecipient, ""), event, deliveryID(t, "delivery-1"))
+
+	var deliveryErr *domain.DeliveryError
+	if !errors.As(err, &deliveryErr) {
+		t.Fatalf("Deliver() error = %v (%T), want *domain.DeliveryError", err, err)
+	}
+	if deliveryErr.Kind() != domain.DeliveryRefusedByPolicy {
+		t.Errorf("kind = %v, want refused_by_policy", deliveryErr.Kind())
+	}
+	if relay.message() != "" {
+		t.Fatalf("a message was sent with an injected header:\n%s", relay.message())
+	}
+	if strings.Contains(err.Error(), "Bcc") {
+		t.Errorf("the recorded reason echoes the offending value: %q", err.Error())
+	}
+}
+
+// One deadline for the whole attempt, taken before the dial. Timing the dial
+// and then starting a fresh timeout would let an attempt run to nearly twice
+// the configured bound, and this type's contract — the one MaxClaimHold is
+// arithmetic over — is a bound on the attempt, not on each of its halves.
+func TestClient_TheAttemptBoundCoversTheDialAndTheConversationTogether(t *testing.T) {
+	relay := startFakeRelay(t, &fakeRelay{silent: true})
+	client := newTestClient(t, relay.addr, false)
+
+	started := time.Now()
+	if err := client.Deliver(context.Background(),
+		newTestPreference(t, testRecipient, ""), completedEvent(t, 1), deliveryID(t, "delivery-1")); err == nil {
+		t.Fatal("Deliver() succeeded against a relay that never answered")
+	}
+
+	// A generous ceiling, because what this rules out is the doubling: a
+	// per-half timeout would allow up to 2x here.
+	if elapsed := time.Since(started); elapsed > testTimeout+testTimeout/2 {
+		t.Fatalf("the attempt took %s, beyond the %s whole-attempt bound", elapsed, testTimeout)
+	}
+}

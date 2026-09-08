@@ -137,3 +137,21 @@ func TestLoadConfigFromEnv_ARefusalDoesNotEchoTheCredential(t *testing.T) {
 		t.Fatalf("the refusal echoes the credential: %v", err)
 	}
 }
+
+// SplitHostPort accepts a value with an empty half, and neither names an
+// endpoint. Accepting one would move the failure from startup — where an
+// operator is told which variable is wrong — to every delivery, as a
+// transport error that says nothing.
+func TestLoadConfigFromEnv_RefusesAnAddressWithAnEmptyHalf(t *testing.T) {
+	for _, addr := range []string{"mail:", ":1025", ":"} {
+		t.Run(addr, func(t *testing.T) {
+			setRelayEnv(t, map[string]string{EnvAddr: addr, EnvFrom: "notifier@fiapx.test"})
+
+			if config, err := LoadConfigFromEnv(); err == nil {
+				t.Fatalf("LoadConfigFromEnv() accepted %q: %+v", addr, config)
+			} else if !strings.Contains(err.Error(), EnvAddr) {
+				t.Fatalf("error = %v, want it to name %s", err, EnvAddr)
+			}
+		})
+	}
+}

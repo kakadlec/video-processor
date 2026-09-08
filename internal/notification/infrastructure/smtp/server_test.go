@@ -2,10 +2,18 @@ package smtp
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeRelay is a scripted SMTP listener: enough of the protocol for one
@@ -29,10 +37,23 @@ type fakeRelay struct {
 	// already returned by then, so nothing else bounds the read.
 	silent bool
 
-	// advertiseSTARTTLS makes the EHLO response offer the extension. The
-	// fake never actually negotiates TLS — a test that reaches StartTLS is
-	// testing that this client tried, not that a handshake succeeded.
+	// advertiseSTARTTLS makes the EHLO response offer the extension and then
+	// abandon the connection at the handshake, which is what shows the
+	// client tried to upgrade.
 	advertiseSTARTTLS bool
+
+	// tlsConfig, when set, makes the fake complete the handshake and keep
+	// speaking SMTP over the encrypted connection. It is what lets the
+	// credentialed path — AUTH after a successful upgrade, then a delivered
+	// message — be exercised rather than only its refusal.
+	tlsConfig *tls.Config
+
+	// upgraded records whether the conversation actually ran over TLS, and
+	// authAfterUpgrade whether AUTH arrived only once it had. Together they
+	// are the ordering assertion: a client that authenticated first would
+	// leave the second false.
+	upgraded         bool
+	authAfterUpgrade bool
 
 	addr     string
 	listener net.Listener
@@ -99,12 +120,26 @@ func (r *fakeRelay) serve(conn net.Conn) {
 			}
 			write("250 fake relay")
 		case strings.HasPrefix(command, "STARTTLS"):
-			// Accepted at the protocol level and then abandoned: the client
-			// under test will fail its handshake, which is the observable
-			// this fake exists to produce.
 			write("220 ready to start TLS")
-			return
+			if r.tlsConfig == nil {
+				// Accepted at the protocol level and then abandoned: the
+				// client under test fails its handshake, which is the
+				// observable that fake exists to produce.
+				return
+			}
+			secured := tls.Server(conn, r.tlsConfig)
+			if err := secured.Handshake(); err != nil {
+				return
+			}
+			r.markUpgraded()
+			// The rest of the conversation continues over the encrypted
+			// connection, and the client re-sends EHLO on it, which is why
+			// the loop is simply re-pointed rather than restarted.
+			conn = secured
+			reader = bufio.NewReader(conn)
+			write = func(line string) { _, _ = conn.Write([]byte(line + "\r\n")) }
 		case strings.HasPrefix(command, "AUTH"):
+			r.markAuth()
 			write("235 authenticated")
 		case strings.HasPrefix(command, "MAIL FROM"), strings.HasPrefix(command, "RCPT TO"):
 			if strings.HasPrefix(command, "RCPT TO") {
@@ -143,6 +178,32 @@ func orDefault(value, fallback string) string {
 	return value
 }
 
+func (r *fakeRelay) markUpgraded() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upgraded = true
+}
+
+// markAuth records that AUTH arrived, and whether the session was already
+// encrypted when it did.
+func (r *fakeRelay) markAuth() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.authAfterUpgrade = r.upgraded
+}
+
+func (r *fakeRelay) sawUpgrade() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.upgraded
+}
+
+func (r *fakeRelay) sawAuthAfterUpgrade() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.authAfterUpgrade
+}
+
 func (r *fakeRelay) record(line string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -171,4 +232,53 @@ func (r *fakeRelay) message() string {
 		return ""
 	}
 	return r.envelope[0]
+}
+
+// newTLSRelay builds a relay that completes STARTTLS, together with the root
+// pool a client must trust to reach it.
+//
+// A generated certificate and an explicit root pool rather than
+// InsecureSkipVerify: what the credentialed path has to be shown doing is
+// authenticating over a *verified* session, and a test that disabled
+// verification would pass just as well against a client that had stopped
+// verifying too.
+func newTLSRelay(t *testing.T) (*fakeRelay, *x509.CertPool) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("unexpected error generating a key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "fake relay"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("unexpected error creating a certificate: %v", err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("unexpected error parsing the certificate: %v", err)
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+
+	relay := startFakeRelay(t, &fakeRelay{
+		advertiseSTARTTLS: true,
+		tlsConfig: &tls.Config{
+			Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: certificate}},
+			MinVersion:   tls.VersionTLS12,
+		},
+	})
+	return relay, roots
 }
