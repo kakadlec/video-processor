@@ -378,7 +378,12 @@ RABBITMQ_URL='amqp://user:pass@broker-host:5672/' go run .
 Where the `rabbitmq_management` plugin is enabled and its port is reachable, the HTTP API does the same. **Substitute the vhost**: the path segment after `/api/exchanges/` is the URL-encoded vhost from `RABBITMQ_URL`, and `%2F` below is the default `/` — a deployment on a named vhost that leaves it at `%2F` gets a `404`, or deletes a same-named exchange in the wrong vhost while the superseded one survives.
 
 ```bash
-curl -u "$RABBITMQ_USER:$RABBITMQ_PASS" -X DELETE \
+# Fill these in from RABBITMQ_URL's userinfo. This system configures the broker
+# through that one variable and defines no separate credential variables, so
+# nothing in the environment sets them for you.
+user='<user from RABBITMQ_URL>'
+pass='<password from RABBITMQ_URL>'
+curl -u "$user:$pass" -X DELETE \
   "http://<broker-host>:15672/api/exchanges/%2F/video.jobs.v1"
 ```
 
