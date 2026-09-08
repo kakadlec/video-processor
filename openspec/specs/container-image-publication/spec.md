@@ -1,7 +1,10 @@
 # container-image-publication Specification
 
 ## Purpose
-TBD - created by archiving change publish-container-image. Update Purpose after archive.
+
+Define what the repository's published container image is and what may be assumed about it: the registry and name it is published under, what triggers a publication, the tag set and what each tag means, that a version tag is immutable, that a tag which already exists can be published deliberately, that the image is pullable without credentials, and that a publication covers every platform the image claims or none at all.
+
+This capability is about the **artifact**, not its deployment. This project has no target environment, and publishing an image deploys nothing; `container-image` governs what the image contains, and this specification governs how a released version of it reaches a consumer.
 ## Requirements
 ### Requirement: Released Versions Are Published As Container Images
 

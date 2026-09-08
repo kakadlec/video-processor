@@ -12,7 +12,7 @@ There are **five** composition roots, all package `main`: `cmd/identity-api/{mai
 
 No development methodology is mandatory. Changes may be implemented directly; OpenSpec is used only when the developer explicitly requests it, invokes an `/opsx:*` command, or continues a named active OpenSpec change. Selecting OpenSpec activates its full lifecycle through the `change-lifecycle` skill; the size or complexity of a direct request does not activate it.
 
-Quality and delivery requirements apply independently of methodology. `main` has no direct pushes, and every PR is gated by `Build & Test`, `SAST (gosec)`, and `Vulnerability Scan (govulncheck)`. The `repo-workflow` skill applies whenever a developer requests a PR action or the agent creates a PR. Full quality-gate, branch-protection, review, merge-authorization, commit, and release rules live in `docs/development.md`.
+Quality and delivery requirements apply independently of methodology. `main` has no direct pushes, and every PR is gated by `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`, and `Container Image Build`. The `repo-workflow` skill applies whenever a developer requests a PR action or the agent creates a PR. Full quality-gate, branch-protection, review, merge-authorization, commit, and release rules live in `docs/development.md`.
 
 One rule worth restating: **`go test ./... -v` must pass locally before reporting a change complete whenever the diff includes a Go module input (`.go`/`go.mod`/`go.sum`)** — tests require `ffmpeg` on `PATH` **and** a reachable MinIO configured through `VIDEO_MINIO_*`, or run via `docker compose run --build --rm app-test go test ./... -v`, which supplies both.
 
