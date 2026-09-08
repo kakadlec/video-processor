@@ -67,13 +67,14 @@ The address the e-mail is delivered to is the preference's own user-supplied `De
 
 *Risk this creates and how it is bounded:* an operator who later adds a channel that *does* dial a user-supplied target must add it to the policy's branch. The spec states the rule as "a destination that is a connection target is judged by the policy at write and at dial", which is a rule about the kind of destination rather than a list of channels, so a future channel is covered by the requirement rather than by remembering this decision.
 
-### 4. The secret invariant becomes conditional in three places, and all three are required
+### 4. The secret invariant becomes conditional in four places, and all four are required
 
 - **Schema:** `notification_preferences_secret_not_empty` becomes `CHECK (channel <> 'webhook' OR secret <> '')`.
 - **Create path:** a third statement, alongside the existing upsert and update. Its inserted tuple **names** `secret` and writes `''` — it must, because the column is `NOT NULL` with deliberately no default, so a statement omitting it inserts NULL and violates the column rather than the CHECK. Its `ON CONFLICT ... DO UPDATE SET` clause **omits** `secret`, and that half is equally load-bearing: `notification-preferences` requires that a write omitting the secret preserves the stored one, and an e-mail preference may carry one even though nothing signs with it. `updatePreferenceQuery` gets that preservation by never naming the column at all; this statement has to name it on the insert branch and not on the update branch, which is the one asymmetry in the file and is why it is written out here rather than left to be inferred from the existing upsert's shape. Copying `upsertPreferenceQuery` wholesale — which sets `secret = EXCLUDED.secret` — would clobber a stored secret on every secret-less write, and is the bug this paragraph exists to prevent.
 
   Which statement runs is decided by the request exactly as it is today — a submitted secret picks the upsert, no secret on a `webhook` triple picks the update whose zero row count is `ErrSecretRequired`, no secret on an `email` triple picks the new one.
 - **Aggregate:** `RestoreNotificationPreference` requires a non-zero secret only when the channel is `webhook`, and `FindDeliverable` parses the column through `NewSecret` only on that branch.
+- **Projection:** `findDeliverablePreferencesQuery` yields a secret only for a row whose channel signs, decided in SQL rather than after the scan (see the addendum to this decision below).
 
 *Why the aggregate one is not optional:* `FindDeliverable` is the delivery path's only read and it restores every row it returns. Leaving the aggregate invariant unconditional would make an e-mail preference writable and permanently unreadable — and the failure would surface as a `FindDeliverable` error, which the disposition table classifies as a pre-attempt repository failure and therefore **requeues**, so one unloadable row would block the queue at prefetch 1 rather than failing visibly.
 
@@ -142,6 +143,16 @@ For a webhook, a recorded `delivered` means the receiver answered 2xx. For e-mai
 `internal/notification`'s `Migrate` already takes `pg_advisory_xact_lock` and runs its statements in one transaction. The constraint swap is added there, guarded on `pg_constraint` so it is a no-op once applied and safe to re-execute on every startup — the pattern `internal/video`'s schema already uses for statements that must reach a database whose table exists.
 
 *Why no backfill and no rewrite:* the change only widens what the table accepts. Every existing row is a `webhook` row carrying a non-empty secret and satisfies the new constraint unchanged.
+
+### 13. The message is written in English
+
+The subject and body are English, and the decision was put to the developer at finalization and confirmed there.
+
+*Why:* `CLAUDE.md`'s language policy requires English for new code, and its pt-BR exception is scoped by file — `cmd/video-api/web/index.html` and `web/app.js` — not by audience. A message body composed in Go is not in that scope.
+
+*What is uncomfortable about it, stated rather than glossed:* the recipients are the same pt-BR audience the upload page is written for, and they read this in an inbox rather than beside that page. The policy's own reasoning — mixing languages within one UI reads as inconsistent — does not obviously reach a channel that is not that UI. It was decided by the policy's letter rather than by extending the exception, because widening the exception by analogy is what makes a scoped rule stop being one.
+
+*Cost of changing later:* two functions in `internal/notification/infrastructure/smtp/message.go` and their tests. No contract moves — the body is prose for a human, not a parsed payload, which is also why it carries no version.
 
 ## Risks / Trade-offs
 

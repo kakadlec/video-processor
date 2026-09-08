@@ -34,7 +34,7 @@ There are **five** `go run` targets, one per composition root, and each requires
 | `go run ./cmd/video-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | the frontend, `POST /upload`, `GET /download/:filename`, `GET /api/status`, `/api/video-jobs` on `:8080` |
 | `go run ./cmd/notification-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR` | `GET`/`PUT /api/notification-preferences` on `:8080` |
 | `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | nothing — no HTTP, no port |
-| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL` | nothing — no HTTP, no port |
+| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL`, `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | nothing — no HTTP, no port |
 
 **All three HTTP services hardcode `:8080` and read no `PORT` variable**, so a bare `go run` supports **one HTTP service at a time** on a host — there is no supported port override, and running them together needs one container or host each. In the compose stack each has its own container and the gateway is the only thing publishing a port, which is why `docker compose up --build` is the simplest local path (see "Docker Workflow" below). What follows is the manual route: pick the HTTP service you need, plus the worker and the notifier, which listen on nothing and can always run alongside it.
 
@@ -105,10 +105,20 @@ go run ./cmd/notification-api
 # It serves no HTTP and exposes no port.
 go run ./cmd/worker
 
-# In a third shell, start the notifier. It needs only three of the exports
-# above — NOTIFICATION_POSTGRES_DSN, RABBITMQ_URL, and the destination
-# relaxation already exported with them. It serves no HTTP and exposes no
-# port.
+# In a third shell, start the notifier. Beyond the exports above —
+# NOTIFICATION_POSTGRES_DSN, RABBITMQ_URL, and the destination relaxation —
+# it needs a relay to send e-mail through, and refuses to start without one:
+# a notifier that cannot send would store e-mail preferences and silently
+# honour none. It serves no HTTP and exposes no port.
+#
+# The compose stack's mail catcher is NOT reachable from the host: it accepts
+# SMTP on the compose network only (mail:1025), and the single port it
+# publishes is its inspection UI. Run any local SMTP listener for this shell
+# instead — for a throwaway one, `docker run --rm -p 1025:1025 -p 8026:8025
+# axllent/mailpit` gives you a catcher on 127.0.0.1:1025 with its own inbox
+# on 127.0.0.1:8026, chosen so it does not collide with the compose stack's.
+export NOTIFICATION_SMTP_ADDR=127.0.0.1:1025
+export NOTIFICATION_SMTP_FROM=notifier@fiapx.local
 go run ./cmd/notifier
 
 # Build binaries
@@ -121,11 +131,11 @@ go build -o notifier ./cmd/notifier
 
 `cmd/worker` reads a deliberately smaller configuration surface: `RABBITMQ_URL`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, and the four required `VIDEO_MINIO_*` variables. It reads **no** `IDENTITY_*` and **no** `NOTIFICATION_*` variables — it makes no access-control decision and resolves no delivery preference, so exporting them anyway is harmless.
 
-`cmd/notifier` reads the smallest surface of the five: `RABBITMQ_URL` and `NOTIFICATION_POSTGRES_DSN` required, and optionally `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS`, `NOTIFICATION_WEBHOOK_MAX_ATTEMPTS`, `NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS`, and `NOTIFICATION_DELIVERY_RECLAIM_SECONDS`. It reads **no** `IDENTITY_*`, **no** `VIDEO_*` (MinIO included), and **no** `REDIS_ADDR`. Two local-development notes: without `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS=true` no `http` or private-address destination can be registered *or* dialled, which is every destination a local receiver could have — and `cmd/notification-api` needs that same variable, since the policy is applied at registration too. The last three are validated against one another at startup: a reclaim bound below twice the attempt budget is a fatal configuration error naming both values, not a warning. See [docs/operations.md](operations.md) for the arithmetic. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
+`cmd/notifier` reads a narrow and very specific surface — narrow in what it deliberately lacks rather than in count, since the e-mail channel gave it four required variables: `RABBITMQ_URL`, `NOTIFICATION_POSTGRES_DSN`, `NOTIFICATION_SMTP_ADDR` and `NOTIFICATION_SMTP_FROM` required, and optionally `NOTIFICATION_SMTP_USERNAME`/`NOTIFICATION_SMTP_PASSWORD` (together or not at all), `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS`, `NOTIFICATION_WEBHOOK_MAX_ATTEMPTS`, `NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS`, and `NOTIFICATION_DELIVERY_RECLAIM_SECONDS`. The two `WEBHOOK`-named budget terms govern **every** channel despite the name — there is one per-attempt bound across channels, because `MaxClaimHold()` is arithmetic over it and a per-channel term would make that arithmetic irreproducible. It reads **no** `IDENTITY_*`, **no** `VIDEO_*` (MinIO included), and **no** `REDIS_ADDR`. Two local-development notes: without `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS=true` no `http` or private-address destination can be registered *or* dialled, which is every destination a local receiver could have — and `cmd/notification-api` needs that same variable, since the policy is applied at registration too. The last three are validated against one another at startup: a reclaim bound below twice the attempt budget is a fatal configuration error naming both values, not a warning. See [docs/operations.md](operations.md) for the arithmetic. `VIDEO_MINIO_PUBLIC_ENDPOINT`/`_USE_SSL` are a different case: the worker never presigns, but `setupWorker` goes through the same MinIO loader and builds the presign client anyway, so `ResultStorage` is fully constructed rather than holding a nil that would panic the day something calls the other half of its interface. They are therefore *read* by the worker even though nothing signs with them, and a malformed value can fail worker startup. Leaving them unset is the normal case — each falls back to its internal counterpart.
 
 `cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **No other process creates a directory at all**: extraction lives in the worker, so nothing else touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk — both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which `cmd/video-api` and `cmd/worker` both require at startup and the Video API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running several processes from the same working directory is fine — only the worker uses it.
 
-To skip the manual wiring entirely, use `docker compose up --build`, which starts all five services plus the gateway inside Docker with everything already configured — see "Docker Workflow" below.
+To skip the manual wiring entirely, use `docker compose up --build`, which starts all five services plus the gateway and a mail catcher inside Docker with everything already configured — see "Docker Workflow" below. The mail catcher (`mail`) accepts every message and delivers none onward; its inbox is at <http://127.0.0.1:8025>, which is the second and last host port the stack publishes. It is reached directly rather than through the gateway: the gateway serves the application's own surface, and a route there for a development-only UI would exist in no deployment.
 
 ## Running Tests
 
@@ -215,13 +225,20 @@ make dev-keys
 
 docker compose up --build
 # Access the UI by opening http://127.0.0.1:8080 in a browser. That port
-# belongs to the `gateway` service, which is the only one that publishes a
-# host port; it routes /api/auth/ to identity-api, /api/notification-
-# preferences to notification-api, and everything else to video-api, so the
-# split is invisible from the browser. Identity, video, notification, Redis,
-# MinIO, and RabbitMQ are already configured, and `worker` and `notifier`
-# are started from the same image, so uploads are actually processed and
-# finished jobs are actually announced.
+# belongs to the `gateway` service, which is the only one publishing a host
+# port for the application; it routes /api/auth/ to identity-api, /api/
+# notification-preferences to notification-api, and everything else to
+# video-api, so the split is invisible from the browser. Identity, video,
+# notification, Redis, MinIO, and RabbitMQ are already configured, and
+# `worker` and `notifier` are started from the same image, so uploads are
+# actually processed and finished jobs are actually announced.
+#
+# The one other published port is the mail catcher's inbox, at
+# http://127.0.0.1:8025. Register an email preference through
+# PUT /api/notification-preferences and every notification for that user
+# lands there instead of being sent anywhere real. It is a development-only
+# support service, so it publishes its own loopback-bound port rather than
+# taking a route on the gateway.
 #
 # Three workers start by default (docker-compose.yml's `deploy.replicas`),
 # so this stack processes several videos at the same time. Prefetch is 1, so
@@ -240,7 +257,7 @@ docker compose up --build --scale worker=1
 
 `docker-compose.yml` is the sole documented way to build and run the application via Docker **for local development** (see "Running the full suite via Docker" above for the equivalent test command). It builds from the same `Dockerfile` used for deployment — see [docs/operations.md](operations.md) for the deployment-focused Docker commands, which are a separate concern from this local dev workflow.
 
-> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app`, `worker`, `notifier`, and deployment all use — ships **all three** compiled binaries (`/app/app`, `/app/worker`, `/app/notifier`) plus `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000). `ffmpeg` is there for the worker rather than for the API or the notifier. The `worker` and `notifier` services are the same image with their command overridden to `/app/worker` and `/app/notifier`. The `notifier` service also carries `stop_grace_period: 90s`, longer than its shutdown drain — Compose's 10-second default would `SIGKILL` a delivery still in flight and leave a claim unresolved on every `docker compose stop`.
+> The `Dockerfile` is a multi-stage build: a `builder` stage compiles a static binary (dependencies resolved read-only from the committed `go.sum` — the build fails rather than silently patching it), a `test` stage adds `ffmpeg` on top of `builder` for running the suite (see `app-test` above), and the default `runtime` stage — the one `app`, `worker`, `notifier`, and deployment all use — ships **all three** compiled binaries (`/app/app`, `/app/worker`, `/app/notifier`) plus `ffmpeg`, no Go toolchain or source tree, running as a non-root user (fixed UID 1000). `ffmpeg` is there for the worker rather than for the API or the notifier. The `worker` and `notifier` services are the same image with their command overridden to `/app/worker` and `/app/notifier`. The `notifier` service also carries `stop_grace_period: 120s`, longer than its shutdown drain — one claim hold per delivery channel plus a 30s grace, 90s at the documented budget — Compose's 10-second default would `SIGKILL` a delivery still in flight and leave a claim unresolved on every `docker compose stop`.
 >
 > **Bind-mount permissions:** there is no longer a bind-mounted working directory to get wrong. `./uploads` and `./outputs` were both removed once their artifacts moved into MinIO, so the non-root user (UID 1000) writes only to `temp/` inside the container, which the image creates and owns. If you still have a root-owned `uploads/` or `outputs/` in your clone from an older checkout, it is inert — delete it.
 
