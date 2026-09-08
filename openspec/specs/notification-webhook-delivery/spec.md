@@ -166,7 +166,7 @@ Every attempt for one delivery SHALL carry the same delivery identifier, so a re
 
 ### Requirement: A Destination Is Refused Both Where It Is Registered and Where It Is Dialled
 
-The system SHALL apply one destination policy at two points: when a preference is written, and again when a connection is opened. The policy SHALL require a transport-secure scheme. At dial time it SHALL be evaluated against the **resolved network address**, not against the hostname alone. Redirects SHALL NOT be followed, the response body SHALL be bounded, and every attempt SHALL be bounded in time.
+The system SHALL apply one destination policy at two points to every destination that is a **connection target** — one the delivery path opens a connection to: when such a preference is written, and again when the connection is opened. A destination that is not a connection target, because its channel connects to infrastructure this deployment configures rather than to the value the user supplied, SHALL NOT be judged by this policy; `notification-email-delivery` states that case and why it is not a gap. The branch between the two SHALL be taken on the closed channel set, so no third path exists that applies neither rule. The policy SHALL require a transport-secure scheme. At dial time it SHALL be evaluated against the **resolved network address**, not against the hostname alone. Redirects SHALL NOT be followed, the response body SHALL be bounded, and every attempt SHALL be bounded in time.
 
 The guarded dial SHALL be the only path to the destination: the delivery transport's proxy SHALL be nil, and a proxy SHALL NOT be taken from the process environment. This is a condition for the address rule meaning anything, not a hardening preference. With a proxy configured, the connection the guarded dial opens is a connection to the *proxy* — whose address is public and duly approved — after which the proxy resolves the user's hostname itself and connects to whatever it resolves to, so the entire enumeration below is bypassed by an environment variable an operator may have set for a reason that has nothing to do with this system.
 
@@ -178,7 +178,7 @@ The IPv6 enumeration SHALL be its own list rather than "the equivalents", becaus
 
 An address in an IPv4-mapped (`::ffff:0:0/96`) or NAT64 (`64:ff9b::/96`) form SHALL be unwrapped to the IPv4 address it embeds and evaluated as that address, so a refused address cannot be reached by rewriting it. **Only the well-known NAT64 prefix `64:ff9b::/96` SHALL be unwrapped; the local-use translation prefix `64:ff9b:1::/48` SHALL be refused outright.** The two differ by one field and read as the same thing, but the local-use prefix exists to translate *inside* an operator's network, so unwrapping it would evaluate an embedded address that is reached through a translator this policy does not control — the same reason 6to4 and Teredo are refused by prefix. The whole enumeration, IPv4 and IPv6 alike, SHALL be explicit and SHALL be tested range by range.
 
-Two evaluations are required rather than one, and neither is redundant. A write-time check alone cannot survive a hostname that resolves differently later, nor a policy tightened after the row was stored. A dial-time check alone silently accepts a destination that will never be delivered to, which is the outcome the closed `Channel` set already rejects for `email`: a preference the system stores and never acts on is indistinguishable, to its owner, from one that works.
+Two evaluations are required rather than one, and neither is redundant. A write-time check alone cannot survive a hostname that resolves differently later, nor a policy tightened after the row was stored. A dial-time check alone silently accepts a destination that will never be delivered to, which is the outcome the closed `Channel` set exists to prevent: a preference the system stores and never acts on is indistinguishable, to its owner, from one that works. That is the argument for judging a connection target where it is registered; it is not an argument for judging a destination that is never dialled, which is why the scope above is stated over connection targets rather than over destinations generally.
 
 A single configuration switch MAY relax the policy for environments that have no TLS and no public addressing — local development and the compose stack. It SHALL default to the restrictive behaviour, and it SHALL relax both the scheme rule and the address rule together, because they are wanted in exactly the same situation and separating them invites enabling half of it where neither belongs.
 
@@ -249,6 +249,11 @@ Preferences stored before this policy took effect SHALL NOT be migrated or delet
 - **WHEN** a destination using `http` and naming a private address is registered and delivered to
 - **THEN** both are accepted, and with the switch absent or disabled both are refused
 
+#### Scenario: A destination that is not a connection target is not judged by this policy
+
+- **GIVEN** a preference on a channel whose delivery connects to infrastructure this deployment configures rather than to the stored destination
+- **WHEN** the preference is written and later delivered to
+- **THEN** the destination policy is not applied to it at either point, and the decision is taken on the channel set rather than by omitting a check
 ### Requirement: Delivery Attempts Are Bounded, and the Outcome Is Recorded Rather Than Retried Indefinitely
 
 A delivery SHALL be attempted a bounded number of times with backoff between attempts, each attempt bounded in time, and the whole budget SHALL be small enough that one unreachable destination costs the consumer seconds rather than minutes. A `2xx` response SHALL record the delivery as delivered. Any other outcome — a non-`2xx` status, a timeout, a refused connection, a policy refusal — SHALL exhaust the budget and record the delivery as failed, naming the last observed reason.

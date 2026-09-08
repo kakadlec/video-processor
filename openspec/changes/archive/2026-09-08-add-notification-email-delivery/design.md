@@ -143,6 +143,16 @@ For a webhook, a recorded `delivered` means the receiver answered 2xx. For e-mai
 
 *Why no backfill and no rewrite:* the change only widens what the table accepts. Every existing row is a `webhook` row carrying a non-empty secret and satisfies the new constraint unchanged.
 
+### 13. The message is written in English
+
+The subject and body are English, and the decision was put to the developer at finalization and confirmed there.
+
+*Why:* `CLAUDE.md`'s language policy requires English for new code, and its pt-BR exception is scoped by file — `cmd/video-api/web/index.html` and `web/app.js` — not by audience. A message body composed in Go is not in that scope.
+
+*What is uncomfortable about it, stated rather than glossed:* the recipients are the same pt-BR audience the upload page is written for, and they read this in an inbox rather than beside that page. The policy's own reasoning — mixing languages within one UI reads as inconsistent — does not obviously reach a channel that is not that UI. It was decided by the policy's letter rather than by extending the exception, because widening the exception by analogy is what makes a scoped rule stop being one.
+
+*Cost of changing later:* two functions in `internal/notification/infrastructure/smtp/message.go` and their tests. No contract moves — the body is prose for a human, not a parsed payload, which is also why it carries no version.
+
 ## Risks / Trade-offs
 
 - **The address is self-declared and unverified — a user can register someone else's** → Bounded, not eliminated: a delivery is only ever triggered by a job that same user owns, so the volume is the registrant's own uploads rather than an open relay. Recorded in `docs/operations.md` and in the new capability. An address-verification flow is a named non-goal and a change of its own.
