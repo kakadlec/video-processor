@@ -83,13 +83,16 @@ docker run \
 # turns the delivery client into an SSRF primitive.
 #
 # --stop-timeout is not optional dressing: Docker's default is 10 seconds and
-# the shutdown drain is MaxClaimHold() + 30s (60s at the documented budget),
-# so the default would SIGKILL a delivery in flight and leave its claim to be
-# reclaimed. 90 matches docker-compose.yml's stop_grace_period, and raising a
-# delivery term lengthens the drain and requires raising this too
+# the shutdown drain is one MaxClaimHold() per delivery channel plus a 30s
+# grace (90s at the documented budget with two channels), so the default would
+# SIGKILL a delivery in flight and leave its claim to be reclaimed. 120
+# matches docker-compose.yml's stop_grace_period; raising a delivery term, or
+# adding a channel, lengthens the drain and requires raising this too
 docker run \
-  --stop-timeout 90 \
+  --stop-timeout 120 \
   -e NOTIFICATION_POSTGRES_DSN="postgres://user:pass@host:5432/notification?sslmode=disable" \
+  -e NOTIFICATION_SMTP_ADDR="mail.example.com:587" \
+  -e NOTIFICATION_SMTP_FROM="notifier@example.com" \
   -e RABBITMQ_URL="amqp://user:pass@host:5672/" \
   video-processor /app/notifier
 ```
@@ -134,7 +137,7 @@ The five processes have deliberately different configuration surfaces. The absen
 
 **`RATE_LIMIT_*` must hold the same value everywhere it is read, or be unset everywhere.** The counter is shared — one budget per user across the whole system, keyed `ratelimit:<userID>` by every service that mounts the middleware — so services holding different thresholds would compare one count against two of them and the effective limit would depend on which route a request happened to take. `docker-compose.yml` leaves both unset on every service for exactly that reason: unset-everywhere is one source of truth (the code default, 60 requests / 60 seconds), whereas pinning the value in the compose file would create a second place for it to drift from.
 
-**The three HTTP services all listen on 8080**, each inside its own container, and none of them publishes it. The gateway is the only process that publishes a host port; the worker and the notifier listen on nothing at all.
+**The three HTTP services all listen on 8080**, each inside its own container, and none of them publishes it. The gateway is the only *application* process that publishes a host port; the worker and the notifier listen on nothing at all. The local compose stack also publishes the mail catcher's inspection port, which is a development-only support service serving no application route and is not part of any deployment.
 
 `NOTIFICATION_ALLOW_INSECURE_DESTINATIONS` is the row that surprises people: it reads like a delivery concern, but `cmd/notification-api` needs it too, because the destination policy is applied both when a preference is written and when its address is dialled. One variable, one parser, and a deployment whose two readers disagree either stores destinations it can never deliver to or refuses at dial what it accepted at write time. The other three processes never see it.
 
@@ -256,7 +259,7 @@ Two-to-three times, not ten: the same value bounds how long an abandoned claim s
 
 Only three of the seven terms are settable from the environment. The backoff intervals and the resolve-retry terms keep their documented defaults, deliberately — every variable exposed is another way to reach a combination the validator has to refuse, and these are the terms with no operational question attached to them.
 
-The shutdown drain follows from the same arithmetic: `cmd/notifier` waits the maximum claim hold plus a 30-second grace (60s at the defaults) for the delivery in hand to reach a disposition, then closes the pool. **If the drain expires, the bound wins and the pool is not closed** — the handler runs on a context the signal does not cancel, so at that point it is still running and can never be joined, and process exit releases the connections anyway. Nothing is lost that the reclaim bound does not already cover. Give the process more termination grace than its drain: `docker-compose.yml` sets `stop_grace_period: 90s` and the `docker run` command above passes `--stop-timeout 90` for exactly this — Docker's own default is 10 seconds, which is below the drain at every supported budget. Raising a delivery term lengthens the drain and requires raising both.
+The shutdown drain follows from the same arithmetic, once per delivery channel: `cmd/notifier` waits one maximum claim hold for each channel in the closed set, plus a single 30-second grace (90s at the defaults, with two channels), for the message in hand to reach a disposition on every preference it resolved to, then closes the pool. It is per channel because one event can resolve to one preference per channel and the handler works through them sequentially, so a drain sized for a single hold would expire during work that is within budget. The reclaim bound is unaffected and stays per claim — each claim is fenced independently. **If the drain expires, the bound wins and the pool is not closed** — the handler runs on a context the signal does not cancel, so at that point it is still running and can never be joined, and process exit releases the connections anyway. Nothing is lost that the reclaim bound does not already cover. Give the process more termination grace than its drain: `docker-compose.yml` sets `stop_grace_period: 90s` and the `docker run` command above passes `--stop-timeout 90` for exactly this — Docker's own default is 10 seconds, which is below the drain at every supported budget. Raising a delivery term lengthens the drain and requires raising both.
 
 #### Two signals this design deliberately leaves behind
 
@@ -548,7 +551,7 @@ Locally, `docker compose up --build` starts a mail catcher that accepts everythi
 
 > The components below are planned for future phases and do not exist in the current deployment. Each is labeled with the phase that introduces it.
 
-**E-mail delivery is no longer planned — it shipped** (`add-notification-email-delivery`) and is documented above: the relay variables under "Environment Variables", the local mail catcher under "Docker", and the operational notes under "The e-mail channel" below.
+**E-mail delivery is no longer planned — it shipped** (`add-notification-email-delivery`) and is documented above: the relay variables under "Environment Variables", the local mail catcher under "Docker", and the operational notes under "The e-mail channel", at the end of the implemented-infrastructure section above.
 
 ### Observability — Planned (Phase 8)
 

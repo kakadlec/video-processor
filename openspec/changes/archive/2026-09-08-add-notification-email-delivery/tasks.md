@@ -3,7 +3,7 @@
 - [x] 1.1 Add `ChannelEmail = "email"` to `internal/notification/domain/channel.go` and accept it in `ParseChannel`; replace the constant's comment, which currently states why there is deliberately no e-mail value. Update `channel_test.go` so the accepted set is asserted as exactly two values and an arbitrary third is still refused.
 - [x] 1.2 Add e-mail address validation to `internal/notification/domain`: a single addr-spec address, rejecting a display name, angle brackets, comment syntax, any value whose canonical rendering is not byte-identical to the input, any CR/LF/NUL, and anything over the length bound. Table-driven tests covering each rejection, including the header-injection cases, are the point of this task.
 - [x] 1.3 Add `NewDestinationFor(channel Channel, raw string) (Destination, error)` to `internal/notification/domain/destination.go`, delegating to the existing URL rule for `webhook` and to 1.2 for `email`. Leave `NewDestination` in place as the webhook rule. Test both branches, including that a URL is refused for `email` and an address for `webhook`.
-- [x] 1.4 Make `RestoreNotificationPreference` require a non-zero `Secret` only when the channel signs, and update the type's doc comment, which currently states the invariant unconditionally. Test that an `email` preference restores with a zero secret and that a `webhook` one still does not.
+- [x] 1.4 Make `RestoreNotificationPreference` require a non-zero `Secret` only when the channel signs — the third of the four sites the invariant lives in, alongside the schema CHECK (2.1), the write-statement selection (2.2) and the delivery read's projection (2.3a) — and update the type's doc comment, which currently states the invariant unconditionally. Test that an `email` preference restores with a zero secret and that a `webhook` one still does not.
 
 ## 2. Storage: the conditional secret rule
 
@@ -52,6 +52,6 @@
 ## 8. Finalization (after the implementation PR merges — not part of it)
 
 - [x] 8.1 Update `docs/architecture.md`, `docs/domain-model.md`, `docs/flows.md`, `docs/operations.md` and `docs/development.md` for the second channel, the per-channel destination rule, the narrowed secret invariant, the new variables, the self-declared-address consideration, and what a recorded `delivered` means on this channel.
-- [x] 8.2 Update `CLAUDE.md`: the channel set is no longer `webhook` alone, the secret invariant is channel-conditional in three places, and the destination policy applies to the webhook branch only.
+- [x] 8.2 Update `CLAUDE.md`: the channel set is no longer `webhook` alone, the secret invariant is channel-conditional in four places (schema CHECK, write-statement selection, aggregate restoration, delivery-read projection), and the destination policy applies to the webhook branch only.
 - [x] 8.3 Flip the `add-notification-email-delivery` row in `docs/roadmap.md` to archived with links, and update the Phase 7 summary — this change closes the phase.
 - [x] 8.4 `npx --yes @fission-ai/openspec validate add-notification-email-delivery --strict --no-interactive`, then archive.
