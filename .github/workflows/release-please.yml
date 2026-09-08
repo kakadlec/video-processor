@@ -57,13 +57,15 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # Publications for one version serialize. The existence check below is a
-    # registry lookup and therefore time-of-check/time-of-use: two runs for
-    # the same absent version could both observe "absent" and both push. The
-    # git tag is 1:1 with the version it normalizes to, and is the only form
-    # available before the job's own steps run.
+    # ALL publications serialize, not just those for the same version. The
+    # checks below are registry lookups and therefore time-of-check/
+    # time-of-use, and the shared thing they race on is `latest`: keyed per
+    # version, an older manual republish and a newer release could both read
+    # the registry, both conclude they are the highest, and let the last push
+    # win — leaving `latest` on the older image. Publishes are rare; a single
+    # lane costs nothing and removes the whole class.
     concurrency:
-      group: publish-image-${{ github.event_name == 'workflow_dispatch' && inputs.tag || needs.release-please.outputs.tag_name }}
+      group: publish-image
       cancel-in-progress: false
     steps:
       - name: Resolve and validate the tag
@@ -131,22 +133,53 @@ jobs:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          image="ghcr.io/${{ github.repository }}"
-          image="$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')"
+          repo="$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/$repo"
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
-          if docker manifest inspect "$image:$VERSION" > /dev/null 2>&1; then
-            echo "::error::$image:$VERSION is already published; delete it from the registry first if it must be replaced"
-            exit 1
-          fi
-
           token=$(curl -sSf -u "${{ github.actor }}:$GH_TOKEN" \
-            "https://ghcr.io/token?scope=repository:${{ github.repository }}:pull&service=ghcr.io" \
-            | jq -r '.token')
-          published=$(curl -sS -H "Authorization: Bearer $token" \
-            "https://ghcr.io/v2/${{ github.repository }}/tags/list" \
-            | jq -r '.tags // [] | .[]' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+            "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
+            | jq -er '.token')
+
+          # Both queries below distinguish "absent" from "could not tell".
+          # Treating every failure as absent would fail OPEN on the one
+          # guarantee this step exists for: a 401 or a 5xx would read as an
+          # empty registry, letting the push overwrite a published version and
+          # letting an older republish drag `latest` backwards.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$repo/manifests/$VERSION")
+          case "$status" in
+            200)
+              echo "::error::$image:$VERSION is already published; delete it from the registry first if it must be replaced"
+              exit 1
+              ;;
+            404) ;;
+            *)
+              echo "::error::cannot tell whether $image:$VERSION exists (HTTP $status); refusing to publish"
+              exit 1
+              ;;
+          esac
+
+          body=$(mktemp)
+          status=$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/$repo/tags/list")
+          case "$status" in
+            # grep exiting 1 here is a legitimately empty result, unlike a
+            # failed request — that is the one failure `|| true` may absorb.
+            200) published=$(jq -r '.tags // [] | .[]' "$body" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true) ;;
+            # No package yet: the bootstrap publish, where nothing is higher.
+            404) published='' ;;
+            *)
+              echo "::error::cannot list published tags (HTTP $status); refusing to publish"
+              exit 1
+              ;;
+          esac
 
           highest=$(printf '%s\n%s\n' "$published" "$VERSION" | grep -v '^$' | sort -V | tail -1)
           if [ "$highest" = "$VERSION" ]; then
@@ -180,6 +213,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.plan.outputs.tags }}
+          # Buildx attaches a minimal provenance attestation by default when
+          # the registry supports one. This change excludes provenance and SBOM
+          # from its scope deliberately, so turn them off rather than shipping
+          # them as a side effect of the tool's defaults.
+          provenance: false
+          sbom: false
 
       - name: Summarize
         run: |
