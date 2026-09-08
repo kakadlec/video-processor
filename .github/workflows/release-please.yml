@@ -41,7 +41,14 @@ jobs:
         # would show up as a release that quietly publishes nothing — so log
         # the whole set, making the first real release the place that proves
         # the names rather than a guess that stays unexamined.
-        run: echo '${{ toJSON(steps.release.outputs) }}'
+        #
+        # Through env, never interpolated into the script: the output object
+        # carries `pr`/`prs`, whose text comes from commit history, so an
+        # apostrophe would break this command and crafted text would become
+        # shell syntax in a job holding a write-capable token.
+        env:
+          RELEASE_OUTPUTS: ${{ toJSON(steps.release.outputs) }}
+        run: echo "$RELEASE_OUTPUTS"
 
   publish-image:
     name: Publish container image
@@ -77,11 +84,13 @@ jobs:
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
           INPUT_TAG: ${{ inputs.tag }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             tag="$INPUT_TAG"
           else
             tag="$RELEASE_TAG"
@@ -95,7 +104,7 @@ jobs:
             echo "::error::'$tag' is not a release tag of the form vX.Y.Z"
             exit 1
           fi
-          if ! gh api "repos/${{ github.repository }}/git/ref/tags/$tag" > /dev/null 2>&1; then
+          if ! gh api "repos/$REPOSITORY/git/ref/tags/$tag" > /dev/null 2>&1; then
             echo "::error::tag '$tag' does not exist in this repository"
             exit 1
           fi
@@ -130,14 +139,16 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          repo="$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          repo="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/$repo"
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
-          token=$(curl -sSf -u "${{ github.actor }}:$GH_TOKEN" \
+          token=$(curl -sSf -u "$ACTOR:$GH_TOKEN" \
             "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
             | jq -er '.token')
 
@@ -170,9 +181,14 @@ jobs:
             -H "Authorization: Bearer $token" \
             "https://ghcr.io/v2/$repo/tags/list")
           case "$status" in
-            # grep exiting 1 here is a legitimately empty result, unlike a
-            # failed request — that is the one failure `|| true` may absorb.
-            200) published=$(jq -r '.tags // [] | .[]' "$body" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true) ;;
+            # Parse first, fail-closed: `|| true` on a jq|grep pipeline
+            # absorbs jq's failure too, so malformed JSON behind an HTTP 200
+            # would read as an empty registry. Filter second, where an empty
+            # result is legitimate and is the only failure worth absorbing.
+            200)
+              tags=$(jq -r '.tags // [] | .[]' "$body")
+              published=$(printf '%s\n' "$tags" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+              ;;
             # No package yet: the bootstrap publish, where nothing is higher.
             404) published='' ;;
             *)
@@ -221,6 +237,10 @@ jobs:
           sbom: false
 
       - name: Summarize
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          MOVED_LATEST: ${{ steps.plan.outputs.latest }}
         run: |
-          echo "published ${{ steps.plan.outputs.image }}:${{ steps.tag.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "moved latest: ${{ steps.plan.outputs.latest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "published $IMAGE:$VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "moved latest: $MOVED_LATEST" >> "$GITHUB_STEP_SUMMARY"
