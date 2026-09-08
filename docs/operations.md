@@ -331,13 +331,48 @@ rabbitmqctl delete_queue video.jobs.queued.v1
 
 **The exchange needs a different tool, and this is the step the runbook used to get wrong.** `rabbitmqctl` has no `delete_exchange` on the `rabbitmq:4-alpine` image `docker-compose.yml` pins — `delete_queue` is there, but the CLI exposes no exchange equivalent at all, so following a two-`rabbitmqctl`-command recipe retires the queue and then fails. Delete it over AMQP from any client, which needs no plugin and no extra port:
 
-```go
-// Channel.ExchangeDelete(name, ifUnused, noWait) — github.com/rabbitmq/amqp091-go,
-// already a dependency of this repository.
-ch.ExchangeDelete("video.jobs.v1", false, false)
+```bash
+# Run from anywhere with the Go toolchain and network reach to the broker.
+# RABBITMQ_URL is the same value the services are configured with, so its
+# vhost, credentials and TLS setting need no separate handling here.
+mkdir -p /tmp/retire-v1 && cd /tmp/retire-v1
+cat > main.go <<'GO'
+package main
+
+import (
+	"log"
+	"os"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+func main() {
+	conn, err := amqp.Dial(os.Getenv("RABBITMQ_URL"))
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("channel: %v", err)
+	}
+	defer ch.Close()
+
+	// ExchangeDelete(name, ifUnused, noWait): delete unconditionally and wait
+	// for the broker to confirm. The name is a literal so no other exchange
+	// is reachable from here.
+	if err := ch.ExchangeDelete("video.jobs.v1", false, false); err != nil {
+		log.Fatalf("delete exchange: %v", err)
+	}
+	log.Println("deleted exchange video.jobs.v1")
+}
+GO
+go mod init retire-v1 && go get github.com/rabbitmq/amqp091-go@v1.14.0
+RABBITMQ_URL='amqp://user:pass@broker-host:5672/' go run .
 ```
 
-Where the `rabbitmq_management` plugin is enabled and its port is reachable, the HTTP API does the same (`%2F` is the default vhost, URL-encoded):
+Where the `rabbitmq_management` plugin is enabled and its port is reachable, the HTTP API does the same. **Substitute the vhost**: the path segment after `/api/exchanges/` is the URL-encoded vhost from `RABBITMQ_URL`, and `%2F` below is the default `/` — a deployment on a named vhost that leaves it at `%2F` gets a `404`, or deletes a same-named exchange in the wrong vhost while the superseded one survives.
 
 ```bash
 curl -u "$RABBITMQ_USER:$RABBITMQ_PASS" -X DELETE \
