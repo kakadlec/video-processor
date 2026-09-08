@@ -325,8 +325,11 @@ Releases are automated via `release-please`. On every push to `main`, it maintai
 The async cutover moved job dispatch to a new generation of the topology — `video.jobs.v2` / `video.jobs.queued.v2`, routing key and outbox `event_type` `video_job.queued.v2`. The previous generation's entities are **not** deleted by the application, and after every replica is running the new build they should be deleted by hand:
 
 ```bash
-# from a shell that can reach the broker's CLI
-rabbitmqctl delete_queue video.jobs.queued.v1
+# from a shell that can reach the broker's CLI. --vhost is the vhost from
+# RABBITMQ_URL, decoded: the CLI takes it literally, unlike the management API
+# path further down. "/" is both rabbitmqctl's default and what the Compose
+# stack's URL selects, so it is written out rather than left implicit.
+rabbitmqctl --vhost / delete_queue video.jobs.queued.v1
 ```
 
 **The exchange needs a different tool, and this is the step the runbook used to get wrong.** `rabbitmqctl` has no `delete_exchange` on the `rabbitmq:4-alpine` image `docker-compose.yml` pins — `delete_queue` is there, but the CLI exposes no exchange equivalent at all, so following a two-`rabbitmqctl`-command recipe retires the queue and then fails. Delete it over AMQP from any client, which needs no plugin and no extra port:
