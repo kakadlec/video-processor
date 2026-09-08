@@ -433,5 +433,9 @@ jobs:
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
-            docker run --rm "video-processor:ci-$arch" ffmpeg -version | head -1
+            # `sed -n 1p` rather than `head -1`: head closes the pipe after
+            # the first line, ffmpeg dies of SIGPIPE, and pipefail turns a
+            # successful check into a failed step. sed reads the stream out.
+            version=$(docker run --rm "video-processor:ci-$arch" ffmpeg -version | sed -n 1p)
+            echo "$arch: $version"
           done
