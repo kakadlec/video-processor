@@ -191,7 +191,7 @@ docker compose down -v    # stop and drop the local data volume(s)
 
 ## Code Quality Gates
 
-The CI pipeline runs three checks — `Build & Test` (`go vet` + `go test`), `SAST` (`gosec`), `Vulnerability Scan` (`govulncheck`) — on every push and pull request, regardless of what the diff touches; that's the branch-protection gate, not a diff-conditional one.
+The CI pipeline runs four checks — `Build & Test` (`go vet` + `go test`), `SAST` (`gosec`), `Vulnerability Scan` (`govulncheck`), and `Container Image Build` (`docker buildx`, both published platforms plus the test stage, pushing nothing) — on every push and pull request, regardless of what the diff touches; that's the branch-protection gate, not a diff-conditional one.
 
 ```bash
 # Static analysis
@@ -315,7 +315,7 @@ Direct work and its PRs are not assigned OpenSpec roles and do not require propo
 
 ### Branch Protection
 
-`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. All review conversations must also be resolved before merge, including inline threads opened by GitHub Copilot. A PR is not mergeable until all three checks pass and no review thread remains unresolved, but its branch does not need to be up to date with `main`. This protection is enforced for administrators too.
+`main` is protected. All changes land via a feature branch and pull request. Required status checks: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`, and `Container Image Build`. All review conversations must also be resolved before merge, including inline threads opened by GitHub Copilot. A PR is not mergeable until all four checks pass and no review thread remains unresolved, but its branch does not need to be up to date with `main`. This protection is enforced for administrators too.
 
 ```bash
 git fetch origin

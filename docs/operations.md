@@ -6,6 +6,18 @@ The application is **five** Go processes built from one image: `cmd/identity-api
 
 ### Docker
 
+The image is published on every release, so the `docker build` below is one of two ways to obtain it and the slower one:
+
+```bash
+docker pull ghcr.io/kakadlec/video-processor:4.0.0   # or :latest
+```
+
+`ghcr.io/kakadlec/video-processor` carries all five binaries for `linux/amd64` and `linux/arm64`. A **version tag is immutable** — a published version is never overwritten, and replacing one means deleting it from the registry first, deliberately and by hand — so it is the reference to deploy from. `latest` moves to whatever the highest published version is, and is a convenience for a reader who has no version in hand, not a reproducible reference.
+
+**Publishing is not deploying.** This project has no deployment target, and nothing here rolls the image anywhere: the commands below are still the documented way to run it, whether the image came from a `docker build` or a `docker pull`. Substitute `ghcr.io/kakadlec/video-processor:<version>` for `video-processor` in each of them if you pulled.
+
+Publication happens when `release-please` creates a release; a merge to `main` that bumps no version publishes nothing. A tag that already exists — one released before this pipeline, or one whose publication failed — is published by running the `Release Please` workflow manually with that tag as its input. That path builds the tag's own tree, so a tag predating the multi-platform build emulates the Go toolchain and is slow; the binaries are still correct.
+
 ```bash
 # Build
 docker build -t video-processor .
@@ -310,15 +322,18 @@ Results accumulate indefinitely. There is no expiry, no lifecycle rule, no clean
 
 ## CI / CD
 
-Three required checks run on every push and pull request:
+**Four** required checks run on every push and pull request:
 
 | Check | Tool | What it does |
 |---|---|---|
 | `Build & Test` | `go vet` + `go test ./... -v` | Compiles the application and runs integration tests (with `ffmpeg` installed on the runner) |
 | `SAST (gosec)` | [`gosec`](https://github.com/securego/gosec) | Static security analysis; fails the build on any finding |
 | `Vulnerability Scan (govulncheck)` | [`govulncheck`](https://go.dev/security/vuln) | Fails only when a known vulnerability is reachable from code actually called by this project |
+| `Container Image Build` | `docker buildx` | Builds the runtime image for both published platforms and the test stage natively, pushing nothing — then reads the ELF headers of all five binaries in each image |
 
-Releases are automated via `release-please`. On every push to `main`, it maintains a "Release PR" showing the next version computed from Conventional Commits. Merging that PR creates the git tag, publishes a GitHub Release, and updates `CHANGELOG.md`.
+That last check exists because everything above it runs on the runner with dependencies installed there, so until it was added a `Dockerfile` that did not build merged green. Its architecture assertion is the part that earns its keep: the builder chains five compilations, and a target architecture reaching four of them produces an image that builds, scans and pushes cleanly while one process dies with `exec format error` on one platform only. Inspecting the image manifest would not catch that — the manifest reports the platform it *claims*, and never opens a layer.
+
+Releases are automated via `release-please`. On every push to `main`, it maintains a "Release PR" showing the next version computed from Conventional Commits. Merging that PR creates the git tag, publishes a GitHub Release, updates `CHANGELOG.md`, and publishes the container image (see [Docker](#docker) above). The publish job lives in the same workflow as `release-please` rather than in one of its own, and that is not a stylistic choice: **a release created by an action using the workflow's own `GITHUB_TOKEN` triggers no further workflow run**, so a separate workflow keyed on the release event would sit silent through every release.
 
 ### Post-deploy step: retire the superseded dispatch generation
 

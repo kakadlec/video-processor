@@ -13,7 +13,7 @@ Before reporting **any** change complete:
 
 - If the diff includes a Go module input file (`.go` source, `go.mod`, or `go.sum`): `go test ./... -v` passes locally — this is the canonical "change complete" requirement. CI's `Build & Test` job also runs `go vet ./...`, so run that too before pushing. Tests are integration tests requiring `ffmpeg` on `PATH`; if unavailable, run via `docker compose run --build --rm app-test go test ./... -v`. A dependency-only bump (`go.mod`/`go.sum` with no `.go` file touched) still requires this — it can change compiled/runtime behavior.
 - If the diff has no Go module input file (documentation or agent/skill configuration only): this requirement doesn't apply — don't claim a test run that didn't happen, and don't skip reporting the change done because of it either.
-- If a PR is open for this work, confirm all three required checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`) are passing (`gh pr checks <n>`) — a PR isn't done with failing checks even if reviews look clean. The branch does not need to be up to date with `main`.
+- If a PR is open for this work, confirm all four required checks (`Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`, `Container Image Build`) are passing (`gh pr checks <n>`) — a PR isn't done with failing checks even if reviews look clean. The branch does not need to be up to date with `main`.
 - If a PR is open for this work, check for review comments (automatic Copilot review + human) and address genuine findings first:
   ```bash
   gh pr view <n> --json reviews
@@ -38,7 +38,7 @@ gh pr create --fill
 
 Branch from freshly-fetched `origin/main`, not from whatever happens to be checked out. Branching from stale or unrelated work can carry unrelated commits into the new PR's diff.
 
-Not mergeable until all three required checks pass: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`. The branch does not need to be up to date with `main`. This applies to every PR, including `release-please`'s own release PR — no special-casing.
+Not mergeable until all four required checks pass: `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`, `Container Image Build`. The branch does not need to be up to date with `main`. This applies to every PR, including `release-please`'s own release PR — no special-casing.
 
 ## Quality gates
 
@@ -49,7 +49,7 @@ gosec ./...        # scans the whole codebase; CI runs it on every PR regardless
 govulncheck ./...  # same — CI-required on every PR regardless of diff content
 ```
 
-All four CI-backed checks (`Build & Test` = `go vet` + `go test`, `SAST` = `gosec`, `Vulnerability Scan` = `govulncheck`) must pass in CI on every PR — that's the branch-protection gate, and it's not diff-conditional. Locally, only `go vet`/`go test` are conditional on the diff containing a Go module input (see Definition of done); `gosec`/`govulncheck` scan the full codebase, so a docs/skill-only change rarely needs a fresh local run of those two — but running them costs little, and CI will catch anything missed regardless. CI fails the build on **any** `gosec` finding — that's deliberate policy, not a bug. `#nosec` is a last resort, not the default response: check the rule's own docs (e.g. `securego.io/docs/rules/g304.html` — lowercase, case-sensitive path) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression. Only suppress a genuine false positive or accepted risk with no recognized fix, using a bare `#nosec G<rule-id>` (no restated prose — that belongs in the commit/PR description). `govulncheck` failures are resolved by upgrading the implicated dependency (check `go mod graph` for which direct dependency pulls it in), then `go mod tidy`.
+All four CI-backed checks (`Build & Test` = `go vet` + `go test`, `SAST` = `gosec`, `Vulnerability Scan` = `govulncheck`, `Container Image Build` = `docker buildx` for both published platforms plus the test stage, pushing nothing) must pass in CI on every PR — that's the branch-protection gate, and it's not diff-conditional. Locally, only `go vet`/`go test` are conditional on the diff containing a Go module input (see Definition of done); `gosec`/`govulncheck` scan the full codebase, so a docs/skill-only change rarely needs a fresh local run of those two — but running them costs little, and CI will catch anything missed regardless. CI fails the build on **any** `gosec` finding — that's deliberate policy, not a bug. `#nosec` is a last resort, not the default response: check the rule's own docs (e.g. `securego.io/docs/rules/g304.html` — lowercase, case-sensitive path) for a validation pattern gosec recognizes as safe, and test it (`gosec ./...`) before reaching for suppression. Only suppress a genuine false positive or accepted risk with no recognized fix, using a bare `#nosec G<rule-id>` (no restated prose — that belongs in the commit/PR description). `govulncheck` failures are resolved by upgrading the implicated dependency (check `go mod graph` for which direct dependency pulls it in), then `go mod tidy`.
 
 ## Merge rule
 

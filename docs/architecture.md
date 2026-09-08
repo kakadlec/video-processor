@@ -70,8 +70,9 @@ video-processor/
   docker-compose.yml # Local dev stack: postgres, redis, minio, rabbitmq, gateway, identity-api, video-api, notification-api, worker, notifier, and the app-test service used to run the suite
   .github/
     workflows/
-      ci.yml                      # Build & Test, SAST (gosec), Vulnerability Scan
-      release-please.yml          # Automated release management
+      ci.yml                      # Build & Test, SAST (gosec), Vulnerability Scan,
+                                  #   Container Image Build
+      release-please.yml          # Automated release management + image publication
   docs/            # Project documentation (this directory)
   openspec/        # Spec-driven change governance artifacts
 ```
