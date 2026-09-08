@@ -2,8 +2,8 @@
 
 - [ ] 1.1 Pin the builder stage to the build platform (`FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder`) and declare `ARG TARGETARCH` in it. Leave `test` as `FROM builder` — that inheritance is what keeps the test stage native, and it is a requirement, not a side effect.
 - [ ] 1.2 Pass `GOARCH=$TARGETARCH` to **all five** `go build` invocations. The five are chained with `&&`; a value reaching four of them produces an image that builds, pushes and scans clean, with one binary that dies at `exec` on one platform only.
-- [ ] 1.3 Verify locally with `docker buildx build --platform linux/amd64,linux/arm64` that both platforms build, then, for each platform, inspect all five binaries in the runtime image and confirm the architecture — `file`, `go version -m`, or reading the ELF header; whatever the image can run. This is the task that catches 1.2 going wrong.
-- [ ] 1.4 Run `ffmpeg -version` inside the `arm64` runtime image. The worker is the only consumer and a missing or wrong-architecture `ffmpeg` would otherwise surface only when a job is processed.
+- [ ] 1.3 Verify locally with `docker buildx build --platform linux/amd64,linux/arm64` that both platforms build, then, for each platform, inspect all five binaries in the runtime image and confirm the architecture. Prefer an inspection that does **not** execute the foreign binaries — reading the ELF header from the host, or `docker buildx imagetools inspect` — so the check works whether or not emulation is available.
+- [ ] 1.4 Run `ffmpeg -version` inside the `arm64` runtime image. This one does require executing a foreign binary: on a host without `binfmt_misc` registered for `arm64` (a plain WSL2 or Linux install typically has none) it fails with `exec format error`, which is an unregistered emulator and not a finding about the image. Register it (`tonistiigi/binfmt`) or run the check where emulation exists; **do not record this task as passed on the strength of a skipped run.**
 - [ ] 1.5 Confirm the local loop is untouched: `docker compose run --build --rm app-test go test ./... -v` still builds the `test` target natively and the suite passes. Compare build time against a run from before the change — a large regression means the test stage stopped being native.
 
 ## 2. The pull-request gate
@@ -16,7 +16,8 @@
 ## 3. The publish workflow
 
 - [ ] 3.1 Add a publish job to `.github/workflows/release-please.yml` that `needs` the release job and runs only when it actually created a release. **Verify the action's real output names against `googleapis/release-please-action@v5`** rather than assuming `release_created`/`tag_name`; the design deliberately does not pin them.
-- [ ] 3.2 Give the job `packages: write` (and the `contents: read` it needs), log in to GHCR with the workflow's own `GITHUB_TOKEN`, and push the runtime image for both platforms as one manifest list, tagged with the release version and `latest`. Confirm the image reference is lowercase.
+- [ ] 3.2 Give the job `packages: write` (and the `contents: read` it needs), log in to GHCR with the workflow's own `GITHUB_TOKEN`, and push the runtime image for both platforms as one manifest list, tagged with the release version. Confirm the image reference is lowercase.
+- [ ] 3.2a Move `latest` onto that image only when no higher version is already published — `latest` tracks the highest published version, not the last publication, so republishing an older tag must leave it where it is. For an automatic release publication the two coincide; the check exists for the deliberate path below.
 - [ ] 3.3 Add a `workflow_dispatch` trigger with a required tag input and an explicit boolean opt-in to replace an existing image. The dispatch path checks out the **named tag**, not `main`.
 - [ ] 3.4 Make the publish refuse a version that already has a published image unless that opt-in is set — one registry lookup before the push. This is what keeps the version tag immutable across a manual trigger that takes a free-text tag name.
 - [ ] 3.5 Confirm that a merge to `main` which creates no release publishes nothing.
@@ -28,6 +29,7 @@
 - [ ] 4.3 Confirm both tags resolve to the same image and that both platforms are present in the manifest list.
 - [ ] 4.4 Start one process from the pulled image (the default command, with configuration deliberately absent) and confirm it fails on missing configuration rather than on a missing or wrong-architecture binary — that failure mode is the one thing the gate cannot show.
 - [ ] 4.5 Re-run the dispatch for `v4.0.0` without the replace opt-in and confirm it refuses.
+- [ ] 4.6 Confirm `latest` points at `4.0.0` after the bootstrap, since it is the highest published version. The republish-does-not-move-`latest` rule cannot be exercised until a second version exists; note that as untested-in-practice in the PR rather than claiming it was verified.
 
 ## 5. Quality gates
 

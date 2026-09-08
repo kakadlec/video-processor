@@ -69,9 +69,11 @@ Nothing is pushed from a pull request. The workflow needs no registry write perm
 
 *Alternative considered.* Native-only on pull requests, both platforms only at release: faster, and the tuning knob if the emulated layer proves slow or flaky, at the cost named in the proposal.
 
-### D5 — Two tags: the version and `latest`
+### D5 — Two tags: the version, and `latest` tracking the highest version
 
 `ghcr.io/kakadlec/video-processor:4.0.0` and `:latest`. No `:4` or `:4.0` moving pointers — every additional moving tag is another way for a reader to run something other than what they think, and this project has one consumer profile (someone evaluating a release), not a fleet with an upgrade policy.
+
+`latest` follows the **highest published version**, not the most recent publication. The two coincide for every automatic publication and diverge for exactly one case that D2 makes reachable: republishing an older tag after a newer one exists. Defining `latest` as "the last thing published" would make that recovery hand an unversioned puller an older image than they had before — a regression caused by an operation whose purpose was to repair something. So the publish path compares against what is already published before moving `latest`, and the bootstrap case falls out of the same rule: `v4.0.0` is the highest published version precisely because nothing is published yet.
 
 The registry path must be lowercase; the owner and repository names already are.
 

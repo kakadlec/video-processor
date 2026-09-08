@@ -4,7 +4,9 @@
 
 The repository SHALL publish its container image to a registry, under a name derived from the repository (`ghcr.io/<owner>/<repository>`, lowercased as the registry requires), so that the image can be obtained without a Go toolchain, without a working tree, and without building it.
 
-Publication SHALL be triggered by a release actually being created, not by a merge to `main`. The version the image carries SHALL be the version the release names — the image tag and the git tag SHALL denote the same commit — because the repository already has exactly one authority on what a version is (`development-workflow`'s "Automated Release Pull Request"), and a second one that computes its own would be able to disagree with it.
+**Automatic** publication SHALL be triggered by a release actually being created, and SHALL NOT be triggered by a merge to `main`. The only other way an image is published SHALL be the deliberate, operator-initiated path defined in "An Existing Tag Can Be Published Deliberately"; there SHALL be no third trigger.
+
+Under either trigger the version the image carries SHALL be the version named by a git tag that already exists, and the image tag and that git tag SHALL denote the same commit. The repository has exactly one authority on what a version is (`development-workflow`'s "Automated Release Pull Request"); no publication path SHALL compute a version of its own, because a second authority would be able to disagree with the first.
 
 Publication SHALL authenticate with the workflow's own repository-scoped token. No registry account, credential, or secret beyond that token SHALL be required.
 
@@ -27,16 +29,23 @@ Publishing an image SHALL NOT deploy it, and no requirement here SHALL be read a
 
 ### Requirement: The Published Tag Set Is The Version And `latest`
 
-A publication SHALL push exactly two tags: the release's version and `latest`. Additional moving pointers (a major-only or major-minor tag) SHALL NOT be published.
+A publication SHALL push the version being published. It SHALL additionally move `latest` onto that image **only when no higher version has already been published**. Additional moving pointers (a major-only or major-minor tag) SHALL NOT be published.
 
-The version tag SHALL be treated as immutable: once a version has been published, a later publication SHALL NOT overwrite it with different contents. `latest` SHALL be understood as moving, and SHALL point at the most recently published version.
+`latest` therefore tracks the highest published version, not the most recent publication. The two differ exactly where the deliberate path below is used to republish an older tag: republishing `4.0.0` after `4.1.0` exists must not hand an unversioned puller an older image than the one they had yesterday, and a rule phrased as "the most recent publication" would require precisely that. This is the one place where "push exactly two tags every time" is wrong, and it is not a special case in the workflow so much as the definition of what `latest` means.
 
-The distinction is what makes either tag useful. The version tag is the one a reader can be told to pull in order to run a known artifact; if it can be rewritten, it names nothing. `latest` exists for a reader who has no version in hand, and is documented as a convenience rather than as a reproducible reference.
+The version tag SHALL be treated as immutable: once a version has been published, a later publication SHALL NOT overwrite it with different contents.
 
-#### Scenario: Both tags are published
+The distinction between the two tags is what makes either useful. The version tag is the one a reader can be told to pull in order to run a known artifact; if it can be rewritten, it names nothing. `latest` exists for a reader who has no version in hand, and is documented as a convenience rather than as a reproducible reference.
 
-- **WHEN** version `X.Y.Z` is published
+#### Scenario: Publishing the newest version moves `latest`
+
+- **WHEN** version `X.Y.Z` is published and no higher version has been published before
 - **THEN** both `X.Y.Z` and `latest` resolve to that image
+
+#### Scenario: Republishing an older version leaves `latest` alone
+
+- **WHEN** version `X.Y.Z` is published while a higher version already has a published image
+- **THEN** `X.Y.Z` resolves to the newly published image and `latest` still resolves to the higher version's image
 
 #### Scenario: A published version is not overwritten
 
