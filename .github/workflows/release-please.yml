@@ -3,6 +3,20 @@ name: Release Please
 on:
   push:
     branches: [main]
+  # Publishes a tag that already exists. This is the bootstrap path — a
+  # release that predates the publish job has no image, and nothing would
+  # ever create one, since only a version bump triggers the job above — and
+  # the recovery path for a publication that failed before pushing anything.
+  #
+  # The trigger applies to the whole workflow, which is why the release job
+  # below is guarded on the event name: a routine image republish must not
+  # create or update a Release PR.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish (vX.Y.Z)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -10,8 +24,223 @@ permissions:
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           release-type: simple
+
+      - name: Report the action's outputs
+        # These are the non-manifest outputs, which is what `release-type:
+        # simple` selects. The publish job keys off them, and a renamed output
+        # would show up as a release that quietly publishes nothing — so log
+        # the whole set, making the first real release the place that proves
+        # the names rather than a guess that stays unexamined.
+        #
+        # Through env, never interpolated into the script: the output object
+        # carries `pr`/`prs`, whose text comes from commit history, so an
+        # apostrophe would break this command and crafted text would become
+        # shell syntax in a job holding a write-capable token.
+        env:
+          RELEASE_OUTPUTS: ${{ toJSON(steps.release.outputs) }}
+        run: echo "$RELEASE_OUTPUTS"
+
+  publish-image:
+    name: Publish container image
+    needs: [release-please]
+    # `always()` because the release job is skipped on a manual dispatch, and
+    # a skipped dependency is not a satisfied one: without it the bootstrap
+    # path would never run.
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       needs.release-please.outputs.release_created == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # ALL publications serialize, not just those for the same version. The
+    # checks below are registry lookups and therefore time-of-check/
+    # time-of-use, and the shared thing they race on is `latest`: keyed per
+    # version, an older manual republish and a newer release could both read
+    # the registry, both conclude they are the highest, and let the last push
+    # win — leaving `latest` on the older image. Publishes are rare; a single
+    # lane costs nothing and removes the whole class.
+    concurrency:
+      group: publish-image
+      cancel-in-progress: false
+    steps:
+      - name: Resolve and validate the tag
+        # The dispatch input is free text and `actions/checkout` resolves a
+        # branch or a SHA just as happily as a tag, so an input of `main`
+        # would publish a non-release tree under whatever version string
+        # accompanied it. Validate the form, then confirm the ref exists as a
+        # tag, before anything is built.
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$RELEASE_TAG"
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "::error::no tag to publish (the release job reported none)"
+            exit 1
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$tag' is not a release tag of the form vX.Y.Z"
+            exit 1
+          fi
+          if ! gh api "repos/$REPOSITORY/git/ref/tags/$tag" > /dev/null 2>&1; then
+            echo "::error::tag '$tag' does not exist in this repository"
+            exit 1
+          fi
+
+          # The git tag carries the leading v; the image tag does not. Both
+          # publication paths normalize here, so the existence check below and
+          # the push cannot end up naming different tags.
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Refuse to overwrite a published version, and decide `latest`
+        # A published version is immutable: there is no input that makes this
+        # step yield. Replacing one means deleting it from the registry first,
+        # which is a deliberate act by a human, outside this pipeline.
+        #
+        # `latest` follows the HIGHEST published version, not the most recent
+        # publication — otherwise republishing an older tag would hand an
+        # unversioned puller an older image than they had, as the result of an
+        # operation whose purpose was to repair something.
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          repo="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/$repo"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          token=$(curl -sSf -u "$ACTOR:$GH_TOKEN" \
+            "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" \
+            | jq -er '.token')
+
+          # Both queries below distinguish "absent" from "could not tell".
+          # Treating every failure as absent would fail OPEN on the one
+          # guarantee this step exists for: a 401 or a 5xx would read as an
+          # empty registry, letting the push overwrite a published version and
+          # letting an older republish drag `latest` backwards.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/$repo/manifests/$VERSION")
+          case "$status" in
+            200)
+              echo "::error::$image:$VERSION is already published; delete it from the registry first if it must be replaced"
+              exit 1
+              ;;
+            404) ;;
+            *)
+              echo "::error::cannot tell whether $image:$VERSION exists (HTTP $status); refusing to publish"
+              exit 1
+              ;;
+          esac
+
+          body=$(mktemp)
+          status=$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/$repo/tags/list")
+          case "$status" in
+            # Parse first, fail-closed: `|| true` on a jq|grep pipeline
+            # absorbs jq's failure too, so malformed JSON behind an HTTP 200
+            # would read as an empty registry. Filter second, where an empty
+            # result is legitimate and is the only failure worth absorbing.
+            200)
+              tags=$(jq -r '.tags // [] | .[]' "$body")
+              published=$(printf '%s\n' "$tags" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+              ;;
+            # No package yet: the bootstrap publish, where nothing is higher.
+            404) published='' ;;
+            *)
+              echo "::error::cannot list published tags (HTTP $status); refusing to publish"
+              exit 1
+              ;;
+          esac
+
+          highest=$(printf '%s\n%s\n' "$published" "$VERSION" | grep -v '^$' | sort -V | tail -1)
+          if [ "$highest" = "$VERSION" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+            printf 'tags<<EOF\n%s:%s\n%s:latest\nEOF\n' "$image" "$VERSION" "$image" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+            echo "not moving latest: $highest is already published"
+            printf 'tags<<EOF\n%s:%s\nEOF\n' "$image" "$VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        # Only the runtime stage needs it: the builder is pinned to the build
+        # platform and cross-compiles. A tag predating that change carries a
+        # Dockerfile without the pin, so its non-native build emulates the Go
+        # toolchain — slow, and accepted, because the alternative is
+        # publishing something other than what the tag contains.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        # One manifest list covering both platforms, pushed as a unit: a
+        # version that exists for one platform and silently not the other is
+        # worse than a version that is absent.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.plan.outputs.tags }}
+          # Buildx attaches a minimal provenance attestation by default when
+          # the registry supports one. This change excludes provenance and SBOM
+          # from its scope deliberately, so turn them off rather than shipping
+          # them as a side effect of the tool's defaults.
+          provenance: false
+          sbom: false
+
+      - name: Summarize
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          MOVED_LATEST: ${{ steps.plan.outputs.latest }}
+        run: |
+          echo "published $IMAGE:$VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "moved latest: $MOVED_LATEST" >> "$GITHUB_STEP_SUMMARY"

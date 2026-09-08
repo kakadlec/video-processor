@@ -319,3 +319,123 @@ jobs:
 
       - name: Run govulncheck
         run: govulncheck ./...
+
+  image:
+    name: Container Image Build
+    runs-on: ubuntu-latest
+    # Nothing is pushed here: this job is the gate, and publication is a
+    # separate concern triggered by a release. Stating the permission
+    # explicitly is also what lets this run on a pull request from a fork
+    # without handing it registry write access.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        # Only the runtime stage needs this: it runs `apk` as the target
+        # platform. The builder stage is pinned to the build platform and
+        # cross-compiles, so the Go toolchain is never emulated.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the runtime image for linux/amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: video-processor:ci-amd64
+          cache-from: type=gha,scope=runtime-amd64
+          cache-to: type=gha,mode=max,scope=runtime-amd64
+
+      - name: Build the runtime image for linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: video-processor:ci-arm64
+          cache-from: type=gha,scope=runtime-arm64
+          cache-to: type=gha,mode=max,scope=runtime-arm64
+
+      - name: Build the test target on the runner's platform
+        # This target backs `docker compose run --build --rm app-test`, the
+        # documented local test path, and is the one stage the runtime build
+        # does not exercise end to end. Native only, deliberately: it is
+        # pinned to the build platform for exactly that reason.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          push: false
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=test
+
+      - name: Verify every binary matches its image's platform
+        # A build that succeeds proves nothing here: the builder chains five
+        # compilations, and GOARCH reaching four of them yields an image that
+        # builds, scans and pushes clean while one process dies at exec on one
+        # platform only. Read the ELF headers of the binaries themselves —
+        # `buildx imagetools inspect` reports the manifest's declared platform
+        # and never opens a layer, so it passes straight through this defect.
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            mkdir -p "extracted/$arch"
+            cid=$(docker create "video-processor:ci-$arch")
+            for bin in identity-api video-api notification-api worker notifier; do
+              docker cp "$cid:/app/$bin" "extracted/$arch/$bin"
+            done
+            docker rm -f "$cid" > /dev/null
+          done
+          python3 - <<'PY'
+          import sys
+
+          # e_machine values from the ELF header, at offset 18.
+          EXPECTED = {"amd64": 0x3E, "arm64": 0xB7}
+          BINARIES = ("identity-api", "video-api", "notification-api", "worker", "notifier")
+
+          failed = []
+          for arch, want in EXPECTED.items():
+              for name in BINARIES:
+                  path = f"extracted/{arch}/{name}"
+                  with open(path, "rb") as handle:
+                      header = handle.read(20)
+                  if header[:4] != b"\x7fELF":
+                      failed.append(f"{path}: not an ELF binary")
+                      continue
+                  machine = int.from_bytes(header[18:20], "little")
+                  status = "ok" if machine == want else "MISMATCH"
+                  print(f"{arch:5} {name:17} e_machine=0x{machine:02x} {status}")
+                  if machine != want:
+                      failed.append(f"{path}: expected 0x{want:02x}, got 0x{machine:02x}")
+
+          if failed:
+              print("\nwrong-architecture binaries:", file=sys.stderr)
+              for line in failed:
+                  print(f"  {line}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Verify ffmpeg runs on every platform
+        # The worker shells out to it and is the only consumer, so a missing
+        # or wrong-architecture ffmpeg would otherwise surface when a job is
+        # processed rather than here. This one does execute a foreign binary,
+        # which is what the QEMU step above is for.
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            # `sed -n 1p` rather than `head -1`: head closes the pipe after
+            # the first line, ffmpeg dies of SIGPIPE, and pipefail turns a
+            # successful check into a failed step. sed reads the stream out.
+            version=$(docker run --rm "video-processor:ci-$arch" ffmpeg -version | sed -n 1p)
+            echo "$arch: $version"
+          done
