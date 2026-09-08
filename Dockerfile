@@ -10,18 +10,33 @@
 # images from one source tree would only create a way for parts of one
 # cutover to be at different commits.
 
-FROM golang:1.27-alpine AS builder
+# Pinned to the BUILD platform, never the target: CGO_ENABLED=0 makes every
+# binary cross-compilable exactly, so the toolchain runs natively and only
+# GOARCH changes. Running the Go toolchain under emulation instead would cost
+# minutes per platform for an identical result.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
+# Supplied by BuildKit. Empty on a builder that does not set it, which makes
+# GOARCH= a no-op and yields a native build — the same thing this produced
+# before there were two platforms.
+ARG TARGETARCH
 ENV GOFLAGS=-mod=readonly
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/identity-api ./cmd/identity-api \
-    && CGO_ENABLED=0 go build -o /out/video-api ./cmd/video-api \
-    && CGO_ENABLED=0 go build -o /out/notification-api ./cmd/notification-api \
-    && CGO_ENABLED=0 go build -o /out/worker ./cmd/worker \
-    && CGO_ENABLED=0 go build -o /out/notifier ./cmd/notifier
+# GOARCH belongs on ALL FIVE. Reaching four of them produces an image that
+# builds, scans and pushes clean, with one process that dies at exec on one
+# platform only — which is why CI reads the ELF headers rather than trusting
+# that this line stayed complete.
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -o /out/identity-api ./cmd/identity-api \
+    && CGO_ENABLED=0 GOARCH=$TARGETARCH go build -o /out/video-api ./cmd/video-api \
+    && CGO_ENABLED=0 GOARCH=$TARGETARCH go build -o /out/notification-api ./cmd/notification-api \
+    && CGO_ENABLED=0 GOARCH=$TARGETARCH go build -o /out/worker ./cmd/worker \
+    && CGO_ENABLED=0 GOARCH=$TARGETARCH go build -o /out/notifier ./cmd/notifier
 
+# Inherits the builder's BUILDPLATFORM pin, which is required rather than
+# incidental: this stage backs `docker compose run --build --rm app-test`, and
+# an emulated Go toolchain would make the documented local test path unusable.
 FROM builder AS test
 RUN apk add --no-cache ffmpeg
 
