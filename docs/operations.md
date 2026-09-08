@@ -325,10 +325,26 @@ Releases are automated via `release-please`. On every push to `main`, it maintai
 The async cutover moved job dispatch to a new generation of the topology — `video.jobs.v2` / `video.jobs.queued.v2`, routing key and outbox `event_type` `video_job.queued.v2`. The previous generation's entities are **not** deleted by the application, and after every replica is running the new build they should be deleted by hand:
 
 ```bash
-# from a shell that can reach the broker's management API / CLI
+# from a shell that can reach the broker's CLI
 rabbitmqctl delete_queue video.jobs.queued.v1
-rabbitmqctl delete_exchange video.jobs.v1
 ```
+
+**The exchange needs a different tool, and this is the step the runbook used to get wrong.** `rabbitmqctl` has no `delete_exchange` on the `rabbitmq:4-alpine` image `docker-compose.yml` pins — `delete_queue` is there, but the CLI exposes no exchange equivalent at all, so following a two-`rabbitmqctl`-command recipe retires the queue and then fails. Delete it over AMQP from any client, which needs no plugin and no extra port:
+
+```go
+// Channel.ExchangeDelete(name, ifUnused, noWait) — github.com/rabbitmq/amqp091-go,
+// already a dependency of this repository.
+ch.ExchangeDelete("video.jobs.v1", false, false)
+```
+
+Where the `rabbitmq_management` plugin is enabled and its port is reachable, the HTTP API does the same (`%2F` is the default vhost, URL-encoded):
+
+```bash
+curl -u "$RABBITMQ_USER:$RABBITMQ_PASS" -X DELETE \
+  "http://<broker-host>:15672/api/exchanges/%2F/video.jobs.v1"
+```
+
+The local Compose stack publishes no management port and enables no such plugin, so the AMQP route is the one that applies there. Order does not matter: deleting the queue first leaves the exchange with no binding, deleting the exchange first leaves the queue unreachable, and both are idle by the time this step runs.
 
 Nothing publishes to or consumes from them once the rollout completes, so this is housekeeping rather than a correctness step — an unretired generation is a bounded, idle queue, and the system is correct whether or not the deletion has happened.
 
