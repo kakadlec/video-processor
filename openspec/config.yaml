@@ -13,10 +13,12 @@ context: |
   dir, always cleaned up), outputs/ (durable zip results) - no database.
   Processing is synchronous and in-request (no job queue yet).
   main_test.go covers integration tests (requires ffmpeg; exits 1 with an
-  error if absent — use Docker fallback). CI (.github/workflows/ci.yml) runs three required checks on
+  error if absent — use Docker fallback). CI (.github/workflows/ci.yml) runs four required checks on
   every push/PR to main: Build & Test (go vet + go test), SAST (gosec),
-  and Vulnerability Scan (govulncheck). Branch protection on main requires
-  all three to pass but does not require an up-to-date branch; no direct pushes to main.
+  Vulnerability Scan (govulncheck), and Container Image Build (docker buildx
+  for both published platforms plus the test stage, pushing nothing).
+  Branch protection on main requires all four to pass but does not require an
+  up-to-date branch; no direct pushes to main.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
