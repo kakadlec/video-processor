@@ -325,10 +325,71 @@ Releases are automated via `release-please`. On every push to `main`, it maintai
 The async cutover moved job dispatch to a new generation of the topology — `video.jobs.v2` / `video.jobs.queued.v2`, routing key and outbox `event_type` `video_job.queued.v2`. The previous generation's entities are **not** deleted by the application, and after every replica is running the new build they should be deleted by hand:
 
 ```bash
-# from a shell that can reach the broker's management API / CLI
-rabbitmqctl delete_queue video.jobs.queued.v1
-rabbitmqctl delete_exchange video.jobs.v1
+# from a shell that can reach the broker's CLI. --vhost is the vhost from
+# RABBITMQ_URL, decoded: the CLI takes it literally, unlike the management API
+# path further down. "/" is both rabbitmqctl's default and what the Compose
+# stack's URL selects, so it is written out rather than left implicit.
+rabbitmqctl --vhost / delete_queue video.jobs.queued.v1
 ```
+
+**The exchange needs a different tool, and this is the step the runbook used to get wrong.** `rabbitmqctl` has no `delete_exchange` on the `rabbitmq:4-alpine` image `docker-compose.yml` pins — `delete_queue` is there, but the CLI exposes no exchange equivalent at all, so following a two-`rabbitmqctl`-command recipe retires the queue and then fails. Delete it over AMQP from any client, which needs no plugin and no extra port:
+
+```bash
+# Run from anywhere with the Go toolchain and network reach to the broker.
+# RABBITMQ_URL is the same value the services are configured with, so its
+# vhost, credentials and TLS setting need no separate handling here.
+cd "$(mktemp -d)"   # a fresh directory: a leftover go.mod fails `go mod init`
+cat > main.go <<'GO'
+package main
+
+import (
+	"log"
+	"os"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+func main() {
+	conn, err := amqp.Dial(os.Getenv("RABBITMQ_URL"))
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("channel: %v", err)
+	}
+	defer ch.Close()
+
+	// ExchangeDelete(name, ifUnused, noWait): delete unconditionally and wait
+	// for the broker to confirm. The name is a literal so no other exchange
+	// is reachable from here.
+	if err := ch.ExchangeDelete("video.jobs.v1", false, false); err != nil {
+		log.Fatalf("delete exchange: %v", err)
+	}
+	log.Println("deleted exchange video.jobs.v1")
+}
+GO
+go mod init retire-v1 && go get github.com/rabbitmq/amqp091-go@v1.14.0
+RABBITMQ_URL='amqp://user:pass@broker-host:5672/' go run .
+```
+
+Where the `rabbitmq_management` plugin is enabled and its port is reachable, the HTTP API does the same. **Substitute the vhost**: the path segment after `/api/exchanges/` is the URL-encoded vhost from `RABBITMQ_URL`, and `%2F` below is the default `/` — a deployment on a named vhost that leaves it at `%2F` gets a `404`, or deletes a same-named exchange in the wrong vhost while the superseded one survives.
+
+```bash
+# Fill these in from RABBITMQ_URL's userinfo. This system configures the broker
+# through that one variable and defines no separate credential variables, so
+# nothing in the environment sets them for you.
+user='<user from RABBITMQ_URL>'
+pass='<password from RABBITMQ_URL>'
+curl -sS --fail-with-body -u "$user:$pass" -X DELETE \
+  "http://<broker-host>:15672/api/exchanges/%2F/video.jobs.v1"
+```
+
+`--fail-with-body` is load-bearing here, not tidiness. A successful delete answers `204` with an empty body, and plain `curl` exits `0` on a `401` or a `404` too — so a wrong credential or a mis-encoded vhost would leave the exchange in place while the command looked exactly like the successful one. The flag turns those into a non-zero exit and still prints the broker's own error body. On curl older than 7.76 use `-f`, which fails the same way but discards that body.
+
+The local Compose stack publishes no management port and enables no such plugin, so the AMQP route is the one that applies there. Order does not matter: deleting the queue first leaves the exchange with no binding, and deleting the exchange first leaves the queue with nothing able to route to it — still holding and still serving whatever it already had, which is why the queue's own deletion is what discards those messages. Both are idle by the time this step runs.
 
 Nothing publishes to or consumes from them once the rollout completes, so this is housekeeping rather than a correctness step — an unretired generation is a bounded, idle queue, and the system is correct whether or not the deletion has happened.
 
