@@ -383,9 +383,11 @@ Where the `rabbitmq_management` plugin is enabled and its port is reachable, the
 # nothing in the environment sets them for you.
 user='<user from RABBITMQ_URL>'
 pass='<password from RABBITMQ_URL>'
-curl -u "$user:$pass" -X DELETE \
+curl -sS --fail-with-body -u "$user:$pass" -X DELETE \
   "http://<broker-host>:15672/api/exchanges/%2F/video.jobs.v1"
 ```
+
+`--fail-with-body` is load-bearing here, not tidiness. A successful delete answers `204` with an empty body, and plain `curl` exits `0` on a `401` or a `404` too — so a wrong credential or a mis-encoded vhost would leave the exchange in place while the command looked exactly like the successful one. The flag turns those into a non-zero exit and still prints the broker's own error body. On curl older than 7.76 use `-f`, which fails the same way but discards that body.
 
 The local Compose stack publishes no management port and enables no such plugin, so the AMQP route is the one that applies there. Order does not matter: deleting the queue first leaves the exchange with no binding, and deleting the exchange first leaves the queue with nothing able to route to it — still holding and still serving whatever it already had, which is why the queue's own deletion is what discards those messages. Both are idle by the time this step runs.
 
