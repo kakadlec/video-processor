@@ -46,6 +46,14 @@ const (
 	// creates as readily as it updates, because there is no rule to refuse a
 	// create with.
 	//
+	// Named for the channel rather than for the missing secret, and not only
+	// for accuracy — the statement is chosen by Channel.Signs, not by
+	// absence alone, since a submitted secret takes the upsert above
+	// whatever the channel. A constant whose name contains "secret" bound to
+	// a string literal is also what gosec's G101 reports as a possible
+	// hardcoded credential, and a name that says what the statement is for
+	// is a better answer to that than a suppression.
+	//
 	// The inserted tuple names the secret column and writes the empty string
 	// rather than omitting it. Omitting it would insert NULL — the column is
 	// NOT NULL with deliberately no default — and fail on the column rather
@@ -58,7 +66,7 @@ const (
 	// nothing on this channel signs with it — so assigning EXCLUDED.secret
 	// the way the upsert above does would clear a stored value on every
 	// later write that simply did not resend it.
-	upsertPreferenceWithoutSecretQuery = `
+	upsertPreferenceOnNonSigningChannelQuery = `
 		INSERT INTO notification_preferences
 		       (user_id, event_type, channel, enabled, destination, secret, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, '', $6, $6)
@@ -168,7 +176,7 @@ func (r *PreferenceRepository) Set(ctx context.Context, intent domain.Preference
 		row = r.db.QueryRowContext(ctx, updatePreferenceQuery,
 			userID, eventType, channel, intent.Enabled(), intent.Destination().String(), now)
 	default:
-		row = r.db.QueryRowContext(ctx, upsertPreferenceWithoutSecretQuery,
+		row = r.db.QueryRowContext(ctx, upsertPreferenceOnNonSigningChannelQuery,
 			userID, eventType, channel, intent.Enabled(), intent.Destination().String(), now)
 	}
 

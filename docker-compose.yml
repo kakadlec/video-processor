@@ -459,6 +459,14 @@ services:
     # same reason the gateway is.
     ports:
       - "127.0.0.1:8025:8025"
+    # Accept any credential, over an unencrypted session. The notifier sends
+    # no AUTH at all here — no username is configured for it above, precisely
+    # so that it does not have to — so neither setting is exercised by the
+    # default stack. They are here for the contributor who does set
+    # NOTIFICATION_SMTP_USERNAME/PASSWORD locally to see that path work: the
+    # client requires an encrypted session before authenticating, so it will
+    # still refuse against this relay, and finding that out from the client's
+    # own refusal rather than from the relay's is the point.
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
       MP_SMTP_AUTH_ALLOW_INSECURE: "true"
