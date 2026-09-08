@@ -379,7 +379,7 @@ curl -u "$RABBITMQ_USER:$RABBITMQ_PASS" -X DELETE \
   "http://<broker-host>:15672/api/exchanges/%2F/video.jobs.v1"
 ```
 
-The local Compose stack publishes no management port and enables no such plugin, so the AMQP route is the one that applies there. Order does not matter: deleting the queue first leaves the exchange with no binding, deleting the exchange first leaves the queue unreachable, and both are idle by the time this step runs.
+The local Compose stack publishes no management port and enables no such plugin, so the AMQP route is the one that applies there. Order does not matter: deleting the queue first leaves the exchange with no binding, and deleting the exchange first leaves the queue with nothing able to route to it — still holding and still serving whatever it already had, which is why the queue's own deletion is what discards those messages. Both are idle by the time this step runs.
 
 Nothing publishes to or consumes from them once the rollout completes, so this is housekeeping rather than a correctness step — an unretired generation is a bounded, idle queue, and the system is correct whether or not the deletion has happened.
 
