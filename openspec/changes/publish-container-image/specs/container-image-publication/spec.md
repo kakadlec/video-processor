@@ -74,6 +74,13 @@ Without it, the first image would appear only when the next version-bumping comm
 
 A tag predating this change carries a `Dockerfile` that predates it too, so building such a tag for a non-native platform emulates the Go toolchain rather than cross-compiling it. That SHALL be accepted rather than worked around: the resulting binaries are correct for their platform and only the build is slow, and rewriting a released tag's tree to obtain a faster build would defeat the point of building the tag at all. The cross-compilation requirement in `container-image` governs what the repository builds from now on, not what a historical tag contained.
 
+The tag it is given SHALL be validated before anything is built or pushed: it SHALL match the project's release-tag form, and it SHALL resolve to a tag that actually exists in the repository. An input that is free text and reaches a build unvalidated turns a typo into either a confusing build failure minutes later or, worse, a published image under a tag nobody intended — and the normalization that derives the image tag from it only makes sense over a value already known to have that shape.
+
+#### Scenario: A malformed or unknown tag is refused before any build
+
+- **WHEN** the manual path is triggered with a value that does not match the release-tag form, or that names a tag which does not exist in the repository
+- **THEN** it fails immediately, before any image is built and before anything is pushed
+
 #### Scenario: An already-released version is published after the fact
 
 - **WHEN** the manual path is triggered for an existing git tag that has no published image

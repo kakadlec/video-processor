@@ -1,3 +1,26 @@
+## MODIFIED Requirements
+
+### Requirement: Merge Requires Passing Status Checks
+A pull request against `main` SHALL NOT be mergeable unless `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`, and the container image build all report success. The PR branch SHALL NOT be required to be up to date with `main` before merging.
+
+Adding a job to the CI workflow does not by itself make it required: branch protection enumerates the checks it blocks on, so a job outside that list runs, reports, and blocks nothing. A gate that cannot block a merge is a notification, and "Container Image Build Gate" would be a promise nothing keeps — which is why registering the new check with branch protection is part of this change rather than an afterthought.
+
+#### Scenario: Merge blocked by a failing required check
+- **WHEN** a PR has `Build & Test`, `SAST (gosec)`, `Vulnerability Scan (govulncheck)`, or the image build failing
+- **THEN** GitHub blocks the merge button/API for that PR
+
+#### Scenario: Merge allowed once all checks pass
+- **WHEN** a PR has all four required checks passing
+- **THEN** the PR is mergeable even if its branch is behind `main`
+
+#### Scenario: The image build is registered as required, not merely present
+- **WHEN** branch protection for `main` is inspected
+- **THEN** the image-build job's check name is among the required status checks, so a red image build blocks the merge rather than only reporting
+
+#### Scenario: Automated release PRs are subject to the same gate
+- **WHEN** `release-please` opens its own release PR against `main`
+- **THEN** that PR is mergeable only under the same conditions as any other PR — no special bypass
+
 ## ADDED Requirements
 
 ### Requirement: Container Image Build Gate
