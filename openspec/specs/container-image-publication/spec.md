@@ -1,5 +1,8 @@
-## ADDED Requirements
+# container-image-publication Specification
 
+## Purpose
+TBD - created by archiving change publish-container-image. Update Purpose after archive.
+## Requirements
 ### Requirement: Released Versions Are Published As Container Images
 
 The repository SHALL publish its container image to a registry, under a name derived from the repository (`ghcr.io/<owner>/<repository>`, lowercased as the registry requires), so that the image can be obtained without a Go toolchain, without a working tree, and without building it.
@@ -105,14 +108,16 @@ The tag it is given SHALL be validated before anything is built or pushed: it SH
 
 The published image SHALL be obtainable by a client that has not authenticated to the registry.
 
-This SHALL NOT be assumed to follow from the repository being public. A newly created registry package is private by default, so anonymous pullability is a state that has to be **established** after the first publication and then verified — from a client that is genuinely logged out, since a logged-in client can pull a private package and would report success either way.
+This SHALL NOT be assumed, in either direction, from the workflow definition: nothing in it decides the package's visibility, which is a registry-side property established when the package is first created. It SHALL therefore be **verified after the first publication**, from a client that is genuinely unauthenticated — a logged-in client pulls a private package happily and would report success either way — and, if the image is not anonymously pullable, made so before the pull command is documented.
 
 Getting this wrong is silent in the only direction that matters: every check passes, the workflow is green, the image exists, and the one audience the documented pull command is written for is the one audience that cannot run it.
 
-#### Scenario: Visibility is set, not inherited
+An earlier draft of this requirement asserted that a new package is private and must be made public. That was written from received wisdom and is not what this repository observed: the first publication of `4.0.0` was anonymously pullable with no visibility change at all. The requirement is therefore stated as the property to check rather than the mechanism that produces it — the property is what a reader depends on, and the mechanism varies with registry and account settings this specification does not control.
+
+#### Scenario: Anonymous pullability is verified, not assumed
 
 - **WHEN** the first publication creates the package
-- **THEN** its visibility is explicitly set to public as part of bootstrapping, rather than assumed to have been inherited from the repository
+- **THEN** an unauthenticated pull is attempted against it, and the image is made anonymously pullable if that attempt fails
 
 #### Scenario: An anonymous client can pull
 
@@ -134,3 +139,4 @@ Partial publication SHALL NOT occur: if one platform cannot be built, nothing is
 
 - **WHEN** the build for one of the two platforms fails
 - **THEN** no tag is published for either
+

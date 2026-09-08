@@ -49,6 +49,18 @@ docker compose up --build --scale worker=1
 
 `docker-compose.yml` is the only supported way to run the application via Docker **for local development** — there is no separate plain `docker build`/`docker run` workflow documented for that purpose. (Container deployment is a different concern; see [docs/operations.md](docs/operations.md).) See [docs/development.md](docs/development.md) for running the test suite the same way.
 
+### The released image
+
+Every release publishes the image these five processes run from, so it can be obtained without a Go toolchain and without building anything:
+
+```bash
+docker pull ghcr.io/kakadlec/video-processor:4.0.0   # or :latest
+```
+
+It carries all five binaries and defaults to the Video API; every other process is the same image started with its own command (`/app/identity-api`, `/app/notification-api`, `/app/worker`, `/app/notifier`). It is built for `linux/amd64` and `linux/arm64`, so an Apple Silicon machine pulls a native image rather than an emulated one.
+
+A version tag is immutable and is the reproducible reference; `latest` moves and is a convenience. Neither is what local development uses — Compose keeps building from your working tree, because running your tests against a published image would not be running them against your code. Deploying from this image is a separate concern, and there is no deployment target: see [docs/operations.md](docs/operations.md).
+
 ## Current Limitations
 
 Processing is asynchronous as of Phase 6, but the system is not yet complete:
