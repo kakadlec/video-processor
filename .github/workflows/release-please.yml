@@ -222,7 +222,7 @@ jobs:
         # One manifest list covering both platforms, pushed as a unit: a
         # version that exists for one platform and silently not the other is
         # worse than a version that is absent.
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: runtime
