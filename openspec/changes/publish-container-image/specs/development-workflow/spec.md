@@ -6,6 +6,8 @@ Every push to `main` and every pull request SHALL build the repository's contain
 
 The gate SHALL build the runtime image for every platform the image is published for, and SHALL additionally build the test stage on the runner's own platform, because that stage backs the documented local test command (`docker compose run --build --rm app-test go test ./... -v`) and is the one stage a runtime build does not exercise end to end.
 
+The gate SHALL also verify, for each platform it builds, that every binary in the resulting runtime image is compiled for that platform. A build that succeeds is not evidence of this: the builder chains five compilations, and one of them missing the target architecture yields an image that builds, scans and pushes cleanly while one of five processes dies at `exec` on one platform only. A gate that would stay green through that failure does not gate the requirement it exists for (`container-image`'s "Multi-Platform Build"), so the check belongs in the recurring job rather than in a one-time manual verification.
+
 The gate SHALL NOT push anything. Its purpose is that a `Dockerfile` which does not build cannot be merged; publication is a separate concern triggered by a release (`container-image-publication`). Not pushing is also what allows the job to run on a pull request from a fork without granting it registry write access.
 
 This gate exists because the image is the artifact the application is delivered as, and until it was added, every other check could pass while the image was unbuildable: the test job compiles and runs the suite on the runner with dependencies installed there, and neither the SAST nor the vulnerability job reads the `Dockerfile` at all.
@@ -19,6 +21,11 @@ This gate exists because the image is the artifact the application is delivered 
 
 - **WHEN** the image builds for every published platform
 - **THEN** the CI image-build job succeeds
+
+#### Scenario: A wrong-architecture binary fails the gate
+
+- **WHEN** a commit builds an image in which one of the five binaries is compiled for a platform other than the image's own
+- **THEN** the CI image-build job fails, rather than passing because the image built
 
 #### Scenario: The test stage is covered by the gate
 

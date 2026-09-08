@@ -33,7 +33,11 @@ A publication SHALL push the version being published. It SHALL additionally move
 
 `latest` therefore tracks the highest published version, not the most recent publication. The two differ exactly where the deliberate path below is used to republish an older tag: republishing `4.0.0` after `4.1.0` exists must not hand an unversioned puller an older image than the one they had yesterday, and a rule phrased as "the most recent publication" would require precisely that. This is the one place where "push exactly two tags every time" is wrong, and it is not a special case in the workflow so much as the definition of what `latest` means.
 
-The version tag SHALL be treated as immutable: once a version has been published, a later publication SHALL NOT overwrite it with different contents.
+The version tag SHALL be immutable: once a version has been published, **no** publication path SHALL overwrite it, and the workflow SHALL offer no input, flag, or parameter that permits overwriting one. Replacing a published version SHALL require deleting it from the registry first, which is a deliberate act performed by a human outside this pipeline and is therefore not something a mistyped input can do.
+
+An earlier draft of this requirement paired the word "immutable" with an opt-in that let the same operator overwrite a version by setting a boolean. That is guarded mutability, and a consumer cannot rely on it: what a version tag means has to be the same whether or not somebody set a flag.
+
+The image tag SHALL be the version **without** any leading `v`, while the git tag retains the project's existing `vX.Y.Z` form: `git tag v4.0.0` publishes image tag `4.0.0`. Every publication path SHALL apply that same normalization before it checks whether a version exists and before it pushes, so the automatic and deliberate paths cannot check one tag and push another.
 
 The distinction between the two tags is what makes either useful. The version tag is the one a reader can be told to pull in order to run a known artifact; if it can be rewritten, it names nothing. `latest` exists for a reader who has no version in hand, and is documented as a convenience rather than as a reproducible reference.
 
@@ -50,7 +54,12 @@ The distinction between the two tags is what makes either useful. The version ta
 #### Scenario: A published version is not overwritten
 
 - **WHEN** a publication is attempted for a version that already has a published image
-- **THEN** it fails without pushing, unless the operator has explicitly opted into replacing it
+- **THEN** it fails without pushing, and no input to the workflow can make it push instead
+
+#### Scenario: The git tag and the image tag differ by the leading `v`
+
+- **WHEN** git tag `vX.Y.Z` is published by either path
+- **THEN** the image tag is `X.Y.Z`, and the existence check that guards the previous scenario is performed against that same normalized tag
 
 #### Scenario: No moving major or minor pointer exists
 
@@ -61,7 +70,9 @@ The distinction between the two tags is what makes either useful. The version ta
 
 The publish workflow SHALL provide a manually triggered path that publishes a git tag which already exists, building that tag's tree rather than the current state of `main`.
 
-Without it, the first image would appear only when the next version-bumping commit lands, so documentation naming a pull command would be false from the moment it is written until some unrelated change ships. This is a bootstrap path and a recovery path — a release whose publication failed for a transient reason is republished the same way — and it is the reason the immutability check above exists, since a manual trigger taking a tag name is where a released version would otherwise be overwritten by a typo.
+Without it, the first image would appear only when the next version-bumping commit lands, so documentation naming a pull command would be false from the moment it is written until some unrelated change ships. It is also the recovery path for a release whose publication failed before pushing anything — and because it takes a tag name as free text, it is precisely where a released version would be overwritten by a typo, which is why the immutability requirement above admits no override.
+
+A tag predating this change carries a `Dockerfile` that predates it too, so building such a tag for a non-native platform emulates the Go toolchain rather than cross-compiling it. That SHALL be accepted rather than worked around: the resulting binaries are correct for their platform and only the build is slow, and rewriting a released tag's tree to obtain a faster build would defeat the point of building the tag at all. The cross-compilation requirement in `container-image` governs what the repository builds from now on, not what a historical tag contained.
 
 #### Scenario: An already-released version is published after the fact
 
@@ -75,14 +86,26 @@ Without it, the first image would appear only when the next version-bumping comm
 
 #### Scenario: The manual path refuses a version that already has an image
 
-- **WHEN** the manual path is triggered for a version whose image is already published, without an explicit opt-in to replace it
+- **WHEN** the manual path is triggered for a version whose image is already published
 - **THEN** it fails without pushing
+
+#### Scenario: A pre-change tag is built as it was
+
+- **WHEN** the manual path publishes a tag whose tree predates the multi-platform build
+- **THEN** the publication succeeds with correct per-platform binaries, and the slower emulated build is accepted rather than treated as a defect
 
 ### Requirement: The Published Image Is Pullable Without Credentials
 
-The published image SHALL be obtainable by a client that has not authenticated to the registry, so long as the repository itself is public.
+The published image SHALL be obtainable by a client that has not authenticated to the registry.
 
-A registry package inherits its repository's visibility when it is first created, which means this property is established by the first publication and is not observable from the workflow definition. It SHALL therefore be verified against the registry after the first publication rather than assumed.
+This SHALL NOT be assumed to follow from the repository being public. A newly created registry package is private by default, so anonymous pullability is a state that has to be **established** after the first publication and then verified — from a client that is genuinely logged out, since a logged-in client can pull a private package and would report success either way.
+
+Getting this wrong is silent in the only direction that matters: every check passes, the workflow is green, the image exists, and the one audience the documented pull command is written for is the one audience that cannot run it.
+
+#### Scenario: Visibility is set, not inherited
+
+- **WHEN** the first publication creates the package
+- **THEN** its visibility is explicitly set to public as part of bootstrapping, rather than assumed to have been inherited from the repository
 
 #### Scenario: An anonymous client can pull
 
