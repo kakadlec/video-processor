@@ -338,7 +338,7 @@ rabbitmqctl --vhost / delete_queue video.jobs.queued.v1
 # Run from anywhere with the Go toolchain and network reach to the broker.
 # RABBITMQ_URL is the same value the services are configured with, so its
 # vhost, credentials and TLS setting need no separate handling here.
-mkdir -p /tmp/retire-v1 && cd /tmp/retire-v1
+cd "$(mktemp -d)"   # a fresh directory: a leftover go.mod fails `go mod init`
 cat > main.go <<'GO'
 package main
 
