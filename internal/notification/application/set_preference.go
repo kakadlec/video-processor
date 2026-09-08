@@ -67,21 +67,35 @@ func (uc *SetPreference) Execute(ctx context.Context, input SetPreferenceInput) 
 		return PreferenceResult{}, err
 	}
 
-	destination, err := domain.NewDestination(input.Destination)
+	destination, err := domain.NewDestinationFor(channel, input.Destination)
 	if err != nil {
 		return PreferenceResult{}, err
 	}
 
-	// Judged before anything is written, and judged whatever Enabled says: a
-	// disabled preference still stores a destination, and enabling it later
-	// goes through no validation of its own. The dial-time check in the
-	// delivery client is not made redundant by this one — a name resolves
-	// somewhere else later, and a policy tightened after the row was stored
-	// never revisits it — but without this one a caller can register a
-	// destination that is refused at every delivery, which from the outside
-	// is indistinguishable from one that simply never fires.
-	if err := uc.policy.CheckDestination(destination); err != nil {
-		return PreferenceResult{}, err
+	// The policy judges a connection target the caller supplied, so it runs
+	// for the channels whose destination is one and not for the others. An
+	// e-mail address is envelope data: delivery opens a connection to the
+	// relay this deployment configures and never to the stored value, so
+	// there is no target here for the policy to judge and no SSRF surface
+	// for it to guard.
+	//
+	// The condition is the channel, which ParseChannel has already confined
+	// to the closed set — a value outside it never reaches this line, so
+	// there is no third path that applies neither rule.
+	//
+	// Where it does run it is judged before anything is written, and judged
+	// whatever Enabled says: a disabled preference still stores a
+	// destination, and enabling it later goes through no validation of its
+	// own. The dial-time check in the delivery client is not made redundant
+	// by this one — a name resolves somewhere else later, and a policy
+	// tightened after the row was stored never revisits it — but without
+	// this one a caller can register a destination that is refused at every
+	// delivery, which from the outside is indistinguishable from one that
+	// simply never fires.
+	if channel.String() == domain.ChannelWebhook {
+		if err := uc.policy.CheckDestination(destination); err != nil {
+			return PreferenceResult{}, err
+		}
 	}
 
 	// Parsed only when submitted: NewSecret rejects the empty string, so an

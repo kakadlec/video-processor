@@ -13,6 +13,7 @@ import (
 	notificationapplication "video-processor/internal/notification/application"
 	notificationdomain "video-processor/internal/notification/domain"
 	notificationmessaging "video-processor/internal/notification/infrastructure/messaging"
+	notificationsmtp "video-processor/internal/notification/infrastructure/smtp"
 	notificationwebhook "video-processor/internal/notification/infrastructure/webhook"
 )
 
@@ -633,3 +634,233 @@ type stubConn struct{}
 func (stubConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
 func (stubConn) Close() error                        { return nil }
 func (stubConn) Begin() (driver.Tx, error)           { return nil, errors.New("unused") }
+
+// Each channel's send configuration is required for the same reason the
+// broker URL and the DSN are: a notifier that cannot send on a channel is
+// one whose preferences on it are stored and silently never honoured, which
+// is the outcome the closed channel set exists to prevent. It is read in the
+// same pass, before any connection is opened.
+func TestSetupNotifier_RequiresTheRelayConfiguration(t *testing.T) {
+	cases := map[string]struct {
+		addr string
+		from string
+		name string
+	}{
+		"no relay address": {addr: "", from: "notifier@fiapx.test", name: notificationsmtp.EnvAddr},
+		"no sender":        {addr: "mail:1025", from: "", name: notificationsmtp.EnvFrom},
+	}
+
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			clearDeliveryBudgetEnv(t)
+			t.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+			t.Setenv("NOTIFICATION_POSTGRES_DSN", "postgres://user:pass@localhost:5432/db?sslmode=disable")
+			t.Setenv(notificationsmtp.EnvAddr, testCase.addr)
+			t.Setenv(notificationsmtp.EnvFrom, testCase.from)
+
+			deps, err := setupNotifier(context.Background())
+			if err == nil {
+				closeDB(deps.db)
+				t.Fatalf("startup succeeded with %s unset", testCase.name)
+			}
+			if !strings.Contains(err.Error(), testCase.name) {
+				t.Errorf("error %q does not name %s", err, testCase.name)
+			}
+		})
+	}
+}
+
+// The drain waits for the whole message, and a message can resolve to one
+// preference per channel handled one after another. A drain sized from a
+// single hold would expire during work that is within budget.
+func TestDrainTimeout_CoversAClaimHoldForEveryChannel(t *testing.T) {
+	deps := &notifierDeps{config: notificationapplication.DefaultDeliveryConfig()}
+
+	hold := deps.config.MaxClaimHold()
+	channels := time.Duration(len(notificationdomain.AllChannels()))
+	if channels < 2 {
+		t.Fatal("this assertion is vacuous with fewer than two channels")
+	}
+
+	if got := deps.drainTimeout(); got < channels*hold {
+		t.Fatalf("drainTimeout() = %s, want at least %s — one hold per channel", got, channels*hold)
+	}
+	if got := deps.drainTimeout(); got != channels*hold+drainGrace {
+		t.Fatalf("drainTimeout() = %s, want %s", got, channels*hold+drainGrace)
+	}
+}
+
+func completedEvent(t *testing.T) notificationdomain.TerminalEvent {
+	t.Helper()
+
+	jobID, err := notificationdomain.NewJobID(testJobID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	userID, err := notificationdomain.NewUserID(testUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	event, err := notificationdomain.NewCompletedEvent(jobID, userID, time.Now(), 1, "frames.zip")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return event
+}
+
+func deliveryID(t *testing.T) notificationdomain.DeliveryID {
+	t.Helper()
+
+	id, err := notificationdomain.NewDeliveryID("11111111-2222-3333-4444-555555555555")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return id
+}
+
+// A recording deliverer, so the routing can be observed without a transport.
+type recordingDeliverer struct {
+	name      string
+	delivered int
+	err       error
+}
+
+func (d *recordingDeliverer) Deliver(context.Context, *notificationdomain.NotificationPreference, notificationdomain.TerminalEvent, notificationdomain.DeliveryID) error {
+	d.delivered++
+	return d.err
+}
+
+func newRoutedPreference(t *testing.T, channelValue string) *notificationdomain.NotificationPreference {
+	t.Helper()
+
+	channel, err := notificationdomain.ParseChannel(channelValue)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	destinations := map[string]string{
+		notificationdomain.ChannelWebhook: "https://hooks.example.test/one",
+		notificationdomain.ChannelEmail:   "user@example.test",
+	}
+	destination, err := notificationdomain.NewDestinationFor(channel, destinations[channelValue])
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	eventType, err := notificationdomain.ParseEventType(notificationdomain.EventTypeVideoJobCompleted)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	userID, err := notificationdomain.NewUserID(testUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var secret notificationdomain.Secret
+	if channel.Signs() {
+		secret, err = notificationdomain.NewSecret("a-signing-secret-long-enough")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	preference, err := notificationdomain.NewNotificationPreference(
+		userID, eventType, channel, true, destination, secret, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return preference
+}
+
+func TestChannelDeliverer_RoutesByChannel(t *testing.T) {
+	webhookDeliverer := &recordingDeliverer{name: "webhook"}
+	emailDeliverer := &recordingDeliverer{name: "email"}
+
+	deliverer, err := newChannelDeliverer(map[string]notificationdomain.Deliverer{
+		notificationdomain.ChannelWebhook: webhookDeliverer,
+		notificationdomain.ChannelEmail:   emailDeliverer,
+	})
+	if err != nil {
+		t.Fatalf("newChannelDeliverer() error = %v", err)
+	}
+
+	event := completedEvent(t)
+	id := deliveryID(t)
+
+	if err := deliverer.Deliver(context.Background(), newRoutedPreference(t, notificationdomain.ChannelEmail), event, id); err != nil {
+		t.Fatalf("Deliver() error = %v", err)
+	}
+	if emailDeliverer.delivered != 1 || webhookDeliverer.delivered != 0 {
+		t.Fatalf("email=%d webhook=%d, want the email preference routed to the email deliverer",
+			emailDeliverer.delivered, webhookDeliverer.delivered)
+	}
+
+	if err := deliverer.Deliver(context.Background(), newRoutedPreference(t, notificationdomain.ChannelWebhook), event, id); err != nil {
+		t.Fatalf("Deliver() error = %v", err)
+	}
+	if webhookDeliverer.delivered != 1 || emailDeliverer.delivered != 1 {
+		t.Fatalf("email=%d webhook=%d, want the webhook preference routed to the webhook deliverer",
+			emailDeliverer.delivered, webhookDeliverer.delivered)
+	}
+}
+
+// The failure a channel with no implementation must produce, and where: at
+// startup rather than at the first delivery on it.
+func TestNewChannelDeliverer_RefusesAnIncompleteSet(t *testing.T) {
+	for _, missing := range notificationdomain.AllChannels() {
+		t.Run(missing.String(), func(t *testing.T) {
+			composed := make(map[string]notificationdomain.Deliverer)
+			for _, channel := range notificationdomain.AllChannels() {
+				if channel.String() == missing.String() {
+					continue
+				}
+				composed[channel.String()] = &recordingDeliverer{name: channel.String()}
+			}
+
+			deliverer, err := newChannelDeliverer(composed)
+			if err == nil {
+				t.Fatalf("newChannelDeliverer() accepted a set missing %q: %v", missing, deliverer)
+			}
+			if !strings.Contains(err.Error(), missing.String()) {
+				t.Errorf("error %q does not name the missing channel", err)
+			}
+		})
+	}
+}
+
+// The map is copied, so a caller mutating the one it passed cannot remove a
+// channel from a deliverer that already validated as complete.
+func TestNewChannelDeliverer_DoesNotShareItsCallersMap(t *testing.T) {
+	composed := map[string]notificationdomain.Deliverer{
+		notificationdomain.ChannelWebhook: &recordingDeliverer{name: "webhook"},
+		notificationdomain.ChannelEmail:   &recordingDeliverer{name: "email"},
+	}
+
+	deliverer, err := newChannelDeliverer(composed)
+	if err != nil {
+		t.Fatalf("newChannelDeliverer() error = %v", err)
+	}
+	delete(composed, notificationdomain.ChannelEmail)
+
+	if err := deliverer.Deliver(context.Background(),
+		newRoutedPreference(t, notificationdomain.ChannelEmail), completedEvent(t), deliveryID(t)); err != nil {
+		t.Fatalf("Deliver() error = %v after the caller's map was edited", err)
+	}
+}
+
+func TestChannelDeliverer_RefusesANilPreference(t *testing.T) {
+	deliverer, err := newChannelDeliverer(map[string]notificationdomain.Deliverer{
+		notificationdomain.ChannelWebhook: &recordingDeliverer{name: "webhook"},
+		notificationdomain.ChannelEmail:   &recordingDeliverer{name: "email"},
+	})
+	if err != nil {
+		t.Fatalf("newChannelDeliverer() error = %v", err)
+	}
+
+	err = deliverer.Deliver(context.Background(), nil, completedEvent(t), deliveryID(t))
+	var deliveryErr *notificationdomain.DeliveryError
+	if !errors.As(err, &deliveryErr) {
+		t.Fatalf("Deliver() error = %v (%T), want *domain.DeliveryError", err, err)
+	}
+	if deliveryErr.Kind() != notificationdomain.DeliveryRefusedByPolicy {
+		t.Errorf("kind = %v, want refused_by_policy", deliveryErr.Kind())
+	}
+}

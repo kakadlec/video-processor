@@ -412,23 +412,64 @@ services:
       # service reachable from this process. Unset, the default posture is
       # https-only to globally-reachable unicast.
       NOTIFICATION_ALLOW_INSECURE_DESTINATIONS: "true"
-    # Longer than this process's shutdown drain, which is MaxClaimHold() plus
-    # a 30s grace — 60s at the documented delivery budget. Compose's default
-    # is 10 seconds, so without this `docker compose stop`/`down` would
-    # SIGKILL a delivery still in flight and leave a claim unresolved: the
-    # exact state the join-before-close ordering exists to avoid, produced
-    # routinely by the documented local workflow.
+      # The mail service below, which captures everything and delivers
+      # nothing onward. No credentials, deliberately: the client refuses to
+      # authenticate over a session with no encryption, so configuring a
+      # username here would make the local stack fail every delivery. That
+      # rule is not the destination policy's and the relaxation above does
+      # not reach it — the relay is operator-supplied, and what it protects
+      # is this deployment's own credential.
+      NOTIFICATION_SMTP_ADDR: mail:1025
+      NOTIFICATION_SMTP_FROM: notifier@fiapx.local
+    # Longer than this process's shutdown drain, which is one MaxClaimHold()
+    # per delivery channel plus a 30s grace — 90s at the documented budget
+    # with two channels. Compose's default is 10 seconds, so without this
+    # `docker compose stop`/`down` would SIGKILL a delivery still in flight
+    # and leave a claim unresolved: the exact state the join-before-close
+    # ordering exists to avoid, produced routinely by the documented local
+    # workflow.
     #
-    # The coupling is to the budget, not to the number: raising
-    # NOTIFICATION_WEBHOOK_MAX_ATTEMPTS or NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS
-    # on this service lengthens the drain, and this value has to stay above
-    # MaxClaimHold() + 30s for whatever budget is configured here.
-    stop_grace_period: 90s
+    # The coupling is to the budget and the channel count, not to the number:
+    # raising NOTIFICATION_WEBHOOK_MAX_ATTEMPTS or
+    # NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS on this service lengthens the
+    # drain, and so does adding a channel. This value has to stay above
+    # channels x MaxClaimHold() + 30s for whatever is configured here.
+    stop_grace_period: 120s
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      mail:
+        condition: service_started
+
+  # A local mail catcher: it accepts every message and delivers none onward,
+  # so a contributor can register an e-mail preference and read the result
+  # without configuring an external relay and without any risk of sending to
+  # a real address.
+  #
+  # Like the gateway, it is built from an image this repository does not
+  # produce and carries no binary, key or credential of ours.
+  mail:
+    image: axllent/mailpit:v1.21
+    # SMTP is reachable only on this private network; the inspection UI gets
+    # a host port of its own rather than a route on the gateway. The gateway
+    # serves the application's own surface, and a path there for a
+    # development-only UI would exist in no deployment. Loopback-only for the
+    # same reason the gateway is.
+    ports:
+      - "127.0.0.1:8025:8025"
+    # Accept any credential, over an unencrypted session. The notifier sends
+    # no AUTH at all here — no username is configured for it above, precisely
+    # so that it does not have to — so neither setting is exercised by the
+    # default stack. They are here for the contributor who does set
+    # NOTIFICATION_SMTP_USERNAME/PASSWORD locally to see that path work: the
+    # client requires an encrypted session before authenticating, so it will
+    # still refuse against this relay, and finding that out from the client's
+    # own refusal rather than from the relay's is the point.
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
 
   # Built from the Dockerfile's "test" stage (Go toolchain + ffmpeg) rather
   # than the runtime services' hardened "runtime" stage, which deliberately

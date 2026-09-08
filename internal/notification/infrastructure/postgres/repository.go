@@ -42,10 +42,45 @@ const (
 		RETURNING enabled, destination, secret <> '' AS has_secret, created_at, updated_at
 	`
 
-	// No secret was submitted: one UPDATE that never names the secret
-	// column, so there is nothing for it to be preserved *from*. Affecting
-	// zero rows is the create-with-no-secret case, and the only signal
-	// needed to refuse it.
+	// No secret was submitted and the channel does not sign: one upsert that
+	// creates as readily as it updates, because there is no rule to refuse a
+	// create with.
+	//
+	// Named for the channel rather than for the missing secret, and not only
+	// for accuracy — the statement is chosen by Channel.Signs, not by
+	// absence alone, since a submitted secret takes the upsert above
+	// whatever the channel. A constant whose name contains "secret" bound to
+	// a string literal is also what gosec's G101 reports as a possible
+	// hardcoded credential, and a name that says what the statement is for
+	// is a better answer to that than a suppression.
+	//
+	// The inserted tuple names the secret column and writes the empty string
+	// rather than omitting it. Omitting it would insert NULL — the column is
+	// NOT NULL with deliberately no default — and fail on the column rather
+	// than on the CHECK the empty string is written to satisfy.
+	//
+	// The conflict clause does NOT name the column, and that half is equally
+	// load-bearing: a write omitting the secret preserves the stored one, and
+	// that holds on every channel. A preference here may carry a secret — a
+	// write submitting one stores it whatever the channel, even though
+	// nothing on this channel signs with it — so assigning EXCLUDED.secret
+	// the way the upsert above does would clear a stored value on every
+	// later write that simply did not resend it.
+	upsertPreferenceOnNonSigningChannelQuery = `
+		INSERT INTO notification_preferences
+		       (user_id, event_type, channel, enabled, destination, secret, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, '', $6, $6)
+		ON CONFLICT (user_id, event_type, channel) DO UPDATE
+		   SET enabled     = EXCLUDED.enabled,
+		       destination = EXCLUDED.destination,
+		       updated_at  = EXCLUDED.updated_at
+		RETURNING enabled, destination, secret <> '' AS has_secret, created_at, updated_at
+	`
+
+	// No secret was submitted and the channel signs: one UPDATE that never
+	// names the secret column, so there is nothing for it to be preserved
+	// *from*. Affecting zero rows is the create-with-no-secret case, and the
+	// only signal needed to refuse it.
 	//
 	// Encoding the omission as '' in an inserted tuple instead would not
 	// work: PostgreSQL evaluates NOT NULL and CHECK against the proposed row
@@ -73,11 +108,27 @@ const (
 	// which reads this file rather than running anything — a query that was
 	// never executed is invisible to a runtime test.
 	//
+	// Even here the projection is conditional: it yields the value only for
+	// a row whose channel signs. A preference on any other channel may still
+	// carry a stored secret, since a write submitting one stores it whatever
+	// the channel, and nothing on that channel's delivery path has a
+	// signature to compute with it. Declining to *use* a value that was
+	// selected and scanned is a weaker guarantee than declining to load it,
+	// and this rule is built on the stronger one — so the decision is made
+	// in SQL, before the value crosses into the process.
+	//
+	// The channel is spelled out rather than parameterized so the statement
+	// keeps one prepared form and two arguments;
+	// TestTheDeliverableProjectionNamesTheSigningChannel pins the literal
+	// against domain.ChannelWebhook.
+	//
 	// The enabled filter is in the statement rather than in the loop so a
 	// disabled preference's secret is not loaded at all: a value never
 	// fetched cannot be leaked by whatever the caller does next.
 	findDeliverablePreferencesQuery = `
-		SELECT event_type, channel, enabled, destination, secret, created_at, updated_at
+		SELECT event_type, channel, enabled, destination,
+		       CASE WHEN channel = 'webhook' THEN secret ELSE '' END,
+		       created_at, updated_at
 		  FROM notification_preferences
 		 WHERE user_id = $1 AND event_type = $2 AND enabled
 		 ORDER BY channel
@@ -107,12 +158,25 @@ func (r *PreferenceRepository) Set(ctx context.Context, intent domain.Preference
 
 	secret, submitted := intent.Secret()
 
+	// Which of the three statements runs follows from the request alone —
+	// was a secret submitted, and does this channel sign? — so none of them
+	// reads a row first and the create-versus-update decision stays the
+	// database's, resolved atomically.
+	//
+	// refusesWithoutSecret names the one case where affecting no row is an
+	// answer rather than an anomaly.
+	refusesWithoutSecret := !submitted && intent.Channel().Signs()
+
 	var row *sql.Row
-	if submitted {
+	switch {
+	case submitted:
 		row = r.db.QueryRowContext(ctx, upsertPreferenceQuery,
 			userID, eventType, channel, intent.Enabled(), intent.Destination().String(), secret.Reveal(), now)
-	} else {
+	case refusesWithoutSecret:
 		row = r.db.QueryRowContext(ctx, updatePreferenceQuery,
+			userID, eventType, channel, intent.Enabled(), intent.Destination().String(), now)
+	default:
+		row = r.db.QueryRowContext(ctx, upsertPreferenceOnNonSigningChannelQuery,
 			userID, eventType, channel, intent.Enabled(), intent.Destination().String(), now)
 	}
 
@@ -125,9 +189,10 @@ func (r *PreferenceRepository) Set(ctx context.Context, intent domain.Preference
 	)
 	if err := row.Scan(&enabled, &destinationValue, &hasSecret, &createdAt, &updatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			if submitted {
-				// The upsert always returns a row on both of its branches,
-				// so no row here is an anomaly rather than a refusal.
+			if !refusesWithoutSecret {
+				// Both upserts always return a row on either of their
+				// branches, so no row there is an anomaly rather than a
+				// refusal.
 				return domain.PreferenceView{}, fmt.Errorf("notification: set preference: upsert returned no row")
 			}
 			return domain.PreferenceView{}, domain.ErrSecretRequired
@@ -135,7 +200,7 @@ func (r *PreferenceRepository) Set(ctx context.Context, intent domain.Preference
 		return domain.PreferenceView{}, fmt.Errorf("notification: set preference: %w", err)
 	}
 
-	destination, err := domain.NewDestination(destinationValue)
+	destination, err := domain.NewDestinationFor(intent.Channel(), destinationValue)
 	if err != nil {
 		return domain.PreferenceView{}, fmt.Errorf("notification: stored destination is invalid: %w", err)
 	}
@@ -188,7 +253,7 @@ func (r *PreferenceRepository) ListByUser(ctx context.Context, userID domain.Use
 		if err != nil {
 			return nil, fmt.Errorf("notification: stored channel is invalid: %w", err)
 		}
-		destination, err := domain.NewDestination(destinationValue)
+		destination, err := domain.NewDestinationFor(channel, destinationValue)
 		if err != nil {
 			return nil, fmt.Errorf("notification: stored destination is invalid: %w", err)
 		}
@@ -252,13 +317,24 @@ func (r *PreferenceRepository) FindDeliverable(ctx context.Context, userID domai
 		if err != nil {
 			return nil, fmt.Errorf("notification: stored channel is invalid: %w", err)
 		}
-		destination, err := domain.NewDestination(destinationValue)
+		destination, err := domain.NewDestinationFor(channel, destinationValue)
 		if err != nil {
 			return nil, fmt.Errorf("notification: stored destination is invalid: %w", err)
 		}
-		secret, err := domain.NewSecret(secretValue)
-		if err != nil {
-			return nil, fmt.Errorf("notification: stored secret is invalid: %w", err)
+
+		// Parsed only where the projection above can have yielded one.
+		// NewSecret rejects the empty string, so parsing unconditionally
+		// would turn every preference on a non-signing channel into a
+		// stored-secret-is-invalid error — and that error arrives on the
+		// delivery path, where the disposition table reads a repository
+		// failure as "attempted nothing" and requeues, so a single such row
+		// would block the queue rather than fail visibly.
+		var secret domain.Secret
+		if channel.Signs() {
+			secret, err = domain.NewSecret(secretValue)
+			if err != nil {
+				return nil, fmt.Errorf("notification: stored secret is invalid: %w", err)
+			}
 		}
 
 		preference, err := domain.RestoreNotificationPreference(

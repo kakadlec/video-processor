@@ -143,12 +143,18 @@ func (i PreferenceIntent) Secret() (Secret, bool) {
 // identity — there is no surrogate id, because nothing references a
 // preference by one.
 //
-// It always carries a secret, which is the invariant that separates it from
-// a PreferenceIntent. Nothing in this change loads one: every read path
-// projects whether a secret is set rather than the secret itself, so the
-// value is not loadable where a response is built. The type exists for the
-// delivery change, which is the one caller that legitimately needs the bytes
-// to sign with.
+// On a channel that signs it always carries a secret, which is the
+// invariant that separates it from a PreferenceIntent. On a channel that
+// does not, it may carry one or not: a write submitting a secret stores it
+// whatever the channel, but nothing on that channel's delivery path has a
+// signature to compute with it. The invariant follows Channel.Signs rather
+// than naming a channel, so the aggregate, the schema constraint, the
+// create path and the delivery read all condition on one rule.
+//
+// Only one read path loads a secret at all — the delivery path's, and only
+// for a row whose channel signs. Every other read projects whether one is
+// set rather than the value, so it is not loadable where a response is
+// built.
 type NotificationPreference struct {
 	userID      UserID
 	eventType   EventType
@@ -183,7 +189,11 @@ func RestoreNotificationPreference(userID UserID, eventType EventType, channel C
 	if destination.IsZero() {
 		return nil, ErrPreferenceDestinationRequired
 	}
-	if secret.IsZero() {
+	// Conditional on the channel, not on whether a value happens to be
+	// present: a preference on a signing channel with no secret describes a
+	// delivery that could never be signed, while one on a non-signing
+	// channel with no secret is the ordinary case.
+	if channel.Signs() && secret.IsZero() {
 		return nil, ErrInvalidSecret
 	}
 	if createdAt.IsZero() || updatedAt.IsZero() {

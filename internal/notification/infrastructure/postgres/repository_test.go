@@ -20,6 +20,9 @@ const (
 	testSecret        = "a-signing-secret-of-sufficient-length"
 	testReplaceSecret = "a-different-signing-secret-entirely"
 
+	testEmailDestination      = "user@example.test"
+	testOtherEmailDestination = "other@example.test"
+
 	testDestination        = "https://hooks.example.com/first"
 	testOtherDestination   = "https://hooks.example.com/second"
 	testUpdatedDestination = "https://hooks.example.com/updated"
@@ -79,10 +82,24 @@ type intentOption func(*intentOptions)
 type intentOptions struct {
 	destination string
 	secret      *string
+	channel     string
 }
 
 func withSecret(raw string) intentOption {
 	return func(o *intentOptions) { o.secret = &raw }
+}
+
+// withChannel switches the triple's channel and, unless withDestination also
+// says otherwise, the destination with it — each channel's rule refuses the
+// other's value, so a channel option that left a URL behind would fail in
+// construction rather than in the assertion under test.
+func withChannel(raw string) intentOption {
+	return func(o *intentOptions) {
+		o.channel = raw
+		if raw == domain.ChannelEmail && o.destination == testDestination {
+			o.destination = testEmailDestination
+		}
+	}
 }
 
 func withDestination(raw string) intentOption {
@@ -95,7 +112,7 @@ func withDestination(raw string) intentOption {
 func newIntent(t *testing.T, userID, eventTypeValue string, opts ...intentOption) domain.PreferenceIntent {
 	t.Helper()
 
-	options := intentOptions{destination: testDestination}
+	options := intentOptions{destination: testDestination, channel: domain.ChannelWebhook}
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -104,11 +121,11 @@ func newIntent(t *testing.T, userID, eventTypeValue string, opts ...intentOption
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	channel, err := domain.ParseChannel(domain.ChannelWebhook)
+	channel, err := domain.ParseChannel(options.channel)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	destination, err := domain.NewDestination(options.destination)
+	destination, err := domain.NewDestinationFor(channel, options.destination)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -135,11 +152,16 @@ func newIntent(t *testing.T, userID, eventTypeValue string, opts ...intentOption
 // statement must never do.
 func storedSecret(t *testing.T, db *sql.DB, userID, eventTypeValue string) string {
 	t.Helper()
+	return storedSecretOn(t, db, userID, eventTypeValue, domain.ChannelWebhook)
+}
+
+func storedSecretOn(t *testing.T, db *sql.DB, userID, eventTypeValue, channel string) string {
+	t.Helper()
 
 	var secret string
 	err := db.QueryRowContext(context.Background(),
 		`SELECT secret FROM notification_preferences WHERE user_id = $1 AND event_type = $2 AND channel = $3`,
-		userID, eventTypeValue, domain.ChannelWebhook).Scan(&secret)
+		userID, eventTypeValue, channel).Scan(&secret)
 	if err != nil {
 		t.Fatalf("unexpected error reading stored secret: %v", err)
 	}
