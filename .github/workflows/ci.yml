@@ -337,7 +337,7 @@ jobs:
         # Only the runtime stage needs this: it runs `apk` as the target
         # platform. The builder stage is pinned to the build platform and
         # cross-compiles, so the Go toolchain is never emulated.
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
