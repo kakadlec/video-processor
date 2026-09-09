@@ -41,7 +41,7 @@ A publication SHALL push the version being published. It SHALL additionally move
 
 The version tag SHALL be immutable: once a version has been published, **no** publication path SHALL overwrite it, and the workflow SHALL offer no input, flag, or parameter that permits overwriting one. Replacing a published version SHALL require deleting it from the registry first, which is a deliberate act performed by a human outside this pipeline and is therefore not something a mistyped input can do.
 
-An earlier draft of this requirement paired the word "immutable" with an opt-in that let the same operator overwrite a version by setting a boolean. That is guarded mutability, and a consumer cannot rely on it: what a version tag means has to be the same whether or not somebody set a flag.
+A guarantee suspended by a flag is not one: pairing the word "immutable" with an opt-in to overwrite would leave a consumer unable to say what a version tag means without also knowing whether somebody set that flag. Hence no such input exists.
 
 The image tag SHALL be the version **without** any leading `v`, while the git tag retains the project's existing `vX.Y.Z` form: `git tag v4.0.0` publishes image tag `4.0.0`. Every publication path SHALL apply that same normalization before it checks whether a version exists and before it pushes, so the automatic and deliberate paths cannot check one tag and push another.
 
@@ -115,7 +115,7 @@ This SHALL NOT be assumed, in either direction, from the workflow definition: no
 
 Getting this wrong is silent in the only direction that matters: every check passes, the workflow is green, the image exists, and the one audience the documented pull command is written for is the one audience that cannot run it.
 
-An earlier draft of this requirement asserted that a new package is private and must be made public. That was written from received wisdom and is not what this repository observed: the first publication of `4.0.0` was anonymously pullable with no visibility change at all. The requirement is therefore stated as the property to check rather than the mechanism that produces it — the property is what a reader depends on, and the mechanism varies with registry and account settings this specification does not control.
+The requirement names the property to check rather than the mechanism that produces it, deliberately: whether a newly created package starts public or private varies with the registry and with account settings this specification does not control, and it is the property a reader depends on either way. Do not restate this as a rule about defaults in one direction or the other — verify.
 
 #### Scenario: Anonymous pullability is verified, not assumed
 
