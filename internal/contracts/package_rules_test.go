@@ -1,6 +1,7 @@
 package contracts_test
 
 import (
+	"errors"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -84,6 +85,15 @@ func TestNoPackageImportsThisOne(t *testing.T) {
 	for _, root := range roots {
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
+				// Same race as internal/notification/infrastructure/webhook's
+				// source walk: ffmpeg's tests create and remove temp/<jobID>
+				// under their package directory while `go test ./...` runs
+				// this one in parallel. An entry that is gone declares no
+				// import, and the parsed-file count below still fails a walk
+				// that skipped too much.
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
 				return err
 			}
 			if d.IsDir() {

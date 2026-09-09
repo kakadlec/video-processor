@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -94,6 +95,17 @@ func TestOnlyTheSignerRevealsAStoredSecret(t *testing.T) {
 	found := make([]string, 0, len(revealCallSites))
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
+			// A source file cannot disappear mid-walk, but a scratch
+			// directory can: `go test ./...` runs packages in parallel, and
+			// internal/video/infrastructure/ffmpeg's tests create and remove
+			// temp/<jobID> under their own package directory while this walk
+			// is running. Returning that error verbatim fails this test for
+			// something it does not examine — an entry that is gone holds no
+			// violation, so skip it and let the assertions below catch a walk
+			// that skipped too much.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if entry.IsDir() {
