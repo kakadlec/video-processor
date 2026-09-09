@@ -14,15 +14,16 @@ Four properties of the existing code constrain the answer, and each was checked 
 **Goals:**
 
 - One machine-readable record format, emitted by all five processes on one stream.
-- Every record identifies the process that emitted it, so three worker replicas are distinguishable.
+- Every record identifies the service and the individual process instance that emitted it, so three worker replicas are distinguishable from each other and not merely from the other services.
 - The positional information currently encoded in message prefixes (`video: worker: sweep: ...`) becomes fields.
 - The HTTP access log and the panic log have the same shape as every other record.
+- A job can be followed by its identifier across every process that acts on it.
 - Passing a domain value to a log call becomes structurally impossible, not merely discouraged.
 - No new module dependency.
 
 **Non-Goals:**
 
-- Changing *what* is logged. No record is added or removed; the survey found no line that should not exist.
+- Changing *what* is logged, with one named exception. No application call site is added or removed, and the survey found no line that should not exist. The exception is the accepted-upload record: on the success path of `POST /upload` every existing call is on an error branch, so the identifier of the job just created appears in no record at all and the end-to-end goal above is unreachable without it. One record, specified rather than slipped in.
 - Request correlation or trace identifiers. Genuinely useful, genuinely a separate design (it needs a propagation decision across an HTTP hop, a broker hop, and an outbox row), and not required to make the existing records readable.
 - Log shipping, aggregation, retention, or any collector. The stream stays stderr-or-stdout under the container runtime.
 - `/health`, `/ready`, `/metrics`, the admin listener. Changes 2 and 3 of Phase 8.
@@ -62,11 +63,15 @@ Each of `cmd/identity-api`, `cmd/video-api` and `cmd/notification-api` gets its 
 
 *Alternative considered — put the gin middleware in `internal/platform/logging`:* one copy instead of three, and nothing in `ddd-architecture` forbids it, since the prohibition on importing an HTTP framework binds the domain and application layers. Rejected because no package under `internal/` imports gin today and this is a poor first exception: the middleware is twenty lines of framework glue, which is exactly the shape the existing two-copy precedent already accepted.
 
-### 5. The access log records the matched route and the raw path, never the query string
+### 5. The access log records the matched route always, the raw path only when nothing matched, and the query string never
 
-The middleware records method, gin's matched route template, the request path, status, latency, response size, and the authenticated subject where the request carries one. It does **not** record the query string, any header, or any body.
+The middleware records method, gin's matched route template, status, latency, response size, and the authenticated subject where the request carries one. It does **not** record the query string, any header, or any body — and it does not record the request path either, except in one case.
 
-A path segment in this system is a storage key at worst, and `docs/operations.md` already instructs that the `StorageKey` be logged. A query string is unbounded caller-supplied text, and this repository has one documented case of a credential legitimately living in one — a webhook destination's query — which is exactly why `notification-webhook-delivery` forbids logging a `*url.Error`. Excluding it costs nothing and closes the class.
+The first draft recorded the path unconditionally, justified as "a path segment is a storage key at worst". That justification only holds for a request that **matched a route**. The middleware is global, so it also runs for requests that matched nothing, and there the path is arbitrary caller-supplied text of arbitrary length — indistinguishable in kind from the query string this decision excludes, which would leave the exclusion resting on a rule the path walks around. A caller could put a megabyte, or a credential, in a 404's path.
+
+So: the matched route is always recorded and is bounded by the router's own definition. The path is recorded **only when no route matched**, truncated to a fixed bound, because a 404 whose record does not say what was asked for is a 404 record worth nothing. For a matched request the path adds only the parameter values, every one of which the handler already logs where it uses it.
+
+A query string is excluded in every case: this repository has one documented instance of a credential legitimately living in one — a webhook destination's query — which is exactly why `notification-webhook-delivery` forbids logging a `*url.Error`.
 
 ### 6. No `slog.Any`, anywhere — attributes are built only from typed scalar constructors, pinned by AST
 
@@ -74,7 +79,7 @@ This is the mechanism behind the non-disclosure rule, and it is stronger than re
 
 `domain.Secret` defends itself through `fmt`: `String`, `GoString` and `Format` render `notification.Secret{REDACTED}`, and `MarshalJSON` returns an error so that a response struct holding one fails at encode time rather than leaking. Under a JSON handler that deliberate error does not redact a field — it discards the record. And the structs that hold a `Secret` as a plain field (`PreferenceIntent`, `NotificationPreference`) are protected today only by the fact that `fmt` cannot call methods on a field; `encoding/json` reaches fields directly.
 
-Rather than teach the handler about these types, the change removes the way they could arrive. The rule, stated as the AST check enforces it: **every argument a log call passes after its message is a call to `slog.String`, `slog.Int`, `slog.Int64`, `slog.Bool`, `slog.Duration` or `slog.Time`.** That forbids `slog.Any`, `slog.Value` and `LogValuer`, and it equally forbids `slog`'s loosely-typed alternating form — `slog.Info("msg", "job_id", id)` — whose value position takes any type and is therefore the identical hole. It does **not** require `slog.LogAttrs`: the ordinary `Info`/`Warn`/`Error` calls accept `slog.Attr` values in their variadic directly, so `slog.Info("job completed", slog.String("job_id", id), slog.Int("frames", n))` satisfies the rule. This matters at 151 call sites — the constraint is on the arguments, not on which function is called, so no site pays the `LogAttrs` ceremony. A test in `internal/platform/logging` AST-walks `cmd/` and `internal/` and fails on any argument that is not one of those calls — the same source-level idiom as `TestNoQueryOutsideFindDeliverableSelectsTheSecret`, `TestTheHTTPCompositionRootDoesNotLoadTheSecret`, and `TestOnlyTheIdentityServiceConstructsATokenIssuer`, the last of which already scans other roots' sources from a test in one of them.
+Rather than teach the handler about these types, the change removes the way they could arrive. The rule, stated as the AST check enforces it: **every argument a log call passes after its message is a call to `slog.String`, `slog.Int`, `slog.Int64`, `slog.Bool`, `slog.Duration` or `slog.Time`.** That forbids `slog.Any`, `slog.Value` and `LogValuer`, and it equally forbids `slog`'s loosely-typed alternating form — `slog.Info("msg", "job_id", id)` — whose value position takes any type and is therefore the identical hole. It does **not** require `slog.LogAttrs`: the ordinary `Info`/`Warn`/`Error` calls accept `slog.Attr` values in their variadic directly, so `slog.Info("job completed", slog.String("job_id", id), slog.Int("frames", n))` satisfies the rule. This matters at 151 call sites — the constraint is on the arguments, not on which function is called, so no site pays the `LogAttrs` ceremony. The same requirement applies to the calls that **bind** attributes to a logger for reuse (`Logger.With`, `Logger.WithGroup`) rather than emitting a record. That is a separate clause, not a restatement: a binding call passes no message, so a rule phrased as "arguments after the message" does not reach it at all — and it is the worse leak of the two, because a domain aggregate bound there rides on every subsequent record the logger emits instead of one. It is also the form this design itself reached for when sketching the service attribute, which is how it was found. A test in `internal/platform/logging` AST-walks `cmd/` and `internal/` and fails on any argument that is not one of those calls — the same source-level idiom as `TestNoQueryOutsideFindDeliverableSelectsTheSecret`, `TestTheHTTPCompositionRootDoesNotLoadTheSecret`, and `TestOnlyTheIdentityServiceConstructsATokenIssuer`, the last of which already scans other roots' sources from a test in one of them.
 
 What this does **not** cover, stated so it is not assumed: an error's own text. `slog.String("error", err.Error())` is permitted and necessary, and a raw transport error passed there would still render a `*url.Error`'s full URL. That rule is separately specified (`notification-webhook-delivery`, `notification-email-delivery`) and separately enforced by behavioural tests over the delivery path, which this change leaves in place. The AST check closes the domain-value half; the existing tests close the transport-error half.
 
@@ -82,7 +87,17 @@ What this does **not** cover, stated so it is not assumed: an error's own text. 
 
 One optional variable per process, parsed by `internal/platform/logging`, defaulting to `info`, with an unparseable value refused at startup rather than silently downgraded.
 
-This is the one piece of configuration read *before* the logger exists, which fixes the startup order in every root: parse the level, build the logger, `slog.SetDefault`, then read everything else. A failure parsing the level is therefore the one startup failure that cannot be reported as a structured record, and is reported on standard error before exiting.
+This is the one piece of configuration read *before* the logger exists, which fixes the startup order in every root: parse the level, build the logger, `slog.SetDefault`, then read everything else.
+
+A level that will not parse is therefore the one failure that occurs before there is a configured logger to report it — but not before there is a *loggable* one. The process builds a logger at the default severity, carrying the same service and instance identity a normal one would, reports the refusal through it, and exits. Writing that one complaint to standard error instead was the first draft and is wrong: it puts the single message a starting operator most needs to see outside the format the rest of the system uses, and it would make the "no unstructured output path remains" requirement carry an exception for the one path most likely to be read by a human under pressure.
+
+### 7a. Service **and** instance identity, both bound at startup
+
+Two fields. `service` names the binary; `instance` names the process, taken from the container hostname (`os.Hostname()`, which under Docker is the container id) with a generated fallback when that is unavailable.
+
+The second is not decoration and is not derivable from the first: `docker-compose.yml` sets `deploy.replicas: 3` on `cmd/worker`, so three processes emit records under one service name into one collected stream. A reader asking "did two workers touch this job" or "is one replica failing while the others are fine" cannot answer it from a service field. Binding it once at startup rather than per call site is what makes it free.
+
+Both are bound as **typed attributes** — `With(slog.String("service", …), slog.String("instance", …))`, not the alternating form — so the code that establishes the disclosure rule is itself subject to it, with no exemption.
 
 Unlike `RATE_LIMIT_MAX_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` — which CLAUDE.md requires to hold the same value everywhere, because the counter is one shared budget keyed on the user — a log level is genuinely per-process state with no shared invariant. Turning up the notifier's verbosity while leaving the API alone is the ordinary use, not a misconfiguration. `docker-compose.yml` leaves it unset.
 
