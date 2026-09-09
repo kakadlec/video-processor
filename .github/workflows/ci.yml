@@ -343,7 +343,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build the runtime image for linux/amd64
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: runtime
@@ -355,7 +355,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=runtime-amd64
 
       - name: Build the runtime image for linux/arm64
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: runtime
@@ -371,7 +371,7 @@ jobs:
         # documented local test path, and is the one stage the runtime build
         # does not exercise end to end. Native only, deliberately: it is
         # pinned to the build platform for exactly that reason.
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: test
