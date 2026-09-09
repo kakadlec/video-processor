@@ -213,7 +213,7 @@ jobs:
         # Dockerfile without the pin, so its non-native build emulates the Go
         # toolchain — slow, and accepted, because the alternative is
         # publishing something other than what the tag contains.
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
