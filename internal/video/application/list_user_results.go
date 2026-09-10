@@ -2,7 +2,7 @@ package application
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -80,7 +80,10 @@ func (uc *ListUserResults) Execute(ctx context.Context, input ListUserResultsInp
 			key := job.StorageKey()
 			size, modifiedAt, err := uc.results.Stat(ctx, key)
 			if err != nil {
-				log.Printf("stat result %s for job %s: %v", key.String(), job.ID().String(), err)
+				logger(componentResultListing).Warn("stat of a stored result failed; the job is omitted from the listing",
+					slog.String("job_id", job.ID().String()),
+					slog.String("storage_key", key.String()),
+					slog.String("error", err.Error()))
 				return
 			}
 			stated[i] = ListUserResultsItem{
