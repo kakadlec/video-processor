@@ -19,7 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -33,6 +33,7 @@ import (
 	notificationpostgres "video-processor/internal/notification/infrastructure/postgres"
 	notificationsmtp "video-processor/internal/notification/infrastructure/smtp"
 	notificationwebhook "video-processor/internal/notification/infrastructure/webhook"
+	"video-processor/internal/platform/logging"
 	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 )
 
@@ -85,11 +86,24 @@ type systemClock struct{}
 func (systemClock) Now() time.Time { return time.Now() }
 
 func main() {
+	// The severity is read, and the process logger installed, before any
+	// other configuration: every remaining startup failure is then reportable
+	// as a structured record.
+	level, err := logging.ParseLevel(os.Getenv(logging.LevelEnvVar))
+	if err != nil {
+		logging.NewBootstrap(logging.ServiceNotifier).Error("the configured log severity is unrecognized",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	slog.SetDefault(logging.New(logging.ServiceNotifier, level))
+
 	ctx := context.Background()
 
 	deps, err := setupNotifier(ctx)
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the notifier could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -209,7 +223,8 @@ func setupNotifier(ctx context.Context) (*notifierDeps, error) {
 		return nil, fmt.Errorf("notification: notifier: ping postgres: %w", err)
 	}
 
-	log.Printf("notification: notifier: destination policy: insecure destinations allowed=%t", policy.AllowsInsecure())
+	logger(componentProcessStartup).Info("the destination policy was loaded",
+		slog.Bool("allow_insecure", policy.AllowsInsecure()))
 
 	// Both transports take the configured timeout, not a constant of their
 	// own and not one each. MaxClaimHold — and with it the reclaim bound the
@@ -327,12 +342,13 @@ func run(ctx context.Context, deps *notifierDeps, consume func(context.Context) 
 	go func() {
 		defer close(consumerDone)
 		if err := consume(ctx); err != nil {
-			log.Printf("notification: notifier: consumer: %v", err)
+			logger(componentTerminalEventConsumer).Error("the terminal event consumer returned an error",
+				slog.String("error", err.Error()))
 		}
 	}()
 
 	<-ctx.Done()
-	log.Print("notification: notifier: shutdown signal received")
+	logger(componentProcessShutdown).Info("a shutdown signal was received")
 
 	select {
 	case <-consumerDone:
@@ -353,7 +369,8 @@ func run(ctx context.Context, deps *notifierDeps, consume func(context.Context) 
 		// connections — nothing is lost that the reclaim bound does not
 		// already cover, since an unresolved claim is exactly what a later
 		// consumer reclaims.
-		log.Printf("notification: notifier: drain deadline of %s expired with a delivery still in flight; exiting without closing the pool", drain)
+		logger(componentProcessShutdown).Warn("the drain deadline expired with a delivery still in flight; exiting without closing the pool",
+			slog.Duration("drain", drain))
 		return drainExpired
 	}
 }
@@ -371,7 +388,9 @@ func run(ctx context.Context, deps *notifierDeps, consume func(context.Context) 
 func (d *notifierDeps) handle(ctx context.Context, eventType string, body []byte) notificationmessaging.Disposition {
 	event, err := decodeEvent(eventType, body)
 	if err != nil {
-		log.Printf("notification: notifier: %v; dead-lettering", err)
+		logger(componentTerminalEventDispatch).Error("the terminal event could not be decoded; dead-lettering",
+			slog.String("event_type", eventType),
+			slog.String("error", err.Error()))
 		return notificationmessaging.Reject
 	}
 
@@ -381,11 +400,16 @@ func (d *notifierDeps) handle(ctx context.Context, eventType string, body []byte
 		return notificationmessaging.Ack
 	case notificationapplication.DeliveryDeferred:
 		if err != nil {
-			log.Printf("notification: notifier: %s job %s: deferred: %v", eventType, event.JobID(), err)
+			logger(componentTerminalEventDispatch).Warn("the delivery was deferred; requeueing",
+				slog.String("event_type", eventType),
+				slog.String("job_id", event.JobID().String()),
+				slog.String("error", err.Error()))
 		} else {
 			// The one deferral that is not a failure: another consumer holds
 			// the claim and has not yet reached the reclaim bound.
-			log.Printf("notification: notifier: %s job %s: deferred: the claim is held by another consumer", eventType, event.JobID())
+			logger(componentTerminalEventDispatch).Warn("the claim is held by another consumer; requeueing",
+				slog.String("event_type", eventType),
+				slog.String("job_id", event.JobID().String()))
 		}
 		return notificationmessaging.Requeue
 	default:
@@ -393,7 +417,10 @@ func (d *notifierDeps) handle(ctx context.Context, eventType string, body []byte
 		// above. Dead-lettered rather than acknowledged because Ack asserts
 		// a settled outcome, and a disposition that arrived unset asserts
 		// nothing — the dead-letter queue is where it can be seen.
-		log.Printf("notification: notifier: %s job %s: unknown disposition %d; dead-lettering", eventType, event.JobID(), disposition)
+		logger(componentTerminalEventDispatch).Error("the use case returned an unknown disposition; dead-lettering",
+			slog.String("event_type", eventType),
+			slog.String("job_id", event.JobID().String()),
+			slog.Int("disposition", int(disposition)))
 		return notificationmessaging.Reject
 	}
 }
@@ -485,6 +512,6 @@ func identifiers(rawJobID, rawUserID string) (notificationdomain.JobID, notifica
 
 func closeDB(db *sql.DB) {
 	if err := db.Close(); err != nil {
-		log.Printf("notification: notifier: close postgres: %v", err)
+		logger(componentProcessShutdown).Warn("closing the PostgreSQL pool failed", slog.String("error", err.Error()))
 	}
 }
