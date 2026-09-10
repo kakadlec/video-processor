@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -96,7 +96,7 @@ func setupIdentity(ctx context.Context) (*identityModule, *sql.DB, error) {
 // a different, more relevant error is already being returned to the caller.
 func closeDB(db *sql.DB) {
 	if err := db.Close(); err != nil {
-		log.Printf("identity: close postgres: %v", err)
+		logger(componentProcessShutdown).Warn("closing the PostgreSQL pool failed", slog.String("error", err.Error()))
 	}
 }
 
@@ -149,7 +149,7 @@ func (m *identityModule) handleRegister(c *gin.Context) {
 		case errors.Is(err, domain.ErrUserAlreadyExists):
 			c.JSON(http.StatusConflict, identityErrorResponse{Error: "an account with this email already exists"})
 		default:
-			log.Printf("register user: %v", err)
+			logger(componentUserRegistration).Error("registering the user failed", slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, identityErrorResponse{Error: "internal server error"})
 		}
 		return
@@ -178,7 +178,7 @@ func (m *identityModule) handleLogin(c *gin.Context) {
 			c.JSON(http.StatusUnauthorized, identityErrorResponse{Error: "invalid email or password"})
 			return
 		}
-		log.Printf("authenticate user: %v", err)
+		logger(componentUserAuthentication).Error("authenticating the user failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, identityErrorResponse{Error: "internal server error"})
 		return
 	}
