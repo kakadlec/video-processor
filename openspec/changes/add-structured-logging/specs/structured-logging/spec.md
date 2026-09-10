@@ -79,7 +79,7 @@ Where a package already accepts an injected logger so that its own tests can rea
 
 A log call site SHALL build every field from a scalar it has extracted itself — a string, an integer, a boolean, a duration, or a time. It SHALL NOT pass a value of arbitrary type to the logger, and SHALL NOT rely on a type rendering itself for the log.
 
-Concretely: every argument a log call passes after its message SHALL be a typed attribute constructor, and so SHALL every argument to a call that **binds attributes to a logger** for later records rather than emitting one. The second half is not a refinement of the first: a binding call takes no message, so a rule phrased only in terms of arguments-after-the-message does not reach it — and a domain aggregate bound there would be attached to every subsequent record the logger emits, which is a wider leak than a single call site, arriving silently. The loosely-typed alternating key-and-value form that `slog`'s top-level functions also accept SHALL NOT be used, because its value position takes any type and is therefore the same hole as an arbitrary-value attribute. Requiring typed attributes is a constraint on the arguments, not on which logging function is called: the ordinary `Info`/`Warn`/`Error` calls accept typed attributes directly, so no call site is obliged to use the attribute-only variant.
+Concretely: every argument a log call passes after its message SHALL be a typed attribute constructor, and so SHALL every argument to a call that **binds attributes to a logger** for later records rather than emitting one — the attribute-binding call specifically, not the one that opens a named group, which takes a name and binds no value. The second half is not a refinement of the first: a binding call takes no message, so a rule phrased only in terms of arguments-after-the-message does not reach it — and a domain aggregate bound there would be attached to every subsequent record the logger emits, which is a wider leak than a single call site, arriving silently. The loosely-typed alternating key-and-value form that `slog`'s top-level functions also accept SHALL NOT be used, because its value position takes any type and is therefore the same hole as an arbitrary-value attribute. Requiring typed attributes is a constraint on the arguments, not on which logging function is called: the ordinary `Info`/`Warn`/`Error` calls accept typed attributes directly, so no call site is obliged to use the attribute-only variant.
 
 This SHALL be enforced at the source level, by a test that walks the syntax of every non-test file under `cmd/` and `internal/` and fails on any field constructed from an arbitrary value or passed in the alternating form, whether it is emitted directly or bound to a logger first. The service and instance identities the composition roots bind at startup SHALL themselves be bound as typed attributes, so the rule holds with no exemption for the code that establishes it. A behavioural test cannot hold this claim: it can only observe the call sites that exist when it is written.
 
@@ -118,7 +118,9 @@ The **matched route** is the route template, which is bounded by the router's ow
 
 Nothing is lost for a matched request: its path adds only the parameter values, and every one of them is already recorded elsewhere by the handler that used it.
 
-A recovered panic SHALL be recorded at error severity with the panic value and the stack as fields, and SHALL still produce the response the service produced before.
+A recovered panic SHALL be recorded at error severity with the panic value and the stack as fields, and SHALL still produce the response the service produced before. This SHALL hold for **every** recovered panic, including one caused by a connection the client has already dropped — a case some framework recovery middleware handles on a separate branch that never reaches the supplied handler, and which would otherwise be the one class of panic recorded nowhere.
+
+No recovered panic SHALL produce output outside the record. A framework's own recovery middleware that writes its stack block to a writer of its own before delegating SHALL NOT be used, because that block is unstructured output the format requirement above forbids, and it is emitted whether or not the delegate also records the panic.
 
 #### Scenario: A request is served
 
@@ -138,7 +140,12 @@ A recovered panic SHALL be recorded at error severity with the panic value and t
 #### Scenario: A handler panics
 
 - **WHEN** a handler panics and the recovery middleware runs
-- **THEN** an error-severity record carries the panic value and the stack, and the client receives the same response as before
+- **THEN** an error-severity record carries the panic value and the stack, the client receives the same response as before, and no other output is produced
+
+#### Scenario: A handler panics on a connection the client has dropped
+
+- **WHEN** a panic is recovered for a request whose connection is already broken
+- **THEN** it is recorded like any other recovered panic, and no response body is attempted
 
 ### Requirement: A Job Is Followable Across the Processes That Handle It
 
