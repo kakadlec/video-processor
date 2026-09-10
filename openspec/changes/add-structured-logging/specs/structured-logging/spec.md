@@ -21,7 +21,9 @@ The message SHALL be a fixed string literal for a given call site: it SHALL NOT 
 #### Scenario: No unstructured output path remains
 
 - **WHEN** a source-level test walks the syntax of every non-test `.go` file under `cmd/` and `internal/`
-- **THEN** it finds no call to a package-level `log` output or exit function (`log.Print`, `log.Printf`, `log.Println`, `log.Fatal`, `log.Fatalf`, `log.Fatalln`, `log.Panic*`) and no call to `fmt.Print`, `fmt.Printf`, `fmt.Println`, or an `fmt.Fprint*` whose destination is standard output or standard error, and it fails naming the file and line if it does
+- **THEN** it finds no import of the standard `log` package at all, and no call to `fmt.Print`, `fmt.Printf`, `fmt.Println`, or an `fmt.Fprint*` whose destination is standard output or standard error, and it fails naming the file and line if it does
+
+The `log` rule is an **import** ban rather than a list of function names, deliberately. Six of the calls this capability replaces are already made on a `*log.Logger` **instance** rather than through the package's functions, so a name-based check would miss them today and would keep missing the next one: a `log.New` plus a method call on the result reintroduces the entire unstructured path while every enumeration of `log.Print`, `log.Fatal` and `log.Panic` stays green. Banning the import closes both forms with one rule and needs no maintenance as the standard library grows.
 
 Value-producing calls (`fmt.Errorf`, `fmt.Sprintf`) are unaffected: they build a value, they do not emit output.
 
@@ -36,12 +38,14 @@ Every record SHALL carry a field identifying the service that emitted it **and**
 
 Two fields, not one, because they answer different questions and the second cannot be derived from the first. `docker-compose.yml` runs **three replicas of `cmd/worker`**, and they all carry the same service name: attributing a record to "a worker" does not say which of the three, which is precisely what is needed when one replica misbehaves or when two are seen working on the same job. The instance identifier SHALL be stable for the life of the process and SHALL be derived from something the runtime already assigns — the container hostname under Docker — rather than generated per record.
 
+The service identifiers SHALL be a closed, canonical set fixed in one place: `identity-api`, `video-api`, `notification-api`, `worker`, `notifier`. These are the binary names, which are also the deployment's own service names, so a filter written against a record matches what an operator already types. They SHALL NOT carry the `cmd/` prefix, which names where the source lives rather than what is running.
+
 This is what makes one aggregated stream readable: `docker-compose.yml` runs three replicas of `cmd/worker` and five services in total, all writing to the same collected output, and without it a record cannot be attributed to its source.
 
 #### Scenario: A shared package logs
 
-- **WHEN** a package under `internal/` emits a record while running inside `cmd/worker`
-- **THEN** the record names `cmd/worker` as the emitting service, and the same package running inside `cmd/video-api` names that service instead
+- **WHEN** a package under `internal/` emits a record while running inside the worker process
+- **THEN** the record's service field is `worker`, and the same package running inside the video API names `video-api` instead — the value drawn from the canonical set above in both cases
 
 #### Scenario: Concurrent replicas
 
@@ -63,7 +67,7 @@ The reason is not presentation. The non-disclosure guarantee below is a property
 
 Each composition root SHALL construct its logger — format, severity threshold, destination, and service identity — as part of its own startup, and SHALL install it as the process-wide default. No package under `internal/` SHALL construct a logger, read logging configuration, or decide a severity threshold.
 
-Where a package already accepts an injected logger so that its own tests can read what it writes, it SHALL continue to, and SHALL treat a nil logger as the process-wide default. Injection SHALL NOT be introduced anywhere it is not already present: threading a logger through constructors that do not need one would be the mechanism by which a package acquires an opinion about its process's logging, which the first paragraph forbids.
+Where a package already accepts an injected logger so that its own tests can read what it writes, it SHALL continue to, and SHALL treat a nil logger as the process-wide default. That injected logger SHALL be a structured one: the six records that reach it today are emitted through a standard `*log.Logger` instance, which is exactly the form the import ban above closes. Injection SHALL NOT be introduced anywhere it is not already present: threading a logger through constructors that do not need one would be the mechanism by which a package acquires an opinion about its process's logging, which the first paragraph forbids.
 
 #### Scenario: A shared package needs no configuration
 
