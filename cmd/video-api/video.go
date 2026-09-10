@@ -766,6 +766,15 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// deferred cleanup above must not touch it whatever else goes wrong.
 	enqueued = true
 
+	// The one record this handler emits on the success path. Every other
+	// call in it is on an error branch, so without this the identifier of
+	// the job just accepted appears in no record from the service that
+	// accepted it, and an accepted-but-never-dispatched job leaves no trace
+	// of its acceptance at all.
+	logger(componentVideoUpload).Info("the upload was accepted and the job queued",
+		slog.String("job_id", created.JobID),
+		slog.String("source_key", sourceKey.String()))
+
 	// Finalized after the enqueue, not before, per upload-idempotency's
 	// "Reservation Is Finalized To The Real VideoJobID Only By Its Owning
 	// Token": a finalized key advertises its job to every duplicate for
