@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -47,7 +47,7 @@ func rateLimitMiddleware(limiter rateLimiter) gin.HandlerFunc {
 		if err != nil {
 			// Fail open: an infrastructure hiccup in the rate limiter must not
 			// take down otherwise-healthy request handling.
-			log.Printf("rate limit check failed, allowing request: %v", err)
+			logger(componentRateLimit).Warn("the rate limit check failed; the request is allowed", slog.String("error", err.Error()))
 			c.Next()
 			return
 		}

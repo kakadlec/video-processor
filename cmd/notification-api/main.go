@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
+	"video-processor/internal/platform/logging"
 	platformratelimit "video-processor/internal/platform/ratelimit"
 	platformredis "video-processor/internal/platform/redis"
 )
@@ -28,22 +30,41 @@ const shutdownTimeout = 30 * time.Second
 const readHeaderTimeout = 10 * time.Second
 
 func main() {
+	// The severity is read, and the process logger installed, before any
+	// other configuration: every remaining startup failure is then reportable
+	// as a structured record.
+	level, err := logging.ParseLevel(os.Getenv(logging.LevelEnvVar))
+	if err != nil {
+		logging.NewBootstrap(logging.ServiceNotificationAPI).Error("the configured log severity is unrecognized",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	slog.SetDefault(logging.New(logging.ServiceNotificationAPI, level))
+
 	ctx := context.Background()
 
 	auth, err := setupAuthenticator()
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the token verifier could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	notification, notificationDB, err := setupNotification(ctx)
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the notification module could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	limiter, redisClient, err := setupRateLimiter()
 	if err != nil {
+		// Closed explicitly before the exit, not deferred: os.Exit runs no
+		// deferred call, exactly as log.Fatal did not.
 		closeDB(notificationDB)
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the rate limiter could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	r := setupRouter(auth, notification, limiter)
@@ -60,7 +81,7 @@ func main() {
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
-	fmt.Println("🔔 Notification API listening on port 8080")
+	logger(componentHTTPServer).Info("the notification API is listening", slog.String("addr", server.Addr))
 
 	serverFailed := make(chan error, 1)
 	go func() {
@@ -73,16 +94,16 @@ func main() {
 	select {
 	case err := <-serverFailed:
 		if err != nil {
-			log.Printf("http server: %v", err)
+			logger(componentHTTPServer).Error("the HTTP server stopped", slog.String("error", err.Error()))
 		}
 	case <-signalCtx.Done():
-		log.Print("shutdown signal received")
+		logger(componentProcessShutdown).Info("a shutdown signal was received")
 	}
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, shutdownTimeout)
 	defer cancelShutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("http server shutdown: %v", err)
+		logger(componentHTTPServer).Error("shutting the HTTP server down failed", slog.String("error", err.Error()))
 	}
 
 	// Shutdown, then close both connections, and there is no ordering
@@ -92,7 +113,7 @@ func main() {
 	// returned, every statement this process will ever run has finished.
 	closeDB(notificationDB)
 	if err := redisClient.Close(); err != nil {
-		log.Printf("close redis: %v", err)
+		logger(componentProcessShutdown).Warn("closing the Redis client failed", slog.String("error", err.Error()))
 	}
 }
 
@@ -118,7 +139,7 @@ func setupRateLimiter() (*platformratelimit.Limiter, *redis.Client, error) {
 	rateLimitConfig, err := platformratelimit.LoadConfigFromEnv()
 	if err != nil {
 		if closeErr := redisClient.Close(); closeErr != nil {
-			log.Printf("close redis: %v", closeErr)
+			logger(componentProcessStartup).Warn("closing the Redis client failed", slog.String("error", closeErr.Error()))
 		}
 		return nil, nil, err
 	}
