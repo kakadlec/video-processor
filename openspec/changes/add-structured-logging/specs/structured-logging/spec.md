@@ -6,12 +6,17 @@ Every process this repository builds — `cmd/identity-api`, `cmd/video-api`, `c
 
 A record SHALL carry, at minimum, a timestamp, a severity level, a message, and the emitting service's identity. Information that identifies what a record is *about* — a job identifier, a lease epoch, a storage key, a delivery identifier, an attempt number, an event type, a channel — SHALL be carried as a named field and SHALL NOT be interpolated into the message.
 
-The message SHALL be a fixed string for a given call site: it SHALL NOT be assembled by formatting a value into it, so that records from one call site remain groupable after their fields change.
+The message SHALL be a fixed string literal for a given call site: it SHALL NOT be assembled by formatting or concatenating a value into it, so that records from one call site remain groupable after their fields change. This SHALL be enforced by the same source-level walk that enforces the attribute rules below — a formatted message satisfies every rule about attributes while putting an identifier back inside the message, which is the exact defect this capability exists to remove, so an unenforced clause here would let the migration land its own regression.
 
 #### Scenario: A record carrying an identifier
 
 - **WHEN** any process logs an event concerning a specific job, delivery, or stored object
 - **THEN** that identifier appears as a named field of the record, and the record's message is the same fixed string for every occurrence of that event
+
+#### Scenario: A message is assembled rather than fixed
+
+- **WHEN** a non-test source file passes anything but a string literal in a log call's message position
+- **THEN** the source-level walk fails and names the file and the call site
 
 #### Scenario: No unstructured output path remains
 
@@ -47,7 +52,7 @@ This is what makes one aggregated stream readable: `docker-compose.yml` runs thr
 
 The record format SHALL be JSON, in every environment, and SHALL NOT be selectable by configuration. No alternative human-readable or console format SHALL be offered.
 
-The reason is not presentation. The non-disclosure guarantee below is a property of how a specific encoder reaches a value, and the two candidate encoders reach values by different paths: a text renderer consults `fmt`, where `internal/notification/domain.Secret`'s defences live, while a JSON encoder consults `encoding/json`, where that type's `MarshalJSON` deliberately returns an error. A configurable format would mean the guarantee holds under whichever encoder was verified and is untested under the other, in the environment where a developer is least likely to be watching for it.
+The reason is not presentation. The non-disclosure guarantee below is a property of how a specific encoder reaches a value, and the two candidate encoders reach values by opposite paths — verified against the implementation rather than assumed. A JSON encoder walks a value's exported fields directly, so a domain value that declines to defend itself is serialized verbatim; a text renderer consults the type's own rendering, where `internal/notification/domain.Secret`'s defences live. Conversely, a value the JSON encoder refuses does not discard the record: the attribute becomes an error marker and every sibling field nested inside it is lost, which the text renderer would have shown. The two therefore fail in opposite directions, and a configurable format would mean the guarantee holds under whichever encoder was verified and is untested under the other — in the environment where a developer is least likely to be watching for it.
 
 #### Scenario: The format cannot be switched
 
@@ -78,7 +83,11 @@ Concretely: every argument a log call passes after its message SHALL be a typed 
 
 This SHALL be enforced at the source level, by a test that walks the syntax of every non-test file under `cmd/` and `internal/` and fails on any field constructed from an arbitrary value or passed in the alternating form, whether it is emitted directly or bound to a logger first. The service and instance identities the composition roots bind at startup SHALL themselves be bound as typed attributes, so the rule holds with no exemption for the code that establishes it. A behavioural test cannot hold this claim: it can only observe the call sites that exist when it is written.
 
-The rule is deliberately stronger than redacting known-sensitive types. `internal/notification/domain.Secret` protects itself through `fmt`, and the aggregates that hold one as a plain field — `PreferenceIntent` and `NotificationPreference` — are protected only because `fmt` cannot call a method on a struct field. A JSON encoder has no such limitation, and `Secret`'s deliberate marshalling error would discard the entire record rather than redact one field of it. Foreclosing the arbitrary-value path removes the question instead of answering it per type.
+The rule is deliberately stronger than redacting known-sensitive types, and for two reasons rather than one.
+
+A value that **does** defend itself is not the problem. `internal/notification/domain.Secret` refuses to be marshalled, and under a JSON encoder that refusal costs the whole attribute — the record is still emitted, with an error marker in that field's place, and every sibling field nested inside it lost with it. That is a silent diagnostic loss, not a leak.
+
+A value that does **not** defend itself is the problem. A JSON encoder walks exported fields directly, with no opportunity for the type to intervene, so any domain value carrying a user-supplied connection target is written out verbatim — a destination URL's query string included, which is the one place this system documents a credential legitimately living. Foreclosing the arbitrary-value path removes both questions instead of answering them per type, and it is the only formulation that covers the types nobody has thought to defend yet.
 
 This rule governs how a *value* reaches a record. It does not govern an error's own text, which remains subject to the existing prohibitions in `notification-webhook-delivery` and `notification-email-delivery`: a recorded reason and every log line on the delivery path are built from a classified error of this system's own, never from a transport error, whose `*url.Error` rendering would carry a destination's query string.
 
