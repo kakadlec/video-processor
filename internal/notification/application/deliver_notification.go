@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"video-processor/internal/notification/domain"
@@ -59,22 +59,26 @@ type DeliverNotification struct {
 	deliverer   domain.Deliverer
 	clock       Clock
 	config      DeliveryConfig
-	logger      *log.Logger
+	logger      *slog.Logger
 }
 
 // NewDeliverNotification wires the use case to its ports. A nil logger means
-// the standard one.
+// the process default the composition root installed.
 func NewDeliverNotification(
 	preferences domain.PreferenceRepository,
 	deliveries domain.DeliveryRepository,
 	deliverer domain.Deliverer,
 	clock Clock,
 	config DeliveryConfig,
-	logger *log.Logger,
+	logger *slog.Logger,
 ) *DeliverNotification {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.Default()
 	}
+	// Bound on the injected logger rather than through a package helper:
+	// the injection point exists so a test can read what this use case
+	// emits, and reaching for the default here would bypass it.
+	logger = logger.With(slog.String("component", "delivery"))
 	return &DeliverNotification{
 		preferences: preferences,
 		deliveries:  deliveries,
@@ -134,8 +138,10 @@ func (uc *DeliverNotification) deliverOne(ctx context.Context, preference *domai
 	if err != nil {
 		// A preference and an event that together cannot name a delivery is
 		// a defect in what is stored, and no redelivery repairs it.
-		uc.logger.Printf("notification: cannot identify a delivery for job %s on channel %s: %v",
-			event.JobID(), preference.Channel(), err)
+		uc.logger.Error("a stored preference and this event cannot name a delivery",
+			slog.String("job_id", event.JobID().String()),
+			slog.String("channel", preference.Channel().String()),
+			slog.String("error", err.Error()))
 		return DeliveryHandled, nil
 	}
 
@@ -162,8 +168,9 @@ func (uc *DeliverNotification) deliverOne(ctx context.Context, preference *domai
 		// prefetch 1, is that an abandoned claim stalls the queue for the
 		// reclaim bound — which is why DeliveryConfig sizes that bound
 		// tightly rather than generously.
-		uc.logger.Printf("notification: delivery for job %s on channel %s is claimed by another consumer; deferring",
-			event.JobID(), preference.Channel())
+		uc.logger.Warn("the delivery is claimed by another consumer; deferring",
+			slog.String("job_id", event.JobID().String()),
+			slog.String("channel", preference.Channel().String()))
 		return DeliveryDeferred, nil
 	default:
 		// Not a claim outcome at all. Nothing was attempted, so deferring is
@@ -231,9 +238,18 @@ func (uc *DeliverNotification) attempt(ctx context.Context, preference *domain.N
 // resolve: an accounting loss, accepted because every alternative is worse,
 // and visible in the table rather than silent.
 func (uc *DeliverNotification) record(ctx context.Context, delivery domain.Delivery, preference *domain.NotificationPreference, event domain.TerminalEvent, status string, attempts int, reason string) {
+	lg := uc.logger.With(
+		slog.String("delivery_id", delivery.ID().String()),
+		slog.String("user_id", preference.UserID().String()),
+		slog.String("event_type", event.EventType().String()),
+		slog.String("channel", preference.Channel().String()),
+		slog.String("job_id", event.JobID().String()),
+	)
+
 	parsed, err := domain.ParseDeliveryStatus(status)
 	if err != nil {
-		uc.logger.Printf("notification: delivery %s carries an unrecognized status %q and cannot be recorded", delivery.ID(), status)
+		lg.Error("the delivery carries an unrecognized status and cannot be recorded",
+			slog.String("status", status))
 		return
 	}
 
@@ -261,18 +277,28 @@ func (uc *DeliverNotification) record(ctx context.Context, delivery domain.Deliv
 			// The fence refused the write, so a successor owns this
 			// delivery and its outcome is the one that counts. Retrying
 			// would only lose again.
-			uc.logger.Printf("notification: delivery %s for %s/%s/%s was superseded before its outcome could be recorded",
-				delivery.ID(), preference.UserID(), event.EventType(), preference.Channel())
+			lg.Warn("the delivery was superseded before its outcome could be recorded")
 			return
 		}
 
-		uc.logger.Printf("notification: delivery %s for %s/%s/%s on job %s recorded as %s after %d attempt(s)%s",
-			delivery.ID(), preference.UserID(), event.EventType(), preference.Channel(), event.JobID(), status, attempts, suffixFor(reason))
+		lg.Info("the delivery outcome was recorded",
+			slog.String("status", status),
+			slog.Int("attempts", attempts),
+			slog.String("reason", reason))
 		return
 	}
 
-	uc.logger.Printf("notification: delivery %s for %s/%s/%s on job %s ended as %s but could not be recorded; the outcome is lost: %v",
-		delivery.ID(), preference.UserID(), event.EventType(), preference.Channel(), event.JobID(), status, lastErr)
+	// lastErr is nil when the loop never ran, which a non-positive resolve
+	// budget allows; %v rendered that, err.Error() would panic on it.
+	resolveError := ""
+	if lastErr != nil {
+		resolveError = lastErr.Error()
+	}
+	lg.Error("the delivery outcome could not be recorded and is lost",
+		slog.String("status", status),
+		slog.Int("attempts", attempts),
+		slog.String("reason", reason),
+		slog.String("error", resolveError))
 }
 
 // reasonFor renders what is stored and logged about a failure.
@@ -293,15 +319,6 @@ func reasonFor(err error) string {
 	// The port admits only *DeliveryError. Anything else could be carrying
 	// anything, so its text is dropped rather than stored.
 	return "notification: delivery failed (unclassified)"
-}
-
-// suffixFor appends a failure's reason to a log line, and nothing to a
-// success's.
-func suffixFor(reason string) string {
-	if reason == "" {
-		return ""
-	}
-	return ": " + reason
 }
 
 // pause waits, and reports whether the wait completed. It is the one place
