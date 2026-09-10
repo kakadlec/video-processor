@@ -525,7 +525,7 @@ func captureLogs(t *testing.T) *syncBuffer {
 // Every captured line must decode as a JSON object: a line that does not is
 // an unstructured escape hatch, and skipping past it would let these
 // assertions pass while the worker logged through something else.
-func hasRecord(t *testing.T, captured string, want map[string]string) bool {
+func hasRecord(t *testing.T, captured string, want map[string]any) bool {
 	t.Helper()
 
 	for _, line := range strings.Split(strings.TrimSpace(captured), "\n") {
@@ -538,7 +538,7 @@ func hasRecord(t *testing.T, captured string, want map[string]string) bool {
 		}
 		matched := true
 		for key, value := range want {
-			if got, ok := record[key].(string); !ok || got != value {
+			if !attributeEquals(t, record[key], value) {
 				matched = false
 				break
 			}
@@ -548,6 +548,25 @@ func hasRecord(t *testing.T, captured string, want map[string]string) bool {
 		}
 	}
 	return false
+}
+
+// attributeEquals compares one decoded attribute against what a test asked
+// for. JSON decodes every number into a float64, so an integer attribute
+// never compares equal to the int a caller wrote without this.
+func attributeEquals(t *testing.T, got, want any) bool {
+	t.Helper()
+
+	switch expected := want.(type) {
+	case string:
+		actual, ok := got.(string)
+		return ok && actual == expected
+	case int:
+		actual, ok := got.(float64)
+		return ok && int(actual) == expected
+	default:
+		t.Fatalf("unsupported attribute type %T", want)
+		return false
+	}
 }
 
 // declaredPublisher declares topo and opens a publisher on it, the way the
@@ -924,7 +943,7 @@ func TestHandle_TerminalWriteFailureLeavesTheJobProcessing(t *testing.T) {
 		t.Fatalf("result %s is missing; the extraction is supposed to have succeeded", resultKey.String())
 	}
 	written := logs.String()
-	if !hasRecord(t, written, map[string]string{"job_id": job.ID().String(), "storage_key": resultKey.String()}) {
+	if !hasRecord(t, written, map[string]any{"job_id": job.ID().String(), "storage_key": resultKey.String()}) {
 		t.Fatalf("no record names both the job and its result key; got:\n%s", written)
 	}
 }
@@ -1068,7 +1087,7 @@ func TestRun_DrainDeadlineExpiresNamingTheInFlightJob(t *testing.T) {
 	}
 
 	written := logs.String()
-	if !hasRecord(t, written, map[string]string{
+	if !hasRecord(t, written, map[string]any{
 		"job_id": job.ID().String(),
 		"status": string(videodomain.JobStatusProcessing),
 	}) {
