@@ -4,9 +4,9 @@ import (
 	"context"
 	"embed"
 	"errors"
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"video-processor/internal/platform/logging"
 	platformratelimit "video-processor/internal/platform/ratelimit"
 )
 
@@ -34,21 +35,38 @@ const readHeaderTimeout = 10 * time.Second
 var webFS embed.FS
 
 func main() {
+	// The severity is read, and the process logger installed, before any
+	// other configuration: every remaining startup failure is then reportable
+	// as a structured record.
+	level, err := logging.ParseLevel(os.Getenv(logging.LevelEnvVar))
+	if err != nil {
+		logging.NewBootstrap(logging.ServiceVideoAPI).Error("the configured log severity is unrecognized",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	slog.SetDefault(logging.New(logging.ServiceVideoAPI, level))
+
 	ctx := context.Background()
 
 	auth, err := setupAuthenticator()
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the token verifier could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	video, videoDB, redisClient, relay, err := setupVideo(ctx)
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the video module could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	rateLimitConfig, err := platformratelimit.LoadConfigFromEnv()
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the rate limiter could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 	limiter := platformratelimit.NewLimiter(redisClient, rateLimitConfig)
 
@@ -67,7 +85,8 @@ func main() {
 	go func() {
 		defer relayDone.Done()
 		if err := relay.Run(relayCtx); err != nil {
-			log.Printf("video: outbox relay: %v", err)
+			logger(componentOutboxRelay).Error("the outbox relay returned an error",
+				slog.String("error", err.Error()))
 		}
 	}()
 
@@ -82,8 +101,8 @@ func main() {
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
-	fmt.Println("🎬 Servidor iniciado na porta 8080")
-	fmt.Println("📂 Acesse: http://localhost:8080")
+	logger(componentHTTPServer).Info("the video API is listening", slog.String("addr", server.Addr))
+	logger(componentHTTPServer).Info("the frontend is served at the root path", slog.String("path", "/"))
 
 	serverFailed := make(chan error, 1)
 	go func() {
@@ -96,16 +115,16 @@ func main() {
 	select {
 	case err := <-serverFailed:
 		if err != nil {
-			log.Printf("http server: %v", err)
+			logger(componentHTTPServer).Error("the HTTP server stopped", slog.String("error", err.Error()))
 		}
 	case <-signalCtx.Done():
-		log.Print("shutdown signal received")
+		logger(componentProcessShutdown).Info("a shutdown signal was received")
 	}
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, shutdownTimeout)
 	defer cancelShutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("http server shutdown: %v", err)
+		logger(componentHTTPServer).Error("shutting the HTTP server down failed", slog.String("error", err.Error()))
 	}
 
 	// Ordering is load-bearing, not stylistic: the relay holds an open
@@ -118,7 +137,7 @@ func main() {
 
 	closeDB(videoDB)
 	if err := redisClient.Close(); err != nil {
-		log.Printf("close redis: %v", err)
+		logger(componentProcessShutdown).Warn("closing the Redis client failed", slog.String("error", err.Error()))
 	}
 	// MinIO is absent on purpose: that adapter exposes no teardown, because
 	// *minio.Client has none — a wrapper could only report success while

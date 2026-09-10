@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
@@ -43,7 +43,7 @@ func (systemClock) Now() time.Time { return time.Now() }
 // and on shutdown, where nothing is left to return it to.
 func closeDB(db *sql.DB) {
 	if err := db.Close(); err != nil {
-		log.Printf("video: close postgres: %v", err)
+		logger(componentProcessShutdown).Warn("closing the PostgreSQL pool failed", slog.String("error", err.Error()))
 	}
 }
 
@@ -419,7 +419,7 @@ func (m *videoModule) handleDownload(c *gin.Context) {
 	if !ok {
 		// requireBearerAuth gates this route, so reaching here means the
 		// router was misconfigured rather than that the caller is anonymous.
-		log.Print("download: no authenticated user on a bearer-gated route")
+		logger(componentResultDownload).Error("no authenticated user on a bearer-gated route")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal error"})
 		return
 	}
@@ -439,7 +439,9 @@ func (m *videoModule) handleDownload(c *gin.Context) {
 	job, err := m.jobs.FindByID(c.Request.Context(), jobID)
 	if err != nil {
 		if !errors.Is(err, videodomain.ErrVideoJobNotFound) {
-			log.Printf("download: look up job %s: %v", jobID.String(), err)
+			logger(componentResultDownload).Error("looking up the job failed",
+				slog.String("job_id", jobID.String()),
+				slog.String("error", err.Error()))
 		}
 		respondArtifactNotFound(c)
 		return
@@ -460,7 +462,9 @@ func (m *videoModule) handleDownload(c *gin.Context) {
 	// cases take the same path for that reason.
 	if _, _, err := m.results.Stat(c.Request.Context(), key); err != nil {
 		if !errors.Is(err, videodomain.ErrResultNotFound) {
-			log.Printf("download: stat result %s: %v", key.String(), err)
+			logger(componentResultDownload).Error("stat of the stored result failed",
+				slog.String("storage_key", key.String()),
+				slog.String("error", err.Error()))
 		}
 		respondArtifactNotFound(c)
 		return
@@ -470,7 +474,9 @@ func (m *videoModule) handleDownload(c *gin.Context) {
 	if err != nil {
 		// The key, never the URL: the URL is the credential this call just
 		// minted, and the wrapped error names the endpoint and bucket.
-		log.Printf("download: presign result %s: %v", key.String(), err)
+		logger(componentResultDownload).Error("presigning the result failed",
+			slog.String("storage_key", key.String()),
+			slog.String("error", err.Error()))
 		respondArtifactNotFound(c)
 		return
 	}
@@ -485,7 +491,7 @@ func (m *videoModule) handleDownload(c *gin.Context) {
 func (m *videoModule) handleStatus(c *gin.Context) {
 	userID, ok := authenticatedUserID(c)
 	if !ok {
-		log.Print("status: no authenticated user on a bearer-gated route")
+		logger(componentResultListing).Error("no authenticated user on a bearer-gated route")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal error"})
 		return
 	}
@@ -494,7 +500,7 @@ func (m *videoModule) handleStatus(c *gin.Context) {
 		UserID: userID.String(),
 	})
 	if err != nil {
-		log.Printf("status: list results for user: %v", err)
+		logger(componentResultListing).Error("listing the results failed", slog.String("error", err.Error()))
 		c.JSON(500, gin.H{"error": "Erro ao listar arquivos"})
 		return
 	}
@@ -576,7 +582,9 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	if err := m.sources.Put(c.Request.Context(), sourceKey, io.TeeReader(file, hasher)); err != nil {
 		// The adapter's error names the endpoint and bucket; log it, never
 		// render it.
-		log.Printf("store source %s: %v", sourceKey.String(), err)
+		logger(componentVideoUpload).Error("storing the source object failed",
+			slog.String("source_key", sourceKey.String()),
+			slog.String("error", err.Error()))
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Failed to store the uploaded file",
@@ -614,7 +622,9 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		cleanupCtx, cancel := videoapplication.NewFinalizationContext()
 		defer cancel()
 		if err := m.sources.Delete(cleanupCtx, sourceKey); err != nil {
-			log.Printf("delete source %s: %v", sourceKey.String(), err)
+			logger(componentVideoUpload).Warn("deleting the source object failed",
+				slog.String("source_key", sourceKey.String()),
+				slog.String("error", err.Error()))
 		}
 	}()
 	contentHash := hex.EncodeToString(hasher.Sum(nil))
@@ -624,7 +634,9 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		// Unreachable in practice: userID.String() is already validated
 		// non-empty above, and contentHash is always a 64-char SHA-256
 		// digest. Handled defensively rather than assumed.
-		log.Printf("build idempotency key for upload %s: %v", sourceKey.String(), err)
+		logger(componentVideoUpload).Error("building the idempotency key failed",
+			slog.String("source_key", sourceKey.String()),
+			slog.String("error", err.Error()))
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Internal error building idempotency key",
@@ -644,7 +656,9 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	var hasReservation bool
 	switch {
 	case err != nil:
-		log.Printf("idempotency reserve for upload %s: %v", sourceKey.String(), err)
+		logger(componentVideoUpload).Warn("reserving the idempotency key failed; proceeding without a reservation",
+			slog.String("source_key", sourceKey.String()),
+			slog.String("error", err.Error()))
 	case !reserved:
 		if jobID, found := m.waitForFinalizedIdempotencyKey(c.Request.Context(), idemKey); found {
 			status, err := m.getJobStatus.Execute(c.Request.Context(), videoapplication.GetJobStatusInput{
@@ -652,7 +666,9 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 				JobID:            jobID.String(),
 			})
 			if err != nil {
-				log.Printf("get job status for duplicate upload %s: %v", sourceKey.String(), err)
+				logger(componentVideoUpload).Error("reading the existing job's status for a duplicate upload failed",
+					slog.String("source_key", sourceKey.String()),
+					slog.String("error", err.Error()))
 				c.JSON(500, ProcessingResult{
 					Success: false,
 					Message: "Failed to retrieve existing job status",
@@ -696,11 +712,16 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		if hasReservation {
 			clearCtx, cancel := videoapplication.NewFinalizationContext()
 			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-				log.Printf("clear idempotency reservation after CreateVideoJob error for upload %s: cleared=%v err=%v", sourceKey.String(), cleared, clearErr)
+				logger(componentVideoUpload).Warn("clearing the idempotency reservation after a failed job creation did not succeed",
+					slog.String("source_key", sourceKey.String()),
+					slog.Bool("cleared", cleared),
+					slog.String("error", errorText(clearErr)))
 			}
 			cancel()
 		}
-		log.Printf("create video job for upload %s: %v", sourceKey.String(), err)
+		logger(componentVideoUpload).Error("creating the video job failed",
+			slog.String("source_key", sourceKey.String()),
+			slog.String("error", err.Error()))
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Erro ao registrar o processamento",
@@ -723,11 +744,16 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		if hasReservation {
 			clearCtx, cancel := videoapplication.NewFinalizationContext()
 			if cleared, clearErr := m.idempotency.Clear(clearCtx, idemKey, token); clearErr != nil || !cleared {
-				log.Printf("clear idempotency reservation after EnqueueVideoJob error for upload %s: cleared=%v err=%v", sourceKey.String(), cleared, clearErr)
+				logger(componentVideoUpload).Warn("clearing the idempotency reservation after a failed enqueue did not succeed",
+					slog.String("source_key", sourceKey.String()),
+					slog.Bool("cleared", cleared),
+					slog.String("error", errorText(clearErr)))
 			}
 			cancel()
 		}
-		log.Printf("enqueue video job %s: %v", created.JobID, err)
+		logger(componentVideoUpload).Error("enqueueing the video job failed",
+			slog.String("job_id", created.JobID),
+			slog.String("error", err.Error()))
 		c.JSON(500, ProcessingResult{
 			Success: false,
 			Message: "Failed to queue the video for processing",
@@ -761,9 +787,14 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	// finalize.
 	if hasReservation {
 		if jobID, err := videodomain.NewVideoJobID(created.JobID); err != nil {
-			log.Printf("invalid job id returned from CreateVideoJob for upload %s: %v", sourceKey.String(), err)
+			logger(componentVideoUpload).Error("the created job's id could not be parsed",
+				slog.String("source_key", sourceKey.String()),
+				slog.String("error", err.Error()))
 		} else if finalized, err := m.idempotency.Finalize(c.Request.Context(), idemKey, token, jobID); err != nil || !finalized {
-			log.Printf("finalize idempotency key for job %s: finalized=%v err=%v", created.JobID, finalized, err)
+			logger(componentVideoUpload).Warn("finalizing the idempotency key did not succeed",
+				slog.String("job_id", created.JobID),
+				slog.Bool("finalized", finalized),
+				slog.String("error", errorText(err)))
 		}
 	}
 
@@ -786,7 +817,8 @@ func (m *videoModule) waitForFinalizedIdempotencyKey(ctx context.Context, key vi
 	for {
 		jobID, found, err := m.idempotency.Lookup(ctx, key)
 		if err != nil {
-			log.Printf("idempotency lookup while waiting for reservation to resolve: %v", err)
+			logger(componentVideoUpload).Warn("looking the idempotency key up while waiting for a reservation to resolve failed",
+				slog.String("error", err.Error()))
 		} else if found {
 			return jobID, true
 		}
@@ -823,7 +855,7 @@ func (m *videoModule) handleCreateVideoJob(c *gin.Context) {
 		case errors.Is(err, videodomain.ErrInvalidOriginalFilename):
 			c.JSON(http.StatusBadRequest, videoErrorResponse{Error: "invalid original filename"})
 		default:
-			log.Printf("create video job: %v", err)
+			logger(componentJobCreation).Error("creating the video job failed", slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, videoErrorResponse{Error: "internal server error"})
 		}
 		return
@@ -855,7 +887,7 @@ func (m *videoModule) handleGetVideoJobStatus(c *gin.Context) {
 		case errors.Is(err, videodomain.ErrVideoJobNotFound):
 			c.JSON(http.StatusNotFound, videoErrorResponse{Error: "job not found"})
 		default:
-			log.Printf("get video job status: %v", err)
+			logger(componentJobStatus).Error("reading the video job's status failed", slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, videoErrorResponse{Error: "internal server error"})
 		}
 		return
@@ -898,7 +930,7 @@ func (m *videoModule) handleListVideoJobs(c *gin.Context) {
 		case errors.Is(err, videoapplication.ErrLimitOutOfRange), errors.Is(err, videoapplication.ErrOffsetNegative):
 			c.JSON(http.StatusBadRequest, videoErrorResponse{Error: err.Error()})
 		default:
-			log.Printf("list video jobs: %v", err)
+			logger(componentJobListing).Error("listing the video jobs failed", slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, videoErrorResponse{Error: "internal server error"})
 		}
 		return
