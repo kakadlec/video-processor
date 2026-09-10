@@ -9,13 +9,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"video-processor/internal/video/domain"
 )
+
+// cacheLogger returns the process logger with this adapter's component
+// bound. It resolves the default per call rather than binding one at package
+// scope: the composition root installs the process logger inside main, long
+// after this package's variables are initialized.
+func cacheLogger() *slog.Logger {
+	return slog.Default().With(slog.String("component", "cache"))
+}
 
 // detachedCleanupTimeout bounds a context deliberately independent of the
 // caller's own request context — used only for Update's post-commit cache
@@ -230,27 +238,37 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 		return nil, false
 	}
 	if err != nil {
-		log.Printf("video: cache: get %s: %v", id.String(), err)
+		cacheLogger().Warn("reading the cache entry failed",
+			slog.String("job_id", id.String()),
+			slog.String("error", err.Error()))
 		if delErr := deleteIfWrongTypeScript.Run(ctx, r.client, []string{key}).Err(); delErr != nil {
-			log.Printf("video: cache: delete wrong-type entry %s: %v", key, delErr)
+			cacheLogger().Warn("deleting a wrong-type cache entry failed",
+				slog.String("cache_key", key),
+				slog.String("error", delErr.Error()))
 		}
 		return nil, false
 	}
 
 	var rec cachedJobRecord
 	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
-		log.Printf("video: cache: unmarshal %s: %v", id.String(), err)
+		cacheLogger().Warn("decoding the cache entry failed",
+			slog.String("job_id", id.String()),
+			slog.String("error", err.Error()))
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
 	if rec.ID != id.String() {
-		log.Printf("video: cache: id mismatch for key %s: stored id %q", key, rec.ID)
+		cacheLogger().Warn("the cache entry names a different job",
+			slog.String("cache_key", key),
+			slog.String("stored_job_id", rec.ID))
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
 	job, err := rec.toVideoJob(r.idParser)
 	if err != nil {
-		log.Printf("video: cache: reconstruct %s: %v", id.String(), err)
+		cacheLogger().Warn("reconstructing the job from the cache entry failed",
+			slog.String("job_id", id.String()),
+			slog.String("error", err.Error()))
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
@@ -259,7 +277,9 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 
 func (r *CachedVideoJobRepository) deleteMalformedIfUnchanged(ctx context.Context, key, malformedValue string) {
 	if err := deleteMalformedIfUnchangedScript.Run(ctx, r.client, []string{key}, malformedValue).Err(); err != nil {
-		log.Printf("video: cache: delete malformed entry %s: %v", key, err)
+		cacheLogger().Warn("deleting a malformed cache entry failed",
+			slog.String("cache_key", key),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -279,11 +299,15 @@ func (r *CachedVideoJobRepository) deleteMalformedIfUnchanged(ctx context.Contex
 func (r *CachedVideoJobRepository) writeCacheIfAbsent(ctx context.Context, job *domain.VideoJob) {
 	data, err := json.Marshal(newCachedJobRecord(job))
 	if err != nil {
-		log.Printf("video: cache: marshal %s: %v", job.ID().String(), err)
+		cacheLogger().Warn("encoding the cache entry failed",
+			slog.String("job_id", job.ID().String()),
+			slog.String("error", err.Error()))
 		return
 	}
 	if err := r.client.SetNX(ctx, cacheKey(job.ID()), data, entryTTL).Err(); err != nil {
-		log.Printf("video: cache: setnx %s: %v", job.ID().String(), err)
+		cacheLogger().Warn("populating the cache entry failed",
+			slog.String("job_id", job.ID().String()),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -344,7 +368,9 @@ func (r *CachedVideoJobRepository) invalidateAfterAmbiguousWrite(id domain.Video
 	cleanupCtx, cancel := detachedCleanupContext()
 	defer cancel()
 	if err := r.client.Del(cleanupCtx, cacheKey(id)).Err(); err != nil {
-		log.Printf("video: cache: invalidate %s: %v", id.String(), err)
+		cacheLogger().Warn("invalidating the cache entry failed",
+			slog.String("job_id", id.String()),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -504,20 +530,28 @@ return 0
 func (r *CachedVideoJobRepository) writeThrough(record cachedJobRecord) {
 	data, err := json.Marshal(record)
 	if err != nil {
-		log.Printf("video: cache: marshal %s: %v", record.ID, err)
+		cacheLogger().Warn("encoding the cache entry failed",
+			slog.String("job_id", record.ID),
+			slog.String("error", err.Error()))
 		return
 	}
 	id, err := r.idParser.ParseVideoJobID(record.ID)
 	if err != nil {
-		log.Printf("video: cache: write-through id %s: %v", record.ID, err)
+		cacheLogger().Warn("parsing the job id for a write-through failed",
+			slog.String("job_id", record.ID),
+			slog.String("error", err.Error()))
 		return
 	}
 	cleanupCtx, cancel := detachedCleanupContext()
 	defer cancel()
 	if err := writeThroughIfCurrentScript.Run(cleanupCtx, r.client, []string{cacheKey(id)}, data, entryTTL.Milliseconds()).Err(); err != nil {
-		log.Printf("video: cache: write-through set %s: %v", record.ID, err)
+		cacheLogger().Warn("the write-through cache update failed",
+			slog.String("job_id", record.ID),
+			slog.String("error", err.Error()))
 		if delErr := r.client.Del(cleanupCtx, cacheKey(id)).Err(); delErr != nil {
-			log.Printf("video: cache: write-through fallback delete %s: %v", record.ID, delErr)
+			cacheLogger().Warn("the write-through fallback delete failed",
+				slog.String("job_id", record.ID),
+				slog.String("error", delErr.Error()))
 		}
 	}
 }
