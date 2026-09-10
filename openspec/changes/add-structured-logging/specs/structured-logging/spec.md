@@ -36,7 +36,7 @@ Value-producing calls (`fmt.Errorf`, `fmt.Sprintf`) are unaffected: they build a
 
 Every record SHALL carry a field identifying the service that emitted it **and** a field identifying the individual process instance, both bound once at that process's startup rather than supplied by each call site. A shared `internal/` package logging on behalf of a process SHALL inherit both without being told what process it is running in.
 
-Two fields, not one, because they answer different questions and the second cannot be derived from the first. `docker-compose.yml` runs **three replicas of `cmd/worker`**, and they all carry the same service name: attributing a record to "a worker" does not say which of the three, which is precisely what is needed when one replica misbehaves or when two are seen working on the same job. The instance identifier SHALL be stable for the life of the process and SHALL be derived from something the runtime already assigns — the container hostname under Docker — rather than generated per record.
+Two fields, not one, because they answer different questions and the second cannot be derived from the first. `docker-compose.yml` runs **three replicas of `cmd/worker`**, and they all carry the same service name: attributing a record to "a worker" does not say which of the three, which is precisely what is needed when one replica misbehaves or when two are seen working on the same job. The instance identifier SHALL be stable for the life of the process, SHALL be resolved once at startup rather than per record, and SHALL identify the **process**, not merely the machine it runs on. A hostname alone does not: under Docker each container has its own, but the documented `go run ./cmd/worker` path runs binaries directly, where two workers on one host share a hostname and would be indistinguishable — the exact case this field exists for. It SHALL therefore combine the hostname with a per-process component (the process identifier, or a value generated at startup), so that two processes of the same binary on one host always differ.
 
 The service identifiers SHALL be a closed, canonical set fixed in one place: `identity-api`, `video-api`, `notification-api`, `worker`, `notifier`. These are the binary names, which are also the deployment's own service names, so a filter written against a record matches what an operator already types. They SHALL NOT carry the `cmd/` prefix, which names where the source lives rather than what is running.
 
@@ -52,16 +52,21 @@ This is what makes one aggregated stream readable: `docker-compose.yml` runs thr
 - **WHEN** more than one replica of the same service runs against one collected stream
 - **THEN** every record can be attributed to both the service and the individual replica that produced it, and two records from different replicas are distinguishable by field rather than by inference
 
+#### Scenario: Two processes of one binary on one host
+
+- **WHEN** two processes of the same binary are started directly on one machine, sharing a hostname
+- **THEN** their records still carry different instance values
+
 ### Requirement: One Record Format In Every Environment
 
-The record format SHALL be JSON, in every environment, and SHALL NOT be selectable by configuration. No alternative human-readable or console format SHALL be offered.
+The record format SHALL be JSON, in every environment, and SHALL NOT be selectable by configuration. No alternative human-readable or console format SHALL be offered. Records SHALL be written to **standard output**, and that destination is part of this requirement rather than an implementation detail: this document is what survives the change, so a destination left unconstrained here would let a later edit move the stream back to standard error while every permanent requirement still passed. Standard output also matches the gateway's own split, where the access log goes to standard output and only the runtime's own errors to standard error.
 
 The reason is not presentation. The non-disclosure guarantee below is a property of how a specific encoder reaches a value, and the two candidate encoders reach values by opposite paths — verified against the implementation rather than assumed. A JSON encoder walks a value's exported fields directly, so a domain value that declines to defend itself is serialized verbatim; a text renderer consults the type's own rendering, where `internal/notification/domain.Secret`'s defences live. Conversely, a value the JSON encoder refuses does not discard the record: the attribute becomes an error marker and every sibling field nested inside it is lost, which the text renderer would have shown. The two therefore fail in opposite directions, and a configurable format would mean the guarantee holds under whichever encoder was verified and is untested under the other — in the environment where a developer is least likely to be watching for it.
 
 #### Scenario: The format cannot be switched
 
 - **WHEN** a process starts under any configuration this repository documents
-- **THEN** it emits JSON records, and no configuration value changes that
+- **THEN** it emits JSON records on standard output, and no configuration value changes either the format or the destination
 
 ### Requirement: The Logger Is Configured Once Per Composition Root
 
@@ -118,6 +123,8 @@ An access record SHALL carry the request method, the matched route, the response
 
 An access record SHALL NOT carry the request's query string, any request or response header, or any part of either body.
 
+The **request method** is caller-supplied on the request line and is not drawn from a closed set by the transport: an unmatched request may carry an arbitrary token of arbitrary length, and it reaches the access record before any authentication or rate limit. It SHALL therefore be recorded verbatim only when it is a recognized HTTP method, and otherwise replaced by a fixed marker. Bounding the path while logging the method unchecked would leave the record unbounded on the same request, through the field beside it.
+
 The **matched route** is the route template, which is bounded by the router's own definition and is therefore the field that can always be recorded. The **request path** SHALL be recorded only when no route matched, and SHALL be truncated to a fixed bound before it is. The distinction is load-bearing rather than fussy: the access middleware runs for unmatched requests too, so on that path the value is arbitrary caller-supplied text of arbitrary length — the same objection that excludes the query string, which would otherwise be excluded on a rule the path escapes. Retaining a bounded copy for the unmatched case keeps the one diagnostic that case exists to give, which is what was asked for.
 
 Nothing is lost for a matched request: its path adds only the parameter values, and every one of them is already recorded elsewhere by the handler that used it.
@@ -133,8 +140,8 @@ No recovered panic SHALL produce output outside the record. A framework's own re
 
 #### Scenario: A request matches no route
 
-- **WHEN** a request arrives for a path no route matches, of any length
-- **THEN** the access record carries the request path truncated to the fixed bound, and the record's size is bounded regardless of the request's
+- **WHEN** a request arrives for a path no route matches, of any length, carrying a method that is not a recognized HTTP method
+- **THEN** the access record carries the request path truncated to the fixed bound and a fixed marker in place of the method, and the record's size is bounded regardless of the request's
 
 #### Scenario: A request carries a query string
 

@@ -75,7 +75,7 @@ Each of `cmd/identity-api`, `cmd/video-api` and `cmd/notification-api` gets its 
 
 ### 5. The access log records the matched route always, the raw path only when nothing matched, and the query string never
 
-The middleware records method, gin's matched route template, status, latency, response size, and the authenticated subject where the request carries one. It does **not** record the query string, any header, or any body — and it does not record the request path either, except in one case.
+The middleware records the method, gin's matched route template, status, latency, response size, and the authenticated subject where the request carries one. The **method is checked against the recognized HTTP methods and replaced by a fixed marker when it is not one** — it is caller-supplied on the request line, an unmatched request may carry an arbitrary token of any length, and bounding the path while logging the method beside it unchecked would leave the same record unbounded through the adjacent field. It does **not** record the query string, any header, or any body — and it does not record the request path either, except in one case.
 
 The first draft recorded the path unconditionally, justified as "a path segment is a storage key at worst". That justification only holds for a request that **matched a route**. The middleware is global, so it also runs for requests that matched nothing, and there the path is arbitrary caller-supplied text of arbitrary length — indistinguishable in kind from the query string this decision excludes, which would leave the exclusion resting on a rule the path walks around. A caller could put a megabyte, or a credential, in a 404's path.
 
@@ -103,7 +103,9 @@ A level that will not parse is therefore the one failure that occurs before ther
 
 ### 7a. Service **and** instance identity, both bound at startup
 
-Two fields. `service` names the binary; `instance` names the process, taken from the container hostname (`os.Hostname()`, which under Docker is the container id) with a generated fallback when that is unavailable.
+Two fields. `service` names the binary; `instance` names the **process** — `os.Hostname()` (the container id under Docker) combined with the process identifier, with a generated value when the hostname is unavailable.
+
+The hostname alone was the first draft and is not enough: it identifies a container, and the documented `go run ./cmd/worker` path runs binaries directly, where two workers on one machine share a hostname and would collide in exactly the field that exists to tell them apart. Under Docker the pid adds nothing, since each container is its own namespace — but it costs nothing there either, and it is what makes the guarantee hold off Docker.
 
 The second is not decoration and is not derivable from the first: `docker-compose.yml` sets `deploy.replicas: 3` on `cmd/worker`, so three processes emit records under one service name into one collected stream. A reader asking "did two workers touch this job" or "is one replica failing while the others are fine" cannot answer it from a service field. Binding it once at startup rather than per call site is what makes it free.
 
@@ -119,9 +121,11 @@ Recovery is **written here rather than delegated to `gin.CustomRecovery`**, and 
 
 Passing `nil` as the writer silences the block and introduces a different defect: the broken-pipe branch (`EPIPE`, `ECONNRESET`, `http.ErrAbortHandler`) calls `c.Error` and `c.Abort` and never reaches the supplied handler at all, so that class of panic would be recorded nowhere — worse than today, where gin at least prints it. Twenty lines written here keep both properties: every recovered panic yields one record at `error` with the panic value and the stack as strings, and each branch's existing response is preserved — no body on a dead connection, the existing `500` otherwise.
 
-### 9. Records go to stdout
+### 9. Records go to stdout, and the spec says so
 
 Today's output is stderr, via the `log` package's default. All records move to stdout, matching the gateway's own split (`access_log /dev/stdout`) and the convention that stdout carries the application's output while stderr carries the runtime's. Under Docker both are captured, so nothing observable changes locally; it matters to a collector that distinguishes them.
+
+The destination is stated in the **capability spec**, not only here. This document is discarded at archive time and the spec is promoted, so a destination that lived only in a design decision would leave a later move back to stderr satisfying every permanent requirement.
 
 ## Risks / Trade-offs
 
