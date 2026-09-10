@@ -9,8 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -503,16 +502,52 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// captureLogs tees the standard logger into a buffer. The worker reports
-// several outcomes only by logging them, so for those the log line is the
+// captureLogs redirects the process logger into a buffer. The worker reports
+// several outcomes only by logging them, so for those the record is the
 // observable behaviour rather than a convenience.
+//
+// It replaces the process-wide default logger, which is shared state exactly
+// as log.SetOutput's destination was: a test that calls this must not run in
+// parallel with one that reads the default's output.
 func captureLogs(t *testing.T) *syncBuffer {
 	t.Helper()
 	buf := &syncBuffer{}
-	previous := log.Writer()
-	log.SetOutput(io.MultiWriter(previous, buf))
-	t.Cleanup(func() { log.SetOutput(previous) })
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
 	return buf
+}
+
+// hasRecord reports whether any captured record carries every attribute in
+// want. Matching on attributes rather than on a message substring is what
+// makes the assertion survive the next rewording of the message.
+//
+// Every captured line must decode as a JSON object: a line that does not is
+// an unstructured escape hatch, and skipping past it would let these
+// assertions pass while the worker logged through something else.
+func hasRecord(t *testing.T, captured string, want map[string]string) bool {
+	t.Helper()
+
+	for _, line := range strings.Split(strings.TrimSpace(captured), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("captured line is not a JSON record: %q", line)
+		}
+		matched := true
+		for key, value := range want {
+			if got, ok := record[key].(string); !ok || got != value {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 // declaredPublisher declares topo and opens a publisher on it, the way the
@@ -889,8 +924,8 @@ func TestHandle_TerminalWriteFailureLeavesTheJobProcessing(t *testing.T) {
 		t.Fatalf("result %s is missing; the extraction is supposed to have succeeded", resultKey.String())
 	}
 	written := logs.String()
-	if !strings.Contains(written, job.ID().String()) || !strings.Contains(written, resultKey.String()) {
-		t.Fatalf("log does not name both the job and its result key; got:\n%s", written)
+	if !hasRecord(t, written, map[string]string{"job_id": job.ID().String(), "storage_key": resultKey.String()}) {
+		t.Fatalf("no record names both the job and its result key; got:\n%s", written)
 	}
 }
 
@@ -1033,11 +1068,11 @@ func TestRun_DrainDeadlineExpiresNamingTheInFlightJob(t *testing.T) {
 	}
 
 	written := logs.String()
-	if !strings.Contains(written, job.ID().String()) {
-		t.Fatalf("drain-deadline log does not name the in-flight job; got:\n%s", written)
-	}
-	if !strings.Contains(written, "stays 'processing'") {
-		t.Fatalf("drain-deadline log does not say the job is stranded; got:\n%s", written)
+	if !hasRecord(t, written, map[string]string{
+		"job_id": job.ID().String(),
+		"status": string(videodomain.JobStatusProcessing),
+	}) {
+		t.Fatalf("no record names the in-flight job and the status it is stranded in; got:\n%s", written)
 	}
 	if status := statusOf(t, env, job); status != videodomain.JobStatusProcessing {
 		t.Fatalf("status = %q, want %q", status, videodomain.JobStatusProcessing)
