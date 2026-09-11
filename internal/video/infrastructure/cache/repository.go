@@ -259,6 +259,7 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 	}
 	if rec.ID != id.String() {
 		cacheLogger().Warn("the cache entry names a different job",
+			slog.String("job_id", id.String()),
 			slog.String("cache_key", key),
 			slog.String("stored_job_id", rec.ID))
 		r.deleteMalformedIfUnchanged(ctx, key, raw)

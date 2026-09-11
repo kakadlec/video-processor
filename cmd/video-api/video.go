@@ -667,6 +667,7 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 			})
 			if err != nil {
 				logger(componentVideoUpload).Error("reading the existing job's status for a duplicate upload failed",
+					slog.String("job_id", jobID.String()),
 					slog.String("source_key", sourceKey.String()),
 					slog.String("error", err.Error()))
 				c.JSON(500, ProcessingResult{
@@ -896,7 +897,9 @@ func (m *videoModule) handleGetVideoJobStatus(c *gin.Context) {
 		case errors.Is(err, videodomain.ErrVideoJobNotFound):
 			c.JSON(http.StatusNotFound, videoErrorResponse{Error: "job not found"})
 		default:
-			logger(componentJobStatus).Error("reading the video job's status failed", slog.String("error", err.Error()))
+			logger(componentJobStatus).Error("reading the video job's status failed",
+				slog.String("job_id", c.Param("id")),
+				slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, videoErrorResponse{Error: "internal server error"})
 		}
 		return

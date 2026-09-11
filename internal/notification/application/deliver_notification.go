@@ -139,6 +139,8 @@ func (uc *DeliverNotification) deliverOne(ctx context.Context, preference *domai
 		// A preference and an event that together cannot name a delivery is
 		// a defect in what is stored, and no redelivery repairs it.
 		uc.logger.Error("a stored preference and this event cannot name a delivery",
+			slog.String("user_id", event.UserID().String()),
+			slog.String("event_type", event.EventType().String()),
 			slog.String("job_id", event.JobID().String()),
 			slog.String("channel", preference.Channel().String()),
 			slog.String("error", err.Error()))
@@ -169,6 +171,8 @@ func (uc *DeliverNotification) deliverOne(ctx context.Context, preference *domai
 		// reclaim bound — which is why DeliveryConfig sizes that bound
 		// tightly rather than generously.
 		uc.logger.Warn("the delivery is claimed by another consumer; deferring",
+			slog.String("user_id", event.UserID().String()),
+			slog.String("event_type", event.EventType().String()),
 			slog.String("job_id", event.JobID().String()),
 			slog.String("channel", preference.Channel().String()))
 		return DeliveryDeferred, nil

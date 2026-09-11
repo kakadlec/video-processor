@@ -221,7 +221,11 @@ func (m *notificationModule) handleSetPreference(c *gin.Context) {
 		case errors.Is(err, domain.ErrSecretRequired):
 			c.JSON(http.StatusBadRequest, notificationErrorResponse{Error: "a signing secret is required to create a preference"})
 		default:
-			logger(componentPreferenceWrite).Error("writing the notification preference failed", slog.String("error", err.Error()))
+			logger(componentPreferenceWrite).Error("writing the notification preference failed",
+				slog.String("user_id", userID.String()),
+				slog.String("event_type", req.EventType),
+				slog.String("channel", req.Channel),
+				slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, notificationErrorResponse{Error: "internal server error"})
 		}
 		return
