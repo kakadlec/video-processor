@@ -643,8 +643,10 @@ Every record carries `time`, `level`, `msg`, and two identity fields bound once 
 
 ```bash
 # One job, end to end. It returns records from video-api (the accepted-job
-# record), worker, and notifier — that is the point of the field
-docker compose logs --no-log-prefix | jq -c 'select(.job_id == "<jobID>")'
+# record), worker, and notifier — that is the point of the field. The five
+# service names are named explicitly for the reason stated below the block
+docker compose logs --no-log-prefix identity-api video-api notification-api worker notifier \
+  | jq -c 'select(.job_id == "<jobID>")'
 
 # Which worker replica did the work
 docker compose logs --no-log-prefix worker | jq -r '[.instance, .msg] | @tsv'
