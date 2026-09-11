@@ -70,8 +70,8 @@ Migrate one package per commit, converting its tests in the same commit, so no i
 ## 7. Finalization (after the implementation PR merges — not part of it)
 
 - [x] 7.1 Check off the implementation tasks above.
-- [ ] 7.2 Update `docs/operations.md`: replace the "Observability — Planned (Phase 8)" section's logging sentence with what shipped, and document `LOG_LEVEL` alongside the other optional variables. Remove the stale claim in that same section that Phase 8 also carries `docker-compose.yml` — the roadmap already records that as delivered.
-- [ ] 7.3 Update `docs/architecture.md` and `docs/flows.md:201`, which says Phase 8 "is next and is not yet decomposed".
-- [ ] 7.4 Update `CLAUDE.md`: how a process logs, where the logger is built, the no-arbitrary-value rule and the test that holds it, and that `gin.New()` plus explicit release mode replaced `gin.Default()`.
-- [ ] 7.5 Add all three Phase 8 rows to `docs/roadmap.md`'s Change Backlog — this one archived with links, `add-health-and-readiness-endpoints` and `add-prometheus-metrics` `not-started` — and replace the "### Phase 8 — not yet decomposed" section, which becomes false here. Update the Phase Summary row and the "Current State" heading accordingly.
-- [ ] 7.6 `npx --yes @fission-ai/openspec validate add-structured-logging --strict --no-interactive`, fix every error, then archive.
+- [x] 7.2 Update `docs/operations.md`: replace the "Observability — Planned (Phase 8)" section's logging sentence with what shipped, and document `LOG_LEVEL` alongside the other optional variables. Remove the stale claim in that same section that Phase 8 also carries `docker-compose.yml` — the roadmap already records that as delivered.
+- [x] 7.3 Update `docs/architecture.md` and `docs/flows.md:201`, which says Phase 8 "is next and is not yet decomposed".
+- [x] 7.4 Update `CLAUDE.md`: how a process logs, where the logger is built, the no-arbitrary-value rule and the test that holds it, and that `gin.New()` plus explicit release mode replaced `gin.Default()`.
+- [x] 7.5 Add all three Phase 8 rows to `docs/roadmap.md`'s Change Backlog — this one archived with links, `add-health-and-readiness-endpoints` and `add-prometheus-metrics` `not-started` — and replace the "### Phase 8 — not yet decomposed" section, which becomes false here. Update the Phase Summary row and the "Current State" heading accordingly.
+- [x] 7.6 `npx --yes @fission-ai/openspec validate add-structured-logging --strict --no-interactive`, fix every error, then archive.
