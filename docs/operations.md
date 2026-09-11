@@ -630,7 +630,7 @@ Locally, `docker compose up --build` starts a mail catcher that accepts everythi
 
 ### Logging — Implemented (Phase 8)
 
-**All five processes write JSON records to standard output, and nothing else.** There is no second format, no console renderer for development, and no configuration that selects one — `add-structured-logging` deliberately left the format and the destination unconfigurable, so the guarantees below hold in the environment a developer is watching and in the one they are not. Standard output rather than standard error matches the gateway's own split, where the access log is stdout and only nginx's own errors are stderr, and it means `docker compose logs` and any collector that reads a container's stdout get the whole stream.
+**All five processes write JSON records to standard output, and nothing else.** There is no second format, no console renderer for development, and no configuration that selects one — `add-structured-logging` deliberately left the format and the destination unconfigurable, so the guarantees below hold in the environment a developer is watching and in the one they are not. Standard output rather than standard error matches the gateway's own split, where the access log is stdout and only nginx's own errors are stderr, and it means `docker compose logs` and any collector that reads a container's stdout get the whole stream. The one thing that is not a record is a Go runtime panic trace from before the logger exists — an unrecognized `GIN_MODE` is the way to provoke one, and its row above says why.
 
 Every record carries `time`, `level`, `msg`, and two identity fields bound once at startup:
 
