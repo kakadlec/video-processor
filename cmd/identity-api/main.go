@@ -61,11 +61,7 @@ func main() {
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 
-	server := &http.Server{
-		Addr:              ":8080",
-		Handler:           r,
-		ReadHeaderTimeout: readHeaderTimeout,
-	}
+	server := newHTTPServer(r)
 
 	logger(componentHTTPServer).Info("the identity API is listening", slog.String("addr", server.Addr))
 
@@ -98,6 +94,23 @@ func main() {
 	// a transaction, so once Shutdown has returned, every statement this
 	// process will ever run has finished.
 	closeDB(identityDB)
+}
+
+// newHTTPServer builds the server main serves through. The construction is
+// extracted for the same reason setupRouter is: a test that configures its own
+// server proves nothing about a root that forgot a field.
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":8080",
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		// net/http reports its own errors — a panic it served, a response
+		// header it could not parse — through this logger. Left nil they go
+		// to the standard log package, which slog.SetDefault bridges into the
+		// handler at info: a failure recorded as routine, and discarded
+		// outright by a process running at error severity.
+		ErrorLog: slog.NewLogLogger(logger(componentHTTPServer).Handler(), slog.LevelError),
+	}
 }
 
 func setupRouter(identity *identityModule) *gin.Engine {

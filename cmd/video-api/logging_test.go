@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -26,9 +29,17 @@ import (
 func captureRecords(t *testing.T) *bytes.Buffer {
 	t.Helper()
 
+	return captureRecordsAt(t, slog.LevelDebug)
+}
+
+// captureRecordsAt is captureRecords at a chosen severity, so a test can run
+// the process the way an operator who set LOG_LEVEL=error runs it.
+func captureRecordsAt(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+
 	buffer := &bytes.Buffer{}
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(buffer, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(buffer, &slog.HandlerOptions{Level: level})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	return buffer
 }
@@ -396,4 +407,86 @@ func TestTheServiceRouterMountsTheAccessLog(t *testing.T) {
 	if output := unstructured(); output != "" {
 		t.Fatalf("the service router wrote outside the record: %q", output)
 	}
+}
+
+// serveErrorProbe serves one request through the server newHTTPServer builds.
+// It serves on an ephemeral listener rather than through ListenAndServe:
+// Serve ignores Addr, so the real construction is driven without binding the
+// port the deployment uses. Shutdown is awaited before the caller reads the
+// buffer, so the record net/http wrote on a connection goroutine is ordered
+// before the read.
+func serveErrorProbe(t *testing.T, handler http.Handler) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open a listener: %v", err)
+	}
+
+	server := newHTTPServer(handler)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = server.Serve(listener)
+	}()
+
+	response, err := http.Get("http://" + listener.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("the probe request failed: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("the probe server did not shut down: %v", err)
+	}
+	<-served
+}
+
+// unparseableContentLength provokes an error net/http reports through
+// Server.ErrorLog itself. It is this provocation and not an obvious one
+// because the obvious ones do not reach that logger at all: a malformed
+// request line, an invalid header name and a TLS handshake against this plain
+// listener are each answered with a status and no report, and a panic raised
+// inside a handler is taken by the recovery middleware before net/http sees
+// it. An unparseable response Content-Length is parsed by net/http on the
+// connection goroutine before the status line is flushed, which also orders
+// the report ahead of the client's response.
+func unparseableContentLength() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "not-a-number")
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+// TestTheHTTPServerRecordsItsOwnErrorsAtErrorSeverity drives newHTTPServer,
+// the construction main serves through, rather than a server the test
+// configures: a correctly configured test server would prove nothing about a
+// root that left the field nil.
+func TestTheHTTPServerRecordsItsOwnErrorsAtErrorSeverity(t *testing.T) {
+	t.Run("the report is recorded at error severity", func(t *testing.T) {
+		buffer := captureRecordsAt(t, slog.LevelDebug)
+
+		serveErrorProbe(t, unparseableContentLength())
+
+		record := onlyRecord(t, buffer, componentHTTPServer)
+		requireField(t, record, "level", "ERROR")
+		if message, ok := record["msg"].(string); !ok || !strings.Contains(message, "invalid Content-Length") {
+			t.Fatalf("the record does not carry what net/http reported: %v", record["msg"])
+		}
+	})
+
+	t.Run("the report survives a process running at error severity", func(t *testing.T) {
+		// The half that matters. The standard log bridge slog.SetDefault
+		// installs is pinned at info, so with ErrorLog left nil every report
+		// net/http makes is discarded in exactly the configuration an
+		// operator chooses to cut noise.
+		buffer := captureRecordsAt(t, slog.LevelError)
+
+		serveErrorProbe(t, unparseableContentLength())
+
+		onlyRecord(t, buffer, componentHTTPServer)
+	})
 }
