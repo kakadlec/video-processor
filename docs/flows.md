@@ -83,7 +83,7 @@ Browser           cmd/video-api/video.go    internal/video/application   MinIO b
   │  error), through one defer guarded on that fact.                        │
 ```
 
-A successful `POST /upload` also emits one record naming the job id and the source key — the only record `add-structured-logging` added anywhere. Every other log call in this handler sits on an error branch, so before it a job that was accepted and then never dispatched left no trace of having been accepted, and the identifier the `202` hands the client appeared in nothing the accepting service wrote.
+A `POST /upload` that queues a new job also emits one record naming the job id and the source key — the one **application-level job-flow** record `add-structured-logging` added. A *duplicate* upload does not emit it: that branch answers `202` with the existing job and returns well before this point, and the request that created that job already recorded its identifier. (The change's other new records carry no job id: one bootstrap refusal per composition root, and one access record and one recovered-panic record per HTTP root.) Every other log call in this handler sits on an error branch, so before it a job that was accepted and then never dispatched left no trace of having been accepted, and the identifier the `202` hands the client appeared in nothing the accepting service wrote.
 
 ### Processing — `cmd/worker` (out of band)
 

@@ -370,7 +370,7 @@ A behavioural test cannot hold any of the three: it observes only the call sites
 
 Three copies of that file, one per HTTP root, for the same reason `auth.go` and `ratelimit.go` are copied: `package main` cannot import `package main`. Each copy carries its own behavioural tests, so a copy that drifts fails in its own package.
 
-**A job is followable across processes by its `job_id` alone.** The worker and the notifier already recorded it; `POST /upload` did not, because every log call in that handler was on an error branch — so the one record this change adds is the accepted job, naming its id and its source key. Without it a job accepted and never dispatched leaves no trace of having been accepted, and the two processes that do record the id both learn it from a message that was never published.
+**A job is followable across processes by its `job_id` alone.** The worker and the notifier already recorded it; `POST /upload` did not, because every log call in that handler was on an error branch — so the one application-level job-flow record this change adds is the accepted job, naming its id and its source key — emitted where the request queues a new job, and not on the duplicate branch, which answers with the job the first request already recorded. The change's other new records (a bootstrap refusal per root, an access and a recovery record per HTTP root) carry no job id. Without it a job accepted and never dispatched leaves no trace of having been accepted, and the two processes that do record the id both learn it from a message that was never published.
 
 ---
 
