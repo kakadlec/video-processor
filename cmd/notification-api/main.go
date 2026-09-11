@@ -82,11 +82,7 @@ func main() {
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 
-	server := &http.Server{
-		Addr:              ":8080",
-		Handler:           r,
-		ReadHeaderTimeout: readHeaderTimeout,
-	}
+	server := newHTTPServer(r)
 
 	logger(componentHTTPServer).Info("the notification API is listening", slog.String("addr", server.Addr))
 
@@ -151,6 +147,17 @@ func setupRateLimiter() (*platformratelimit.Limiter, *redis.Client, error) {
 		return nil, nil, err
 	}
 	return platformratelimit.NewLimiter(redisClient, rateLimitConfig), redisClient, nil
+}
+
+// newHTTPServer builds the server main serves through. The construction is
+// extracted for the same reason setupRouter is: a test that configures its own
+// server proves nothing about a root that forgot a field.
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":8080",
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
 }
 
 func setupRouter(auth *authenticator, notification *notificationModule, limiter rateLimiter) *gin.Engine {

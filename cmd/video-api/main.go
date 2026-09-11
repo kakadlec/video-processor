@@ -97,16 +97,7 @@ func main() {
 		}
 	}()
 
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: r,
-		// Only the header read is bounded. A ReadTimeout or WriteTimeout
-		// would cut off POST /upload, which streams a whole video into the
-		// bucket before responding; headers arrive immediately regardless of
-		// body size, so bounding that alone costs nothing and closes the
-		// slow-header hold.
-		ReadHeaderTimeout: readHeaderTimeout,
-	}
+	server := newHTTPServer(r)
 
 	logger(componentHTTPServer).Info("the video API is listening", slog.String("addr", server.Addr))
 	logger(componentHTTPServer).Info("the frontend is served at the root path", slog.String("path", "/"))
@@ -158,6 +149,22 @@ func serveEmbeddedFile(c *gin.Context, path, contentType string) {
 		return
 	}
 	c.Data(200, contentType, data)
+}
+
+// newHTTPServer builds the server main serves through. The construction is
+// extracted for the same reason setupRouter is: a test that configures its own
+// server proves nothing about a root that forgot a field.
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:    ":8080",
+		Handler: handler,
+		// Only the header read is bounded. A ReadTimeout or WriteTimeout
+		// would cut off POST /upload, which streams a whole video into the
+		// bucket before responding; headers arrive immediately regardless of
+		// body size, so bounding that alone costs nothing and closes the
+		// slow-header hold.
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
 }
 
 func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter) *gin.Engine {
