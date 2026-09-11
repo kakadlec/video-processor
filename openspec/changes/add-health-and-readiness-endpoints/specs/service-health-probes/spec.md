@@ -139,6 +139,8 @@ The record for a transition to not ready SHALL be at warning severity and SHALL 
 
 These records SHALL obey `structured-logging` unchanged: a fixed string-literal message and typed scalar attributes only. The dependency names SHALL be drawn from a closed set this repository owns and SHALL NOT be assembled from any caller-supplied value.
 
+The verdict a process holds before its first probe SHALL be **ready**, and that is a consequence of the startup contract rather than an arbitrary seed: startup verifies every readiness dependency and is specified to be fatal, so a process that has reached the point of serving a route had all of them reachable a moment earlier. Seeding it any other way — "unknown", or "not ready until proven otherwise" — makes the first successful probe of every process start look like a recovery from a failure that never happened, and emits a record that means nothing on every deploy.
+
 Concurrent probes SHALL NOT be able to produce more than one record for one transition. The verdict SHALL be updated by an atomic compare-and-set, so that two probers observing the same change between them yield one record and not two.
 
 #### Scenario: A dependency fails and recovers
@@ -146,6 +148,12 @@ Concurrent probes SHALL NOT be able to produce more than one record for one tran
 - **GIVEN** a service probed repeatedly while a readiness dependency fails and later recovers
 - **WHEN** the probes run
 - **THEN** exactly two records are emitted — one at warning severity naming the failed dependency, one at informational severity on recovery — regardless of how many probes were answered in between
+
+#### Scenario: The first probe after a process starts
+
+- **GIVEN** a freshly started service whose readiness dependencies are reachable
+- **WHEN** it answers its first readiness probe
+- **THEN** it answers `200` and emits no record, because the verdict has not changed from the one its own successful startup established
 
 #### Scenario: Probes with no change of verdict
 
