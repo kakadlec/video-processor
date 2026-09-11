@@ -375,3 +375,25 @@ func TestTheAccessRecordNamesTheAuthenticatedSubject(t *testing.T) {
 		requireNoField(t, onlyRecord(t, buffer, componentHTTPAccess), "user_id")
 	})
 }
+
+// TestTheServiceRouterMountsTheAccessLog drives the real setupRouter rather
+// than a reconstruction of it. Everything above builds its own engine, so a
+// root that stopped mounting the pair would leave every one of those tests
+// green — gin.Default() still compiles, and an unused middleware is not an
+// error.
+func TestTheServiceRouterMountsTheAccessLog(t *testing.T) {
+	buffer := captureRecords(t)
+	unstructured := captureUnstructuredOutput(t)
+
+	auth, _ := newTestAuthenticatorWithTokens(t)
+	recorder := httptest.NewRecorder()
+	setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
+
+	record := onlyRecord(t, buffer, componentHTTPAccess)
+	requireField(t, record, "method", http.MethodGet)
+	requireField(t, record, "path", "/no-such-route")
+
+	if output := unstructured(); output != "" {
+		t.Fatalf("the service router wrote outside the record: %q", output)
+	}
+}
