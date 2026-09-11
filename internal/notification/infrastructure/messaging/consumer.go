@@ -4,13 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"video-processor/internal/platform/rabbitmq"
 )
+
+// The component this package's records are attributed to, and the closed set
+// of dial-loop lifecycle values. This context's own copy of a vocabulary
+// Video Processing's messaging package also keeps: ddd-architecture forbids
+// importing that package, the same reason the terminal topology and its
+// payload structs are copied here.
+const (
+	componentTerminalEventConsumer = "terminal_event_consumer"
+	phaseStarted                   = "started"
+	phaseConnected                 = "connected"
+	phaseConnectionLost            = "connection_lost"
+	phaseStopped                   = "stopped"
+)
+
+// logger returns the process logger with this consumer's component bound. It
+// resolves the default per call rather than binding one at package scope: the
+// composition root installs the process logger inside main, long after this
+// package's variables are initialized.
+func logger() *slog.Logger {
+	return slog.Default().With(slog.String("component", componentTerminalEventConsumer))
+}
 
 // consumerPrefetch is the number of unacknowledged deliveries the broker may
 // hand one consumer.
@@ -146,8 +167,9 @@ func NewConsumer(config rabbitmq.Config, topology rabbitmq.Topology, tag string,
 // It always returns nil: every failure it can meet is a broker that will come
 // back.
 func (c *Consumer) Run(ctx context.Context) error {
-	log.Print("notification: terminal event consumer: started")
-	defer log.Print("notification: terminal event consumer: stopped")
+	lg := logger()
+	lg.Info("the terminal event consumer started", slog.String("phase", phaseStarted))
+	defer lg.Info("the terminal event consumer stopped", slog.String("phase", phaseStopped))
 
 	backoff := dialBackoffInitial
 	for {
@@ -157,18 +179,22 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		conn, err := rabbitmq.Open(c.config)
 		if err != nil {
-			log.Printf("notification: terminal event consumer: connect: %v; retrying in %s", err, backoff)
+			lg.Warn("connecting to the broker failed",
+				slog.Duration("retry_in", backoff),
+				slog.String("error", err.Error()))
 			if !sleepCtx(ctx, backoff) {
 				return nil
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		log.Print("notification: terminal event consumer: connected")
+		lg.Info("the terminal event consumer connected to the broker", slog.String("phase", phaseConnected))
 
 		served, err := c.serve(ctx, conn)
 		if err != nil {
-			log.Printf("notification: terminal event consumer: connection lost: %v", err)
+			lg.Warn("the broker connection was lost",
+				slog.String("phase", phaseConnectionLost),
+				slog.String("error", err.Error()))
 		}
 		_ = rabbitmq.Close(conn)
 		if ctx.Err() != nil {
@@ -182,7 +208,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 			backoff = dialBackoffInitial
 			continue
 		}
-		log.Printf("notification: terminal event consumer: connection was unusable; retrying in %s", backoff)
+		lg.Warn("the broker connection was unusable",
+			slog.Duration("retry_in", backoff))
 		if !sleepCtx(ctx, backoff) {
 			return nil
 		}
@@ -251,7 +278,8 @@ func (c *Consumer) serve(ctx context.Context, conn *amqp.Connection) (bool, erro
 			// claimed, nothing was sent.
 			if ctx.Err() != nil {
 				if err := delivery.Nack(false, true); err != nil {
-					log.Printf("notification: terminal event consumer: requeue on shutdown: %v", err)
+					logger().Error("requeueing an event on shutdown failed",
+						slog.String("error", err.Error()))
 				}
 				return served, nil
 			}
@@ -276,11 +304,13 @@ func (c *Consumer) dispatch(ctx context.Context, delivery amqp.Delivery) {
 	switch disposition {
 	case Ack:
 		if err := delivery.Ack(false); err != nil {
-			log.Printf("notification: terminal event consumer: ack: %v", err)
+			logger().Error("acknowledging the event failed",
+				slog.String("error", err.Error()))
 		}
 	case Requeue:
 		if err := delivery.Nack(false, true); err != nil {
-			log.Printf("notification: terminal event consumer: requeue: %v", err)
+			logger().Error("requeueing the event failed",
+				slog.String("error", err.Error()))
 		}
 		_ = sleepCtx(ctx, c.requeuePause)
 	default:
@@ -290,7 +320,8 @@ func (c *Consumer) dispatch(ctx context.Context, delivery amqp.Delivery) {
 		// where it can be looked at, rather than back onto the queue that
 		// would hand it straight back.
 		if err := delivery.Reject(false); err != nil {
-			log.Printf("notification: terminal event consumer: reject: %v", err)
+			logger().Error("rejecting the event failed",
+				slog.String("error", err.Error()))
 		}
 	}
 }

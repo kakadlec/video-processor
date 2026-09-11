@@ -351,8 +351,14 @@ func TestSweep_TakesOverNothingWhenTheLeaseStoreIsUnreachable(t *testing.T) {
 	if stored.LeaseEpoch() != epoch {
 		t.Fatalf("lease epoch = %d, want it left at %d", stored.LeaseEpoch(), epoch)
 	}
-	if !strings.Contains(logs.String(), "lease store unreachable") {
-		t.Fatalf("logs do not report the outage:\n%s", logs.String())
+	// Matched on the attributes rather than on the message: the count is
+	// what says the sweep saw this job and took over none of it, and it
+	// stays true through the next rewording.
+	if !hasRecord(t, logs.String(), map[string]any{
+		"component":   componentRecoverySweeper,
+		"unreachable": 1,
+	}) {
+		t.Fatalf("no record reports the outage:\n%s", logs.String())
 	}
 }
 

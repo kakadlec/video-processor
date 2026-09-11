@@ -20,7 +20,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -29,6 +29,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"video-processor/internal/platform/logging"
 	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 	platformredis "video-processor/internal/platform/redis"
 	videoapplication "video-processor/internal/video/application"
@@ -69,15 +70,30 @@ const (
 const consumerTag = "video-worker"
 
 func main() {
+	// The severity is read, and the process logger installed, before any
+	// other configuration: every remaining startup failure is then reportable
+	// as a structured record.
+	level, err := logging.ParseLevel(os.Getenv(logging.LevelEnvVar))
+	if err != nil {
+		logging.NewBootstrap(logging.ServiceWorker).Error("the configured log severity is unrecognized",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	slog.SetDefault(logging.New(logging.ServiceWorker, level))
+
 	ctx := context.Background()
 
 	if err := createDirs(); err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the scratch directory could not be created",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	deps, err := setupWorker(ctx)
 	if err != nil {
-		log.Fatal(err)
+		logger(componentProcessStartup).Error("the worker could not be built",
+			slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -90,7 +106,7 @@ func main() {
 	// extraction would fail the terminal write rather than the work.
 	closeDB(deps.db)
 	if err := deps.redis.Close(); err != nil {
-		log.Printf("video: worker: close redis: %v", err)
+		logger(componentProcessShutdown).Warn("closing the Redis client failed", slog.String("error", err.Error()))
 	}
 	// MinIO is absent for the same reason it is in cmd/video-api: that adapter
 	// exposes no teardown.
@@ -123,7 +139,8 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 			return
 		}
 		if err := deps.terminalRelay.Run(relayCtx); err != nil {
-			log.Printf("video: worker: terminal relay: %v", err)
+			logger(componentTerminalRelay).Error("the terminal event relay returned an error",
+				slog.String("error", err.Error()))
 		}
 	}()
 
@@ -135,7 +152,8 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 	go func() {
 		defer close(consumerDone)
 		if err := consumer.Run(ctx); err != nil {
-			log.Printf("video: worker: consumer: %v", err)
+			logger(componentJobConsumer).Error("the job consumer returned an error",
+				slog.String("error", err.Error()))
 		}
 	}()
 
@@ -150,7 +168,7 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 	}()
 
 	<-ctx.Done()
-	log.Print("video: worker: shutdown signal received")
+	logger(componentProcessShutdown).Info("a shutdown signal was received")
 
 	// Joined before returning, and therefore before main closes PostgreSQL
 	// and Redis — the same reasoning as cmd/video-api's join of its outbox
@@ -171,9 +189,11 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 	case <-consumerDone:
 	case <-time.After(drain):
 		if jobID := inFlight.Load(); jobID != nil {
-			log.Printf("video: worker: drain deadline expired with job %s still running; it stays 'processing' and will not be redelivered", *jobID)
+			logger(componentProcessShutdown).Error("the drain deadline expired with a job still running; it stays in this status and will not be redelivered",
+				slog.String("job_id", *jobID),
+				slog.String("status", string(videodomain.JobStatusProcessing)))
 		} else {
-			log.Print("video: worker: drain deadline expired")
+			logger(componentProcessShutdown).Warn("the drain deadline expired")
 		}
 	}
 }
@@ -357,13 +377,16 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.Pointer[string]) videomessaging.Disposition {
 	msg, err := videomessaging.ParseJobQueuedMessage(body)
 	if err != nil {
-		log.Printf("video: worker: undecodable dispatch, dead-lettering: %v", err)
+		logger(componentJobDispatch).Error("the dispatch could not be decoded; dead-lettering",
+			slog.String("error", err.Error()))
 		return videomessaging.Reject
 	}
 
 	sourceKey, err := videodomain.NewStorageKey(msg.SourceKey)
 	if err != nil {
-		log.Printf("video: worker: dispatch for job %s names no source, dead-lettering: %v", msg.JobID, err)
+		logger(componentJobDispatch).Error("the dispatch names no source object; dead-lettering",
+			slog.String("job_id", msg.JobID),
+			slog.String("error", err.Error()))
 		return videomessaging.Reject
 	}
 
@@ -376,10 +399,12 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		// Another consumer owns this job, or it is already terminal. Nothing
 		// is touched — emphatically including the source object, which that
 		// other consumer is very likely reading right now.
-		log.Printf("video: worker: job %s was already claimed, dropping the duplicate dispatch", msg.JobID)
+		logger(componentJobDispatch).Error("the job was already claimed; dropping the duplicate dispatch",
+			slog.String("job_id", msg.JobID))
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrVideoJobNotFound):
-		log.Printf("video: worker: dispatch names unknown job %s, dead-lettering", msg.JobID)
+		logger(componentJobDispatch).Error("the dispatch names an unknown job; dead-lettering",
+			slog.String("job_id", msg.JobID))
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrJobFenced):
 		// This run was taken over while it was working: the sweep decided
@@ -391,7 +416,10 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		// The lease is not released either; a conditional release at a
 		// superseded epoch is a no-op whose only effect is a confusing log
 		// line.
-		log.Printf("video: worker: job %s was taken over while this worker held epoch %d, dead-lettering and keeping its source: %v", msg.JobID, result.LeaseEpoch, err)
+		logger(componentJobDispatch).Error("the job was taken over while this worker held its epoch; dead-lettering and keeping its source",
+			slog.String("job_id", msg.JobID),
+			slog.Int64("lease_epoch", result.LeaseEpoch),
+			slog.String("error", err.Error()))
 		return videomessaging.Reject
 	case err != nil:
 		// The run broke before any terminal state was committed. The job
@@ -399,7 +427,9 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		// is recoverable through the bucket's lifecycle rule, deleting an
 		// input that no terminal state accounts for is not. The row is left
 		// `processing`, which the sweeper recovers once the lease lapses.
-		log.Printf("video: worker: job %s did not reach a terminal state, dead-lettering: %v", msg.JobID, err)
+		logger(componentJobDispatch).Error("the job did not reach a terminal state; dead-lettering",
+			slog.String("job_id", msg.JobID),
+			slog.String("error", err.Error()))
 		return videomessaging.Reject
 	}
 
@@ -407,7 +437,9 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	// from here: a second failure write on a job this process no longer owns
 	// is exactly the overwrite the claim exists to prevent.
 	if !result.Success {
-		log.Printf("video: worker: job %s failed: %s", msg.JobID, result.FailureReason)
+		logger(componentJobDispatch).Error("the job failed",
+			slog.String("job_id", msg.JobID),
+			slog.String("reason", result.FailureReason))
 		// Cleanup is one-shot and rides on this actor's own committed
 		// write. A result that merely matched a terminal row another actor
 		// had already written cleans up nothing: that actor did it.
@@ -421,7 +453,11 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 
 	if err := d.completeWithRetry(ctx, result); err != nil {
 		if errors.Is(err, videodomain.ErrJobFenced) {
-			log.Printf("video: worker: job %s produced result %s but was taken over at epoch %d, dead-lettering and keeping its source: %v", msg.JobID, result.StorageKey, result.LeaseEpoch, err)
+			logger(componentJobDispatch).Error("the job produced a result but was taken over; dead-lettering and keeping its source",
+				slog.String("job_id", msg.JobID),
+				slog.String("storage_key", result.StorageKey),
+				slog.Int64("lease_epoch", result.LeaseEpoch),
+				slog.String("error", err.Error()))
 			return videomessaging.Reject
 		}
 		// The artifact is stored and the row still says `processing`. Both
@@ -430,7 +466,10 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		// acked, so the dispatch is still on record. The result key is
 		// logged because it is the only pointer to an artifact no listing
 		// will show.
-		log.Printf("video: worker: job %s produced result %s but could not be marked completed, dead-lettering and keeping its source: %v", msg.JobID, result.StorageKey, err)
+		logger(componentJobDispatch).Error("the job produced a result but could not be marked completed; dead-lettering and keeping its source",
+			slog.String("job_id", msg.JobID),
+			slog.String("storage_key", result.StorageKey),
+			slog.String("error", err.Error()))
 		return videomessaging.Reject
 	}
 
@@ -440,7 +479,10 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	// every failure path above too.
 	d.releaseLease(ctx, msg.JobID, result.LeaseEpoch)
 	d.deleteSource(ctx, msg.JobID, sourceKey)
-	log.Printf("video: worker: job %s completed with %d frames", msg.JobID, result.FrameCount)
+	logger(componentJobDispatch).Info("the job completed",
+		slog.String("job_id", msg.JobID),
+		slog.String("storage_key", result.StorageKey),
+		slog.Int("frames", result.FrameCount))
 	return videomessaging.Ack
 }
 
@@ -455,13 +497,18 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 func (d *workerDeps) releaseLease(ctx context.Context, jobID string, epoch int64) {
 	id, err := d.ids.ParseVideoJobID(jobID)
 	if err != nil {
-		log.Printf("video: worker: release lease for job %s: %v", jobID, err)
+		logger(componentJobCleanup).Warn("the job id could not be parsed to release its lease",
+			slog.String("job_id", jobID),
+			slog.String("error", err.Error()))
 		return
 	}
 	releaseCtx, cancel := videoapplication.NewFinalizationContext()
 	defer cancel()
 	if err := d.leases.Release(releaseCtx, id, epoch); err != nil {
-		log.Printf("video: worker: release lease for job %s at epoch %d: %v", jobID, epoch, err)
+		logger(componentJobCleanup).Warn("releasing the lease failed",
+			slog.String("job_id", jobID),
+			slog.Int64("lease_epoch", epoch),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -494,7 +541,11 @@ func (d *workerDeps) completeWithRetry(ctx context.Context, result videoapplicat
 		if errors.Is(err, videodomain.ErrJobFenced) {
 			return err
 		}
-		log.Printf("video: worker: mark job %s completed (attempt %d/%d): %v", result.JobID, attempt, terminalWriteAttempts, err)
+		logger(componentJobDispatch).Warn("marking the job completed failed; retrying",
+			slog.String("job_id", result.JobID),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", terminalWriteAttempts),
+			slog.String("error", err.Error()))
 		if attempt < terminalWriteAttempts {
 			time.Sleep(time.Duration(attempt) * terminalWriteBackoff)
 		}
@@ -510,7 +561,10 @@ func (d *workerDeps) deleteSource(ctx context.Context, jobID string, sourceKey v
 	cleanupCtx, cancel := videoapplication.NewFinalizationContext()
 	defer cancel()
 	if err := d.sources.Delete(cleanupCtx, sourceKey); err != nil {
-		log.Printf("video: worker: delete source %s for job %s: %v", sourceKey.String(), jobID, err)
+		logger(componentJobCleanup).Warn("deleting the source object failed",
+			slog.String("job_id", jobID),
+			slog.String("source_key", sourceKey.String()),
+			slog.String("error", err.Error()))
 	}
 }
 
@@ -522,12 +576,14 @@ func (d *workerDeps) clearIdempotencyKey(ctx context.Context, jobID string) {
 	clearCtx, cancel := videoapplication.NewFinalizationContext()
 	defer cancel()
 	if _, err := d.clearKey.Execute(clearCtx, jobID); err != nil {
-		log.Printf("video: worker: clear idempotency key for job %s: %v", jobID, err)
+		logger(componentJobCleanup).Warn("clearing the idempotency key failed",
+			slog.String("job_id", jobID),
+			slog.String("error", err.Error()))
 	}
 }
 
 func closeDB(db *sql.DB) {
 	if err := db.Close(); err != nil {
-		log.Printf("video: worker: close postgres: %v", err)
+		logger(componentProcessShutdown).Warn("closing the PostgreSQL pool failed", slog.String("error", err.Error()))
 	}
 }

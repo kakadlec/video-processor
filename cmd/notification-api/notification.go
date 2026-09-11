@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -27,7 +27,7 @@ func (systemClock) Now() time.Time { return time.Now() }
 // and on the shutdown path where there is nobody left to return one to.
 func closeDB(db *sql.DB) {
 	if err := db.Close(); err != nil {
-		log.Printf("notification: close postgres: %v", err)
+		logger(componentProcessShutdown).Warn("closing the PostgreSQL pool failed", slog.String("error", err.Error()))
 	}
 }
 
@@ -86,7 +86,8 @@ func setupNotification(ctx context.Context) (*notificationModule, *sql.DB, error
 		return nil, nil, fmt.Errorf("notification: connect to postgres: %w", err)
 	}
 
-	log.Printf("notification: destination policy: insecure destinations allowed=%t", policy.AllowsInsecure())
+	logger(componentProcessStartup).Info("the destination policy was loaded",
+		slog.Bool("allow_insecure", policy.AllowsInsecure()))
 
 	repo := postgres.NewPreferenceRepository(db)
 	clock := systemClock{}
@@ -167,7 +168,7 @@ func (m *notificationModule) handleListPreferences(c *gin.Context) {
 
 	results, err := m.listPreferences.Execute(c.Request.Context(), userID.String())
 	if err != nil {
-		log.Printf("list notification preferences: %v", err)
+		logger(componentPreferenceListing).Error("listing the notification preferences failed", slog.String("error", err.Error()))
 		c.JSON(http.StatusInternalServerError, notificationErrorResponse{Error: "internal server error"})
 		return
 	}
@@ -220,7 +221,11 @@ func (m *notificationModule) handleSetPreference(c *gin.Context) {
 		case errors.Is(err, domain.ErrSecretRequired):
 			c.JSON(http.StatusBadRequest, notificationErrorResponse{Error: "a signing secret is required to create a preference"})
 		default:
-			log.Printf("set notification preference: %v", err)
+			logger(componentPreferenceWrite).Error("writing the notification preference failed",
+				slog.String("user_id", userID.String()),
+				slog.String("event_type", req.EventType),
+				slog.String("channel", req.Channel),
+				slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, notificationErrorResponse{Error: "internal server error"})
 		}
 		return

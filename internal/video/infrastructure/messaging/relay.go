@@ -3,7 +3,8 @@ package messaging
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
+	"strings"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -101,8 +102,9 @@ func NewTerminalRelay(outbox outboxClaimer, config rabbitmq.Config) *Relay {
 // returning an error would only give the caller a reason to exit a process
 // whose request path is unaffected.
 func (r *Relay) Run(ctx context.Context) error {
-	log.Print("video: outbox relay: started")
-	defer log.Print("video: outbox relay: stopped")
+	lg := logger(componentOutboxRelay)
+	lg.Info("the outbox relay started", slog.String("phase", phaseStarted))
+	defer lg.Info("the outbox relay stopped", slog.String("phase", phaseStopped))
 
 	backoff := dialBackoffInitial
 	for {
@@ -112,18 +114,22 @@ func (r *Relay) Run(ctx context.Context) error {
 
 		conn, err := rabbitmq.Open(r.config)
 		if err != nil {
-			log.Printf("video: outbox relay: connect: %v; retrying in %s", err, backoff)
+			lg.Warn("connecting to the broker failed",
+				slog.Duration("retry_in", backoff),
+				slog.String("error", err.Error()))
 			if !sleepCtx(ctx, backoff) {
 				return nil
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		log.Print("video: outbox relay: connected")
+		lg.Info("the outbox relay connected to the broker", slog.String("phase", phaseConnected))
 
 		served, err := r.serve(ctx, conn)
 		if err != nil {
-			log.Printf("video: outbox relay: connection lost: %v", err)
+			lg.Warn("the broker connection was lost",
+				slog.String("phase", phaseConnectionLost),
+				slog.String("error", err.Error()))
 		}
 		_ = rabbitmq.Close(conn)
 		if ctx.Err() != nil {
@@ -140,7 +146,8 @@ func (r *Relay) Run(ctx context.Context) error {
 			backoff = dialBackoffInitial
 			continue
 		}
-		log.Printf("video: outbox relay: connection was unusable; retrying in %s", backoff)
+		lg.Warn("the broker connection was unusable",
+			slog.Duration("retry_in", backoff))
 		if !sleepCtx(ctx, backoff) {
 			return nil
 		}
@@ -222,7 +229,8 @@ func (r *Relay) cycle(ctx context.Context, publisher *Publisher) error {
 	batch, err := r.outbox.Claim(ctx, r.eventTypes, maxPublishBatch)
 	if err != nil {
 		if ctx.Err() == nil {
-			log.Printf("video: outbox relay: claim: %v", err)
+			logger(componentOutboxRelay).Warn("claiming a batch of outbox rows failed",
+				slog.String("error", err.Error()))
 		}
 		return nil
 	}
@@ -256,18 +264,23 @@ func (r *Relay) cycle(ctx context.Context, publisher *Publisher) error {
 	// relay that errored here would turn back-pressure into a reconnect
 	// loop, and one that stamped anyway would turn it into silent loss.
 	if refused := refusedIDs(messages, published); len(refused) > 0 {
-		log.Printf("video: outbox relay: broker did not accept %d of %d messages, left unpublished for the next poll: %v", len(refused), len(messages), refused)
+		logger(componentOutboxRelay).Warn("the broker did not accept every message; the rest stay unpublished for the next poll",
+			slog.Int("refused", len(refused)),
+			slog.Int("attempted", len(messages)),
+			slog.String("refused_ids", strings.Join(refused, ",")))
 	}
 
 	if err := batch.MarkPublished(ctx, published); err != nil {
 		if ctx.Err() == nil {
-			log.Printf("video: outbox relay: mark published: %v", err)
+			logger(componentOutboxRelay).Warn("marking the claimed rows published failed",
+				slog.String("error", err.Error()))
 		}
 		return nil
 	}
 	if err := batch.Commit(); err != nil {
 		if ctx.Err() == nil {
-			log.Printf("video: outbox relay: commit: %v", err)
+			logger(componentOutboxRelay).Warn("committing the outbox batch failed",
+				slog.String("error", err.Error()))
 		}
 	}
 	return nil

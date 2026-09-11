@@ -6,8 +6,9 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -583,10 +584,13 @@ func TestRelay_Run_BacksOffWhenAConnectionIsUnusable(t *testing.T) {
 
 	// log output is captured rather than instrumented: the dial rate is only
 	// observable through the relay's own lifecycle logging, which is also
-	// the thing an operator would see flooding.
+	// the thing an operator would see flooding. The capture replaces the
+	// process-wide default logger, which is shared state — this test must
+	// not run in parallel with one that reads it.
 	var logs safeBuffer
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
 
 	relay := newTestRelay(t, db, topo)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -599,13 +603,39 @@ func TestRelay_Run_BacksOffWhenAConnectionIsUnusable(t *testing.T) {
 	cancel()
 	<-done
 
-	attempts := strings.Count(logs.String(), "video: outbox relay: connected")
+	// Counted by attribute, not by message text: a record carrying the
+	// connected phase is what says a dial succeeded, and stays true through
+	// the next rewording of the message.
+	attempts := countPhase(t, logs.String(), phaseConnected)
 	if attempts == 0 {
 		t.Fatal("the relay never connected; the test never reached the path it is checking")
 	}
 	if attempts > 4 {
 		t.Fatalf("the relay dialed %d times in 3.5s; a connection that fails after dialing must be backed off, not retried in a tight loop", attempts)
 	}
+}
+
+// countPhase reports how many of the captured records carry phase. Every
+// captured line must decode as a JSON object: a line that does not is an
+// unstructured escape hatch, and counting past it would let this assertion
+// pass while the relay logged through something else.
+func countPhase(t *testing.T, captured, phase string) int {
+	t.Helper()
+
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(captured), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("captured line is not a JSON record: %q", line)
+		}
+		if record["phase"] == phase {
+			count++
+		}
+	}
+	return count
 }
 
 // safeBuffer is a bytes.Buffer usable from the relay's goroutine and the

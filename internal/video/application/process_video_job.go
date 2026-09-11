@@ -3,7 +3,7 @@ package application
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,10 +212,14 @@ func NewProcessVideoJob(start *StartProcessing, fail *FailJob, extractor domain.
 // It does not release the lease. Release happens after the outcome is
 // committed, which is the caller's moment, not this one's.
 func (uc *ProcessVideoJob) holdLease(ctx context.Context, id domain.VideoJobID, epoch int64) func() {
+	lg := logger(componentJobProcessing).With(
+		slog.String("job_id", id.String()),
+		slog.Int64("lease_epoch", epoch),
+	)
 	if acquired, err := uc.leases.Acquire(ctx, id, epoch); err != nil {
-		log.Printf("acquire lease for job %s at epoch %d: %v", id.String(), epoch, err)
+		lg.Warn("acquiring the lease failed", slog.String("error", err.Error()))
 	} else if !acquired {
-		log.Printf("lease for job %s already held at a newer epoch than %d", id.String(), epoch)
+		lg.Warn("the lease is already held at a newer epoch")
 	}
 
 	renewCtx, cancel := context.WithCancel(ctx)
@@ -231,7 +235,7 @@ func (uc *ProcessVideoJob) holdLease(ctx context.Context, id domain.VideoJobID, 
 			case <-ticker.Ticks():
 				renewed, err := uc.leases.Renew(renewCtx, id, epoch)
 				if err != nil {
-					log.Printf("renew lease for job %s at epoch %d: %v", id.String(), epoch, err)
+					lg.Warn("renewing the lease failed", slog.String("error", err.Error()))
 					continue
 				}
 				if renewed {
@@ -239,11 +243,11 @@ func (uc *ProcessVideoJob) holdLease(ctx context.Context, id domain.VideoJobID, 
 				}
 				reacquired, err := uc.leases.Acquire(renewCtx, id, epoch)
 				if err != nil {
-					log.Printf("reacquire lease for job %s at epoch %d: %v", id.String(), epoch, err)
+					lg.Warn("reacquiring the lease failed", slog.String("error", err.Error()))
 					continue
 				}
 				if !reacquired {
-					log.Printf("lease for job %s taken over at an epoch newer than %d, stopping renewal", id.String(), epoch)
+					lg.Warn("the lease was taken over at a newer epoch; renewal stopped")
 					return
 				}
 			}
@@ -275,13 +279,17 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 	stopLease := uc.holdLease(ctx, id, epoch)
 	defer stopLease()
 
+	runLog := logger(componentJobProcessing).With(slog.String("job_id", jobID))
+
 	videoPath, err := localSourcePath(id)
 	if err != nil {
-		log.Printf("build local source path for job %s: %v", jobID, err)
+		runLog.Error("building the local source path failed", slog.String("error", err.Error()))
 		return uc.failWith(jobID, epoch, err, fetchFailureReason)
 	}
 	if err := uc.sources.Get(ctx, sourceKey, videoPath); err != nil {
-		log.Printf("fetch source %s for job %s: %v", sourceKey.String(), jobID, err)
+		runLog.Error("fetching the source object failed",
+			slog.String("source_key", sourceKey.String()),
+			slog.String("error", err.Error()))
 		return uc.failWith(jobID, epoch, err, fetchFailureReason)
 	}
 	// Registered before extraction, not after: the extraction-error path
@@ -289,7 +297,9 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 	// downloaded video would be left behind on every failure.
 	defer func() {
 		if err := os.Remove(videoPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("remove local source %s for job %s: %v", videoPath, jobID, err)
+			runLog.Warn("removing the local source copy failed",
+				slog.String("path", videoPath),
+				slog.String("error", err.Error()))
 		}
 	}()
 
@@ -301,13 +311,17 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 	// Put-error path returns.
 	defer func() {
 		if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("remove extracted zip %s for job %s: %v", zipPath, jobID, err)
+			runLog.Warn("removing the extracted archive failed",
+				slog.String("path", zipPath),
+				slog.String("error", err.Error()))
 		}
 	}()
 
 	storageKey := domain.ResultStorageKey(id)
 	if err := uc.results.Put(ctx, storageKey, zipPath); err != nil {
-		log.Printf("store result %s for job %s: %v", storageKey.String(), jobID, err)
+		runLog.Error("storing the result object failed",
+			slog.String("storage_key", storageKey.String()),
+			slog.String("error", err.Error()))
 		return uc.failWith(jobID, epoch, err, storeFailureReason)
 	}
 

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -116,8 +116,9 @@ func NewConsumer(config rabbitmq.Config, topology rabbitmq.Topology, tag string,
 // It always returns nil, for the same reason Relay.Run does: every failure it
 // can meet is a broker that will come back.
 func (c *Consumer) Run(ctx context.Context) error {
-	log.Print("video: job consumer: started")
-	defer log.Print("video: job consumer: stopped")
+	lg := logger(componentJobConsumer)
+	lg.Info("the job consumer started", slog.String("phase", phaseStarted))
+	defer lg.Info("the job consumer stopped", slog.String("phase", phaseStopped))
 
 	backoff := dialBackoffInitial
 	for {
@@ -127,18 +128,22 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		conn, err := rabbitmq.Open(c.config)
 		if err != nil {
-			log.Printf("video: job consumer: connect: %v; retrying in %s", err, backoff)
+			lg.Warn("connecting to the broker failed",
+				slog.Duration("retry_in", backoff),
+				slog.String("error", err.Error()))
 			if !sleepCtx(ctx, backoff) {
 				return nil
 			}
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		log.Print("video: job consumer: connected")
+		lg.Info("the job consumer connected to the broker", slog.String("phase", phaseConnected))
 
 		served, err := c.serve(ctx, conn)
 		if err != nil {
-			log.Printf("video: job consumer: connection lost: %v", err)
+			lg.Warn("the broker connection was lost",
+				slog.String("phase", phaseConnectionLost),
+				slog.String("error", err.Error()))
 		}
 		_ = rabbitmq.Close(conn)
 		if ctx.Err() != nil {
@@ -153,7 +158,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 			backoff = dialBackoffInitial
 			continue
 		}
-		log.Printf("video: job consumer: connection was unusable; retrying in %s", backoff)
+		lg.Warn("the broker connection was unusable",
+			slog.Duration("retry_in", backoff))
 		if !sleepCtx(ctx, backoff) {
 			return nil
 		}
@@ -223,7 +229,8 @@ func (c *Consumer) serve(ctx context.Context, conn *amqp.Connection) (bool, erro
 			// take it intact.
 			if ctx.Err() != nil {
 				if err := delivery.Nack(false, true); err != nil {
-					log.Printf("video: job consumer: requeue on shutdown: %v", err)
+					logger(componentJobConsumer).Error("requeueing a delivery on shutdown failed",
+						slog.String("error", err.Error()))
 				}
 				return served, nil
 			}
@@ -243,7 +250,8 @@ func (c *Consumer) dispatch(ctx context.Context, delivery amqp.Delivery) {
 
 	if disposition == Ack {
 		if err := delivery.Ack(false); err != nil {
-			log.Printf("video: job consumer: ack: %v", err)
+			logger(componentJobConsumer).Error("acknowledging the delivery failed",
+				slog.String("error", err.Error()))
 		}
 		return
 	}
@@ -251,6 +259,7 @@ func (c *Consumer) dispatch(ctx context.Context, delivery amqp.Delivery) {
 	// can be looked at, rather than back onto the queue that would hand it
 	// straight back.
 	if err := delivery.Reject(false); err != nil {
-		log.Printf("video: job consumer: reject: %v", err)
+		logger(componentJobConsumer).Error("rejecting the delivery failed",
+			slog.String("error", err.Error()))
 	}
 }

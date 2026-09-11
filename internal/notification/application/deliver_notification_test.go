@@ -3,9 +3,11 @@ package application_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -341,7 +343,7 @@ func TestDeliverNotification_LogsNeitherTheSecretNorTheBody(t *testing.T) {
 		webhook.NewClient(domain.NewDestinationPolicy(true), time.Second),
 		fakeClock{now: deliveryTestNow},
 		fastDeliveryConfig(),
-		log.New(logs, "", 0),
+		captureLogger(logs),
 	)
 
 	if _, err := useCase.Execute(context.Background(), mustCompletedEvent(t, deliveryTestOccurredAt)); err != nil {
@@ -356,18 +358,46 @@ func TestDeliverNotification_LogsNeitherTheSecretNorTheBody(t *testing.T) {
 		t.Fatal("the destination received no body; this test would then be asserting on nothing")
 	}
 
-	output := logs.String()
-	if !strings.Contains(output, deliveryTestID) || !strings.Contains(output, domain.DeliveryStatusDelivered) {
-		t.Errorf("log output does not record the delivery: %q", output)
+	records := loggedRecords(t, logs.String())
+
+	// The allow-list is what makes this stricter than the substring search
+	// it replaces: an attribute added later has to be admitted here before
+	// it can ride along unexamined.
+	permitted := map[string]bool{
+		slog.TimeKey: true, slog.LevelKey: true, slog.MessageKey: true,
+		"component": true, "delivery_id": true, "user_id": true,
+		"event_type": true, "channel": true, "job_id": true,
+		"status": true, "attempts": true, "reason": true,
 	}
-	if strings.Contains(output, deliveryTestSecret) {
-		t.Error("log output contains the signing secret")
+	recorded := false
+	for _, record := range records {
+		for key := range record {
+			if !permitted[key] {
+				t.Errorf("a record carries an unadmitted attribute %q: %v", key, record)
+			}
+		}
+		if record["delivery_id"] == deliveryTestID && record["status"] == domain.DeliveryStatusDelivered {
+			recorded = true
+		}
 	}
-	if strings.Contains(output, string(body)) || strings.Contains(output, `"data"`) || strings.Contains(output, "version") {
-		t.Errorf("log output contains the request body: %q", output)
+	if !recorded {
+		t.Errorf("no record names the delivery and its delivered status: %v", records)
 	}
-	if strings.Contains(output, server.URL) {
-		t.Errorf("log output contains the destination: %q", output)
+
+	// The needles are the request body itself and the two markers of its
+	// shape, applied to attribute *values* rather than to the whole line: a
+	// JSON record renders its keys into that line too, so a raw search would
+	// answer for the record's own vocabulary instead of for what was logged.
+	for _, value := range recordedValues(records) {
+		if strings.Contains(value, deliveryTestSecret) {
+			t.Errorf("a logged attribute contains the signing secret: %q", value)
+		}
+		if strings.Contains(value, string(body)) || strings.Contains(value, `"data"`) || strings.Contains(value, "version") {
+			t.Errorf("a logged attribute contains the request body: %q", value)
+		}
+		if strings.Contains(value, server.URL) {
+			t.Errorf("a logged attribute contains the destination: %q", value)
+		}
 	}
 }
 
@@ -398,7 +428,7 @@ func TestDeliverNotification_ACredentialInTheQueryReachesNeitherTheRecordNorTheL
 		webhook.NewClient(domain.NewDestinationPolicy(true), 200*time.Millisecond),
 		fakeClock{now: deliveryTestNow},
 		fastDeliveryConfig(),
-		log.New(logs, "", 0),
+		captureLogger(logs),
 	)
 
 	disposition, err := useCase.Execute(context.Background(), mustCompletedEvent(t, deliveryTestOccurredAt))
@@ -429,6 +459,52 @@ func TestDeliverNotification_ACredentialInTheQueryReachesNeitherTheRecordNorTheL
 	}
 }
 
-func discardLogger() *log.Logger {
-	return log.New(&bytes.Buffer{}, "", 0)
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(io.Discard, nil))
+}
+
+// captureLogger writes the use case's records into logs. It is injected
+// rather than installed as the process default, so these tests stay safe to
+// run beside anything that reads the default.
+func captureLogger(logs io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(logs, nil))
+}
+
+// loggedRecords decodes what captureLogger collected. Every line must be a
+// JSON object: a line that is not would be an unstructured escape hatch, and
+// the assertions below would then be searching text this use case did not
+// shape.
+func loggedRecords(t *testing.T, captured string) []map[string]any {
+	t.Helper()
+
+	var records []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(captured), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("captured line is not a JSON record: %q", line)
+		}
+		records = append(records, record)
+	}
+	if len(records) == 0 {
+		t.Fatal("the use case emitted no record; these assertions would then be checking nothing")
+	}
+	return records
+}
+
+// recordedValues renders every attribute value of every record. The
+// non-disclosure assertions run over these rather than over the raw line:
+// against a JSON record a substring search of the whole line also matches
+// attribute *keys*, which would make the assertion fail — or pass — for a
+// reason unrelated to what it defends.
+func recordedValues(records []map[string]any) []string {
+	var values []string
+	for _, record := range records {
+		for _, value := range record {
+			values = append(values, fmt.Sprint(value))
+		}
+	}
+	return values
 }

@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	videodomain "video-processor/internal/video/domain"
@@ -92,7 +92,8 @@ func (s *sweeper) run(ctx context.Context, interval time.Duration) {
 func (s *sweeper) sweep(ctx context.Context) {
 	jobs, err := s.deps.jobReader.FindProcessing(ctx, s.cursor, sweepBatchSize)
 	if err != nil {
-		log.Printf("video: worker: sweep: scan processing jobs: %v", err)
+		logger(componentRecoverySweeper).Warn("scanning the processing jobs failed",
+			slog.String("error", err.Error()))
 		return
 	}
 
@@ -130,7 +131,8 @@ func (s *sweeper) sweep(ctx context.Context) {
 		s.recover(ctx, job, epoch)
 	}
 	if unreachable > 0 {
-		log.Printf("video: worker: sweep: lease store unreachable for %d job(s), taking over none of them", unreachable)
+		logger(componentRecoverySweeper).Warn("the lease store was unreachable; taking over none of these jobs",
+			slog.Int("unreachable", unreachable))
 	}
 
 	// After the loop, never before it: the prune below discards marks for
@@ -172,33 +174,44 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 	// the scan instead would leave them stranded, which is the condition this
 	// sweep exists to end.
 	if job.SourceKey().IsZero() {
-		log.Printf("video: worker: sweep: job %s is processing with no source, failing it", job.ID().String())
+		logger(componentRecoverySweeper).Error("the job is processing with no source object; failing it",
+			slog.String("job_id", job.ID().String()))
 		s.abandon(ctx, job, epoch)
 		return
 	}
 	if epoch >= maxRequeues {
-		log.Printf("video: worker: sweep: job %s has been requeued %d time(s), failing it", job.ID().String(), epoch)
+		logger(componentRecoverySweeper).Error("the job has been requeued too often; failing it",
+			slog.String("job_id", job.ID().String()),
+			slog.Int64("lease_epoch", epoch))
 		s.abandon(ctx, job, epoch)
 		return
 	}
 
 	if err := job.Requeue(); err != nil {
-		log.Printf("video: worker: sweep: requeue job %s: %v", job.ID().String(), err)
+		logger(componentRecoverySweeper).Warn("the job refused the requeue transition",
+			slog.String("job_id", job.ID().String()),
+			slog.String("error", err.Error()))
 		return
 	}
 	requeued, err := s.deps.jobWriter.Requeue(ctx, job, epoch)
 	if err != nil {
-		log.Printf("video: worker: sweep: requeue job %s: %v", job.ID().String(), err)
+		logger(componentRecoverySweeper).Warn("requeueing the job failed",
+			slog.String("job_id", job.ID().String()),
+			slog.String("error", err.Error()))
 		return
 	}
 	if !requeued {
 		// Normal, not an error: another sweeper won, or the job left
 		// processing between the scan and this write. Nothing to retry.
-		log.Printf("video: worker: sweep: job %s was no longer at epoch %d, leaving it alone", job.ID().String(), epoch)
+		logger(componentRecoverySweeper).Info("the job was no longer at the observed epoch; leaving it alone",
+			slog.String("job_id", job.ID().String()),
+			slog.Int64("lease_epoch", epoch))
 		return
 	}
 	delete(s.marks, job.ID())
-	log.Printf("video: worker: sweep: requeued job %s at epoch %d", job.ID().String(), job.LeaseEpoch())
+	logger(componentRecoverySweeper).Info("the job was requeued",
+		slog.String("job_id", job.ID().String()),
+		slog.Int64("lease_epoch", job.LeaseEpoch()))
 }
 
 // abandon fails the job at the epoch the scan observed and, only if that
@@ -213,7 +226,9 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 func (s *sweeper) abandon(ctx context.Context, job *videodomain.VideoJob, epoch int64) {
 	result, err := s.deps.fail.Abandon(ctx, job.ID().String(), epoch)
 	if err != nil {
-		log.Printf("video: worker: sweep: fail abandoned job %s: %v", job.ID().String(), err)
+		logger(componentRecoverySweeper).Warn("failing the abandoned job failed",
+			slog.String("job_id", job.ID().String()),
+			slog.String("error", err.Error()))
 		return
 	}
 	delete(s.marks, job.ID())
@@ -224,5 +239,7 @@ func (s *sweeper) abandon(ctx context.Context, job *videodomain.VideoJob, epoch 
 		s.deps.deleteSource(ctx, job.ID().String(), job.SourceKey())
 	}
 	s.deps.clearIdempotencyKey(ctx, job.ID().String())
-	log.Printf("video: worker: sweep: job %s failed after abandonment at epoch %d", job.ID().String(), epoch)
+	logger(componentRecoverySweeper).Error("the job failed after abandonment",
+		slog.String("job_id", job.ID().String()),
+		slog.Int64("lease_epoch", epoch))
 }
