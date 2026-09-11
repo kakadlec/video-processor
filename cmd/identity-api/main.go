@@ -104,6 +104,12 @@ func newHTTPServer(handler http.Handler) *http.Server {
 		Addr:              ":8080",
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
+		// net/http reports its own errors — a panic it served, a response
+		// header it could not parse — through this logger. Left nil they go
+		// to the standard log package, which slog.SetDefault bridges into the
+		// handler at info: a failure recorded as routine, and discarded
+		// outright by a process running at error severity.
+		ErrorLog: slog.NewLogLogger(logger(componentHTTPServer).Handler(), slog.LevelError),
 	}
 }
 
