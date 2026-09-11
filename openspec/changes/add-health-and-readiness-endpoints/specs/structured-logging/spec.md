@@ -26,7 +26,7 @@ No recovered panic SHALL produce output outside the record. A framework's own re
 
 #### Scenario: A request is served
 
-- **WHEN** any HTTP service answers a request that matched a route
+- **WHEN** any HTTP service answers a request that matched a route other than the two probe route templates exempted above
 - **THEN** it emits one access record in the same format as its other records, naming the method, matched route, status, duration, size, and the authenticated subject when there is one — and not the request path
 
 #### Scenario: A request matches no route

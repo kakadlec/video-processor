@@ -3,7 +3,7 @@
 `proposal.md` states why an unprobeable process is a problem. This document settles the shape of the answer. Six properties of the existing code constrain it, and each was read out of the tree rather than assumed:
 
 - **Startup is the only place a dependency is ever verified, and it is fatal.** `cmd/identity-api/identity.go:68-81`, `cmd/video-api/video.go:150-211`, `cmd/notification-api/notification.go:76-87`. Nothing re-checks. This is what makes a readiness endpoint worth anything at all: it is not a second opinion on `t=0`, it is the only opinion on `t>0`.
-- **The checks already exist and are already wired.** `db.PingContext` (context-taking; `internal/video/infrastructure/postgres/db.go:10-13` documents it as the caller's job) and `storage.Ping` (a real `BucketExists` round trip, chosen over `IsOnline` because that reports a cached observation — `internal/video/infrastructure/storage/client.go:28-37`). `platformredis.Ping` and `platformrabbitmq.Ping` exist with **zero production callers**.
+- **The database check already exists and is already wired; the object-storage one does not.** `db.PingContext` is context-taking and documented as the caller's job (`internal/video/infrastructure/postgres/db.go:10-13`). `storage.Ping` issues a real `BucketExists` round trip — chosen over `IsOnline` because that reports a cached observation — but **discards the boolean** (`internal/video/infrastructure/storage/client.go:32-36`), so it answers *is the server reachable*, not *does the bucket exist*. Startup does not notice, because it calls `EnsureBucket` on the next line. A readiness endpoint has no next line, and that gap is what decision 9 closes. `platformredis.Ping` and `platformrabbitmq.Ping` exist with **zero production callers**.
 - **`platformrabbitmq.Ping(conn)` takes a live connection and no context** (`internal/platform/rabbitmq/client.go:38-51`). No HTTP process holds an AMQP connection: the relay stores a `Config` and dials inside its loop, closing per cycle (`internal/video/infrastructure/messaging/relay.go:63-68`, `:115`, `:134`). So consulting the broker from a probe is not a judgement call this design makes — it is unavailable, and would be unbounded if it were.
 - **The JWT verifier is network-free.** PEM from environment, no JWKS (`cmd/video-api/auth.go:37-43`). There is nothing there a readiness check could consult, which is the property `split-api-by-bounded-context` bought deliberately.
 - **The router shape is fixed and has a precedent for an ungrouped route.** All three `setupRouter`s mount the global middleware pair first, then CORS, then ungrouped routes, then the authenticated group (`cmd/video-api/main.go:185-215`, `cmd/notification-api/main.go:169-200`, `cmd/identity-api/main.go:116-150`). `/`, `/styles.css` and `/app.js` already sit outside the group. The documented invariant is about the *pair and its order* — the limiter keys on the subject the auth middleware establishes — not about every route being inside it.
@@ -20,7 +20,7 @@ One more fact shapes everything below: **there is no orchestrator.** `docs/opera
 - Every check bounded, with the bound related to the prober's bound rather than chosen independently of it.
 - A probe response that discloses nothing an unauthenticated caller should not have, while the *reason* stays recoverable by someone who can read the log stream.
 - The two non-HTTP processes answered — not omitted — and the cost of that answer stated.
-- No new dependency, no new check implementation, no change to startup.
+- No new dependency and no change to startup, with the one new check implementation the existing ones cannot express confined to a single read-only adapter operation.
 
 **Non-Goals:**
 
@@ -49,7 +49,7 @@ One more fact shapes everything below: **there is no orchestrator.** `docs/opera
 Generalised to a process: **readiness consults only the dependencies whose absence prevents that process from honouring its own contract. A dependency the system is designed to survive is not a readiness dependency.** Applied:
 
 - **PostgreSQL, every service.** With it down, `identity-api`'s two routes fail (both are bcrypt plus a row), `notification-api`'s two routes fail, and `video-api`'s `POST /upload` `500`s at `createVideoJob` (`cmd/video-api/video.go:698-731`) with `/download` and `/api/status` failing too. Nothing in the system is designed to survive it.
-- **MinIO, `video-api` only.** `POST /upload` `500`s at `m.sources.Put` (`video.go:582-592`); `/download` and `/api/status` both need it. Excluded elsewhere — neither other service holds a client.
+- **MinIO, `video-api` only.** `POST /upload` `500`s at `m.sources.Put` (`video.go:582-592`); `/download` and `/api/status` both need it. And the check has to be *presence*, not merely reachability: all three routes name objects inside one configured bucket, so a reachable server whose bucket has been deleted fails every one of them while a reachability ping still passes. Excluded elsewhere — neither other service holds a client.
 - **Redis, nowhere.** Every feature over it is specified to fail open: `upload-idempotency`'s `Reserve` logs and proceeds (`video.go:658-661`), `rate-limiting` allows the request, `videojob-status-cache` degrades to PostgreSQL. With Redis down the system is slower and unmetered and entirely correct. Reporting not-ready would take a serving process out of rotation for a condition its own specifications call survivable — which is the gateway comment's failure mode exactly.
 - **RabbitMQ, nowhere.** Two independent reasons, and the second is a hard constraint rather than a preference. *Behavioural*: `EnqueueVideoJob` touches no broker — it commits the `pending → queued` update and the outbox row in one PostgreSQL transaction (`internal/video/infrastructure/postgres/repository.go:479-509`) — so `POST /upload` answers `202` with the broker down and the relay dispatches when it returns. *Structural*: no HTTP process holds a connection to ping, and `Ping` takes no context, so the check could not be bounded per decision 4.
 
@@ -102,7 +102,13 @@ This is a **`structured-logging` delta**, not an implementation detail, and the 
 
 Today `/health` and `/ready` on `video-api` would be reachable from outside for free, because they fall into `location /` (`docker/nginx/nginx.conf:107`), while the same paths on `identity-api` and `notification-api` would be unreachable — they would fall through to `video-api`. That asymmetry is an artifact of the default route, not a decision.
 
-Two exact-match blocks on the gateway — `location = /health` and `location = /ready`, each `return 404` — make the answer uniform: **no probe is reachable through the gateway, on any service.** `404` rather than `403` or `444` follows the repository's existing byte-identical-`404` idiom, and it costs nothing at request time.
+Two exact-match blocks on the gateway — `location = /health` and `location = /ready`, each `return 404` — make the answer uniform: **no probe is reachable through the gateway, on any service.** `404` rather than `403` or `444` follows the repository's existing `404` idiom, and it costs nothing at request time.
+
+**What "indistinguishable" can mean here, and what it cannot.** These two refusals and the `404` an unknown application path receives are *not* byte-identical, and this design does not pretend otherwise: the first is generated by nginx itself, while the second is gin's own `404 page not found` handed back through the proxy, so they differ in body, in `Content-Type` and in `Content-Length`. The only way to collapse them at the gateway is `proxy_intercept_errors on` (it is off by default and unset today), and that directive intercepts **every** upstream `404` in the system and replaces its body — including `GET /download/:filename`'s, which this repository makes byte-identical across every rejection deliberately, and `GET /api/video-jobs/:id`'s. Buying body-equivalence on two probe paths by rewriting the body of the one route whose contract depends on its own is a bad trade, and it would make a routing directive load-bearing for an authorization decision two contexts away.
+
+The requirement is therefore **status-code equivalence plus non-arrival**: a probe path requested through the gateway answers `404`, the same status an unserved path answers, and the request reaches no service. Both halves are directly checkable against the running gateway, the second because these blocks carry no `proxy_pass` at all.
+
+**The residual, stated rather than glossed.** A caller who compares bodies can tell that the gateway names these two paths specially. What that discloses is that this deployment has probe endpoints at two conventional names — not a verdict, not which dependency is unavailable, not the dependency inventory. Every one of those is withheld at the service itself by decision 3 and none of them travels through the gateway on any path. The control that matters is that no probe is *answered* through the ingress; indistinguishability of the refusal is a weaker property, worth having where it is free and not worth `proxy_intercept_errors`.
 
 The prober does not need the gateway: a compose healthcheck runs *inside the container* and talks to `127.0.0.1:8080`, the same port the service already listens on, on no published port at all. So `container-image`'s and `development-workflow`'s requirement that the three application services publish no host port is untouched.
 
@@ -134,13 +140,25 @@ A readiness verdict nothing consumes is documentation, not behaviour — and for
 
 Because the answer is a *claim about source*, it is pinned the way this repository pins such claims (`TestOnlyTheIdentityServiceConstructsATokenIssuer`): `cmd/worker` and `cmd/notifier` each carry a source-level test over **their own** package's non-test files asserting that neither constructs an HTTP server nor imports gin. In-package rather than a cross-root scan, so the failure lands in the package that introduced the listener.
 
-### 9. `setupVideo` returns the MinIO client it already pinged
+### 9. `setupVideo` returns a purpose-built object-storage readiness check, not the raw client
 
-The readiness checker needs the handles `main` holds. `setupIdentity` and `setupNotification` already return `*sql.DB`. `setupVideo` returns `(*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, error)` and does **not** return the MinIO client, although it constructs, pings and bucket-checks one (`video.go:191-211`). It gains that return value.
+The readiness check is built from the handles `main` holds. For the database that is enough already: `setupIdentity` and `setupNotification` return their `*sql.DB`, and `db.PingContext` needs nothing else. Object storage is the case that does not work, and it fails twice over.
 
-The checker is built in `main`, not reached through `videoModule`. `videoModule` holds use cases and domain ports — `sources`, `results` — deliberately, and a `*minio.Client` on it would be the first raw driver handle there. Readiness is a composition-root concern for the same reason the shutdown sequence is.
+**First, `main` holds neither handle the check needs.** `setupVideo` returns `(*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, error)`. It constructs, pings and bucket-checks a `*minio.Client` (`video.go:191-211`) and returns it to nobody, and the bucket name never leaves the function at all — it lives in the local `minioConfig` variable. Every object-storage call in this repository takes `(ctx, client, bucket)`, so the check cannot be assembled from what the composition root has.
 
-*Alternative considered — check MinIO through the `SourceStorage` port instead.* Would avoid the signature change. Rejected: the port has no health operation, adding one puts a probe concern into a domain interface, and `Stat` of a key that does not exist is a `404` that means *healthy* — a check whose success condition is an error is a check waiting to be "fixed".
+**Second, the call it would make does not answer the question.** `storage.Ping` runs `BucketExists` and **discards the boolean** (`internal/video/infrastructure/storage/client.go:32-36`): a reachable server whose bucket has been deleted returns nil. Startup is unaffected only because `EnsureBucket` runs on the next line and would recreate it. A readiness endpoint has no next line and must never create anything, so `Ping` alone would hold `/ready` at `200` while upload, status and download all failed.
+
+Both are answered by one decision. **`setupVideo` gains a single return value: a readiness check that has already captured the client and the bucket**, with the same `func(context.Context) error` shape every check in this change has, and that check performs a **bounded, read-only bucket-presence** call rather than `Ping`.
+
+The new storage operation is `EnsureBucket`'s first half without its second — `BucketExists`, with the boolean read instead of dropped, and no `MakeBucket`. It is read-only by construction, not by convention, and it is bounded by the caller's context like every other call in that package.
+
+**`Ping` is left exactly as it is**, and the reason is concrete rather than stylistic. Startup pings *before* it ensures. A `Ping` that asserted presence would make every first boot against an empty object store fatal, on a bucket `EnsureBucket` was about to create one line later — it would silently change what startup checks, in a change whose stated premise is that startup is not touched. Two callers want two different questions, so there are two operations.
+
+*Why a check rather than the two values.* Returning `(*minio.Client, string)` would work and is the smaller diff, and it is still the wrong seam: it puts a raw driver handle and a bucket name into a composition root that has no other use for either, and it makes every future caller re-derive what "is object storage ready" means. Returning the check keeps that definition in the package that owns the bucket, and gives `main` a value it can only use one way. It is also the shape this repository already reaches for — `setupRouter(auth, video, limiter)` is handed its collaborators rather than the configuration they were built from, and `logger(component)` returns a configured logger rather than the logging configuration.
+
+*Alternative considered — put the client on `videoModule`.* Rejected. `videoModule` holds use cases and domain ports — `sources`, `results` — and a `*minio.Client` on it would be the first raw driver handle there. Readiness is a composition-root concern for the same reason the shutdown sequence is.
+
+*Alternative considered — check object storage through the `SourceStorage` port instead.* Would avoid the signature change. **Rejected, and this rejection is unchanged by the decision above**: the port has no health operation, adding one puts a probe concern into a domain interface, and `Stat` of a key that does not exist is a `404` that means *healthy* — a check whose success condition is an error is a check waiting to be "fixed". The presence check adopted here is not that alternative arriving by another door: it sits in the infrastructure adapter beside `Ping` and `EnsureBucket`, where a bucket-level operation already lives, and the domain port is untouched.
 
 ## Risks / Trade-offs
 
@@ -156,7 +174,7 @@ The checker is built in `main`, not reached through `videoModule`. `videoModule`
 
 Additive throughout; no intermediate state is broken.
 
-1. Handlers and the readiness checker in each of the three roots, with `setupVideo`'s new return value.
+1. The read-only bucket-presence operation in the storage adapter; then the handlers and the readiness check in each of the three roots, with `setupVideo`'s new return value.
 2. The access-log exception and the transition record, with the three pinned tests updated in the same commit as the middleware they pin.
 3. The gateway's two refusal blocks.
 4. `docker-compose.yml`'s three healthchecks, verified against a stack with a dependency deliberately stopped.

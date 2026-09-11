@@ -38,11 +38,17 @@ This rule is not introduced here. It is the rule this system already applies to 
 Applied to the three services as they are built:
 
 - **PostgreSQL SHALL be a readiness dependency of all three.** Every route that does anything at all reads or writes the service's own context database, and no route is specified to degrade without it.
-- **Object storage SHALL be a readiness dependency of `cmd/video-api` and of no other service.** Upload stores into the bucket and both read routes stat objects in it; neither other service holds a client.
+- **Object storage SHALL be a readiness dependency of `cmd/video-api` and of no other service.** Upload stores into the bucket and both read routes stat objects in it; neither other service holds a client. The check SHALL establish that **the configured bucket is present**, not merely that the object store answers. All three routes name objects inside one configured bucket, so a reachable server whose bucket has been removed fails every one of them while a reachability check still succeeds — a readiness endpoint that reported `200` under that condition would assert precisely the thing that is false.
 - **The cache SHALL NOT be a readiness dependency of any service.** Every feature built on it is specified to fail open — the upload idempotency reservation, the per-user rate limiter, and the job status cache each log and proceed on a cache error. A service with the cache down is slower and unmetered and still correct, so reporting it not ready would remove a serving process from rotation for a condition its own specifications call survivable.
 - **The message broker SHALL NOT be a readiness dependency of any service.** `POST /upload` commits the transition to `queued` and its outbox row in one database transaction and answers `202` with the broker unreachable; the outbox relay dispatches when the broker returns. That is the design, not a tolerated defect. Independently, no HTTP process holds a broker connection to check — the relay holds configuration and dials inside its own cycle — and the broker health check this repository provides takes no context and therefore could not satisfy the bounding requirement below.
 
-A readiness check SHALL reuse the health checks the service's own startup already performs rather than introducing a second way to ask the same question, and SHALL NOT report from a cached or background-refreshed observation: an answer computed at a different moment from the one the caller asked about is the failure mode the object-storage health check was specifically written to avoid.
+A readiness check SHALL reuse a health check the service's own startup already performs wherever one answers the same question, rather than introducing a second way to ask it. The database check is such a case.
+
+**Object storage is not, and the exception is required rather than permitted.** Startup's object-storage sequence is a reachability check followed by a create-the-bucket-if-absent call, and it is only the second of those that establishes presence. A readiness endpoint SHALL NOT create anything, so it cannot reuse that sequence, and reusing the first call alone would report ready for a reachable object store with no bucket. The readiness check SHALL therefore be a **read-only presence check**: it SHALL determine whether the configured bucket exists, and SHALL NOT create it, SHALL NOT write any object, and SHALL NOT otherwise modify the object store.
+
+The reachability check startup performs SHALL NOT be redefined to assert presence. Startup checks reachability *before* it creates the bucket, so a presence-asserting form of it would make a first start against an empty object store fail fatally on a bucket the next call was about to create — changing what startup verifies, which this capability does not do.
+
+No readiness check SHALL report from a cached or background-refreshed observation: an answer computed at a different moment from the one the caller asked about is the failure mode the object-storage reachability check was specifically written to avoid.
 
 #### Scenario: Readiness with every readiness dependency reachable
 
@@ -61,6 +67,12 @@ A readiness check SHALL reuse the health checks the service's own startup alread
 - **GIVEN** the video service, whose database is reachable and whose object storage is not
 - **WHEN** a caller requests `GET /ready`
 - **THEN** it answers `503`, and the two services that hold no object-storage client answer `200` under the same condition
+
+#### Scenario: Readiness with object storage reachable and the bucket absent
+
+- **GIVEN** the video service, whose object store answers but whose configured bucket has been removed since the service started
+- **WHEN** a caller requests `GET /ready`
+- **THEN** it answers `503`, and the bucket is not created and no object is written while answering
 
 #### Scenario: Readiness with the cache unreachable
 
@@ -171,7 +183,11 @@ Concurrent probes SHALL NOT be able to produce more than one record for one tran
 
 Neither probe endpoint SHALL be reachable through the application's ingress, on any service.
 
-Without an explicit rule the outcome would be accidental and asymmetric: the ingress routes by path prefix and sends everything it does not otherwise name to the video service, so a probe path on that one service would be publicly reachable while the identical path on the other two would not — a distinction nobody chose. The ingress SHALL therefore refuse both probe paths exactly, and the refusal SHALL be indistinguishable from a path the application does not serve.
+Without an explicit rule the outcome would be accidental and asymmetric: the ingress routes by path prefix and sends everything it does not otherwise name to the video service, so a probe path on that one service would be publicly reachable while the identical path on the other two would not — a distinction nobody chose. The ingress SHALL therefore refuse both probe paths by exact match, the refusal SHALL carry the **same status code** the ingress produces for a path the application does not serve, and the refused request SHALL reach no service.
+
+**The equivalence required is of the status code, and the reason it is not of the whole response is a constraint rather than a preference.** The ingress generates its own refusal, while an unserved application path is refused by the service behind it and passed back through, so the two bodies differ. Making them byte-identical would require the ingress to intercept and replace the bodies of upstream error responses, which it does not do today and which would apply to **every** upstream `404` in the system — including the download route's, which this repository makes byte-identical across all of its own rejections deliberately, and which would then be rewritten by a routing directive belonging to an unrelated concern. That trade is refused.
+
+What remains distinguishable is that the ingress names these two paths. That discloses the existence of probe endpoints at conventional names and nothing further: no verdict, no failing dependency, and no part of the dependency inventory, each of which is withheld by the non-disclosure requirement above and none of which is reachable through the ingress by any path. The property that carries the weight is that no probe is **answered** through the ingress.
 
 A prober SHALL reach a probe endpoint on the service's own listening port from inside the deployment rather than through the ingress. This SHALL NOT cause any application service to publish a host port, which `container-image` and `development-workflow` both forbid and this capability does not relax.
 
@@ -180,7 +196,7 @@ The requirement that a contributor reaches every route of the application on one
 #### Scenario: A probe path is requested through the ingress
 
 - **WHEN** a client requests the liveness or readiness path through the application's ingress
-- **THEN** the ingress refuses it with the same response it gives a path the application does not serve, and the request reaches no service
+- **THEN** the ingress answers the same status code it answers for a path the application does not serve, and the request reaches no service — no probe handler runs and no readiness dependency is consulted
 
 #### Scenario: A prober inside the deployment
 
