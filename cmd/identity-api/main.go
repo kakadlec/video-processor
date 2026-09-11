@@ -46,6 +46,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Release mode, set here rather than in setupRouter: gin's mode is
+	// process-global, and gin.New() plus every route registration writes an
+	// unstructured [GIN-debug] line to gin.DefaultWriter while it is debug.
+	// main never runs in a test binary, so the two test helpers that select
+	// gin.TestMode are unaffected by this call.
+	gin.SetMode(gin.ReleaseMode)
+
 	r := setupRouter(identity)
 
 	// Signal-aware rather than log.Fatal(r.Run(...)): that exits through
@@ -94,7 +101,15 @@ func main() {
 }
 
 func setupRouter(identity *identityModule) *gin.Engine {
-	r := gin.Default()
+	r := gin.New()
+
+	// The access log and the recovery handler this service writes itself,
+	// replacing what gin.Default() mounted. Both are global rather than
+	// grouped: the access record has to cover the requests that matched no
+	// route, and a panic can be raised from anywhere in the chain. The
+	// access log runs outermost, as gin.Default()'s did, so a recovered
+	// panic still yields an access record carrying the status it answered.
+	r.Use(accessLogMiddleware(), recoveryMiddleware())
 
 	// Byte-identical to the other services' CORS middleware, deliberately.
 	// A browser reaches all of them through one origin, so advertising a
