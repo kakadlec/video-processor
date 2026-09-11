@@ -155,19 +155,25 @@ type fileScan struct {
 	// must fail the rule loudly rather than escape it silently.
 	loggers    map[string]bool
 	notLoggers map[string]bool
+	// streamAliases holds the identifiers this file assigns a standard
+	// stream to, so a destination written as a name is judged like the
+	// selector it was assigned from.
+	streamAliases map[string]bool
 }
 
 func newFileScan(fset *token.FileSet, file *ast.File, found *findings) *fileScan {
 	scan := &fileScan{
-		fset:       fset,
-		file:       file,
-		found:      found,
-		imports:    map[string]string{},
-		loggers:    map[string]bool{},
-		notLoggers: map[string]bool{},
+		fset:          fset,
+		file:          file,
+		found:         found,
+		imports:       map[string]string{},
+		loggers:       map[string]bool{},
+		notLoggers:    map[string]bool{},
+		streamAliases: map[string]bool{},
 	}
 	scan.collectImports()
 	scan.collectTypeHints()
+	scan.collectStreamAliases()
 	return scan
 }
 
@@ -213,6 +219,88 @@ func (s *fileScan) collectTypeHints() {
 		}
 		return true
 	})
+}
+
+// collectStreamAliases resolves the identifiers this file assigns a standard
+// stream to, so `out := os.Stdout` followed by `fmt.Fprintln(out, v)` is the
+// output path it plainly is. Resolution is by provenance rather than by type:
+// os.Stdout is an *os.File, a type every other file this repository opens
+// shares, so type information cannot tell the standard stream from any of
+// them and only the assignment that produced the value can.
+//
+// Collected in the constructor rather than during the walk, so a call site
+// appearing before the assignment that names its destination is judged the
+// same as one appearing after it.
+func (s *fileScan) collectStreamAliases() {
+	assigned := map[string][]ast.Expr{}
+	pair := func(targets, values []ast.Expr) {
+		// Unequal lengths are a multi-value call, where no value expression
+		// pairs with a name.
+		if len(targets) != len(values) {
+			return
+		}
+		for i, target := range targets {
+			if ident, ok := target.(*ast.Ident); ok && ident.Name != "_" {
+				assigned[ident.Name] = append(assigned[ident.Name], values[i])
+			}
+		}
+	}
+
+	ast.Inspect(s.file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.AssignStmt:
+			pair(n.Lhs, n.Rhs)
+		case *ast.ValueSpec:
+			if len(n.Values) == 0 {
+				return true
+			}
+			targets := make([]ast.Expr, 0, len(n.Names))
+			for _, name := range n.Names {
+				targets = append(targets, name)
+			}
+			pair(targets, n.Values)
+		}
+		return true
+	})
+
+	// A name assigned a standard stream anywhere in the file counts as one
+	// everywhere in it, matching this walk's posture elsewhere: a name it
+	// cannot settle must fail the rule loudly rather than escape it.
+	var resolves func(name string, seen map[string]bool) bool
+	resolves = func(name string, seen map[string]bool) bool {
+		if seen[name] {
+			return false
+		}
+		seen[name] = true
+		for _, value := range assigned[name] {
+			switch expr := unparenthesize(value).(type) {
+			case *ast.SelectorExpr:
+				if s.isStandardStreamSelector(expr) {
+					return true
+				}
+			case *ast.Ident:
+				if resolves(expr.Name, seen) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for name := range assigned {
+		if resolves(name, map[string]bool{}) {
+			s.streamAliases[name] = true
+		}
+	}
+}
+
+func unparenthesize(expr ast.Expr) ast.Expr {
+	for {
+		parenthesized, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = parenthesized.X
+	}
 }
 
 func (s *fileScan) run() {
@@ -347,10 +435,16 @@ func (s *fileScan) checkUnstructuredOutput(call *ast.CallExpr) {
 }
 
 func (s *fileScan) isStandardStream(arg ast.Expr) bool {
-	sel, ok := arg.(*ast.SelectorExpr)
-	if !ok {
-		return false
+	switch destination := unparenthesize(arg).(type) {
+	case *ast.SelectorExpr:
+		return s.isStandardStreamSelector(destination)
+	case *ast.Ident:
+		return s.streamAliases[destination.Name]
 	}
+	return false
+}
+
+func (s *fileScan) isStandardStreamSelector(sel *ast.SelectorExpr) bool {
 	ident, ok := sel.X.(*ast.Ident)
 	if !ok {
 		return false
@@ -473,7 +567,10 @@ func scanSource(t *testing.T, src string) findings {
 // dangerous direction — a destination-blind fmt.Fprintf rule rejects the
 // eleven calls that assemble the mail message, an alternating key-and-value
 // pair is the same hole as an arbitrary-value attribute, and gin's
-// c.Error(err) is not a log call.
+// c.Error(err) is not a log call. The alias cases carry the same tension
+// from both sides: a destination named by an identifier still has to be
+// judged by what was assigned to it, and judging it by its name alone would
+// reject the builder those eleven calls write into.
 func TestTheWalkJudgesEachFormItMustJudge(t *testing.T) {
 	cases := []struct {
 		name               string
@@ -547,6 +644,47 @@ import (
 )
 func f(v string) { fmt.Fprintln(os.Stderr, v) }`,
 			unstructuredOutput: 1,
+		},
+		{
+			name: "fmt.Fprintln to a name the file assigned standard output",
+			src: `package p
+import (
+	"fmt"
+	"os"
+)
+func f(v string) {
+	out := os.Stdout
+	fmt.Fprintln(out, v)
+}`,
+			unstructuredOutput: 1,
+		},
+		{
+			name: "a standard stream reached through a second name",
+			src: `package p
+import (
+	"fmt"
+	"os"
+)
+func f(v string) {
+	var first = os.Stderr
+	second := first
+	fmt.Fprintf(second, "%s\n", v)
+}`,
+			unstructuredOutput: 1,
+		},
+		{
+			name: "a builder reached through a name, which is still not output",
+			src: `package p
+import (
+	"fmt"
+	"strings"
+)
+func f(v string) string {
+	var b strings.Builder
+	w := &b
+	fmt.Fprintf(w, "To: %s\r\n", v)
+	return b.String()
+}`,
 		},
 		{
 			name: "fmt.Println",
