@@ -145,7 +145,11 @@ The five processes have deliberately different configuration surfaces. The absen
 | `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | not read | not read | **not read** — it validates an address, it sends nothing | not read | **required** |
 | `NOTIFICATION_SMTP_USERNAME`, `NOTIFICATION_SMTP_PASSWORD` | not read | not read | not read | not read | optional, and only **together** — one without the other fails startup |
 | `RATE_LIMIT_*` | not read — its two routes are how a caller obtains a token, so limiting them would be circular | optional | optional | not read | not read |
-| `PORT` / `GIN_MODE` | as below | as below | as below | not read — the worker serves no HTTP and exposes no port | not read — same |
+| `PORT` | as below | as below | as below | not read — the worker serves no HTTP and exposes no port | not read — same |
+| `GIN_MODE` | **read by gin, then overridden** — see below | same | same | not read — no gin, no HTTP surface | not read — same |
+| `LOG_LEVEL` | optional | optional | optional | optional | optional |
+
+**`LOG_LEVEL` is the one row with no absences**, which in a table whose point is the absences is worth saying out loud: every process this repository builds emits structured records, so every one of them reads it. It is also the one variable that is deliberately *not* required to agree across services — unlike `RATE_LIMIT_*` below, which governs one shared per-user counter, this threshold governs only the process that reads it. Raising the worker's verbosity while leaving the three HTTP services at the default is the ordinary use of it, not a misconfiguration. See "Logging" under Implemented Infrastructure for what a record looks like.
 
 **`RATE_LIMIT_*` must hold the same value everywhere it is read, or be unset everywhere.** The counter is shared — one budget per user across the whole system, keyed `ratelimit:<userID>` by every service that mounts the middleware — so services holding different thresholds would compare one count against two of them and the effective limit would depend on which route a request happened to take. `docker-compose.yml` leaves both unset on every service for exactly that reason: unset-everywhere is one source of truth (the code default, 60 requests / 60 seconds), whereas pinning the value in the compose file would create a second place for it to drift from.
 
@@ -158,7 +162,8 @@ The one row that needs explaining is `VIDEO_MINIO_PUBLIC_*`. The worker never mi
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Listening port (hardcoded as `:8080` in each HTTP service's `main.go`; no env var read currently — listed here for future use) |
-| `GIN_MODE` | `debug` | Set to `release` to suppress Gin debug output |
+| `GIN_MODE` | — | **No longer a deployment knob.** gin still reads it in its own package initializer, so the variable is not "not read" — but all three HTTP `main()`s call `gin.SetMode(gin.ReleaseMode)` unconditionally before registering a route, which overrides whatever it said. Setting it changes nothing. The mode is pinned rather than configured because debug mode prints `[GIN-debug]` route registrations and an ANSI banner to standard error, and one unstructured line is one too many now that every other byte a process writes is a JSON record. |
+| `LOG_LEVEL` | `info` | Minimum severity this process records: `debug`, `info`, `warn` (or `warning`), or `error`, case-insensitive. Optional as of Phase 8's `add-structured-logging`, and read by **all five** processes. Absent means informational. A value that is *set* and cannot be parsed is refused rather than silently replaced by the default: the process emits one error-severity record naming the offending value — structured, through a logger built at the default severity carrying the same `service` and `instance` fields as any other record — and exits non-zero. Per-process by design; two services holding different values is a supported configuration, not a drift (contrast `RATE_LIMIT_*` above). |
 | `IDENTITY_POSTGRES_DSN` | unset | PostgreSQL connection string for the Identity module (e.g. `postgres://user:pass@host:5432/identity?sslmode=disable`). Required at startup. |
 | `IDENTITY_JWT_PRIVATE_KEY` | unset | PKCS#8 RSA private key, in PEM form, that access tokens are signed with (RS256). Held by the one process that mints tokens and by no other. Required at startup; there is no default or embedded key, and startup fails clearly rather than falling back to one. Generate with `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`. |
 | `IDENTITY_JWT_KEY_ID` | unset | The key id stamped into every issued token's `kid` header, naming which key signed it. Required at startup alongside the private key, and held by the same single process. |
@@ -450,7 +455,7 @@ Authoritative state store for users (`User` aggregate), `VideoJob`s, and `Notifi
 3. **Status cache** — **Implemented.** `CachedVideoJobRepository` provides cache-aside polling reads and atomic epoch/status-ordered write-through. Ownership decisions bypass the cache; Redis errors fall back to PostgreSQL correctness. No separate environment variable; the TTL is fixed at five minutes.
 4. **Worker leases** — **Implemented.** `internal/video/infrastructure/lease.RedisStore` stores `videojob:lease:<jobID> = <lease_epoch>` with a fixed 90-second TTL. A holder renews every 30 seconds and reacquires an absent equal-epoch lease; the recovery sweeper uses successful absence at the observed epoch as its liveness signal. Lease errors fail open for execution but fail closed for takeover.
 
-During a Redis outage, rate limiting, idempotency, status caching, and lease maintenance fail open for request/execution availability, while each sweeper query fails closed: it logs `lease store unreachable ... taking over none`, clears the queried job's prior confirmation, and takes over that job only after two later successful absence observations. PostgreSQL claims and fence predicates continue to prevent state corruption. Marks for jobs outside the failing scan batch are not globally cleared; if one survives the outage, its first successful post-outage absence can complete the pair. This is part of the documented prolonged-stall risk, not a two-fresh-observations guarantee for every job after any Redis outage.
+During a Redis outage, rate limiting, idempotency, status caching, and lease maintenance fail open for request/execution availability, while each sweeper query fails closed: it records `the lease store was unreachable; taking over none of these jobs` with an `unreachable` count, clears the queried job's prior confirmation, and takes over that job only after two later successful absence observations. PostgreSQL claims and fence predicates continue to prevent state corruption. Marks for jobs outside the failing scan batch are not globally cleared; if one survives the outage, its first successful post-outage absence can complete the pair. This is part of the documented prolonged-stall risk, not a two-fresh-observations guarantee for every job after any Redis outage.
 
 ### MinIO — Source and result storage implemented (Phase 5)
 
@@ -548,7 +553,7 @@ Operationally, three things are worth knowing before they surprise you:
   A growing `video_job.queued.v2` count with an ageing `min(occurred_at)` means the dispatch relay is not publishing — a broker that is down, a full queue, or an unroutable exchange. The same reading applies to `video_job.completed.v1` and `video_job.failed.v1` for the worker's terminal relay, with one difference in the expected steady state: those two should hover near zero and drain within a poll or two regardless of what the consumer is doing, because a stamped row means the broker accepted and routed the message, not that anyone read it — a notifier that is down shows up as queue *depth*, never as unpublished rows. A growing unpublished count for them, paired with a `video.jobs.terminal.events.v1` depth sitting at its 10 000-message limit, is the `reject-publish` back-pressure symptom described below. A large and **steadily growing** `video_job.created` count is normal: one row is written per job created and none is ever marked published, so that number only ever goes up. Those rows are internal events, are never dispatched, and are excluded from the claim by the `event_type` filter and its partial index (`video_job_outbox_unpublished_idx`) — which is exactly why an unbounded backlog there is harmless rather than a leak to chase.
 - **Delivery is at-least-once.** The relay commits only after the broker acknowledges, so a crash in between republishes rather than loses. A consumer must tolerate a duplicate regardless, since a nack or a consumer crash produces one too. That holds for the terminal events too: exactly one *row* is recorded per job outcome, but one row can still become more than one message, and deduplication belongs to whatever consumes the queue. `cmd/notifier` discharges that obligation with a durable delivery record keyed on `(user_id, event_type, channel, job_id)` and claimed atomically **before** any request is made — not by trusting the transport, and not by recording afterwards, which would leave a read-then-act window two consumer processes both lose.
 
-Its lifecycle transitions are logged — started, connection lost, reconnected, stopped — because a healthy relay is otherwise invisible. Repeated dial failures back off from 1 s to a 30 s ceiling, and the topology is redeclared after every successful dial, so a broker that was recreated while the relay was disconnected gets its exchange and queues back before the next publish.
+Its lifecycle transitions are recorded under a `phase` field — `started`, `connected`, `connection_lost`, `stopped` — because a healthy relay is otherwise invisible, and because `connected` appearing a second time is how a reconnection reads. Repeated dial failures back off from 1 s to a 30 s ceiling, and the topology is redeclared after every successful dial, so a broker that was recreated while the relay was disconnected gets its exchange and queues back before the next publish.
 
 #### The terminal-event queue and its consumer
 
@@ -594,9 +599,11 @@ Correlate each candidate with worker logs and, from an authorized Redis shell, `
 - the same epoch with a positive TTL shows only that the lease has not expired; sample `PTTL` again to confirm it increases on renewal rather than counting down to zero — extraction duration alone does not imply abandonment;
 - no key is one observation, not permission to mutate the row — allow the sweeper a second successful observation;
 - a greater key epoch belongs to a successor and fences the older run;
-- `lease store unreachable ... taking over none` means Redis recovery failed closed and all pending confirmations for affected jobs were reset;
-- `requeued job ... at epoch N` means the row advanced and a new outbox dispatch committed;
-- `failed after abandonment` means the row exhausted three requeues, or had no source key, and the sweep applied the terminal write.
+- `the lease store was unreachable; taking over none of these jobs` means Redis recovery failed closed and all pending confirmations for affected jobs were reset;
+- `the job was requeued` (with `job_id` and `lease_epoch`) means the row advanced and a new outbox dispatch committed;
+- `the job failed after abandonment` means the row exhausted three requeues, or had no source key, and the sweep applied the terminal write.
+
+All three are records from `component: recovery_sweeper`, so `jq 'select(.component == "recovery_sweeper")'` is the filter that shows the sweep's whole account of a cycle; a named job's is `select(.job_id == "<jobID>")`.
 
 Normal recovery latency includes the remaining lease TTL plus up to two sweep intervals. A backlog may add cycles because one cycle examines 50 rows. Restarting a worker also discards its in-memory first-observation marks, deliberately requiring two fresh observations. Confirmation mitigates the ordinary claim-to-acquire race but is not a proof against a process paused across multiple scans: such a run may be treated as abandoned and fenced when it resumes; at the requeue bound, recovery may instead commit `failed` and remove the source.
 
@@ -621,6 +628,40 @@ Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking d
 
 Locally, `docker compose up --build` starts a mail catcher that accepts everything and forwards nothing; its inbox is on `127.0.0.1:8025`. It publishes its own loopback-bound port rather than taking a route on the gateway, which serves the application's surface only.
 
+### Logging — Implemented (Phase 8)
+
+**All five processes write JSON records to standard output, and nothing else.** There is no second format, no console renderer for development, and no configuration that selects one — `add-structured-logging` deliberately left the format and the destination unconfigurable, so the guarantees below hold in the environment a developer is watching and in the one they are not. Standard output rather than standard error matches the gateway's own split, where the access log is stdout and only nginx's own errors are stderr, and it means `docker compose logs` and any collector that reads a container's stdout get the whole stream.
+
+Every record carries `time`, `level`, `msg`, and two identity fields bound once at startup:
+
+| Field | Value |
+|---|---|
+| `service` | One of `identity-api`, `video-api`, `notification-api`, `worker`, `notifier` — a closed set, fixed in `internal/platform/logging`. These are the binary names, which are also the Compose service names, so a filter matches what you already type. No `cmd/` prefix. |
+| `instance` | `<hostname>-<pid>-<n>`, resolved once per process. Under Docker the hostname is the container id; run directly, two `go run ./cmd/worker` processes share a hostname, which is exactly why the process identifier is in there. `docker-compose.yml` runs **three** worker replicas, so this is the field that says *which* worker. |
+
+**Identifiers are fields, never substrings of the message.** The message is a fixed string literal for a given call site — enforced at the source level, not by convention — so grouping by `msg` groups occurrences of one event, and selecting by `job_id`, `delivery_id`, `storage_key`, `lease_epoch`, `user_id`, `event_type` or `channel` selects on the thing itself. `component` names the subsystem (`http_access`, `outbox_relay`, `recovery_sweeper`, `video_upload`, …), replacing the hierarchical `video: worker: sweep:` prefixes the prose used to carry.
+
+```bash
+# One job, end to end. It returns records from video-api (the accepted-job
+# record), worker, and notifier — that is the point of the field
+docker compose logs --no-log-prefix | jq -c 'select(.job_id == "<jobID>")'
+
+# Which worker replica did the work
+docker compose logs --no-log-prefix worker | jq -r '[.instance, .msg] | @tsv'
+
+# Everything a process complained about
+docker compose logs --no-log-prefix notifier | jq -c 'select(.level == "ERROR")'
+```
+
+`docker compose logs` also collects nginx, PostgreSQL, Redis, RabbitMQ, MinIO and the mail catcher, none of which this repository builds and none of which emits JSON. Scope the command to the five application services before piping to `jq`, or it fails on the first line of somebody else's format.
+
+**Each HTTP request produces exactly one access record** (`component: http_access`) naming the method, the matched route, the status, the duration, the response size, and the authenticated subject where the request carried one. It carries **no query string, no header, and no body**, and no request path when a route matched — the route template is the bounded field, and a matched path adds only parameter values the handler already records. A request that matched *no* route records its path instead, truncated to 256 bytes, and a request method that is not a recognized HTTP method is replaced by `UNRECOGNIZED`: both values are caller-supplied and reach the record before authentication and before the rate limiter, so both are bounded there. A recovered panic is a record like any other (`component: http_recovery`, error severity, carrying the panic value and the stack) — including a panic on a connection the client has already dropped, which gin's own recovery middleware handles on a branch that never reaches a supplied handler.
+
+**What a record never carries** is unchanged by this and worth restating in one place, because the stream is now easy to grep and therefore easy to over-collect: no presigned download URL (it is a credential — the `StorageKey` is logged instead), no webhook signing secret, no destination query string (which is where a webhook credential legitimately lives, and why every recorded reason on the delivery path is built from this system's own classification rather than from a transport error's text), no request or response body, and no token. A log call may only build a field from a scalar it extracted itself, so a domain aggregate cannot be handed to the logger and serialized by accident.
+
+**Severity is per-process and optional** — `LOG_LEVEL`, documented in the table above. An unparseable value stops the process, structurally: it is reported as a record and the exit code is non-zero, rather than starting quietly at a severity nobody asked for.
+
+
 ---
 
 ## Planned Infrastructure (Not Yet Implemented)
@@ -629,6 +670,10 @@ Locally, `docker compose up --build` starts a mail catcher that accepts everythi
 
 **E-mail delivery is no longer planned — it shipped** (`add-notification-email-delivery`) and is documented above: the relay variables under "Environment Variables", the local mail catcher under "Docker", and the operational notes under "The e-mail channel", at the end of the implemented-infrastructure section above.
 
-### Observability — Planned (Phase 8)
+### Observability — Partly implemented (Phase 8)
 
-Structured logging (zerolog or slog), Prometheus metrics at `/metrics`, health endpoint at `/health`, readiness endpoint at `/ready`. Also in Phase 8: `docker-compose.yml` for the full local development stack (API, worker, PostgreSQL, Redis, RabbitMQ, MinIO).
+**Structured logging shipped** (`add-structured-logging`) and is documented above under "Logging", alongside `LOG_LEVEL` in the environment-variable tables. It was the first of Phase 8's three changes because it is the only one that touches every file the other two will.
+
+What remains is metrics and the two probe endpoints: Prometheus metrics at `/metrics`, a health endpoint at `/health`, and a readiness endpoint at `/ready`. Neither change is decomposed yet, and one question they share is already visible from this document: `cmd/worker` and `cmd/notifier` have no HTTP surface at all, so whether they acquire one to be scraped and probed — or are observed some other way — is undecided rather than implied by the paths above.
+
+`docker-compose.yml` used to be listed here as Phase 8 work. It is not: the full local stack was built up change by change, is documented in `docs/development.md`, and `docs/roadmap.md` records it as delivered.
