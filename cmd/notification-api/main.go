@@ -74,7 +74,7 @@ func main() {
 	// gin.TestMode are unaffected by this call.
 	gin.SetMode(gin.ReleaseMode)
 
-	r := setupRouter(auth, notification, limiter)
+	r := setupRouter(auth, notification, limiter, newReadinessChecker(notificationDB))
 
 	// Signal-aware rather than log.Fatal(r.Run(...)): that exits through
 	// os.Exit, which runs no deferred call, so an in-flight preference write
@@ -166,7 +166,7 @@ func newHTTPServer(handler http.Handler) *http.Server {
 	}
 }
 
-func setupRouter(auth *authenticator, notification *notificationModule, limiter rateLimiter) *gin.Engine {
+func setupRouter(auth *authenticator, notification *notificationModule, limiter rateLimiter, readiness *readinessChecker) *gin.Engine {
 	r := gin.New()
 
 	// The access log and the recovery handler this service writes itself,
@@ -194,6 +194,15 @@ func setupRouter(auth *authenticator, notification *notificationModule, limiter 
 
 		c.Next()
 	})
+
+	// The probes are mounted on the engine, outside the group below and so
+	// outside both of its middlewares. r.Use is not retroactive, so the
+	// registration order here is what makes that true. A probe carries no
+	// bearer token, which the limiter would have nothing to key on; worse, a
+	// probe issued at a fixed interval from inside the limiter would
+	// eventually exhaust a budget and be answered 429, which a prober reads
+	// as an outage the limiter itself manufactured.
+	newProbeEndpoints(readiness).registerRoutes(r)
 
 	// Bearer authentication, then the limiter, in that order. The pair and
 	// its order are the invariant — the limiter keys on the authenticated

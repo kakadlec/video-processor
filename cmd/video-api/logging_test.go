@@ -398,7 +398,7 @@ func TestTheServiceRouterMountsTheAccessLog(t *testing.T) {
 
 	auth, _ := newTestAuthenticatorWithTokens(t)
 	recorder := httptest.NewRecorder()
-	setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
+	setupRouter(auth, newTestVideoModule(t), alwaysAllowRateLimiter{}, newChecker()).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
 
 	record := onlyRecord(t, buffer, componentHTTPAccess)
 	requireField(t, record, "method", http.MethodGet)

@@ -400,7 +400,7 @@ func TestTheServiceRouterMountsTheAccessLog(t *testing.T) {
 
 	auth, _ := newTestAuthenticatorWithTokens(t)
 	recorder := httptest.NewRecorder()
-	setupRouter(auth, newTestNotificationModuleWithPolicy(newInMemoryPreferenceRepository(), notificationdomain.NewDestinationPolicy(false)), alwaysAllowRateLimiter{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
+	setupRouter(auth, newTestNotificationModuleWithPolicy(newInMemoryPreferenceRepository(), notificationdomain.NewDestinationPolicy(false)), alwaysAllowRateLimiter{}, newChecker()).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
 
 	record := onlyRecord(t, buffer, componentHTTPAccess)
 	requireField(t, record, "method", http.MethodGet)

@@ -179,7 +179,7 @@ func newTestIdentityModule(t *testing.T) *identityModule {
 // than relocating.
 func startTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t)))
+	srv := httptest.NewServer(setupRouter(newTestIdentityModule(t), newChecker()))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -308,7 +308,7 @@ func TestHandleLogin_Success(t *testing.T) {
 // them could check.
 func TestHandleLogin_MintsAVerifiableRS256TokenNamingTheKeyID(t *testing.T) {
 	module, tokens := newTestIdentityModuleWithTokens(t)
-	srv := httptest.NewServer(setupRouter(module))
+	srv := httptest.NewServer(setupRouter(module, newChecker()))
 	defer srv.Close()
 
 	registerTestAccount(t, srv.URL, "user@example.com", "correct-horse")

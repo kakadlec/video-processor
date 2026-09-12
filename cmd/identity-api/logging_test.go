@@ -367,7 +367,7 @@ func TestTheServiceRouterMountsTheAccessLog(t *testing.T) {
 	unstructured := captureUnstructuredOutput(t)
 
 	recorder := httptest.NewRecorder()
-	setupRouter(newTestIdentityModule(t)).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
+	setupRouter(newTestIdentityModule(t), newChecker()).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
 
 	record := onlyRecord(t, buffer, componentHTTPAccess)
 	requireField(t, record, "method", http.MethodGet)
