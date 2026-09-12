@@ -106,10 +106,12 @@ func accessLogMiddleware() gin.HandlerFunc {
 
 		c.Next()
 
-		// After the chain, not before it: what is exempt is the record, not
-		// the request. The recovery middleware and the handler both sit
-		// behind this call, so returning ahead of it would answer every probe
-		// from the middleware itself.
+		// After the chain rather than before it: what is exempt is the
+		// record, not the request. Returning ahead of c.Next() happens to
+		// work — gin's own loop advances past a middleware that did not call
+		// it — but it reads as skipping the request, and the one edit from
+		// there that really does skip it answers every probe from inside this
+		// middleware, with an empty body and no recovery record.
 		if accessRecordExempt(c.FullPath()) {
 			return
 		}
