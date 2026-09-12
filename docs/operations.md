@@ -740,7 +740,7 @@ Verified by stopping each backing service in turn: with PostgreSQL down all thre
 
 **E-mail delivery is no longer planned — it shipped** (`add-notification-email-delivery`) and is documented above: the relay variables under "Environment Variables", the local mail catcher under "Docker", and the operational notes under "The e-mail channel", at the end of the implemented-infrastructure section above.
 
-### Observability — Partly implemented (Phase 8)
+### Observability — Only metrics remain (Phase 8)
 
 **Two of Phase 8's three changes have shipped and are documented above**, not here. `add-structured-logging` is under "Logging", alongside `LOG_LEVEL` in the environment-variable tables; it went first because it is the only one of the three that touches every file the other two will. `add-health-and-readiness-endpoints` is under "Health and readiness probes", with the per-service readiness matrix and the one constraint that spans two files.
 
