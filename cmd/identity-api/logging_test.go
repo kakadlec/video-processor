@@ -488,13 +488,16 @@ func newProbeAccessRouter(t *testing.T, readiness *readinessChecker) *gin.Engine
 }
 
 // TestAProbeYieldsNoAccessRecordAndIsStillServed holds the exemption and the
-// trap it sets in one assertion. The natural implementation — returning from
-// the access middleware as soon as the matched route is a probe template —
-// never calls c.Next(), so the probe handler never runs: every probe then
-// answers 200 with an empty body and none of the headers the handler sets,
-// which satisfies both "a probe yields no access record" and "a probe answers
-// 200" and fails only an assertion that reads what came back. The exemption
-// suppresses the record, not the chain.
+// trap it sets in one assertion. The trap is not a plain early return, which
+// is harmless: gin drives Next() as a loop and advances past a middleware
+// that did not call it, so the chain runs either way. It is aborting — the
+// c.Abort(); return form, one edit away and the way a middleware that means
+// to suppress something is usually written — which does stop the chain, so
+// the probe handler never runs: every probe then answers 200 with an empty
+// body and none of the headers the handler sets, and /ready answers 200 where
+// it should answer 503. That satisfies both "a probe yields no access record"
+// and "a probe answers 200" and fails only an assertion that reads what came
+// back. The exemption suppresses the record, not the chain.
 func TestAProbeYieldsNoAccessRecordAndIsStillServed(t *testing.T) {
 	for name, probe := range map[string]struct {
 		path    string
