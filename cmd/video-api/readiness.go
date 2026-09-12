@@ -105,9 +105,15 @@ func (rc *readinessChecker) failingDependencies(ctx context.Context) []string {
 //
 // The broker is absent for two independent reasons. POST /upload commits the
 // transition to queued and its outbox row in one PostgreSQL transaction and
-// answers 202 with the broker unreachable, so nothing here needs it; and
-// this process holds no AMQP connection to check, because the relay keeps
-// configuration and dials inside its own cycle.
+// answers 202 with the broker unreachable, so nothing here needs it; and the
+// readiness path has no connection it could check — which is a claim about
+// access, not absence. This process does hold an AMQP connection whenever its
+// dispatch relay is serving: internal/video/infrastructure/messaging's
+// Relay.Run opens one inside its own dial cycle, holds it for that cycle and
+// closes it at the end, so it is transient and no composition-root handle and
+// no probe handle exposes it. And internal/platform/rabbitmq's Ping takes a
+// live *amqp.Connection and no context, so it could not be bounded the way
+// every check here is even if a handle were reachable.
 func newReadinessChecker(db *sql.DB, objectStorage func(context.Context) error) *readinessChecker {
 	return newChecker(
 		readinessCheck{name: dependencyDatabase, probe: db.PingContext},
