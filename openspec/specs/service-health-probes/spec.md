@@ -1,5 +1,9 @@
-## ADDED Requirements
+# service-health-probes Specification
 
+## Purpose
+Defines how a process of this system reports whether it is alive and whether it can serve: the two endpoints each HTTP service exposes and why they are two rather than one, since the remedy wired to a failed liveness answer is a restart and a restart cannot repair a dependency; the rule that decides what a readiness endpoint may consult — a dependency whose absence stops the process serving, which is the criterion this system already applies to its own ingress — and the per-service matrix that rule produces, including the dependencies deliberately excluded because the system is specified to survive them; the bound every check runs under and the relationship it must keep with the prober's own timeout, which is stated here because the two values live in different files; what a probe response may disclose, which is the verdict and nothing else; the record that carries the withheld diagnostic, emitted once per change of verdict rather than once per probe and never on behalf of a caller that has gone, since a cancelled request fails every check at once and a verdict read out of that would be a fabricated outage followed by a fabricated recovery; the refusal of both paths at the application's ingress; and the local stack's health checks, which nothing is made to wait on. Four neighbouring concerns belong to other specifications: the format of the readiness record and the access-record exemption that pays for it are defined by `structured-logging`; the rule that no application service publishes a host port by `container-image` and `development-workflow`; the fail-open behaviour that keeps the cache out of every readiness matrix by `rate-limiting`, `upload-idempotency` and `videojob-status-cache`; and the transactional dispatch that keeps the broker out of it by `videojob-outbox-relay`.
+
+## Requirements
 ### Requirement: Each HTTP Service Serves a Liveness Probe and a Readiness Probe
 
 Each of this repository's three HTTP services — `cmd/identity-api`, `cmd/video-api`, and `cmd/notification-api` — SHALL serve two probe endpoints: a **liveness** endpoint at `GET /health` and a **readiness** endpoint at `GET /ready`.
@@ -40,7 +44,7 @@ Applied to the three services as they are built:
 - **PostgreSQL SHALL be a readiness dependency of all three.** Every route that does anything at all reads or writes the service's own context database, and no route is specified to degrade without it.
 - **Object storage SHALL be a readiness dependency of `cmd/video-api` and of no other service.** Upload stores into the bucket and both read routes stat objects in it; neither other service holds a client. The check SHALL establish that **the configured bucket is present**, not merely that the object store answers. All three routes name objects inside one configured bucket, so a reachable server whose bucket has been removed fails every one of them while a reachability check still succeeds — a readiness endpoint that reported `200` under that condition would assert precisely the thing that is false.
 - **The cache SHALL NOT be a readiness dependency of any service.** Every feature built on it is specified to fail open — the upload idempotency reservation, the per-user rate limiter, and the job status cache each log and proceed on a cache error. A service with the cache down is slower and unmetered and still correct, so reporting it not ready would remove a serving process from rotation for a condition its own specifications call survivable.
-- **The message broker SHALL NOT be a readiness dependency of any service.** `POST /upload` commits the transition to `queued` and its outbox row in one database transaction and answers `202` with the broker unreachable; the outbox relay dispatches when the broker returns. That is the design, not a tolerated defect. Independently, no HTTP process holds a broker connection to check — the relay holds configuration and dials inside its own cycle — and the broker health check this repository provides takes no context and therefore could not satisfy the bounding requirement below.
+- **The message broker SHALL NOT be a readiness dependency of any service.** `POST /upload` commits the transition to `queued` and its outbox row in one database transaction and answers `202` with the broker unreachable; the outbox relay dispatches when the broker returns. That is the design, not a tolerated defect. Independently, no readiness path holds a broker connection it could check — which is a claim about **access, not about absence**, and is stated that way because one HTTP service does hold such a connection while its outbox relay is serving: the relay opens it inside its own dial cycle, holds it for that cycle and closes it at the end, so it is transient and no composition-root handle and no probe handle exposes it. And the broker health check this repository provides takes no context and therefore could not satisfy the bounding requirement below even if a handle were reachable.
 
 A readiness check SHALL reuse a health check the service's own startup already performs wherever one answers the same question, rather than introducing a second way to ask it. The database check is such a case.
 
@@ -89,6 +93,8 @@ No readiness check SHALL report from a cached or background-refreshed observatio
 ### Requirement: Every Readiness Check Is Bounded, and Bounded Against the Prober
 
 Every check a readiness endpoint performs SHALL be governed by an explicit timeout, and SHALL also honour cancellation of the request that triggered it so that a caller that disconnects releases the work.
+
+Releasing the work is only half of what a cancellation means, and this requirement governs that half alone. What such a probe SHALL do with the verdict and with the record — nothing, in both cases — is specified under *A Readiness Verdict Is Recorded When It Changes, Not When It Is Asked For* below, because a cancellation is not a change of verdict and must not be recorded as one.
 
 That timeout SHALL be shorter than the timeout of the prober configured against the endpoint. The relationship, not either value alone, is what is being required: if a check may run longer than the prober waits, the prober abandons every request and **every verdict becomes a failure regardless of the dependency's state**. The signal does not merely degrade, it inverts, and it inverts without emitting anything that says so. Because the two values are set in different files, the constraint is stated here rather than left implicit in whichever file happens to hold the prober.
 
@@ -154,6 +160,22 @@ These records SHALL obey `structured-logging` unchanged: a fixed string-literal 
 The verdict a process holds before its first probe SHALL be **ready**, and that is a consequence of the startup contract rather than an arbitrary seed: startup verifies every readiness dependency and is specified to be fatal, so a process that has reached the point of serving a route had all of them reachable a moment earlier. Seeding it any other way — "unknown", or "not ready until proven otherwise" — makes the first successful probe of every process start look like a recovery from a failure that never happened, and emits a record that means nothing on every deploy.
 
 Concurrent probes SHALL NOT be able to produce more than one record for one transition. The verdict SHALL be updated by an atomic compare-and-set, so that two probers observing the same change between them yield one record and not two.
+
+**A probe whose caller has gone SHALL NOT move the stored verdict and SHALL NOT emit any record.** Every check derives from the request that triggered it, so cancelling that one request fails all of them at once — which at the point of decision is indistinguishable from every dependency being down. Read as a verdict, it would name the entire dependency inventory in a warning and then announce a recovery from it on the next healthy probe: a pair of events that never happened, and the pair an operator pages on. The endpoint SHALL therefore consult the triggering request's cancellation **after** its checks return and, if the caller has gone, SHALL leave the stored verdict exactly as it stands and emit nothing. Nothing is lost by that silence, because the verdict is left where it stands rather than moved: a real degradation this probe could not confirm is still there for the next probe from a live caller to record. The response SHALL still be `503`, because readiness was not established — no check is known to have answered under its own timeout — and no caller remains to read it.
+
+Both halves of that rule are required, and the second is the one that would otherwise ship. A `503` written to a caller that has already gone is read by nobody, so the false degradation is nearly invisible; the recovery it manufactures is emitted to a live reader on the next probe, at informational severity, describing an outage that never occurred. A requirement that stopped at cancelling the dependency call would be satisfied by an implementation that did exactly this, which is why the outcome is stated here and not left to be inferred from the bound.
+
+#### Scenario: A probe whose caller disconnects records nothing
+
+- **GIVEN** a service holding the verdict ready, and a readiness check in progress
+- **WHEN** the caller closes the connection before the checks complete
+- **THEN** no readiness record is emitted and the stored verdict is still ready
+
+#### Scenario: The probe after a cancelled one
+
+- **GIVEN** a service whose previous readiness probe was cancelled by its caller, its readiness dependencies having been reachable throughout
+- **WHEN** a live caller requests `GET /ready`
+- **THEN** it answers `200` and emits no record, because the verdict never moved and there is therefore no recovery to announce
 
 #### Scenario: A dependency fails and recovers
 

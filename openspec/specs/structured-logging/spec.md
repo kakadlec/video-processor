@@ -134,13 +134,19 @@ The **matched route** is the route template, which is bounded by the router's ow
 
 Nothing is lost for a matched request: its path adds only the parameter values, and every one of them is already recorded elsewhere by the handler that used it.
 
-A recovered panic SHALL be recorded at error severity with the panic value and the stack as fields, and SHALL still produce the response the service produced before. This SHALL hold for **every** recovered panic, including one caused by a connection the client has already dropped — a case some framework recovery middleware handles on a separate branch that never reaches the supplied handler, and which would otherwise be the one class of panic recorded nowhere.
+**Exactly one class of request SHALL be exempt from the access record: a request that matched one of the two probe route templates `service-health-probes` defines.** The exemption is stated as a closed list of those two route templates and no other, and there SHALL be no general mechanism — no configurable exclusion list, no middleware option, no per-route opt-out — by which any further route can leave the access log. The distinction matters more than the exemption: a general mechanism would let a future route stop being recorded without that ever being reviewed as a change to this capability, and the value of the rule above is that it has no escape hatch.
+
+The exemption is justified by what the excluded records would contain, not by their number alone. A liveness probe consults nothing, so its record's status is `200` and its duration near zero on every occurrence; the record varies in no field and therefore carries no information. A readiness probe's status does vary, but the informative event is a *change* of verdict rather than a verdict, and a change is recorded by `service-health-probes` at the moment it happens, at a severity that reflects it, naming the dependency that failed — which an access record cannot do at all. The exemption therefore does not remove a diagnostic; it replaces a per-request record that says nothing with a per-transition record that says more.
+
+The volume is the reason the choice cannot be deferred rather than a reason on its own: probes arrive at a fixed interval forever, across every HTTP service, and would become the overwhelming majority of every record this system emits — in a system whose entire migration to structured records catalogued 170 emitting call sites. Recording them at a severity below the default threshold was considered and SHALL NOT be used as the mechanism: records invisible at the default setting satisfy this requirement only in letter, and they reappear in bulk exactly when an operator lowers the threshold to investigate something else.
+
+A recovered panic SHALL be recorded at error severity with the panic value and the stack as fields, and SHALL still produce the response the service produced before. This SHALL hold for **every** recovered panic, including one raised while serving a probe route and including one caused by a connection the client has already dropped — a case some framework recovery middleware handles on a separate branch that never reaches the supplied handler, and which would otherwise be the one class of panic recorded nowhere. **The access-record exemption above SHALL NOT extend to the panic record**: what is exempt is the routine per-request record, not the report of a failure.
 
 No recovered panic SHALL produce output outside the record. A framework's own recovery middleware that writes its stack block to a writer of its own before delegating SHALL NOT be used, because that block is unstructured output the format requirement above forbids, and it is emitted whether or not the delegate also records the panic.
 
 #### Scenario: A request is served
 
-- **WHEN** any HTTP service answers a request that matched a route
+- **WHEN** any HTTP service answers a request that matched a route other than the two probe route templates exempted above
 - **THEN** it emits one access record in the same format as its other records, naming the method, matched route, status, duration, size, and the authenticated subject when there is one — and not the request path
 
 #### Scenario: A request matches no route
@@ -153,6 +159,16 @@ No recovered panic SHALL produce output outside the record. A framework's own re
 - **WHEN** a request arrives with a query string
 - **THEN** no part of it appears in the access record
 
+#### Scenario: A probe route is served
+
+- **WHEN** any HTTP service answers a request that matched either of the two probe route templates
+- **THEN** it emits no access record for that request
+
+#### Scenario: Every other route still yields an access record
+
+- **WHEN** any HTTP service answers a request that matched a route other than the two probe routes, or a request that matched no route at all
+- **THEN** it emits one access record, so that the exemption is bounded to the two named templates rather than to a class a later route can join
+
 #### Scenario: A handler panics
 
 - **WHEN** a handler panics and the recovery middleware runs
@@ -162,6 +178,11 @@ No recovered panic SHALL produce output outside the record. A framework's own re
 
 - **WHEN** a panic is recovered for a request whose connection is already broken
 - **THEN** it is recorded like any other recovered panic, and no response body is attempted
+
+#### Scenario: A probe handler panics
+
+- **WHEN** a panic is recovered while serving one of the two probe routes
+- **THEN** it is recorded like any other recovered panic, the access-record exemption notwithstanding
 
 ### Requirement: A Job Is Followable Across the Processes That Handle It
 
