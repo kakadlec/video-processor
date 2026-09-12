@@ -61,7 +61,11 @@ services:
   # would leave completed video_jobs rows pointing at objects that no longer
   # exist — the same dangling state postgres_data exists to prevent.
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # quay.io, not Docker Hub: the minio/minio repository was withdrawn from
+    # Docker Hub, and an anonymous pull now fails with "pull access denied ...
+    # repository does not exist". quay.io is MinIO's own registry and still
+    # serves this exact tag. Do not "restore" the shorter Docker Hub name.
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
     environment:
       # Fixed, non-secret local-only defaults — same rationale as the
