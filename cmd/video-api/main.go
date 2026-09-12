@@ -55,7 +55,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	video, videoDB, redisClient, relay, err := setupVideo(ctx)
+	video, videoDB, redisClient, relay, _, err := setupVideo(ctx)
 	if err != nil {
 		logger(componentProcessStartup).Error("the video module could not be built",
 			slog.String("error", err.Error()))

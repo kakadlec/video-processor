@@ -899,7 +899,7 @@ func postJSONWithAuthorization(t *testing.T, url, authorizationHeader string, pa
 func TestSetupVideo_DSNMissing_ReturnsError(t *testing.T) {
 	t.Setenv("VIDEO_POSTGRES_DSN", "")
 
-	module, db, _, _, err := setupVideo(context.Background())
+	module, db, _, _, _, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when VIDEO_POSTGRES_DSN is not set")
 	}
@@ -919,7 +919,7 @@ func TestSetupVideo_UnreachablePostgres_ReturnsError(t *testing.T) {
 	// refused) rather than hanging, so this stays a fast unit-style test.
 	t.Setenv("VIDEO_POSTGRES_DSN", "postgres://user:pass@127.0.0.1:1/video?sslmode=disable&connect_timeout=1")
 
-	_, _, _, _, err := setupVideo(context.Background())
+	_, _, _, _, _, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when configured PostgreSQL is unreachable")
 	}
@@ -942,7 +942,7 @@ func TestSetupVideo_RabbitMQURLMissing_ReturnsError(t *testing.T) {
 		t.Fatalf("unsetenv: %v", err)
 	}
 
-	module, db, _, relay, err := setupVideo(context.Background())
+	module, db, _, relay, objectStorageReady, err := setupVideo(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when RABBITMQ_URL is not set")
 	}
@@ -951,6 +951,9 @@ func TestSetupVideo_RabbitMQURLMissing_ReturnsError(t *testing.T) {
 	}
 	if module != nil || db != nil || relay != nil {
 		t.Fatalf("expected nil module, db, and relay on error, got %+v %+v %+v", module, db, relay)
+	}
+	if objectStorageReady != nil {
+		t.Fatal("expected a nil object-storage readiness check on error")
 	}
 }
 
