@@ -473,7 +473,7 @@ S3-compatible object storage. As of `migrate-result-storage-to-minio` it holds e
 
 Unlike Redis's, MinIO's contents are authoritative once results move there: `docker-compose.yml` gives the local service a named `minio_data` volume for that reason, since losing the bucket would leave `completed` `VideoJob` rows pointing at objects that no longer exist.
 
-- **Local/CI service:** `docker-compose.yml` starts a pinned `minio/minio` instance; CI starts the same image with a `docker run` step (a GitHub Actions service container cannot pass the `server /data` arguments the image requires). The adapter's own tests use `VIDEO_MINIO_TEST_*` against a separate bucket, since they create and delete buckets; `cmd/video-api`'s tests use the runtime variables.
+- **Local/CI service:** `docker-compose.yml` starts a pinned `quay.io/minio/minio` instance (quay.io rather than Docker Hub, whose `minio/minio` repository was withdrawn); CI starts the same image with a `docker run` step (a GitHub Actions service container cannot pass the `server /data` arguments the image requires). The adapter's own tests use `VIDEO_MINIO_TEST_*` against a separate bucket, since they create and delete buckets; `cmd/video-api`'s tests use the runtime variables.
 - **Local/CI credentials** (`minioadmin`/`minioadmin`) are fixed, non-secret defaults — never used outside a developer's machine or CI.
 
 ---
