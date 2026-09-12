@@ -771,3 +771,39 @@ func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
 		buffer.Reset()
 	}
 }
+
+// TestTheDegradationRecordNamesEveryFailingDependency is written here because
+// this is the only service in the deployment with two readiness dependencies,
+// and so the only place the joined attribute has a non-trivial value at all.
+// Everything else in this file exercises a single-dependency checker, against
+// which a join that dropped its separator, dropped a name or reordered them
+// is indistinguishable from a correct one.
+//
+// The expected value is built from the two constants rather than written out,
+// which pins the separator and the declaration order together: the names go
+// into a record, and an attribute whose value depends on goroutine scheduling
+// is not a fact about the system.
+//
+// It also pins the half of the initial verdict that the transition test only
+// implies. This is the first probe this router ever answers, and it answers
+// it not ready: a process that starts degraded is recorded rather than silent.
+func TestTheDegradationRecordNamesEveryFailingDependency(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	router := newProbeOnlyRouter(newChecker(
+		readinessCheck{name: dependencyDatabase, probe: readinessProbeFailing},
+		readinessCheck{name: dependencyObjectStorage, probe: readinessProbeFailing},
+	))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("%s answered %d, want %d", readyRoutePath, recorder.Code, http.StatusServiceUnavailable)
+	}
+
+	record := onlyRecord(t, buffer, componentReadinessProbe)
+	requireField(t, record, "level", "WARN")
+	requireField(t, record, "dependencies", dependencyDatabase+","+dependencyObjectStorage)
+	requireField(t, record, "dependency_count", float64(2))
+}
