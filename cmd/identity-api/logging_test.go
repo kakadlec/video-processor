@@ -506,15 +506,19 @@ func TestAProbeYieldsNoAccessRecordAndIsStillServed(t *testing.T) {
 		"readiness, ready":     {path: readyRoutePath, status: http.StatusOK, body: probeBodyReady},
 		"readiness, not ready": {path: readyRoutePath, failing: true, status: http.StatusServiceUnavailable, body: probeBodyNotReady},
 	} {
+		dependency := readinessProbeOK
+		if probe.failing {
+			dependency = readinessProbeFailing
+		}
+		// Built against the parent rather than inside the subtest: one root
+		// derives a real object-storage bucket name from t.Name(), and a
+		// subtest name is neither short enough nor punctuation-free enough to
+		// survive that derivation.
+		router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: dependency}))
+
 		t.Run(name, func(t *testing.T) {
 			buffer := captureRecords(t)
 			captureUnstructuredOutput(t)
-
-			dependency := readinessProbeOK
-			if probe.failing {
-				dependency = readinessProbeFailing
-			}
-			router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: dependency}))
 
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, probe.path, nil))
@@ -542,7 +546,9 @@ func TestAProbeYieldsNoAccessRecordAndIsStillServed(t *testing.T) {
 // entirely. The rows carrying another method against a probe path are the
 // discriminating ones — they match no route, so the record must be written,
 // and an exemption keyed on the request path would suppress it.
-func TestEveryRouteOtherThanAProbeStillYieldsAnAccessRecord(t *testing.T) {
+func TestEveryOtherRouteStillYieldsAnAccessRecord(t *testing.T) {
+	router := newProbeAccessRouter(t, newChecker())
+
 	for name, request := range map[string]struct {
 		method string
 		target string
@@ -558,7 +564,6 @@ func TestEveryRouteOtherThanAProbeStillYieldsAnAccessRecord(t *testing.T) {
 			buffer := captureRecords(t)
 			captureUnstructuredOutput(t)
 
-			router := newProbeAccessRouter(t, newChecker())
 			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(request.method, request.target, nil))
 
 			record := onlyRecord(t, buffer, componentHTTPAccess)
@@ -611,6 +616,18 @@ func TestAPanicWhileServingAProbeIsStillRecorded(t *testing.T) {
 	}
 }
 
+// newProbeOnlyRouter mounts this process's probe endpoints, and nothing else,
+// on a bare engine. The verdict a transition is measured against is held by
+// probeEndpoints, so that is what the two tests below drive: standing up the
+// whole service router once per round would exercise the same constructor
+// while also building every other dependency the root happens to hold —
+// which, on one of the three, means a real object-storage bucket per round.
+func newProbeOnlyRouter(readiness *readinessChecker) *gin.Engine {
+	r := gin.New()
+	newProbeEndpoints(readiness).registerRoutes(r)
+	return r
+}
+
 // togglableReadinessProbe returns a dependency check whose verdict the caller
 // controls, so one router can be driven across a failure and a recovery.
 func togglableReadinessProbe() (func(context.Context) error, func(bool)) {
@@ -639,7 +656,7 @@ func TestTheReadinessVerdictIsRecordedOncePerTransition(t *testing.T) {
 	captureUnstructuredOutput(t)
 
 	probe, setFailing := togglableReadinessProbe()
-	router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+	router := newProbeOnlyRouter(newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
 
 	probeRepeatedly := func(want int) {
 		t.Helper()
@@ -680,9 +697,9 @@ func TestTheReadinessVerdictIsRecordedOncePerTransition(t *testing.T) {
 // swap. The barrier alone does not discriminate, which is why the width and
 // the repetition are both here and both calibrated rather than guessed: the
 // window a read-then-write leaves open is two instructions wide, and two
-// callers released once simply serialize. Eight callers across four thousand
-// rounds catch the read-then-write form on every run, in about a fifth of a
-// second. Each round gets its own router, so each observes the transition
+// callers released once simply serialize. Eight callers across eight thousand
+// rounds caught the read-then-write form on forty runs out of forty, in about
+// a second. Each round gets its own router, so each observes the transition
 // afresh; the correct implementation can never record twice, so nothing here
 // is probabilistic in the direction that would flake.
 func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
@@ -690,7 +707,7 @@ func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
 	captureUnstructuredOutput(t)
 
 	const callers = 8
-	for round := 0; round < 4000; round++ {
+	for round := 0; round < 8000; round++ {
 		arrived := make(chan struct{}, callers)
 		release := make(chan struct{})
 		probe := func(context.Context) error {
@@ -698,7 +715,7 @@ func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
 			<-release
 			return errProbeDependencyDown
 		}
-		router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+		router := newProbeOnlyRouter(newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
 
 		var wg sync.WaitGroup
 		for i := 0; i < callers; i++ {
