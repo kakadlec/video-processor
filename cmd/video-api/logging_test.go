@@ -159,7 +159,12 @@ func decodeRecords(t *testing.T, buffer *bytes.Buffer) []map[string]any {
 	return records
 }
 
-func onlyRecord(t *testing.T, buffer *bytes.Buffer, component string) map[string]any {
+// recordsWithComponent returns every record attributed to component, in the
+// order they were emitted. A count of zero is an assertion in its own right —
+// the access-record exemption is stated as an absence — and it has to be read
+// per component rather than off an empty buffer, because a readiness probe
+// that changes verdict writes a record of its own into the same buffer.
+func recordsWithComponent(t *testing.T, buffer *bytes.Buffer, component string) []map[string]any {
 	t.Helper()
 
 	var found []map[string]any
@@ -168,6 +173,13 @@ func onlyRecord(t *testing.T, buffer *bytes.Buffer, component string) map[string
 			found = append(found, record)
 		}
 	}
+	return found
+}
+
+func onlyRecord(t *testing.T, buffer *bytes.Buffer, component string) map[string]any {
+	t.Helper()
+
+	found := recordsWithComponent(t, buffer, component)
 	if len(found) != 1 {
 		t.Fatalf("expected exactly one %q record, got %d: %s", component, len(found), buffer.String())
 	}
@@ -489,4 +501,142 @@ func TestTheHTTPServerRecordsItsOwnErrorsAtErrorSeverity(t *testing.T) {
 
 		onlyRecord(t, buffer, componentHTTPServer)
 	})
+}
+
+// newProbeAccessRouter builds this service's real router over a caller-supplied
+// readiness checker. The exemption keys on the matched route template, so it
+// can only be exercised against the router that registers the probes: against
+// the engine the rest of this file builds, a request for the liveness path
+// matches nothing at all and is recorded with a path like any other unmatched
+// request — and a test written there would pass against an exemption keyed on
+// the request path, which is the wrong key.
+func newProbeAccessRouter(t *testing.T, readiness *readinessChecker) *gin.Engine {
+	t.Helper()
+
+	router, _ := newProbeTestRouter(t, alwaysAllowRateLimiter{}, readiness)
+	return router
+}
+
+// TestAProbeYieldsNoAccessRecordAndIsStillServed holds the exemption and the
+// trap it sets in one assertion. The natural implementation — returning from
+// the access middleware as soon as the matched route is a probe template —
+// never calls c.Next(), so the probe handler never runs: every probe then
+// answers 200 with an empty body and none of the headers the handler sets,
+// which satisfies both "a probe yields no access record" and "a probe answers
+// 200" and fails only an assertion that reads what came back. The exemption
+// suppresses the record, not the chain.
+func TestAProbeYieldsNoAccessRecordAndIsStillServed(t *testing.T) {
+	for name, probe := range map[string]struct {
+		path    string
+		failing bool
+		status  int
+		body    string
+	}{
+		"liveness":             {path: healthRoutePath, status: http.StatusOK, body: probeBodyHealthy},
+		"readiness, ready":     {path: readyRoutePath, status: http.StatusOK, body: probeBodyReady},
+		"readiness, not ready": {path: readyRoutePath, failing: true, status: http.StatusServiceUnavailable, body: probeBodyNotReady},
+	} {
+		t.Run(name, func(t *testing.T) {
+			buffer := captureRecords(t)
+			captureUnstructuredOutput(t)
+
+			dependency := readinessProbeOK
+			if probe.failing {
+				dependency = readinessProbeFailing
+			}
+			router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: dependency}))
+
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, probe.path, nil))
+
+			if recorder.Code != probe.status {
+				t.Fatalf("%s answered %d, want %d", probe.path, recorder.Code, probe.status)
+			}
+			if got := recorder.Body.String(); got != probe.body {
+				t.Fatalf("%s answered body %q, want %q — the exemption suppresses the record, not the chain", probe.path, got, probe.body)
+			}
+			if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("%s answered Cache-Control %q, want %q — the probe handler did not run", probe.path, got, "no-store")
+			}
+
+			if records := recordsWithComponent(t, buffer, componentHTTPAccess); len(records) != 0 {
+				t.Fatalf("a probe yielded %d access records: %s", len(records), buffer.String())
+			}
+		})
+	}
+}
+
+// TestEveryRouteOtherThanAProbeStillYieldsAnAccessRecord is the boundary the
+// exemption has to be held to rather than its existence: an assertion that a
+// probe yields no record passes against a middleware that was removed
+// entirely. The rows carrying another method against a probe path are the
+// discriminating ones — they match no route, so the record must be written,
+// and an exemption keyed on the request path would suppress it.
+func TestEveryRouteOtherThanAProbeStillYieldsAnAccessRecord(t *testing.T) {
+	for name, request := range map[string]struct {
+		method string
+		target string
+		route  string
+		path   string
+	}{
+		"a matched route":                      {method: http.MethodGet, target: "/", route: "/"},
+		"a request that matched no route":      {method: http.MethodGet, target: "/no-such-route", path: "/no-such-route"},
+		"the liveness path on another method":  {method: http.MethodPost, target: healthRoutePath, path: healthRoutePath},
+		"the readiness path on another method": {method: http.MethodPost, target: readyRoutePath, path: readyRoutePath},
+	} {
+		t.Run(name, func(t *testing.T) {
+			buffer := captureRecords(t)
+			captureUnstructuredOutput(t)
+
+			router := newProbeAccessRouter(t, newChecker())
+			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(request.method, request.target, nil))
+
+			record := onlyRecord(t, buffer, componentHTTPAccess)
+			if request.route != "" {
+				requireField(t, record, "route", request.route)
+				return
+			}
+			requireField(t, record, "path", request.path)
+			requireNoField(t, record, "route")
+		})
+	}
+}
+
+// TestAPanicWhileServingAProbeIsStillRecorded pins the other boundary the
+// skip's placement in the chain can get wrong. What is exempt is the routine
+// per-request record and not the report of a failure, so the recovery record
+// survives a probe route and the access record does not.
+//
+// The panicking handler is registered at the real probe template on an engine
+// of its own: the exemption keys on the matched route, so a handler registered
+// under any other path would not exercise it at all.
+func TestAPanicWhileServingAProbeIsStillRecorded(t *testing.T) {
+	for _, route := range []string{healthRoutePath, readyRoutePath} {
+		t.Run(route, func(t *testing.T) {
+			buffer := captureRecords(t)
+			unstructured := captureUnstructuredOutput(t)
+
+			r := gin.New()
+			r.Use(accessLogMiddleware(), recoveryMiddleware())
+			r.GET(route, func(c *gin.Context) { panic("a deliberate panic") })
+
+			recorder := httptest.NewRecorder()
+			r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, route, nil))
+
+			record := onlyRecord(t, buffer, componentHTTPRecovery)
+			requireField(t, record, "level", "ERROR")
+			requireField(t, record, "route", route)
+			requireField(t, record, "panic", "a deliberate panic")
+
+			if records := recordsWithComponent(t, buffer, componentHTTPAccess); len(records) != 0 {
+				t.Fatalf("a panicking probe yielded %d access records; the exemption covers the routine record, not the report of a failure", len(records))
+			}
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("a panicking probe answered %d, want 500", recorder.Code)
+			}
+			if output := unstructured(); output != "" {
+				t.Fatalf("a recovered panic wrote outside the record: %q", output)
+			}
+		})
+	}
 }
