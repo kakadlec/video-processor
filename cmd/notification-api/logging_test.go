@@ -13,6 +13,8 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -640,5 +642,117 @@ func TestAPanicWhileServingAProbeIsStillRecorded(t *testing.T) {
 				t.Fatalf("a recovered panic wrote outside the record: %q", output)
 			}
 		})
+	}
+}
+
+// togglableReadinessProbe returns a dependency check whose verdict the caller
+// controls, so one router can be driven across a failure and a recovery.
+func togglableReadinessProbe() (func(context.Context) error, func(bool)) {
+	var failing atomic.Bool
+	probe := func(context.Context) error {
+		if failing.Load() {
+			return errProbeDependencyDown
+		}
+		return nil
+	}
+	return probe, failing.Store
+}
+
+// TestTheReadinessVerdictIsRecordedOncePerTransition is what the access-record
+// exemption traded the per-probe record for, and the count is the whole
+// assertion: a probe answered every few seconds forever must record a change
+// of verdict and not a verdict. Nine probes spanning one failure and one
+// recovery yield exactly two records.
+//
+// The run opens with three probes that are ready and expects silence from
+// them, which pins the initial verdict: a process that starts ready has not
+// recovered from anything, so announcing that it had would be a record of an
+// event that never happened.
+func TestTheReadinessVerdictIsRecordedOncePerTransition(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	probe, setFailing := togglableReadinessProbe()
+	router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+
+	probeRepeatedly := func(want int) {
+		t.Helper()
+		for i := 0; i < 3; i++ {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+			if recorder.Code != want {
+				t.Fatalf("%s answered %d, want %d", readyRoutePath, recorder.Code, want)
+			}
+		}
+	}
+
+	probeRepeatedly(http.StatusOK)
+	setFailing(true)
+	probeRepeatedly(http.StatusServiceUnavailable)
+	setFailing(false)
+	probeRepeatedly(http.StatusOK)
+
+	records := recordsWithComponent(t, buffer, componentReadinessProbe)
+	if len(records) != 2 {
+		t.Fatalf("nine probes across one failure and one recovery yielded %d records, want 2: %s", len(records), buffer.String())
+	}
+
+	requireField(t, records[0], "level", "WARN")
+	requireField(t, records[0], "dependencies", dependencyDatabase)
+	requireField(t, records[0], "dependency_count", float64(1))
+
+	requireField(t, records[1], "level", "INFO")
+	requireNoField(t, records[1], "dependencies")
+}
+
+// TestTwoConcurrentProbesObservingOneTransitionRecordItOnce is what makes the
+// compare-and-swap load-bearing rather than decorative: a read followed by a
+// write has both callers observe the old verdict and both record the change.
+//
+// The dependency check holds every caller at a barrier until all of them have
+// arrived, so all of them are provably past the read before any reaches the
+// swap. The barrier alone does not discriminate, which is why the width and
+// the repetition are both here and both calibrated rather than guessed: the
+// window a read-then-write leaves open is two instructions wide, and two
+// callers released once simply serialize. Eight callers across four thousand
+// rounds catch the read-then-write form on every run, in about a fifth of a
+// second. Each round gets its own router, so each observes the transition
+// afresh; the correct implementation can never record twice, so nothing here
+// is probabilistic in the direction that would flake.
+func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	const callers = 8
+	for round := 0; round < 4000; round++ {
+		arrived := make(chan struct{}, callers)
+		release := make(chan struct{})
+		probe := func(context.Context) error {
+			arrived <- struct{}{}
+			<-release
+			return errProbeDependencyDown
+		}
+		router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+
+		var wg sync.WaitGroup
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+			}()
+		}
+
+		for i := 0; i < callers; i++ {
+			<-arrived
+		}
+		close(release)
+		wg.Wait()
+
+		if records := recordsWithComponent(t, buffer, componentReadinessProbe); len(records) != 1 {
+			t.Fatalf("round %d: %d concurrent probes observing one transition yielded %d records, want 1: %s",
+				round, callers, len(records), buffer.String())
+		}
+		buffer.Reset()
 	}
 }

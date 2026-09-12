@@ -22,6 +22,7 @@ const (
 	componentHTTPServer        = "http_server"
 	componentHTTPAccess        = "http_access"
 	componentHTTPRecovery      = "http_recovery"
+	componentReadinessProbe    = "readiness_probe"
 	componentRateLimit         = "rate_limit"
 	componentPreferenceListing = "preference_listing"
 	componentPreferenceWrite   = "preference_write"

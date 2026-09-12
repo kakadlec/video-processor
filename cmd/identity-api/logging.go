@@ -22,6 +22,7 @@ const (
 	componentHTTPServer         = "http_server"
 	componentHTTPAccess         = "http_access"
 	componentHTTPRecovery       = "http_recovery"
+	componentReadinessProbe     = "readiness_probe"
 	componentUserRegistration   = "user_registration"
 	componentUserAuthentication = "user_authentication"
 )

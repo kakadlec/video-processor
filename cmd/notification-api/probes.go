@@ -1,7 +1,10 @@
 package main
 
 import (
+	"log/slog"
 	"net/http"
+	"strings"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 )
@@ -39,10 +42,24 @@ const probeContentType = "application/json; charset=utf-8"
 // probeEndpoints serves this process's liveness and readiness probes.
 type probeEndpoints struct {
 	readiness *readinessChecker
+
+	// The verdict the last answered readiness probe reached, held for the
+	// life of the process so that a change of verdict can be recorded once
+	// instead of every verdict being recorded every time. It is what the
+	// access-record exemption trades the per-probe record for.
+	ready atomic.Bool
 }
 
 func newProbeEndpoints(readiness *readinessChecker) *probeEndpoints {
-	return &probeEndpoints{readiness: readiness}
+	p := &probeEndpoints{readiness: readiness}
+
+	// Ready is the initial verdict, and it is chosen rather than inherited
+	// from the zero value. A process that starts not ready reaches its first
+	// probe as a transition and is recorded, which is the case that must not
+	// be silent; a process that starts ready emits nothing, rather than
+	// announcing a recovery from a degradation it never had.
+	p.ready.Store(true)
+	return p
 }
 
 // registerRoutes mounts both probes on the engine. They are registered for GET
@@ -79,9 +96,44 @@ func (p *probeEndpoints) handleReady(c *gin.Context) {
 	// code and the body.
 	c.Header("Cache-Control", "no-store")
 
-	if len(p.readiness.failingDependencies(c.Request.Context())) > 0 {
+	if failing := p.readiness.failingDependencies(c.Request.Context()); len(failing) > 0 {
+		p.recordDegradation(failing)
 		c.Data(http.StatusServiceUnavailable, probeContentType, []byte(probeBodyNotReady))
 		return
 	}
+	p.recordRecovery()
 	c.Data(http.StatusOK, probeContentType, []byte(probeBodyReady))
+}
+
+// recordDegradation records the move from ready to not ready, once, naming
+// the dependencies that failed.
+//
+// The swap is atomic rather than a read followed by a write: two probes
+// answered concurrently both observe the old verdict, and only the one that
+// actually swapped it may record the transition. A read-then-write would
+// record the same change twice, which is exactly the noise the access-record
+// exemption was granted to avoid.
+//
+// The names arrive as a slice and are joined into one string attribute. The
+// record format admits only typed scalars — slog.Any is denied by name — so
+// the slice cannot be passed, and the closed set these names are drawn from
+// is two entries long in the largest service, which is why one joined value
+// stays readable.
+func (p *probeEndpoints) recordDegradation(failing []string) {
+	if !p.ready.CompareAndSwap(true, false) {
+		return
+	}
+	logger(componentReadinessProbe).Warn("this service is no longer ready",
+		slog.String("dependencies", strings.Join(failing, ",")),
+		slog.Int("dependency_count", len(failing)))
+}
+
+// recordRecovery records the move from not ready back to ready, once. It
+// names no dependency: what recovered is the service, and which check now
+// answers is not a fact this probe learned — every check answered.
+func (p *probeEndpoints) recordRecovery() {
+	if !p.ready.CompareAndSwap(false, true) {
+		return
+	}
+	logger(componentReadinessProbe).Info("this service is ready again")
 }

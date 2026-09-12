@@ -22,6 +22,7 @@ const (
 	componentHTTPServer      = "http_server"
 	componentHTTPAccess      = "http_access"
 	componentHTTPRecovery    = "http_recovery"
+	componentReadinessProbe  = "readiness_probe"
 	componentOutboxRelay     = "outbox_relay"
 	componentRateLimit       = "rate_limit"
 	componentVideoUpload     = "video_upload"
