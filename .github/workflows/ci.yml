@@ -139,12 +139,16 @@ jobs:
         # The flags below cover what a services: block would have provided:
         # the published port the test env vars point at, and root
         # credentials matching VIDEO_MINIO_TEST_ACCESS_KEY/SECRET_KEY.
+        #
+        # The image comes from quay.io because the Docker Hub minio/minio
+        # repository was withdrawn; the tag is unchanged and must stay in
+        # step with docker-compose.yml's.
         run: |
           docker run -d --name minio \
             -p 127.0.0.1:9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z \
             server /data
 
       - name: Wait for MinIO
