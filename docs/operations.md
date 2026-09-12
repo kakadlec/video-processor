@@ -129,6 +129,8 @@ That default is load-bearing in one narrow way worth knowing: removing or renami
 
 The five processes have deliberately different configuration surfaces. The absences are the point: a dependency a process does not use should not be reachable from it.
 
+**This table enumerates the variables each process reads, which is not the same set as the connections each process opens** — and the difference is large enough to have been a trap. `REDIS_ADDR` is required at three startups, but `internal/platform/redis.Open` constructs a client without connecting to anything. `RABBITMQ_URL` is required at `cmd/video-api`'s startup — loaded as `setupVideo`'s first statement — and that process performs no AMQP dial at all; the relay dials inside its own cycle. `NOTIFICATION_SMTP_ADDR`/`_FROM` are required at `cmd/notifier`'s startup, which loads the relay configuration and dials nothing until a delivery. Every cell below is correct about what it enumerates; none of them is a claim that a connection exists. `add-health-and-readiness-endpoints` needed the other set and derived it by reading the five `setup*` functions instead — see "Health and readiness probes" for the result, whose rows deliberately do not match this table's.
+
 | | `identity-api` | `video-api` | `notification-api` | `worker` | `notifier` |
 |---|---|---|---|---|---|
 | `IDENTITY_POSTGRES_DSN` | **required** | **not read** | **not read** | not read | not read |
@@ -202,7 +204,7 @@ Since `add-presigned-download-urls`, `GET /download/:filename` returns a signed 
 | Where it shows up | What you see |
 |---|---|
 | The API's logs | Nothing. `GET /download/:filename` returns `200` with a well-formed URL. |
-| The API's metrics/health | Nothing. No error, no elevated latency, no failed request. |
+| The API's metrics/health | Nothing. No error, no elevated latency, no failed request. `GET /ready` stays `200` throughout, and correctly: it checks the bucket over the *internal* endpoint, while the presign client built against the public one is deliberately never pinged and never used for an object operation. Readiness is not a check on whether a URL this service issues can be redeemed. |
 | The browser | A connection or DNS error on the storage host — often `ERR_NAME_NOT_RESOLVED` or a connection timeout — after a `200` from the API. |
 | `curl` against the issued URL | The same failure to connect, before any HTTP status is returned. |
 
@@ -657,11 +659,77 @@ docker compose logs --no-log-prefix notifier | jq -c 'select(.level == "ERROR")'
 
 `docker compose logs` also collects nginx, PostgreSQL, Redis, RabbitMQ, MinIO and the mail catcher, none of which this repository builds and none of which emits JSON. Scope the command to the five application services before piping to `jq`, or it fails on the first line of somebody else's format.
 
-**Each HTTP request produces exactly one access record** (`component: http_access`) naming the method, the matched route, the status, the duration, the response size, and the authenticated subject where the request carried one. It carries **no query string, no header, and no body**, and no request path when a route matched — the route template is the bounded field, and a matched path adds only parameter values the handler already records. A request that matched *no* route records its path instead, truncated to 256 bytes, and a request method that is not a recognized HTTP method is replaced by `UNRECOGNIZED`: both values are caller-supplied and reach the record before authentication and before the rate limiter, so both are bounded there. A recovered panic is a record like any other (`component: http_recovery`, error severity, carrying the panic value and the stack) — including a panic on a connection the client has already dropped, which gin's own recovery middleware handles on a branch that never reaches a supplied handler.
+**Each HTTP request produces exactly one access record** (`component: http_access`) naming the method, the matched route, the status, the duration, the response size, and the authenticated subject where the request carried one. It carries **no query string, no header, and no body**, and no request path when a route matched — the route template is the bounded field, and a matched path adds only parameter values the handler already records. A request that matched *no* route records its path instead, truncated to 256 bytes, and a request method that is not a recognized HTTP method is replaced by `UNRECOGNIZED`: both values are caller-supplied and reach the record before authentication and before the rate limiter, so both are bounded there. A recovered panic is a record like any other (`component: http_recovery`, error severity, carrying the panic value and the stack) — including a panic on a connection the client has already dropped, which gin's own recovery middleware handles on a branch that never reaches a supplied handler, and including a panic raised while serving a probe route, which the exemption below does not reach: what is exempt is the routine per-request record, not the report of a failure.
+
+**Exactly one class of request is exempt from the access record: one that matched `GET /health` or `GET /ready`.** The exemption is a closed list of those two route templates in each root's `logging.go` and there is no general mechanism behind it — no configurable skip list, no per-route option — because a general one would let a future route leave the access log without that ever being reviewed. What the excluded records would have contained is the justification: a liveness record's status is `200` and its duration near zero on every occurrence, so it varies in no field and carries no information, while probes arrive at a fixed interval forever across three services and would become the majority of everything this system emits. Recording them below the default threshold was considered and refused — records invisible at the default setting reappear in bulk exactly when an operator lowers it to investigate something else.
+
+**In their place, one record per readiness *transition*** (`component: readiness_probe`), not one per probe: a `warn` when the verdict turns from ready to not ready, naming the failing dependencies in the `dependencies` field as a comma-joined string drawn from a closed set this repository owns (`postgres`, `object_storage`) plus a `dependency_count`, and an `info` on the return to ready, which names nothing because what recovered is the service. The verdict is swapped by an atomic compare-and-set, so two probers observing one change between them produce one record and not two. A freshly started process holds **ready** before its first probe — startup verified every readiness dependency and is fatal without them — so a healthy start emits nothing rather than announcing a recovery from a degradation it never had.
+
+**No transition record is ever emitted on behalf of a caller that vanished.** Every check derives from the request's context, so one canceled request fails all of them at once, which is indistinguishable at that point from every dependency being down; recorded, it would name the whole inventory in a warning and then announce a recovery from it on the next healthy probe — a pair of events that never happened and that an operator pages on. The handler consults the request context after the checks and, if the caller has gone, records nothing and leaves the verdict where it stands: a real degradation this probe could not confirm is still there for the next probe from a live caller to record. The response is still `503`, because readiness was not established.
 
 **What a record never carries** is unchanged by this and worth restating in one place, because the stream is now easy to grep and therefore easy to over-collect: no presigned download URL (it is a credential — the `StorageKey` is logged instead), no webhook signing secret, no destination query string (which is where a webhook credential legitimately lives, and why every recorded reason on the delivery path is built from this system's own classification rather than from a transport error's text), no request or response body, and no token. A log call may only build a field from a scalar it extracted itself, so a domain aggregate cannot be handed to the logger and serialized by accident.
 
 **Severity is per-process and optional** — `LOG_LEVEL`, documented in the table above. An unparseable value stops the process, structurally: it is reported as a record and the exit code is non-zero, rather than starting quietly at a severity nobody asked for.
+
+
+### Health and readiness probes — Implemented (Phase 8)
+
+Each of the three HTTP services serves two probe endpoints, and they differ in *criterion* rather than only in path.
+
+| Endpoint | Consults | Answers |
+|---|---|---|
+| `GET /health` | nothing at all | always `200 {"status":"ok"}` |
+| `GET /ready` | that service's readiness dependencies, on every request | `200 {"status":"ready"}` or `503 {"status":"not ready"}` |
+
+**Why two rather than one**, because the pair looks redundant until the failure it prevents is named: the action a runtime takes on a failed liveness answer is to restart the process, and restarting a process cannot repair a dependency. A single endpoint that both consults dependencies and drives restarts turns a bounded dependency outage into a crash loop that outlives it — every replica is restarted, each restart re-runs a startup sequence this document specifies as fatal on exactly that dependency, and each therefore exits. A 30-second PostgreSQL failover would be survived by a process that merely serves `503` for thirty seconds, and not by one that is killed for it. `/health` consults nothing so that the dependency-consulting endpoint can never become the restart trigger. What a `200` from it asserts is correspondingly narrow: the process is scheduled, it is still accepting connections, and its global middleware chain still returns. Nothing about any dependency, any other route, or whether work is progressing.
+
+#### The readiness matrix
+
+| | `identity-api` | `video-api` | `notification-api` |
+|---|---|---|---|
+| PostgreSQL (that service's own context database) | checked | checked | checked |
+| MinIO — **the configured bucket is present**, not merely that the server answers | not held | checked | not held |
+| Redis | **deliberately excluded** | **deliberately excluded** | **deliberately excluded** |
+| RabbitMQ | not held | **deliberately excluded** | not held |
+
+The criterion behind every cell is not invented here. It is the one this stack already applies to its own ingress, written into `docker-compose.yml` beside the gateway's `nginx -t` healthcheck: *the gateway is healthy when it can serve, and tying its health to a backend's would make an unrelated service's restart look like an ingress failure.* Stated generally — a readiness dependency is one whose absence stops the process serving — the per-service answers are derivable rather than a matter of taste.
+
+- **PostgreSQL is a readiness dependency of all three.** Every route that does anything reads or writes the service's own context database, and no route is specified to degrade without it.
+- **Object storage is one for `video-api` alone**, and the check asks whether the configured bucket is *present*. `POST /upload`, `GET /api/status` and `GET /download/:filename` all name objects inside one bucket, so a reachable object store whose bucket has been removed fails every one of them while a reachability check still succeeds.
+- **Redis is excluded on all three.** Every feature built over it is specified to fail open — the upload idempotency reservation logs and proceeds, the rate limiter allows the request, the status cache falls back to PostgreSQL. A service with Redis down is slower and unmetered and still correct, so reporting it not ready would remove a serving process from rotation for a condition this document already calls survivable.
+- **RabbitMQ is excluded**, for two independent reasons. `POST /upload` commits the transition to `queued` and its outbox row in one PostgreSQL transaction and answers `202` with the broker unreachable — that is the design, not a tolerated defect — and the relay dispatches when the broker returns. Structurally, no HTTP process holds an AMQP connection to check at all: the relay keeps configuration and dials inside its own cycle, and `internal/platform/rabbitmq`'s health check takes a live `*amqp.Connection` and no context, so it could not be bounded the way every readiness check must be.
+
+The database check is `db.PingContext`, which is what startup already uses. The object-storage check is **new** (`storage.CheckBucket`) and `storage.Ping` is deliberately not reused for it — see the MinIO section above for why those two must stay two.
+
+#### The bound and the prober's timeout
+
+Every check is bounded by `readinessCheckTimeout` (2s, in each root's `readiness.go`) derived from the request's own context, so a hung dependency cannot hold a goroutine and a caller that disconnects releases the work. Where a service has two dependencies the checks run concurrently, so the endpoint's worst case is the slower check rather than the sum.
+
+**That bound must stay strictly below the timeout of whatever probes the endpoint** — in this stack, the `timeout: 5s` on each service's compose healthcheck. Stated in both directions because only one of them is safe: with the prober's timeout the larger, an unhealthy dependency produces a `503` the prober reads; with the handler's bound the larger, the prober abandons every request and **every verdict becomes a failure whatever the dependency is doing**. The signal does not degrade, it inverts, and it inverts without emitting anything that says so. The two numbers live in different files, which is why the relationship is written down rather than left to be inferred from either.
+
+#### What a probe response does and does not say
+
+The bodies are fixed per verdict and neither endpoint names the dependency that failed, nor any error text, host, endpoint address, connection string, bucket name, version, or instance identifier. The status code carries the whole answer. A readiness body naming the failing dependency would publish this deployment's dependency inventory to an unauthenticated caller and, by repetition, the times at which each part of it is degraded — the same posture the destination policy's single sentinel and the download route's byte-identical `404` already take. Both responses carry `Cache-Control: no-store`, so no intermediary answers a probe from a stored verdict.
+
+The diagnostic is relocated rather than destroyed: which dependency failed goes to the log, whose reader is already inside the deployment. See the readiness transition record under "Logging" above.
+
+Both endpoints are registered on the engine, outside the bearer group and outside the rate limiter. A probe carries no authenticated subject for the limiter to key on, and a probe at a fixed interval from inside it would eventually exhaust a budget and be answered `429` — the limiter manufacturing the outage it is meant to have no part in.
+
+#### Reaching a probe
+
+**Neither path is reachable through the gateway.** `docker/nginx/nginx.conf` refuses `/health` and `/ready` with two exact-match `location = … { return 404; }` blocks that carry no `set $backend` and no `proxy_pass`, so the refused request reaches no service — no handler runs and no dependency is consulted. Without them the outcome would have been asymmetric rather than chosen: the gateway sends everything it does not otherwise name to `video-api`, so that one service's probes would have been public while the identical paths on the other two were not.
+
+`404` is the status an unserved application path already answers with, and **status-code equivalence is the requirement — the two are not byte-identical and the configuration says so**. nginx generates its refusal while an unserved path is refused by gin and handed back through the proxy, so they differ in body, `Content-Type` and `Content-Length`. Collapsing that would take `proxy_intercept_errors on`, which replaces the body of *every* upstream `404` in the system, including the one `GET /download/:filename` keeps byte-identical across all of its rejections on purpose. That trade was refused.
+
+A prober therefore reaches a service on its own `:8080` from inside the network, and no application service publishes a host port for it.
+
+#### The local stack
+
+Each of the three HTTP services carries a healthcheck against `/ready` — `interval: 10s`, `timeout: 5s`, `retries: 5`, no `start_period`. It targets readiness rather than liveness because a container that is running but cannot serve is what an operator needs to see. The command uses `wget` rather than `curl`, which is not in the Alpine runtime image; the flags issue a `GET` (verified against the service's own access record, since busybox `wget --spider` may issue a `HEAD`, which gin does not answer on a `GET`-only route) and exit non-zero on a `503`.
+
+**Nothing depends on these verdicts.** No `depends_on: condition: service_healthy` was added against them, and the gateway's `depends_on` stays a bare list. Making the gateway wait for a backend to be *ready* would tie ingress startup to that backend's own dependencies — the coupling the gateway's own healthcheck exists to refuse — and it already tolerates a backend that is not yet up, because it resolves each backend's address per request rather than at configuration load. This system has no orchestrator, so a readiness verdict is presently read by a person and by nothing else, and the liveness endpoint has no consumer in this repository at all. It is served anyway, because the pair is what keeps the criterion legible: a lone readiness endpoint invites whatever arrives next to restart on it.
+
+Verified by stopping each backing service in turn: with PostgreSQL down all three report unhealthy and the gateway does not; with MinIO down `video-api` reports unhealthy and the other two do not; with Redis down all three stay healthy. That last one is what proves the criterion was implemented rather than merely written down.
 
 
 ---
@@ -674,8 +742,12 @@ docker compose logs --no-log-prefix notifier | jq -c 'select(.level == "ERROR")'
 
 ### Observability — Partly implemented (Phase 8)
 
-**Structured logging shipped** (`add-structured-logging`) and is documented above under "Logging", alongside `LOG_LEVEL` in the environment-variable tables. It was the first of Phase 8's three changes because it is the only one that touches every file the other two will.
+**Two of Phase 8's three changes have shipped and are documented above**, not here. `add-structured-logging` is under "Logging", alongside `LOG_LEVEL` in the environment-variable tables; it went first because it is the only one of the three that touches every file the other two will. `add-health-and-readiness-endpoints` is under "Health and readiness probes", with the per-service readiness matrix and the one constraint that spans two files.
 
-What remains is metrics and the two probe endpoints: Prometheus metrics at `/metrics`, a health endpoint at `/health`, and a readiness endpoint at `/ready`. Neither change is decomposed yet, and one question they share is already visible from this document: `cmd/worker` and `cmd/notifier` have no HTTP surface at all, so whether they acquire one to be scraped and probed — or are observed some other way — is undecided rather than implied by the paths above.
+**What remains is metrics alone**: Prometheus counters, gauges and latency histograms at `/metrics`. It is not decomposed yet, and it inherits logging's non-disclosure question in the form of label cardinality — an identifier in a label is unbounded cardinality as well as a possible disclosure.
+
+**The question the two remaining changes used to share is now answered, and the answer has a cost worth stating.** `cmd/worker` and `cmd/notifier` acquire **no** HTTP surface — not for probing, not for anything — and that is now a requirement rather than an omission: `container-image` already forbids either of them to expose a port, and each carries an in-package source test asserting something stronger still, that its own non-test sources construct no HTTP server and import no HTTP framework. A raw `net.Listen` is the stated residual neither test catches.
+
+The cost is that **neither process has a liveness signal of any kind**, and no log record fires on an idle stack for either one. The worker's recovery sweeper logs only when it finds something; the notifier's records are all per-message, and a healthy connected consumer is silent. So an idle-but-wedged worker is indistinguishable from an idle-and-healthy one — both are a running container emitting nothing — and the same holds for the notifier. What an operator has instead is indirect and lagging: jobs that stay `queued`, or a `video.jobs.terminal.events.v1` backlog that stops draining. Metrics are where that gap is closed if it is closed, and closing it is not a reason to give either process a port.
 
 `docker-compose.yml` used to be listed here as Phase 8 work. It is not: the full local stack was built up change by change, is documented in `docs/development.md`, and `docs/roadmap.md` records it as delivered.
