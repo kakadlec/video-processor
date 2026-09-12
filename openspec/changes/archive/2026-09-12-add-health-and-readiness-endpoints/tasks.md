@@ -70,4 +70,4 @@
 - [x] 9.3 `docs/operations.md`'s environment matrix: it enumerates *variables read*, and the three divergences task 1.1 names are already there. Correct them, or add a sentence saying explicitly that the table is about variables and not about connections — which is what made it the wrong source for this change's own matrix.
 - [x] 9.4 `docs/architecture.md` and `CLAUDE.md`: the two endpoints, the readiness criterion and where it came from, the access-log exemption, and that the worker and the notifier serve nothing by requirement rather than by omission.
 - [x] 9.5 `docs/roadmap.md`: mark this row `archived` with its links and update the Phase 8 summary row — one of three becomes two of three.
-- [ ] 9.6 `npx --yes @fission-ai/openspec validate add-health-and-readiness-endpoints --strict --no-interactive`, fix every error, then archive.
+- [x] 9.6 `npx --yes @fission-ai/openspec validate add-health-and-readiness-endpoints --strict --no-interactive`, fix every error, then archive.
