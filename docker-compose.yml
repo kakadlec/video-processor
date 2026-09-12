@@ -182,6 +182,27 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      # /ready, not /health: this asks whether the process can still serve,
+      # which is what a prober is for. wget rather than curl because the
+      # runtime image is Alpine and carries busybox; these flags issue a GET
+      # (verified against the service's own access record) and exit non-zero
+      # on the 503 an unready service answers with.
+      #
+      # timeout (5s) must stay strictly greater than readinessCheckTimeout
+      # (2s in readiness.go), and not the other way round: a handler allowed
+      # to run longer than the prober waits makes the prober abandon every
+      # request, so every verdict becomes a failure whatever the dependency
+      # is doing, and nothing in the output says so. The checks run
+      # concurrently, so two dependencies still bound at ~2s, not 4s.
+      #
+      # No start_period, deliberately: main() pings every dependency before
+      # it binds the port at all, so there is no window in which this service
+      # is listening but legitimately not ready.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     # Longer than main.go's 30s shutdownTimeout. Compose sends SIGKILL 10s
     # after SIGTERM by default, so without this the graceful window the
     # process asks for cannot be honoured and an in-flight registration is
@@ -226,6 +247,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # Same command and the same timeout ordering as identity-api above:
+      # 5s here against readiness.go's 2s per-check bound. This service's
+      # readiness matrix names PostgreSQL alone — Redis backs the limiter,
+      # which fails open, so a service that cannot reach it still serves.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     # Same reason as identity-api above: Compose's 10s default would SIGKILL
     # this process well inside the 30s graceful window it asks for.
     stop_grace_period: 45s
@@ -307,6 +337,16 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck:
+      # Same command and the same timeout ordering as identity-api above:
+      # 5s here against readiness.go's 2s per-check bound. This is the one
+      # service whose matrix holds two checks, PostgreSQL and the object
+      # store; they run concurrently, so the bound is still ~2s. Redis is
+      # absent from it for the same reason as on notification-api.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     # Same reason as identity-api above, and it matters more here: shutdown
     # joins the outbox relay, which holds a database transaction while it
     # runs. The 10s default would SIGKILL it mid-claim.
