@@ -53,7 +53,7 @@ func main() {
 	// gin.TestMode are unaffected by this call.
 	gin.SetMode(gin.ReleaseMode)
 
-	r := setupRouter(identity)
+	r := setupRouter(identity, newReadinessChecker(identityDB))
 
 	// Signal-aware rather than log.Fatal(r.Run(...)): that exits through
 	// os.Exit, which runs no deferred call, so an in-flight registration
@@ -113,7 +113,7 @@ func newHTTPServer(handler http.Handler) *http.Server {
 	}
 }
 
-func setupRouter(identity *identityModule) *gin.Engine {
+func setupRouter(identity *identityModule, readiness *readinessChecker) *gin.Engine {
 	r := gin.New()
 
 	// The access log and the recovery handler this service writes itself,
@@ -141,6 +141,14 @@ func setupRouter(identity *identityModule) *gin.Engine {
 
 		c.Next()
 	})
+
+	// The probes are mounted on the engine, ahead of everything else this
+	// router carries. This service mounts neither bearer authentication nor
+	// the limiter, so there is no group to be outside of — the placement is
+	// what keeps that an accident of this service rather than a policy, since
+	// a probe answered here and refused on the other two would be an
+	// authentication rule nobody chose.
+	newProbeEndpoints(readiness).registerRoutes(r)
 
 	// No bearer-auth group and no rate limiter, matching what the single API
 	// did for these two routes: they are how a caller obtains a token, so

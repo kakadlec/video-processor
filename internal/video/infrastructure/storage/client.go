@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/minio/minio-go/v7"
@@ -32,6 +33,35 @@ func Open(cfg Config) (*minio.Client, error) {
 func Ping(ctx context.Context, client *minio.Client, bucket string) error {
 	if _, err := client.BucketExists(ctx, bucket); err != nil {
 		return fmt.Errorf("video: minio ping: %w", err)
+	}
+	return nil
+}
+
+// ErrBucketAbsent reports that the server answered and the configured bucket
+// is not there. It is a distinct outcome from a transport failure: every
+// object operation this adapter performs names a key inside one configured
+// bucket, so a reachable server without it serves nothing.
+var ErrBucketAbsent = errors.New("video: the configured bucket does not exist")
+
+// CheckBucket reports whether the configured bucket is usable right now,
+// returning ErrBucketAbsent when the server answers and the bucket is gone.
+// It reads the boolean BucketExists returns, creates nothing, and writes
+// nothing, so a caller may run it on any schedule without changing the state
+// of the object store.
+//
+// It is deliberately not folded into Ping, and the two are not collapsible.
+// Ping answers "does the server respond"; this answers "is the bucket
+// there". Startup asks the first question immediately before EnsureBucket
+// creates the bucket, so teaching Ping to assert presence would make a first
+// start against an empty object store fail fatally on a bucket the very next
+// call was about to create. Two callers, two questions, two operations.
+func CheckBucket(ctx context.Context, client *minio.Client, bucket string) error {
+	exists, err := client.BucketExists(ctx, bucket)
+	if err != nil {
+		return fmt.Errorf("video: check bucket %q: %w", bucket, err)
+	}
+	if !exists {
+		return ErrBucketAbsent
 	}
 	return nil
 }

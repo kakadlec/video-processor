@@ -121,7 +121,9 @@ func newVideoModule(createVideoJob *videoapplication.CreateVideoJob, getJobStatu
 // are always required. The opened *redis.Client is also returned so callers (main's
 // rate-limiter wiring) can reuse the same connection instead of opening a
 // second one, and so is the outbox relay, which main owns the lifetime of.
-func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, error) {
+// The last value before the error is this service's object-storage
+// readiness check, with the client and the bucket already captured.
+func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *videomessaging.Relay, func(context.Context) error, error) {
 	// Loaded first, and loaded only — this reads an environment variable and
 	// touches no network. Every other subsystem below interleaves its config
 	// load with opening and pinging the thing it configures, so leaving this
@@ -139,31 +141,31 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	// deliberately neither MinIO's fail-closed nor Redis's fail-open.
 	rabbitConfig, err := platformrabbitmq.LoadConfigFromEnv()
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 
 	pgConfig, err := videopostgres.LoadConfigFromEnv()
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 
 	db, err := videopostgres.Open(pgConfig)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	if err := videopostgres.Migrate(ctx, db); err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	if err := db.PingContext(ctx); err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("video: connect to postgres: %w", err)
 	}
 
 	redisConfig, err := platformredis.LoadConfigFromEnv()
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, fmt.Errorf("video: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("video: %w", err)
 	}
 	// Open never itself connects (platformredis.Open's own contract) — a
 	// Ping/command failure surfaces at request time instead of here, per
@@ -176,12 +178,12 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	minioConfig, err := videostorage.LoadConfigFromEnv()
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	minioClient, err := videostorage.Open(minioConfig)
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	// Fail-closed, deliberately unlike the Redis wiring above: rate
 	// limiting, idempotency, and the status cache all degrade to a slower
@@ -191,11 +193,11 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	// confirmed here rather than discovered on the first upload.
 	if err := videostorage.Ping(ctx, minioClient, minioConfig.Bucket); err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	if err := videostorage.EnsureBucket(ctx, minioClient, minioConfig.Bucket); err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	// The region is discovered here, on the reachable client, and handed to
 	// the presigning client rather than configured: the server can simply
@@ -207,14 +209,27 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	region, err := videostorage.BucketRegion(ctx, minioClient, minioConfig.Bucket)
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	presignClient, err := videostorage.OpenPresigner(minioConfig, region)
 	if err != nil {
 		closeDB(db)
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	resultStorage := videostorage.NewResultStorage(minioClient, presignClient, minioConfig.Bucket)
+	// The object-storage readiness check, built here because this is the
+	// only place holding both the client and the bucket name — the latter
+	// never leaves this function otherwise. It is handed back as the check
+	// rather than as those two values so the composition root, which has no
+	// other use for either, gets something it can only use one way.
+	//
+	// It asks whether the bucket is present rather than only whether the
+	// server answers: every route names objects inside this one bucket, so a
+	// reachable object store without it serves nothing — which is exactly
+	// what the Ping above would report as healthy.
+	objectStorageReady := func(ctx context.Context) error {
+		return videostorage.CheckBucket(ctx, minioClient, minioConfig.Bucket)
+	}
 	sourceStorage := videostorage.NewSourceStorage(minioClient, minioConfig.Bucket)
 
 	ids := videoidgen.New()
@@ -251,7 +266,7 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 		resultStorage,
 		ids,
 	)
-	return module, db, redisClient, relay, nil
+	return module, db, redisClient, relay, objectStorageReady, nil
 }
 
 func (m *videoModule) registerRoutes(videoRoutes *gin.RouterGroup) {

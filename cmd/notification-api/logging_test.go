@@ -13,6 +13,8 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -161,7 +163,12 @@ func decodeRecords(t *testing.T, buffer *bytes.Buffer) []map[string]any {
 	return records
 }
 
-func onlyRecord(t *testing.T, buffer *bytes.Buffer, component string) map[string]any {
+// recordsWithComponent returns every record attributed to component, in the
+// order they were emitted. A count of zero is an assertion in its own right —
+// the access-record exemption is stated as an absence — and it has to be read
+// per component rather than off an empty buffer, because a readiness probe
+// that changes verdict writes a record of its own into the same buffer.
+func recordsWithComponent(t *testing.T, buffer *bytes.Buffer, component string) []map[string]any {
 	t.Helper()
 
 	var found []map[string]any
@@ -170,6 +177,13 @@ func onlyRecord(t *testing.T, buffer *bytes.Buffer, component string) map[string
 			found = append(found, record)
 		}
 	}
+	return found
+}
+
+func onlyRecord(t *testing.T, buffer *bytes.Buffer, component string) map[string]any {
+	t.Helper()
+
+	found := recordsWithComponent(t, buffer, component)
 	if len(found) != 1 {
 		t.Fatalf("expected exactly one %q record, got %d: %s", component, len(found), buffer.String())
 	}
@@ -400,7 +414,7 @@ func TestTheServiceRouterMountsTheAccessLog(t *testing.T) {
 
 	auth, _ := newTestAuthenticatorWithTokens(t)
 	recorder := httptest.NewRecorder()
-	setupRouter(auth, newTestNotificationModuleWithPolicy(newInMemoryPreferenceRepository(), notificationdomain.NewDestinationPolicy(false)), alwaysAllowRateLimiter{}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
+	setupRouter(auth, newTestNotificationModuleWithPolicy(newInMemoryPreferenceRepository(), notificationdomain.NewDestinationPolicy(false)), alwaysAllowRateLimiter{}, newChecker()).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/no-such-route", nil))
 
 	record := onlyRecord(t, buffer, componentHTTPAccess)
 	requireField(t, record, "method", http.MethodGet)
@@ -490,5 +504,348 @@ func TestTheHTTPServerRecordsItsOwnErrorsAtErrorSeverity(t *testing.T) {
 		serveErrorProbe(t, unparseableContentLength())
 
 		onlyRecord(t, buffer, componentHTTPServer)
+	})
+}
+
+// newProbeAccessRouter builds this service's real router over a caller-supplied
+// readiness checker. The exemption keys on the matched route template, so it
+// can only be exercised against the router that registers the probes: against
+// the engine the rest of this file builds, a request for the liveness path
+// matches nothing at all and is recorded with a path like any other unmatched
+// request — and a test written there would pass against an exemption keyed on
+// the request path, which is the wrong key.
+func newProbeAccessRouter(t *testing.T, readiness *readinessChecker) *gin.Engine {
+	t.Helper()
+
+	router, _ := newProbeTestRouter(t, alwaysAllowRateLimiter{}, readiness)
+	return router
+}
+
+// TestAProbeYieldsNoAccessRecordAndIsStillServed holds the exemption and the
+// trap it sets in one assertion. The trap is not a plain early return, which
+// is harmless: gin drives Next() as a loop and advances past a middleware
+// that did not call it, so the chain runs either way. It is aborting — the
+// c.Abort(); return form, one edit away and the way a middleware that means
+// to suppress something is usually written — which does stop the chain, so
+// the probe handler never runs: every probe then answers 200 with an empty
+// body and none of the headers the handler sets, and /ready answers 200 where
+// it should answer 503. That satisfies both "a probe yields no access record"
+// and "a probe answers 200" and fails only an assertion that reads what came
+// back. The exemption suppresses the record, not the chain.
+func TestAProbeYieldsNoAccessRecordAndIsStillServed(t *testing.T) {
+	for name, probe := range map[string]struct {
+		path    string
+		failing bool
+		status  int
+		body    string
+	}{
+		"liveness":             {path: healthRoutePath, status: http.StatusOK, body: probeBodyHealthy},
+		"readiness, ready":     {path: readyRoutePath, status: http.StatusOK, body: probeBodyReady},
+		"readiness, not ready": {path: readyRoutePath, failing: true, status: http.StatusServiceUnavailable, body: probeBodyNotReady},
+	} {
+		dependency := readinessProbeOK
+		if probe.failing {
+			dependency = readinessProbeFailing
+		}
+		// Built against the parent rather than inside the subtest: one root
+		// derives a real object-storage bucket name from t.Name(), and a
+		// subtest name is neither short enough nor punctuation-free enough to
+		// survive that derivation.
+		router := newProbeAccessRouter(t, newChecker(readinessCheck{name: dependencyDatabase, probe: dependency}))
+
+		t.Run(name, func(t *testing.T) {
+			buffer := captureRecords(t)
+			captureUnstructuredOutput(t)
+
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, probe.path, nil))
+
+			if recorder.Code != probe.status {
+				t.Fatalf("%s answered %d, want %d", probe.path, recorder.Code, probe.status)
+			}
+			if got := recorder.Body.String(); got != probe.body {
+				t.Fatalf("%s answered body %q, want %q — the exemption suppresses the record, not the chain", probe.path, got, probe.body)
+			}
+			if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("%s answered Cache-Control %q, want %q — the probe handler did not run", probe.path, got, "no-store")
+			}
+
+			if records := recordsWithComponent(t, buffer, componentHTTPAccess); len(records) != 0 {
+				t.Fatalf("a probe yielded %d access records: %s", len(records), buffer.String())
+			}
+		})
+	}
+}
+
+// TestEveryRouteOtherThanAProbeStillYieldsAnAccessRecord is the boundary the
+// exemption has to be held to rather than its existence: an assertion that a
+// probe yields no record passes against a middleware that was removed
+// entirely. The rows carrying another method against a probe path are the
+// discriminating ones — they match no route, so the record must be written,
+// and an exemption keyed on the request path would suppress it.
+func TestEveryOtherRouteStillYieldsAnAccessRecord(t *testing.T) {
+	router := newProbeAccessRouter(t, newChecker())
+
+	for name, request := range map[string]struct {
+		method string
+		target string
+		route  string
+		path   string
+	}{
+		"a matched route":                      {method: http.MethodGet, target: notificationPreferencesPath, route: notificationPreferencesPath},
+		"a request that matched no route":      {method: http.MethodGet, target: "/no-such-route", path: "/no-such-route"},
+		"the liveness path on another method":  {method: http.MethodPost, target: healthRoutePath, path: healthRoutePath},
+		"the readiness path on another method": {method: http.MethodPost, target: readyRoutePath, path: readyRoutePath},
+	} {
+		t.Run(name, func(t *testing.T) {
+			buffer := captureRecords(t)
+			captureUnstructuredOutput(t)
+
+			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(request.method, request.target, nil))
+
+			record := onlyRecord(t, buffer, componentHTTPAccess)
+			if request.route != "" {
+				requireField(t, record, "route", request.route)
+				return
+			}
+			requireField(t, record, "path", request.path)
+			requireNoField(t, record, "route")
+		})
+	}
+}
+
+// TestAPanicWhileServingAProbeIsStillRecorded pins the other boundary the
+// skip's placement in the chain can get wrong. What is exempt is the routine
+// per-request record and not the report of a failure, so the recovery record
+// survives a probe route and the access record does not.
+//
+// The panicking handler is registered at the real probe template on an engine
+// of its own: the exemption keys on the matched route, so a handler registered
+// under any other path would not exercise it at all.
+func TestAPanicWhileServingAProbeIsStillRecorded(t *testing.T) {
+	for _, route := range []string{healthRoutePath, readyRoutePath} {
+		t.Run(route, func(t *testing.T) {
+			buffer := captureRecords(t)
+			unstructured := captureUnstructuredOutput(t)
+
+			r := gin.New()
+			r.Use(accessLogMiddleware(), recoveryMiddleware())
+			r.GET(route, func(c *gin.Context) { panic("a deliberate panic") })
+
+			recorder := httptest.NewRecorder()
+			r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, route, nil))
+
+			record := onlyRecord(t, buffer, componentHTTPRecovery)
+			requireField(t, record, "level", "ERROR")
+			requireField(t, record, "route", route)
+			requireField(t, record, "panic", "a deliberate panic")
+
+			if records := recordsWithComponent(t, buffer, componentHTTPAccess); len(records) != 0 {
+				t.Fatalf("a panicking probe yielded %d access records; the exemption covers the routine record, not the report of a failure", len(records))
+			}
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("a panicking probe answered %d, want 500", recorder.Code)
+			}
+			if output := unstructured(); output != "" {
+				t.Fatalf("a recovered panic wrote outside the record: %q", output)
+			}
+		})
+	}
+}
+
+// newProbeOnlyRouter mounts this process's probe endpoints, and nothing else,
+// on a bare engine. The verdict a transition is measured against is held by
+// probeEndpoints, so that is what the two tests below drive: standing up the
+// whole service router once per round would exercise the same constructor
+// while also building every other dependency the root happens to hold —
+// which, on one of the three, means a real object-storage bucket per round.
+func newProbeOnlyRouter(readiness *readinessChecker) *gin.Engine {
+	r := gin.New()
+	newProbeEndpoints(readiness).registerRoutes(r)
+	return r
+}
+
+// togglableReadinessProbe returns a dependency check whose verdict the caller
+// controls, so one router can be driven across a failure and a recovery.
+func togglableReadinessProbe() (func(context.Context) error, func(bool)) {
+	var failing atomic.Bool
+	probe := func(context.Context) error {
+		if failing.Load() {
+			return errProbeDependencyDown
+		}
+		return nil
+	}
+	return probe, failing.Store
+}
+
+// TestTheReadinessVerdictIsRecordedOncePerTransition is what the access-record
+// exemption traded the per-probe record for, and the count is the whole
+// assertion: a probe answered every few seconds forever must record a change
+// of verdict and not a verdict. Nine probes spanning one failure and one
+// recovery yield exactly two records.
+//
+// The run opens with three probes that are ready and expects silence from
+// them, which pins the initial verdict: a process that starts ready has not
+// recovered from anything, so announcing that it had would be a record of an
+// event that never happened.
+func TestTheReadinessVerdictIsRecordedOncePerTransition(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	probe, setFailing := togglableReadinessProbe()
+	router := newProbeOnlyRouter(newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+
+	probeRepeatedly := func(want int) {
+		t.Helper()
+		for i := 0; i < 3; i++ {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+			if recorder.Code != want {
+				t.Fatalf("%s answered %d, want %d", readyRoutePath, recorder.Code, want)
+			}
+		}
+	}
+
+	probeRepeatedly(http.StatusOK)
+	setFailing(true)
+	probeRepeatedly(http.StatusServiceUnavailable)
+	setFailing(false)
+	probeRepeatedly(http.StatusOK)
+
+	records := recordsWithComponent(t, buffer, componentReadinessProbe)
+	if len(records) != 2 {
+		t.Fatalf("nine probes across one failure and one recovery yielded %d records, want 2: %s", len(records), buffer.String())
+	}
+
+	requireField(t, records[0], "level", "WARN")
+	requireField(t, records[0], "dependencies", dependencyDatabase)
+	requireField(t, records[0], "dependency_count", float64(1))
+
+	requireField(t, records[1], "level", "INFO")
+	requireNoField(t, records[1], "dependencies")
+}
+
+// TestTwoConcurrentProbesObservingOneTransitionRecordItOnce is what makes the
+// compare-and-swap load-bearing rather than decorative: a read followed by a
+// write has both callers observe the old verdict and both record the change.
+//
+// The dependency check holds every caller at a barrier until all of them have
+// arrived, so all of them are provably past the read before any reaches the
+// swap. The barrier alone does not discriminate, which is why the width and
+// the repetition are both here and both calibrated rather than guessed: the
+// window a read-then-write leaves open is two instructions wide, and two
+// callers released once simply serialize. Eight callers across eight thousand
+// rounds caught the read-then-write form on forty runs out of forty, in about
+// a second. Each round gets its own router, so each observes the transition
+// afresh; the correct implementation can never record twice, so nothing here
+// is probabilistic in the direction that would flake.
+func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	const callers = 8
+	for round := 0; round < 8000; round++ {
+		arrived := make(chan struct{}, callers)
+		release := make(chan struct{})
+		probe := func(context.Context) error {
+			arrived <- struct{}{}
+			<-release
+			return errProbeDependencyDown
+		}
+		router := newProbeOnlyRouter(newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+
+		var wg sync.WaitGroup
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+			}()
+		}
+
+		for i := 0; i < callers; i++ {
+			<-arrived
+		}
+		close(release)
+		wg.Wait()
+
+		if records := recordsWithComponent(t, buffer, componentReadinessProbe); len(records) != 1 {
+			t.Fatalf("round %d: %d concurrent probes observing one transition yielded %d records, want 1: %s",
+				round, callers, len(records), buffer.String())
+		}
+		buffer.Reset()
+	}
+}
+
+// probeHangingUntilAnswered returns a dependency check that blocks until its
+// caller's context ends, until the returned function releases it, so one
+// router — and so one shared verdict — can be driven across a probe whose
+// caller disconnects and a probe that completes normally.
+func probeHangingUntilAnswered() (func(context.Context) error, func()) {
+	var answering atomic.Bool
+	probe := func(ctx context.Context) error {
+		if answering.Load() {
+			return nil
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return probe, func() { answering.Store(true) }
+}
+
+// TestAProbeWhoseCallerDisconnectsMovesNoVerdict pins that a canceled request
+// is not a dependency outage. Every check derives from the request context, so
+// cancelling one request fails all of them, and a handler that read that as a
+// verdict would name the whole dependency inventory in a warning — and then
+// announce a recovery from it on the next healthy probe.
+//
+// The second half is the one that would otherwise ship. A 503 written to a
+// caller that has already gone away is read by nobody, so the false
+// degradation is nearly invisible; the recovery it manufactures is emitted to
+// a live reader on the next probe, at info, describing an outage that never
+// occurred. The two halves are separate subtests, and the first reports rather
+// than aborts, so a regression in either is visible on one run instead of the
+// first one masking the second.
+func TestAProbeWhoseCallerDisconnectsMovesNoVerdict(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	probe, answer := probeHangingUntilAnswered()
+	router := newProbeOnlyRouter(newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+
+	t.Run("the canceled probe records no degradation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			request := httptest.NewRequest(http.MethodGet, readyRoutePath, nil).WithContext(ctx)
+			router.ServeHTTP(httptest.NewRecorder(), request)
+		}()
+
+		cancel()
+		select {
+		case <-served:
+		case <-time.After(readinessCheckTimeout / 2):
+			t.Fatalf("the endpoint outlived its caller; the check is not derived from the request context")
+		}
+
+		if records := recordsWithComponent(t, buffer, componentReadinessProbe); len(records) != 0 {
+			t.Errorf("a canceled probe yielded %d readiness records, want 0: %s", len(records), buffer.String())
+		}
+		buffer.Reset()
+	})
+
+	t.Run("the healthy probe after it records no recovery", func(t *testing.T) {
+		answer()
+
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s answered %d, want %d", readyRoutePath, recorder.Code, http.StatusOK)
+		}
+
+		if records := recordsWithComponent(t, buffer, componentReadinessProbe); len(records) != 0 {
+			t.Errorf("the probe after a canceled one yielded %d readiness records, want 0: %s", len(records), buffer.String())
+		}
 	})
 }

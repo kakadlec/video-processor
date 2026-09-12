@@ -162,7 +162,7 @@ func newNotificationTestServerOver(
 ) *httptest.Server {
 	t.Helper()
 
-	srv := httptest.NewServer(setupRouter(auth, newTestNotificationModuleWithPolicy(repo, policy), limiter))
+	srv := httptest.NewServer(setupRouter(auth, newTestNotificationModuleWithPolicy(repo, policy), limiter, newChecker()))
 	t.Cleanup(srv.Close)
 	return srv
 }

@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -199,6 +200,117 @@ func TestPing_HonorsCanceledContext(t *testing.T) {
 	cancel()
 
 	if err := storage.Ping(ctx, client, "bucket"); err == nil {
+		t.Fatal("expected an error for an already-canceled context")
+	}
+}
+
+func TestCheckBucket_SucceedsWhenTheBucketIsPresent(t *testing.T) {
+	client, cfg := testClient(t)
+	bucket := uniqueBucket(t, cfg.Bucket)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := storage.EnsureBucket(ctx, client, bucket); err != nil {
+		t.Fatalf("create the bucket: %v", err)
+	}
+	defer removeBucket(t, client, bucket)
+
+	if err := storage.CheckBucket(ctx, client, bucket); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestCheckBucket_ReportsAnAbsentBucketOnAReachableServer covers the case a
+// reachability ping cannot see: the server answers and the bucket is gone.
+// Ping returns nil here — it discards the boolean — which is why readiness
+// asks this question with its own operation.
+func TestCheckBucket_ReportsAnAbsentBucketOnAReachableServer(t *testing.T) {
+	client, cfg := testClient(t)
+	bucket := uniqueBucket(t, cfg.Bucket)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := storage.EnsureBucket(ctx, client, bucket); err != nil {
+		t.Fatalf("create the bucket: %v", err)
+	}
+	if err := client.RemoveBucket(ctx, bucket); err != nil {
+		t.Fatalf("remove the bucket: %v", err)
+	}
+
+	if err := storage.Ping(ctx, client, bucket); err != nil {
+		t.Fatalf("expected the reachability ping to pass for a missing bucket, got: %v", err)
+	}
+
+	err := storage.CheckBucket(ctx, client, bucket)
+	if !errors.Is(err, storage.ErrBucketAbsent) {
+		t.Fatalf("expected storage.ErrBucketAbsent, got: %v", err)
+	}
+
+	// Answering must not have created what it reported missing.
+	exists, existsErr := client.BucketExists(ctx, bucket)
+	if existsErr != nil {
+		t.Fatalf("bucket exists check: %v", existsErr)
+	}
+	if exists {
+		t.Fatalf("bucket %q was created by the readiness check", bucket)
+	}
+}
+
+// TestCheckBucket_WritesNothingIntoAPresentBucket is the other half of the
+// read-only claim: the absent case cannot write an object because there is no
+// bucket to write it into, so the present case is where a write would land.
+func TestCheckBucket_WritesNothingIntoAPresentBucket(t *testing.T) {
+	client, cfg := testClient(t)
+	bucket := uniqueBucket(t, cfg.Bucket)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := storage.EnsureBucket(ctx, client, bucket); err != nil {
+		t.Fatalf("create the bucket: %v", err)
+	}
+	defer removeBucket(t, client, bucket)
+
+	for range 3 {
+		if err := storage.CheckBucket(ctx, client, bucket); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	for object := range client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Recursive: true}) {
+		if object.Err != nil {
+			t.Fatalf("list %q: %v", bucket, object.Err)
+		}
+		t.Fatalf("bucket %q holds %q after a readiness check", bucket, object.Key)
+	}
+}
+
+func TestCheckBucket_FailsAgainstUnreachableMinIO(t *testing.T) {
+	client := unreachableClient(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := storage.CheckBucket(ctx, client, "bucket")
+	if err == nil {
+		t.Fatal("expected an error against an unreachable instance")
+	}
+	// A transport failure is not the absent-bucket outcome: the server never
+	// answered, so nothing was learned about the bucket.
+	if errors.Is(err, storage.ErrBucketAbsent) {
+		t.Fatalf("expected a transport error rather than storage.ErrBucketAbsent, got: %v", err)
+	}
+}
+
+func TestCheckBucket_HonorsCanceledContext(t *testing.T) {
+	client := unreachableClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := storage.CheckBucket(ctx, client, "bucket"); err == nil {
 		t.Fatal("expected an error for an already-canceled context")
 	}
 }

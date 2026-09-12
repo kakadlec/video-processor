@@ -55,7 +55,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	video, videoDB, redisClient, relay, err := setupVideo(ctx)
+	video, videoDB, redisClient, relay, objectStorageReady, err := setupVideo(ctx)
 	if err != nil {
 		logger(componentProcessStartup).Error("the video module could not be built",
 			slog.String("error", err.Error()))
@@ -77,7 +77,7 @@ func main() {
 	// gin.TestMode are unaffected by this call.
 	gin.SetMode(gin.ReleaseMode)
 
-	r := setupRouter(auth, video, limiter)
+	r := setupRouter(auth, video, limiter, newReadinessChecker(videoDB, objectStorageReady))
 
 	// Signal-aware rather than log.Fatal(r.Run(...)): that exits through
 	// os.Exit, which runs no deferred call and waits for nothing, so the
@@ -173,7 +173,7 @@ func newHTTPServer(handler http.Handler) *http.Server {
 	}
 }
 
-func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter) *gin.Engine {
+func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter, readiness *readinessChecker) *gin.Engine {
 	r := gin.New()
 
 	// The access log and the recovery handler this service writes itself,
@@ -206,6 +206,15 @@ func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter) *
 	r.GET("/app.js", func(c *gin.Context) {
 		serveEmbeddedFile(c, "web/app.js", "application/javascript; charset=utf-8")
 	})
+
+	// The probes join the three routes above on the engine, outside the group
+	// below and so outside both of its middlewares. r.Use is not retroactive,
+	// so the registration order here is what makes that true. A probe carries
+	// no bearer token, which the limiter would have nothing to key on; worse,
+	// a probe issued at a fixed interval from inside the limiter would
+	// eventually exhaust a budget and be answered 429, which a prober reads
+	// as an outage the limiter itself manufactured.
+	newProbeEndpoints(readiness).registerRoutes(r)
 
 	// videoRoutes holds every route that serves or accepts video-processing
 	// artifacts. All of them require a valid bearer token and are subject to

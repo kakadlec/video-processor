@@ -22,6 +22,7 @@ const (
 	componentHTTPServer        = "http_server"
 	componentHTTPAccess        = "http_access"
 	componentHTTPRecovery      = "http_recovery"
+	componentReadinessProbe    = "readiness_probe"
 	componentRateLimit         = "rate_limit"
 	componentPreferenceListing = "preference_listing"
 	componentPreferenceWrite   = "preference_write"
@@ -58,6 +59,28 @@ var recognizedMethods = map[string]bool{
 	http.MethodTrace:   true,
 }
 
+// accessRecordExempt reports whether a request that matched this route
+// template is exempt from the access record. It is a closed list of exactly
+// the two probe route templates, and there is deliberately no mechanism — no
+// middleware option, no configurable exclusion list, no per-route opt-out — by
+// which any further route can join it: a general mechanism would let a later
+// route stop being recorded without that ever being reviewed as a change to
+// this capability, and the value of the rule it excepts is that it has no
+// escape hatch.
+//
+// What the two excluded records would contain is the justification. A liveness
+// probe consults nothing, so its record varies in no field; a readiness
+// probe's verdict does vary, but the informative event is a change of verdict,
+// which is recorded at the moment it happens, at a severity that reflects it,
+// naming the dependency that failed — which an access record cannot do at all.
+//
+// It is keyed on the matched route template rather than on the request path:
+// a request for one of these paths that matched no route — another method,
+// say — is a request like any other and is recorded like one.
+func accessRecordExempt(route string) bool {
+	return route == healthRoutePath || route == readyRoutePath
+}
+
 // accessLogMiddleware emits one record per request through the process logger,
 // replacing gin's own access log. It is mounted on the engine rather than on a
 // group: it has to see the requests that matched no route, which is also the
@@ -67,6 +90,16 @@ func accessLogMiddleware() gin.HandlerFunc {
 		start := time.Now()
 
 		c.Next()
+
+		// After the chain rather than before it: what is exempt is the
+		// record, not the request. Returning ahead of c.Next() happens to
+		// work — gin's own loop advances past a middleware that did not call
+		// it — but it reads as skipping the request, and the one edit from
+		// there that really does skip it answers every probe from inside this
+		// middleware, with an empty body and no recovery record.
+		if accessRecordExempt(c.FullPath()) {
+			return
+		}
 
 		record := requestLocation(logger(componentHTTPAccess), c).With(
 			slog.String("method", recordedMethod(c.Request.Method)),
