@@ -773,3 +773,76 @@ func TestTwoConcurrentProbesObservingOneTransitionRecordItOnce(t *testing.T) {
 		buffer.Reset()
 	}
 }
+
+// probeHangingUntilAnswered returns a dependency check that blocks until its
+// caller's context ends, until the returned function releases it, so one
+// router — and so one shared verdict — can be driven across a probe whose
+// caller disconnects and a probe that completes normally.
+func probeHangingUntilAnswered() (func(context.Context) error, func()) {
+	var answering atomic.Bool
+	probe := func(ctx context.Context) error {
+		if answering.Load() {
+			return nil
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return probe, func() { answering.Store(true) }
+}
+
+// TestAProbeWhoseCallerDisconnectsMovesNoVerdict pins that a canceled request
+// is not a dependency outage. Every check derives from the request context, so
+// cancelling one request fails all of them, and a handler that read that as a
+// verdict would name the whole dependency inventory in a warning — and then
+// announce a recovery from it on the next healthy probe.
+//
+// The second half is the one that would otherwise ship. A 503 written to a
+// caller that has already gone away is read by nobody, so the false
+// degradation is nearly invisible; the recovery it manufactures is emitted to
+// a live reader on the next probe, at info, describing an outage that never
+// occurred. The two halves are separate subtests, and the first reports rather
+// than aborts, so a regression in either is visible on one run instead of the
+// first one masking the second.
+func TestAProbeWhoseCallerDisconnectsMovesNoVerdict(t *testing.T) {
+	buffer := captureRecords(t)
+	captureUnstructuredOutput(t)
+
+	probe, answer := probeHangingUntilAnswered()
+	router := newProbeOnlyRouter(newChecker(readinessCheck{name: dependencyDatabase, probe: probe}))
+
+	t.Run("the canceled probe records no degradation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			request := httptest.NewRequest(http.MethodGet, readyRoutePath, nil).WithContext(ctx)
+			router.ServeHTTP(httptest.NewRecorder(), request)
+		}()
+
+		cancel()
+		select {
+		case <-served:
+		case <-time.After(readinessCheckTimeout / 2):
+			t.Fatalf("the endpoint outlived its caller; the check is not derived from the request context")
+		}
+
+		if records := recordsWithComponent(t, buffer, componentReadinessProbe); len(records) != 0 {
+			t.Errorf("a canceled probe yielded %d readiness records, want 0: %s", len(records), buffer.String())
+		}
+		buffer.Reset()
+	})
+
+	t.Run("the healthy probe after it records no recovery", func(t *testing.T) {
+		answer()
+
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, readyRoutePath, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s answered %d, want %d", readyRoutePath, recorder.Code, http.StatusOK)
+		}
+
+		if records := recordsWithComponent(t, buffer, componentReadinessProbe); len(records) != 0 {
+			t.Errorf("the probe after a canceled one yielded %d readiness records, want 0: %s", len(records), buffer.String())
+		}
+	})
+}

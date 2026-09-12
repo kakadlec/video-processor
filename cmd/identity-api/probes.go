@@ -96,7 +96,27 @@ func (p *probeEndpoints) handleReady(c *gin.Context) {
 	// code and the body.
 	c.Header("Cache-Control", "no-store")
 
-	if failing := p.readiness.failingDependencies(c.Request.Context()); len(failing) > 0 {
+	failing := p.readiness.failingDependencies(c.Request.Context())
+
+	// A caller that went away takes its verdict with it. Every check derives
+	// from the request context, so one canceled request fails all of them at
+	// once, which is indistinguishable here from every dependency being down:
+	// recorded, it would name the entire inventory in a warning and then
+	// announce a recovery from it on the next healthy probe. Neither event
+	// happened, and a pair of them is exactly what an operator pages on.
+	//
+	// Nothing is lost by staying silent, because the verdict is left where it
+	// stands rather than moved: a real degradation this probe could not
+	// confirm is still there for the next probe from a live caller to record.
+	// The answer is not ready because readiness was not established — no
+	// check is known to have answered under its own timeout — and no one is
+	// left to read it.
+	if c.Request.Context().Err() != nil {
+		c.Data(http.StatusServiceUnavailable, probeContentType, []byte(probeBodyNotReady))
+		return
+	}
+
+	if len(failing) > 0 {
 		p.recordDegradation(failing)
 		c.Data(http.StatusServiceUnavailable, probeContentType, []byte(probeBodyNotReady))
 		return
