@@ -47,7 +47,7 @@ No metric name, and no metric label name or label value, SHALL carry a user iden
 
 The rule SHALL be enforced against the **source**, on one walk over every non-test file under `cmd/` and `internal/`, in the same manner and in the same place as the logging capability's three source rules. No behavioural test can hold it: such a test sees only the call sites that existed when it was written. The walk SHALL hold three rules:
 
-1. **Every label value at a call site SHALL be a string literal, or the result of one of a closed, named set of total constructors.** This SHALL cover every syntactic position a label value can occupy — the varargs form, the map-literal form, and the constant-metric form — because a rule that covers only the first is silently absent from the code that builds a gauge.
+1. **Every label value at a call site SHALL be a string literal, or the result of one of a closed, named set of total constructors.** The rule SHALL be written as a **permission with a failing default**: an argument the walk cannot resolve to one of those two forms fails, *including an argument whose syntactic form the walk does not recognize at all*. Enumerating the ways around it is not sufficient and is not what is required here — a walk that inspects the direct varargs, the map literal and the constant-metric form and silently passes everything else is bypassed by a single line, because `WithLabelValues(values...)` spreads a slice and `With(prometheus.Labels(m))` converts a map, and neither contains a literal or a permitted constructor anywhere for the walk to reject. A spread argument, a `prometheus.Labels` argument that is not a composite literal, and any further form a later version of the client library introduces SHALL therefore all fail by default rather than by enumeration. **Label *names* supplied at a call site are held to the same rule**: a key inside a `prometheus.Labels{…}` literal SHALL be a string literal, since a computed key is a label name chosen at runtime and rule 2 covers only the names written at declaration.
 2. **Every metric name, help string, and label-name entry SHALL be a string literal** — not a formatted string, not a concatenation, not a named constant. A formatted metric name satisfies every rule about label values while putting the identifier back into the series, which is the same defect the logging capability's string-literal message rule exists to prevent, one level worse because a name is a series too.
 3. **The client library's default registry SHALL NOT be used, named, or reached through an automatic-registration helper.** A process-global default registry is mutable state that any transitively imported package can write a metric family into, with no call site in this repository at all. Registration SHALL be into one explicit registry this repository constructs, so that what the endpoint exposes is answerable by reading this repository.
 
@@ -59,6 +59,11 @@ A runtime sanitizer — stripping, truncating or hashing a label value — SHALL
 
 - **WHEN** the source walk reads a call that passes a formatted, converted, concatenated or variable value as a metric label value, in any of the positions a label value can occupy
 - **THEN** it fails, naming the file and line, unless that value is the result of one of the named total constructors
+
+#### Scenario: A label value reaches the call site indirectly
+
+- **WHEN** the source walk reads a call that spreads a slice of label values, or that passes a `prometheus.Labels` argument which is not a composite literal, or that writes a computed key into such a literal
+- **THEN** it fails, naming the file and line, because the default for an unresolved or unrecognized argument form is rejection rather than silence
 
 #### Scenario: A metric is registered into the library's default registry
 
@@ -76,9 +81,11 @@ A runtime sanitizer — stripping, truncating or hashing a label value — SHALL
 - **WHEN** the source walk parses no file, because the tree moved or an error skipped every entry
 - **THEN** it fails rather than reporting every rule satisfied
 
-### Requirement: The One Variable Label Is Bounded by the Router's Own Route Table
+### Requirement: The Two Variable Labels Are Bounded by the Router's Own Route Table
 
-Exactly one label in this system takes a value that is not written as a literal at its call site: the HTTP route a request matched. Its domain SHALL be the route table the router itself reports, read from the router once at startup after every route is registered.
+Exactly two labels in this system take a value that is not written as a literal at its call site, and both come from the same request and are bounded by the same table: **the HTTP route a request matched, and its request method.** Their domain SHALL be the route table the router itself reports, read from the router once at startup after every route is registered. Both are the total constructors the label rule above permits, and they are the only two; the ceiling below is a product over both, so describing the route alone would leave the method outside the contract that bounds it.
+
+The route table SHALL be handed to the shared package in a **representation of this repository's own**, a route and a method per entry, and not in the HTTP framework's type. The framework belongs in the composition roots: nothing under `internal/` imports it today, the platform namespace's own dependency test names that as a rule about this package rather than an accident, and a shared package that named the framework's route type would be the first import of it outside a root — for a value that is two strings. Each composition root therefore translates its own router's table at the point it binds it.
 
 A route value not present in that table SHALL be replaced by a single fixed literal, and a request method not present in it SHALL be replaced by a single fixed literal, reusing the marker the access record already uses for an unrecognized method so that the same fact reads the same in a record and in a series. The resolution SHALL be **fail-closed**: with the table unbound, every route and method resolves to its fallback rather than passing through.
 
@@ -101,6 +108,11 @@ The consequence SHALL be that the number of route-labelled series a service can 
 - **GIVEN** a process in which the route table was not bound at startup
 - **WHEN** a request is recorded
 - **THEN** it resolves to the fallback route and method values rather than passing the request's own values through
+
+#### Scenario: The shared package does not name the HTTP framework
+
+- **WHEN** the shared metrics package's own dependency test reads its imports
+- **THEN** it finds no import of the HTTP framework, and the route table reaches the package as a representation this repository declares
 
 ### Requirement: A Metric Family Is Declared Where It Is Recorded
 
@@ -133,7 +145,7 @@ The following families SHALL exist, and each is named with the decision it infor
 
 - **Per-request count, labelled by method, matched route and response class**, and **per-request duration as a histogram**, labelled by method and matched route, on all three HTTP services. The response **class** rather than the numeric status, because rendering the code into a label is exactly the non-literal value the label rule refuses, and the exact code is already in that request's access record.
 - **Rate-limit decisions**, labelled by outcome, including a distinct outcome for the fail-open path. This is the family with the strongest claim: the rate limiter is specified to allow the request when its backing store fails, which is a loss of *enforcement* and not of efficiency, and it presently produces one warning record per request — the wrong shape for a question whose answer is a total. The budget is one budget per user across the whole system, so this family is summed across the services that mount a limiter rather than read per service.
-- **Upload idempotency reservations**, labelled by outcome — a reservation taken, a duplicate answered with the existing job, and the fail-open path where the reservation could not be made and deduplication is silently off.
+- **Upload idempotency reservations**, labelled by outcome, covering **every** branch the upload handler distinguishes at that call site and not only the ones the feature is named for — a reservation taken; a duplicate answered with the existing job; the **conflict** the handler answers `409` with when a reservation it did not win never resolves within its bounded wait; and the fail-open path where the reservation could not be made at all and deduplication is silently off. The conflict outcome is enumerated rather than folded into the duplicate one because the two are different events with different actions: a duplicate is the feature working, and a conflict is a request refused because another request holds a reservation it has not finished — ordinarily rare, and a rising rate of it means a holder is crashing between reserving and finalizing. Omitting it would also make the family fail to account for the decisions actually taken, so the sum of its outcomes would be less than the number of uploads that reached the reservation, with nothing saying where the difference went.
 - **Job status cache lookups**, labelled by outcome — hit, miss, and error. The hit ratio is the only evidence the cache earns its complexity, and the error rate reports the health of a dependency that `service-health-probes` deliberately refuses to make a readiness dependency.
 - **Aggregates of in-flight work**, as gauges: jobs per in-flight state and the age of the oldest in each, and unpublished outbox events per event type and the age of the oldest in each. These are the requirement below.
 - **The runtime's own collectors** — goroutines, heap, garbage collection, file descriptors, process resources — registered explicitly into this repository's registry rather than obtained by using the library's default one. They are the only available signal for a class of failure nothing else here can see, in a system that runs relays, a sweeper, consumers and a lease heartbeat as goroutines.
@@ -154,6 +166,12 @@ The histogram's buckets SHALL be chosen from what the routes actually do rather 
 - **WHEN** the second request is answered with the first request's job
 - **THEN** the duplicate outcome is counted, and the reservation outcome is not
 
+#### Scenario: A reservation that never resolves
+
+- **GIVEN** a user whose identical content is held by a reservation that neither finalizes nor clears
+- **WHEN** a second request's bounded wait elapses and it is refused
+- **THEN** the conflict outcome is counted, distinctly from a duplicate and from a fail-open
+
 #### Scenario: A second metric for an answered question
 
 - **WHEN** a family is proposed that reports what an existing family already reports
@@ -167,7 +185,9 @@ It SHALL NOT report a cached, background-refreshed, or last-known value. An answ
 
 **On a failure to compute a value, the collector SHALL emit no sample for that family and SHALL report the failure to the scraper**, so that the scrape itself is seen to have failed. It SHALL NOT emit zero. A queued-work gauge reading zero means *nothing is waiting*, which is the most reassuring statement this endpoint can make; emitting it because a query timed out converts a database failure into a healthy-looking dashboard.
 
-A count SHALL saturate at a stated bound rather than being computed exactly without limit, while an oldest-age gauge SHALL NOT saturate. The reasoning is asymmetric because the costs are: a count over a backlog costs work proportional to the backlog, in exactly the case that recurs every scrape interval for as long as the backlog lasts, whereas the age is a single-row lookup. A saturated count still reports *at least this many*, and the age is the number that distinguishes a busy system from a stopped one.
+**The converse SHALL hold with equal force: on a successful collection the count gauge SHALL carry a sample for every member of its fixed label set, zero-valued where nothing matched.** The two rules are one decision read in both directions, and neither works without the other. Absence is how this collector reports failure, so absence must not also be how it reports emptiness: a `queued` count that simply disappears when the queue drains is indistinguishable from one that disappeared because the database was unreachable, and a series that vanishes and returns is also a series no range query can read across. The **age** gauge is the one value legitimately absent on a successful collection, because an empty state has no oldest row whose age could be reported — so a scrape of a healthy idle system carries every count at zero and no age at all, and that combination is itself the signature of *idle* rather than *broken*.
+
+A count SHALL saturate at the bound the persistence requirement states (10,000) rather than being computed exactly without limit, while an oldest-age gauge SHALL NOT saturate. The reasoning is asymmetric because the costs are: a count over a backlog costs work proportional to the backlog, in exactly the case that recurs every scrape interval for as long as the backlog lasts, whereas the age is a single-row lookup. A saturated count still reports *at least this many*, and the age is the number that distinguishes a busy system from a stopped one.
 
 The collector's bound SHALL be strictly below the timeout of whatever scrapes it. The relationship is stated because only one direction is safe: with the scraper's timeout the larger, a slow dependency produces a failed family the scraper records; with the collector's bound the larger, the scraper abandons every request and the endpoint appears wholly unavailable for a reason that has nothing to do with the endpoint.
 
@@ -179,11 +199,17 @@ A gauge over state shared by every replica of a service SHALL be understood as r
 - **WHEN** the endpoint is scraped
 - **THEN** no sample is emitted for that family, the scrape is reported as failed, and no zero value appears
 
+#### Scenario: An in-flight state is empty
+
+- **GIVEN** a system with no job in one of the in-flight states and a reachable database
+- **WHEN** the endpoint is scraped
+- **THEN** the count for that state is present with the value zero, and no age sample is emitted for it
+
 #### Scenario: The backlog exceeds the count's bound
 
-- **GIVEN** more rows in an in-flight state than the count's stated bound
+- **GIVEN** more rows in an in-flight state than the count's stated bound of 10,000
 - **WHEN** the endpoint is scraped
-- **THEN** the count reports the bound and the oldest-age gauge reports the true age
+- **THEN** the count reports 10,000 and the oldest-age gauge reports the true age
 
 #### Scenario: A stopped consumer
 
