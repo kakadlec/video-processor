@@ -46,7 +46,7 @@ The handler already knows, structurally, whether `ProcessVideoJob` got past `Sta
 
 Two outcomes, two mechanisms that already exist, and the disposition is correct under both. **That is what makes the boundary sharp — not that nothing happened, but that everything that could have happened is already owned.** An earlier draft of this document argued the near side was "bit-for-bit unchanged". It is not, the source disproves it, and the argument never needed it.
 
-On the far side, every one of those statements is false, and the existing rule is correct for exactly that reason: the row is `processing`, the claim predicate admits `queued` alone, and a redelivery can only lose the claim and be dead-lettered — which `videojob-lease-recovery` already states as its reason for not building recovery on broker redelivery.
+On the far side there is no disjunction at all — the claim was reported won, so the row is `processing`, a lease is held, and work has begun — and the existing rule is correct for exactly that reason: the claim predicate admits `queued` alone, so a redelivery can only lose the claim and be dead-lettered, which `videojob-lease-recovery` already states as its reason for not building recovery on broker redelivery. What the near side'"'"'s second branch shares with the far side is the row'"'"'s status and nothing else; it is the *absent lease* that makes it the sweeper'"'"'s, and that is why a failure after a won claim cannot borrow this disposition.
 
 So the new disposition applies to one condition: **the claim step could not learn whether the claim was won**, because the persistence layer could not answer. Not "an error occurred before the claim" — decision 2 explains why that is not the same sentence, and not "the claim provably did not happen", which decision 1 has just shown the statement cannot provide.
 
@@ -54,7 +54,7 @@ So the new disposition applies to one condition: **the claim step could not lear
 
 ### 2. The rule is "the server could not answer", classified by the error's own evidence — **not** "an error occurred before the claim", and **not** "which driver call failed"
 
-This is the decision the change turns on, and the obvious formulation is wrong.
+This is the decision the change turns on, and the two obvious formulations are both wrong — one in what it classifies, the other in what it classifies *by*.
 
 `FindByID` runs inside the claim step, and it can fail *permanently on a healthy database*: `scanJobRow` parses five stored values and then calls `RestoreVideoJob`, so a row carrying a status outside the closed set, or a legacy row the aggregate refuses to reconstruct, returns an error that is neither `ErrVideoJobNotFound` nor `ErrJobClaimLost`. Under "requeue anything that fails before the claim", one such row requeues forever at the pause interval — and because prefetch is 1 and a nacked message returns toward the *front* of the queue, it would block **all three replicas** against every healthy job behind it. That is strictly worse than today, where the row is silently dead-lettered.
 
