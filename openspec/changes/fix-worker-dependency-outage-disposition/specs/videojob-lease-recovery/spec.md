@@ -12,7 +12,11 @@ The confirmation state SHALL be worker-local and in-memory, never persisted or s
 
 Recovery SHALL NOT be built on broker redelivery. When a worker process dies its unacknowledged delivery is requeued by the broker immediately, usually before a successfully acquired lease lapses; regardless of whether any lease exists, the redelivery is dead-lettered because the PostgreSQL row remains `processing` and the claim admits only `queued`. By the time lease absence can authorize recovery there is no message left. A delayed-retry queue SHALL NOT be substituted either: its delay would have to exceed every possible extraction to be correct.
 
-**That clause is about a job already `processing`, and SHALL NOT be read as forbidding the requeue `videojob-worker` performs for a dispatch that was never acted on.** The two are different operations on different rows. Recovery returns a job whose claim was *won and then abandoned* to the queue, and it is the lease's absence that authorizes it. `videojob-worker`'s requeue puts back a dispatch whose claim was **never decided**, for a row still `queued`, which no actor owns and which holds no lease to reason about; the redelivery is decided by the same conditional claim the original delivery would have been. Nothing in that path consults a lease, advances an epoch, or writes an outbox row, so none of the reasoning above applies to it. Stated here because the clause is otherwise the first thing a reviewer will quote against that disposition.
+**That clause is about a job already `processing` whose claim was won, and SHALL NOT be read as forbidding the requeue `videojob-worker` performs for a dispatch whose claim outcome was never learned.** The two are different operations. Recovery returns a job whose claim was *won and then abandoned* to the queue, and it is the lease's absence that authorizes it. `videojob-worker`'s requeue puts back a dispatch for which no actor performed any work; nothing in that path consults a lease, advances an epoch, or writes an outbox row.
+
+Its two possible outcomes are covered between the two requirements rather than by either alone, and the second is **this sweeper's ordinary input rather than an exception to it**. If the claim never committed, the row is still `queued` and the redelivery is decided by the same conditional claim the original delivery would have been — a case none of the reasoning above concerns. If the claim committed and its result was lost, the row is `processing` and holds no lease, because a lease is acquired only once a claim is reported won; the redelivery is dead-lettered exactly as this clause describes, and the row is recovered here on the ordinary two-observation path. Stated here because the clause is otherwise the first thing a reviewer will quote against that disposition, and because that second outcome would otherwise look like a gap between the two requirements rather than the seam where they meet.
+
+That second outcome spends one of the bounded requeues below, and that cost is accepted rather than compensated for: a job that exhausts the bound is committed `failed` — visible to its owner, with its idempotency key cleared — which is the outcome this capability already prescribes at the bound and is strictly better than a `queued` row nothing can reach.
 
 **The sweeper SHALL NOT be extended to scan `queued` rows** as an alternative to that disposition. Its authority comes from the lease, and a `queued` job holds none by design — which is exactly what makes a `processing` row without one evidence of abandonment. A `queued` row offers no equivalent signal, because `queued` is the ordinary state of a job waiting for a free worker: a job whose dispatch is en route behind a backlog and a job whose dispatch is gone are indistinguishable to any scan. Acting on age instead would re-dispatch healthy jobs during exactly the backlog that made them look old, and re-dispatching means writing a **new** outbox row, since the original is already stamped published — so the sweeper would become a standing source of duplicate dispatches to cover a failure the consumer's own disposition prevents outright. A separate reconciliation process over aged `queued` rows SHALL NOT be substituted: it is the same heuristic in another process, with a second recovery mechanism's interaction with this one left unreasoned.
 
@@ -72,8 +76,14 @@ The claim predicate SHALL NOT be widened to admit a `processing` row instead. Do
 - **WHEN** the sweeper runs
 - **THEN** it is not touched — the sweeper scans `processing` rows only, and preventing the stranding is the consumer's disposition's job rather than this one's
 
-#### Scenario: A dispatch requeued for an undecided claim is not a sweeper concern either
+#### Scenario: A dispatch requeued on an unknown claim outcome is not a sweeper concern while the row is queued
 
-- **GIVEN** a job in `queued` status whose dispatch the worker requeued because it could not reach the database
+- **GIVEN** a job still in `queued` status whose dispatch the worker requeued because its repository could not answer
 - **WHEN** the sweeper runs
 - **THEN** it is not touched, and the job is advanced by the redelivery rather than by any action of the sweeper's
+
+#### Scenario: The same requeue over a claim that had committed is an ordinary abandoned job
+
+- **GIVEN** a job whose claim committed but whose result the worker could not read, leaving the row `processing` with no lease while the worker requeued the dispatch
+- **WHEN** two successful sweep cycles confirm that it is not leased at that epoch
+- **THEN** it is requeued like any other abandoned job, spending one of the bounded requeues, with no special handling for having arrived by that route

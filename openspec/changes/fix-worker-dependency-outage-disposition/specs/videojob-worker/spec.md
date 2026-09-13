@@ -4,7 +4,7 @@
 
 When the worker cannot act on a message, it SHALL reject the message **without requeue**, so the topology's dead-letter route takes it. This SHALL apply to a message whose payload cannot be parsed, one naming no source object, one naming a job that does not exist, one whose job the worker could not claim, and one whose job was **taken away from the worker while it ran** — a terminal write refused by the fence (see `videojob-lease-recovery`).
 
-**"Cannot act on" means the message names work this worker will never be able to perform, not work it could not perform on this attempt.** That distinction is now load-bearing rather than implicit: exactly one condition — a claim the persistence layer could not decide — is licensed to be retried instead, and the requirement below states it. Every condition enumerated here, and **every condition not enumerated in either requirement**, SHALL be dead-lettered. The default SHALL remain rejection, so a failure mode neither requirement anticipated behaves as it does today rather than entering a retry loop nobody reasoned about.
+**"Cannot act on" means the message names work this worker will never be able to perform, not work it could not perform on this attempt.** That distinction is now load-bearing rather than implicit: exactly one condition — a claim whose outcome the persistence layer could not report — is licensed to be retried instead, and the requirement below states it. Every condition enumerated here, and **every condition not enumerated in either requirement**, SHALL be dead-lettered. The default SHALL remain rejection, so a failure mode neither requirement anticipated behaves as it does today rather than entering a retry loop nobody reasoned about.
 
 It SHALL NOT requeue a message that falls under this requirement: none of these conditions is transient, so requeueing produces an unbounded redelivery loop against a message that will never succeed. A fenced result means either a newer epoch was re-dispatched and may have a live successor, or another actor committed a different terminal outcome at the same epoch. Requeueing is wrong in both cases: it would add a competing delivery in the first and can never claim the already-terminal row in the second.
 
@@ -54,13 +54,18 @@ A fenced outcome SHALL be logged distinctly from a lost claim, naming the job, t
 
 ## ADDED Requirements
 
-### Requirement: A Dispatch Whose Claim the Worker Could Not Decide Is Requeued, Paced
+### Requirement: A Dispatch Whose Claim Outcome the Worker Could Not Learn Is Requeued, Paced
 
-When the worker's claim step **could not reach the database**, the worker SHALL requeue the message rather than dead-lettering it, and SHALL pause before taking its next delivery.
+When the worker's claim step **could not learn whether the claim was won**, because the persistence layer could not answer, the worker SHALL requeue the message rather than dead-lettering it, and SHALL pause before taking its next delivery.
 
-The condition SHALL be identified positively and narrowly: the claim was attempted, the persistence layer could not answer, and therefore **no actor owns this job and this worker has changed nothing**. It SHALL be distinguished from a claim that was decided against this worker — which is a lost claim and dead-letters — and from a row that was read and could not be interpreted, which is permanent and dead-letters. The worker SHALL NOT identify it by inspecting a database driver's error values; the distinction SHALL be carried as a sentinel raised by the layer that made the call, per `videojob-persistence` and `videojob-execution`.
+The condition SHALL be identified positively and narrowly: the claim was attempted, the persistence layer could not report its outcome, and therefore **this worker has run no extraction, acquired no lease, read no source object and written no event**. It SHALL be distinguished from a claim that was decided against this worker — a lost claim, which dead-letters — and from every failure in which the database *did* answer: a row that could not be interpreted, and a statement the server refused, both of which are permanent and dead-letter. The worker SHALL NOT identify the condition by inspecting a database driver's error values; the distinction SHALL be carried as a sentinel raised by the layer that made the call, per `videojob-persistence` and `videojob-execution`.
 
-**What licenses the requeue is a statement about state, not about the error.** On this path the row is still `queued`, no lease exists, no source object has been read, no extraction has run and no event has been written — the system is in the state it was in before the delivery arrived. A redelivery is therefore not a retry of work but the same dispatch arriving later, decided by the same conditional claim. This is the whole of the justification, and it SHALL NOT be extended to any condition for which those statements are not all true.
+**What licenses the requeue is that the set of possible states is closed and every member of it is already owned.** The claim is a single conditional statement whose result is read over the connection that carried it, so a failure reading that result leaves exactly two possibilities and no third:
+
+- **The claim did not commit.** The row is still `queued`, no lease exists, no source object has been read, no extraction has run and no event has been written. The redelivery is not a retry of work but the same dispatch arriving later, decided by the same conditional claim.
+- **The claim committed and its result was lost.** The row is `processing` and carries **no lease**, because `videojob-execution` acquires a lease only once a claim is reported won and here none was. The redelivery is refused by the claim predicate and dead-lettered under the requirement above, and the row is then exactly what `videojob-lease-recovery`'s sweeper exists to recover: `processing`, unleased, requeued at a fresh epoch after two observations.
+
+This is the whole of the justification. **It SHALL NOT be restated as a guarantee that the system is unchanged** — the statement cannot provide that, and the disposition does not need it. It SHALL NOT be extended to any condition for which both branches are not covered, and in particular not to a failure arising after a claim was reported won, where a redelivery could only lose the claim.
 
 The requeue SHALL NOT be bounded by a delivery count. The message is the only record that a `queued` job still needs dispatching, and `videojob-lease-recovery`'s sweeper does not reach a `queued` row; discarding the message after N attempts reproduces the defect this requirement exists to remove. A bound SHALL NOT be obtained by changing the work queue's type, by republishing a counter-carrying copy — which would make the worker a second producer on a stream `videojob-outbox-relay` owns — or by counting in worker-local memory, which counts to one per replica.
 
@@ -74,9 +79,11 @@ The pause SHALL be taken on the consumer's own cancellable context, not on the d
 
 **The accepted cost is head-of-line blocking, unbounded in duration.** At a prefetch of one, a requeued message occupies each replica in turn for as long as the condition lasts. That is accepted here — where the analogous consumer in `notification-event-consumer` accepts it only under a bound — for a reason specific to this condition: it is entered only when the dependency **every** message on this queue requires is unavailable, so there is no work any replica could be doing instead and the queue's head and tail are blocked equally. That premise SHALL be preserved by keeping the condition narrow; a broader rule admitting a per-message permanent failure would let one message block every replica against healthy work.
 
-#### Scenario: A dispatch whose claim could not reach the database is requeued
+**A second accepted cost: an ambiguous commit spends one of the sweeper's bounded requeues.** Each pass through the committed branch above leaves a row `videojob-lease-recovery` requeues at a fresh epoch, consuming one of the requeues it permits before it commits `failed`. A server available enough to commit and unavailable enough to lose its result can therefore exhaust that bound on a single job. The outcome is then a job its owner can see and re-upload — the committed failure clears the idempotency key — rather than a job stranded in `queued` with nothing able to reach it, which is the outcome this requirement exists to remove. The trade SHALL NOT be answered by widening the sweeper's bound, which would weaken recovery for every other job to soften an outcome that is already visible and already recoverable by the user.
 
-- **GIVEN** a job in `queued` status and a worker whose database is unreachable
+#### Scenario: A dispatch whose claim the repository could not answer is requeued
+
+- **GIVEN** a job in `queued` status and a worker that cannot connect to its database, so the claim statement never reaches the server
 - **WHEN** the worker consumes that job's dispatch
 - **THEN** the message is requeued rather than dead-lettered, the job is still `queued`, no source object was read, no lease was acquired, and nothing appears in the dead-letter queue
 
@@ -104,8 +111,14 @@ The pause SHALL be taken on the consumer's own cancellable context, not on the d
 - **WHEN** the worker consumes it
 - **THEN** the message is dead-lettered rather than requeued, because the claim was decided and this worker lost it
 
-#### Scenario: An ambiguous claim commit is recovered by the sweeper
+#### Scenario: An ambiguous claim commit is requeued and then recovered by the sweeper
 
-- **GIVEN** a claim that committed in the database but whose result the worker could not read, so the worker requeued the dispatch
+- **GIVEN** a claim that committed in the database but whose result the worker could not read
+- **WHEN** the worker applies this requirement's disposition
+- **THEN** it requeues the dispatch on the same sentinel as the uncommitted branch, having acquired no lease and read no source object — the disposition does not distinguish the two branches, and is not required to
+
+#### Scenario: The redelivery of an ambiguous claim commit is dead-lettered, and the row is the sweeper's
+
+- **GIVEN** a dispatch requeued after a claim that had in fact committed
 - **WHEN** the redelivery arrives and finds the row `processing`
-- **THEN** it is refused by the claim and dead-lettered, and the row — `processing` with no lease — is recovered by the sweeper on its ordinary two-observation path
+- **THEN** it is refused by the claim and dead-lettered under the requirement above, and the row — `processing` with no lease — is recovered by the sweeper on its ordinary two-observation path, at the cost of one of its bounded requeues

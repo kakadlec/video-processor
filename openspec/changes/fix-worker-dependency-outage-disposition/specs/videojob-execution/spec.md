@@ -8,9 +8,11 @@ The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID an
 
 **`StartProcessing` is a claim, and a lost claim SHALL be propagated unchanged.** When `StartProcessing` reports that the job was no longer `queued`, `ProcessVideoJob` SHALL return that sentinel error and SHALL NOT call `FailJob`, SHALL NOT download the source, and SHALL NOT delete anything. Another consumer owns the job; the correct behavior is to touch nothing at all. An implementer SHALL NOT convert a lost claim into a job failure to make the error handling uniform.
 
-**A claim the persistence layer could not *decide* SHALL be propagated as its own sentinel, distinct from a lost claim.** When `StartProcessing` fails because the repository could not reach the database — the condition `videojob-persistence` requires the adapter to mark — `ProcessVideoJob` SHALL surface a sentinel meaning *the claim was not decided*, and SHALL otherwise behave exactly as it does for a lost claim: it SHALL NOT call `FailJob`, SHALL NOT download the source, SHALL NOT acquire a lease, and SHALL NOT touch anything. The two sentinels answer different questions and SHALL NOT be collapsed into one: a lost claim means **another actor owns this job**, and an undecided claim means **nobody does, and this call could not find out**. `videojob-worker` gives them opposite dispositions on that difference alone.
+**A claim whose *outcome* the persistence layer could not report SHALL be propagated as its own sentinel, distinct from a lost claim.** When `StartProcessing` fails because the repository could not answer — the condition `videojob-persistence` requires the adapter to mark — `ProcessVideoJob` SHALL surface a sentinel meaning *this call could not learn the claim's outcome*, and SHALL otherwise behave exactly as it does for a lost claim: it SHALL NOT call `FailJob`, SHALL NOT download the source, SHALL NOT acquire a lease, and SHALL NOT touch anything. The two sentinels answer different questions and SHALL NOT be collapsed into one: a lost claim means **another actor owns this job**, and an unknown outcome means **this call cannot say who owns it, including whether this worker does**. `videojob-worker` gives them opposite dispositions on that difference alone.
 
-The conversion SHALL happen at the single point where `Execute` propagates the claim step's error, and SHALL preserve the original error as a wrapped cause. It SHALL NOT be applied to the same unreachable-database condition arising **after** the claim has been won — a failure write that cannot commit, in particular — which SHALL keep propagating unchanged. By then the row is `processing` and the claim predicate admits `queued` alone, so nothing is gained by telling the caller the failure was transient, and `videojob-worker` would requeue a message that could only lose the claim. An implementer SHALL NOT simplify this by marking the condition once at the repository and letting the caller branch on it wherever it appears; the distinction the caller needs is *where in the sequence* the failure happened, which only this use case can state.
+**The sentinel SHALL NOT be defined as meaning the claim did not happen.** The claim is a single conditional statement whose result is read over the connection that carried it, so a failure reading that result leaves two possible states: the transition did not commit, or it committed and this call did not learn the epoch. What the sentinel asserts is the intersection of the two — that this use case ran no extraction, acquired no lease, read no source object, wrote no event and called no terminal write — and that intersection is what `videojob-worker`'s disposition is licensed by. An implementer SHALL NOT strengthen it into a claim about the stored row, and SHALL NOT add a follow-up read to resolve the ambiguity: a read issued against a repository that has just failed to answer is no likelier to answer, and one that succeeds reports only what was true at that instant. The committed branch is accounted for by `videojob-lease-recovery`, which reaches a `processing` row holding no lease — and no lease is held here, because this use case acquires one only once a claim is reported **won**.
+
+The conversion SHALL happen at the single point where `Execute` propagates the claim step's error, and SHALL preserve the original error as a wrapped cause. It SHALL NOT be applied to the same repository-unavailability condition arising **after** the claim has been won — a failure write that cannot commit, in particular — which SHALL keep propagating unchanged. By then the row is `processing` and the claim predicate admits `queued` alone, so nothing is gained by telling the caller the failure was transient, and `videojob-worker` would requeue a message that could only lose the claim. An implementer SHALL NOT simplify this by marking the condition once at the repository and letting the caller branch on it wherever it appears; the distinction the caller needs is *where in the sequence* the failure happened, which only this use case can state.
 
 **The fence epoch `StartProcessing` reports SHALL be carried through the sequence**: `ProcessVideoJob` SHALL pass it to its own `FailJob` calls and SHALL report it in its result, so the caller's `CompleteJob` is fenced by the same value. It SHALL NOT re-read the epoch from the job at the point of the write — by then the row may carry a successor's, and a fence checked against that value would pass in exactly the case it exists to reject.
 
@@ -58,17 +60,23 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 - **WHEN** `ProcessVideoJob.Execute` is called with its ID and source key
 - **THEN** it returns the lost-claim sentinel, no source object was downloaded, `ffmpeg` was not invoked, `FailJob` was not called, and the job's persisted state is unchanged
 
-#### Scenario: A claim that could not reach the database stops the sequence with its own sentinel
+#### Scenario: A claim the repository could not answer stops the sequence with its own sentinel
 
-- **GIVEN** a `VideoJob` in `queued` status and a repository whose database is unreachable
+- **GIVEN** a `VideoJob` in `queued` status and a repository that cannot connect to its database, so the claim statement never reaches the server
 - **WHEN** `ProcessVideoJob.Execute` is called with its ID and source key
-- **THEN** it returns the undecided-claim sentinel rather than the lost-claim one, no source object was downloaded, no lease was acquired, `ffmpeg` was not invoked, `FailJob` was not called, and the job's persisted state is unchanged
+- **THEN** it returns the unknown-outcome sentinel rather than the lost-claim one, no source object was downloaded, no lease was acquired, `ffmpeg` was not invoked, `FailJob` was not called, and the job's persisted state is unchanged
 
-#### Scenario: The same unreachable database after the claim is not reported as undecided
+#### Scenario: A claim that committed and lost its result yields the same sentinel and the same absence of side effects
+
+- **GIVEN** a `VideoJob` in `queued` status and a claim statement that commits its transition and then fails while its result is read
+- **WHEN** `ProcessVideoJob.Execute` is called with its ID and source key
+- **THEN** it returns the same unknown-outcome sentinel, no lease was acquired, no source object was downloaded, `ffmpeg` was not invoked and `FailJob` was not called — and the stored row is `processing`, which this use case neither observes nor asserts anything about
+
+#### Scenario: The same unavailability after the claim is not reported as an unknown claim outcome
 
 - **GIVEN** a run that won its claim and whose `FailJob` write then cannot reach the database
 - **WHEN** `ProcessVideoJob.Execute` returns
-- **THEN** the error is not the undecided-claim sentinel, so the caller dead-letters the message and leaves the `processing` row to the sweeper
+- **THEN** the error is not the unknown-outcome sentinel, so the caller dead-letters the message and leaves the `processing` row to the sweeper
 
 #### Scenario: A failure the caller did not write is reported as already present
 
