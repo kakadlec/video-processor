@@ -1,5 +1,19 @@
 # Changelog
 
+## [4.1.0](https://github.com/kakadlec/video-processor/compare/v4.0.0...v4.1.0) (2026-09-13)
+
+
+### Features
+
+* log every process through slog as structured JSON records ([#253](https://github.com/kakadlec/video-processor/issues/253)) ([48e80a0](https://github.com/kakadlec/video-processor/commit/48e80a0beffffa5e04d27775604c10e58bd7cc48))
+* serve liveness and readiness probes on the three HTTP services ([#259](https://github.com/kakadlec/video-processor/issues/259)) ([c94d223](https://github.com/kakadlec/video-processor/commit/c94d2233f9f17b5353156da468f776ae71f62d9f))
+
+
+### Bug Fixes
+
+* **ci:** pull the MinIO image from quay.io instead of Docker Hub ([#258](https://github.com/kakadlec/video-processor/issues/258)) ([c101955](https://github.com/kakadlec/video-processor/commit/c10195564fdec328b2409c2769ef377ca2becf7c))
+* report each HTTP server's own errors at error severity ([#256](https://github.com/kakadlec/video-processor/issues/256)) ([b3937e1](https://github.com/kakadlec/video-processor/commit/b3937e1c94c7d18139cc75a6ea2176fdc4f8c056))
+
 ## [4.0.0](https://github.com/kakadlec/video-processor/compare/v3.0.0...v4.0.0) (2026-09-08)
 
 
