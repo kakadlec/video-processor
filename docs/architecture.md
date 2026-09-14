@@ -145,18 +145,21 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
         │    redelivering it would fail identically forever)
         ├─ NewStorageKey(msg.source_key)           (empty/invalid → Reject → DLQ)
         ├─ ProcessVideoJob (job_id, source_key):
-        │    ├─ StartProcessing → ClaimForProcessing
+        │    ├─ StartProcessing → FindByID (authoritative), then ClaimForProcessing
         │    │    UPDATE video_jobs SET status='processing'
         │    │      WHERE id=$1 AND status='queued' RETURNING lease_epoch
         │    │    ├─ no row affected → ErrJobClaimLost → Reject → DLQ,
         │    │    │    touching nothing at all (another consumer owns it)
-        │    │    └─ the claim, or the existence probe that follows a
-        │    │         zero-row claim, could not be answered (marked
-        │    │         ErrRepositoryUnavailable) → ErrJobClaimOutcomeUnknown
-        │    │         → Requeue, then a 5s pause; no lease, no source read,
-        │    │         no extraction. A claim that committed and lost its
-        │    │         result leaves the row `processing` with no lease:
-        │    │         the sweeper's input
+        │    │    └─ the load, the claim, or the existence probe that
+        │    │         follows a zero-row claim could not be answered
+        │    │         (marked ErrRepositoryUnavailable) →
+        │    │         ErrJobClaimOutcomeUnknown → Requeue, then a 5s pause;
+        │    │         no lease, no source read, no extraction. Nothing is
+        │    │         asserted about the row: a failed load precedes any
+        │    │         claim, so the row may hold any state, and the
+        │    │         redelivery's own load and claim decide it. Only a
+        │    │         claim that committed and lost its result necessarily
+        │    │         leaves it `processing` with no lease: the sweeper's input
         │    ├─ Acquire Redis lease at the returned epoch; renew every 30s
         │    │    for the run (errors fail open; an absent lease is
         │    │    reacquired, a newer epoch stops the heartbeat)
@@ -283,7 +286,7 @@ video.jobs.terminal.events.v1        cmd/notifier/main.go          internal/noti
 | Undecodable body, or an event type this consumer does not recognize | **Reject** → DLQ, never requeued |
 | Any repository failure **before an attempt is made** — `FindDeliverable`'s included — or a claim refused as **held by another** | **Requeue**, after a pause |
 
-`cmd/worker` has had the same three since `fix-worker-dependency-outage-disposition`, and the two consumers now share the rule behind them: requeue only on a narrow condition whose every possible outcome is already owned by something that will resolve it — which for the notifier is a handler that has attempted nothing, and for the worker is not, since its claim may have committed. Where they apply it differs with what each can know. The worker requeues exactly one condition — its claim step could not learn whether the claim was won, because PostgreSQL could not answer — and dead-letters everything else, because once a claim is known to be won or lost a redelivery meets a row that has moved past `queued` and can only lose the claim again. Here this handler has attempted nothing and the blocking condition — a database that is down, a claim another consumer holds — resolves itself, so dead-lettering would discard a user's notification because of a blip. In both, the pause is what keeps a requeue from becoming a hot loop. The one place they still disagree is deliberate: this consumer requeues a claim held by another, because a delivery claim expires under the reclaim bound, while the worker never requeues a lost claim, which no later delivery can reopen.
+`cmd/worker` has had the same three since `fix-worker-dependency-outage-disposition`, and the two consumers now share the rule behind them: requeue only on a narrow condition whose every possible outcome is already owned by something that will resolve it — which for the notifier is a handler that has attempted nothing, and for the worker is a claim step that produced no side effect, whatever its claim did — which may have committed, or never have been attempted. Where they apply it differs with what each can know. The worker requeues exactly one condition — its claim step could not learn whether the claim was won, because PostgreSQL could not answer — and dead-letters everything else, because once a claim is known to be won or lost a redelivery meets a row that has moved past `queued` and can only lose the claim again. Here this handler has attempted nothing and the blocking condition — a database that is down, a claim another consumer holds — resolves itself, so dead-lettering would discard a user's notification because of a blip. In both, the pause is what keeps a requeue from becoming a hot loop. The one place they still disagree is deliberate: this consumer requeues a claim held by another, because a delivery claim expires under the reclaim bound, while the worker never requeues a lost claim, which no later delivery can reopen.
 
 `ClaimHeldByAnother` requeueing rather than acking is the counter-intuitive one and is load-bearing: a crashed claimant's redelivery arrives within seconds, far inside the reclaim bound, so an ack there would strand a `pending` row nothing else will ever meet and drop the notification without a trace. The loop terminates — the holder either resolves it (the next refusal reads *already resolved*) or does not (the bound expires and the claim is granted). At prefetch 1 the accepted cost is head-of-line blocking bounded by the reclaim bound, which is why that bound is sized as a small multiple of one claimant's budget rather than a comfortable round number.
 
