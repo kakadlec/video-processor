@@ -572,20 +572,22 @@ Its lifecycle transitions are recorded under a `phase` field — `started`, `con
 
 `cmd/worker` consumes `video.jobs.queued.v2` with a **prefetch of one**: one unacknowledged delivery at a time, because the unit of work is a full `ffmpeg` run and buffering a second delivery would hide it from every other consumer for the duration. Scale out by running more worker processes; there is no concurrency setting to raise. The local `docker-compose.yml` starts three (`worker`'s `deploy.replicas`, overridable per run with `--scale worker=<n>`); a deployment scales the same way, by process count.
 
-A delivery is acknowledged only after a terminal outcome is confirmed. Cleanup depends on whether this actor applied it; everything without a terminal outcome is rejected without requeue and reaches `video.jobs.dlx`:
+A delivery is acknowledged only after a terminal outcome is confirmed. Cleanup depends on whether this actor applied it. Exactly one situation without a terminal outcome is requeued — a claim whose outcome the worker could not learn because PostgreSQL could not answer; everything else without one is rejected without requeue and reaches `video.jobs.dlx`:
 
 | Situation | Disposition | Job left as | Source / lease cleanup |
 |---|---|---|---|
-| Body will not decode, names no source key, or names an unknown job | Reject → DLQ | untouched / n/a | untouched |
+| Body will not decode, names no source key, or names a malformed or unknown job | Reject → DLQ | untouched / n/a | untouched |
 | Claim lost (duplicate or stale dispatch) | Reject → DLQ | untouched | kept; this run acquired no lease |
-| Run broke before any terminal state committed | Reject → DLQ | usually `processing` | kept; lease left to expire so recovery can act |
+| PostgreSQL could not answer the claim, or the existence probe after a zero-row claim (`ErrJobClaimOutcomeUnknown`) | **Requeue**, then a 5s pause before the next delivery | as the claim found it — usually still `queued`; `processing` with no lease if the claim committed and its result was lost, which the sweeper recovers | none; this run acquired no lease, read no source and cleared nothing |
+| The claim step failed with an error the database *answered* — a row that will not reconstruct, a statement it refused (a half-applied migration, a missing privilege) | Reject → DLQ | still `queued`, with nothing able to advance it until the dispatch is replayed (see below) | untouched |
+| Run broke after the claim was won, before any terminal state committed — a dependency outage included | Reject → DLQ | usually `processing` | kept; lease left to expire so recovery can act |
 | This run applied `failed` | **Ack** | `failed` | one best-effort attempt each to delete the source, conditionally clear the idempotency key, and release the held lease; failures are logged without changing the Ack |
 | An identical `failed` outcome was already present | **Ack** | `failed` | no cleanup; this actor did not apply the write |
 | Result stored but completion still errors after 4 retries | Reject → DLQ | usually `processing` | source and lease kept; result key logged |
 | Terminal write returns `ErrJobFenced` | Reject → DLQ | authoritative winner's state | source/idempotency untouched and no lease released; held epoch is logged, plus the result key when a fenced completion produced one. The current log says `taken over` for both a newer epoch and a same-epoch terminal winner |
 | Completion succeeds, including a retry that finds its identical outcome already present | **Ack** | `completed` | one best-effort attempt each to delete the source and release the held lease; failures are logged without changing the Ack |
 
-The AMQP consumer requeues only a delivery pulled off the channel after shutdown, before handling began. Crash recovery does not broker-requeue a `processing` delivery: the sweeper first commits a new `queued` row state and outbox event, and the ordinary relay publishes a fresh dispatch.
+Besides the `Requeue` disposition above, the AMQP consumer requeues only a delivery pulled off the channel after shutdown, before handling began. Crash recovery does not broker-requeue a `processing` delivery: the sweeper first commits a new `queued` row state and outbox event, and the ordinary relay publishes a fresh dispatch.
 
 **Operator symptom: a job remains `processing`.** After successful acquisition, a claimed job holds Redis key `videojob:lease:<jobID>` with its PostgreSQL `lease_epoch` as the value and a 90-second TTL. Acquisition errors fail open, so a running job may temporarily have no key. The worker renews every 30 seconds. The sweeper runs every 60 seconds, scans at most 50 rows with a rotating keyset cursor, and acts only after two consecutive successful "not held at this epoch" observations. A Redis query error clears the first observation and takes over nothing.
 
@@ -613,6 +615,143 @@ Do **not** manually change `status` or `lease_epoch`, publish a dispatch, or del
 
 Shutdown is `SIGINT`/`SIGTERM`: cancellation tells the consumer to stop taking deliveries and the recovery sweeper to stop concurrently. `run` joins the sweeper first, then stops and joins the terminal-event relay — both hold a database transaction while they run, so the pool must outlive them — and only then waits up to **5 minutes** for the consumer's job in hand. The handler is detached from the shutdown signal, so a normal shutdown does not kill `ffmpeg` or abort its terminal write. If the deadline expires and the process is terminated, the delivery may be redelivered and lose its old claim; after the abandoned lease expires and absence is confirmed, the sweeper either advances the row's epoch and emits a fresh dispatch or, at the requeue bound, commits terminal `failed` without another dispatch. Give worker containers more than five minutes of stop grace, adding margin for the preceding sweeper and relay joins and final resource shutdown, to avoid duplicated extraction even though the fence protects state. The relay is stopped where its cycle stands rather than drained to empty, so a terminal row committed during the drain is published by a later cycle — in the next worker to start, or in another replica — rather than delaying shutdown.
 
+**Operator symptom: a dispatch requeueing while PostgreSQL is down.** When the claim step cannot learn its outcome, each worker records `warn`, `component: job_dispatch`, `the claim outcome could not be learned; requeueing`, with `job_id` and `error`, and pauses five seconds before its next delivery. With the database stopped under connected workers, expect:
+
+- the record repeating every 5s **per worker replica, as a burst across replicas** rather than evenly spaced — a nack restores the consumer's prefetch credit, so the broker pushes the requeued message into a consumer that is still pausing, where it waits the pause out. `rabbitmqctl --vhost / list_queues name messages_ready messages_unacknowledged` shows `video.jobs.queued.v2` at `0` and `1`;
+- `video.jobs.dead` not growing;
+- an `error` naming whatever reached the adapter — with the database container stopped, a DNS `no such host` inside a `*pgconn.ConnectError`;
+- the job completing on its own on the first pass after PostgreSQL answers again, with nothing to replay.
+
+At prefetch one every replica is held by that message while the outage lasts, which is accepted because every message on the queue needs the same database. **The same record repeating on one `job_id` while PostgreSQL is demonstrably serving is a defect, not an outage**: an error the adapter's permission list (`internal/video/infrastructure/postgres/errors.go`) admits as unavailability that is in fact permanent for that job. Nothing bounds that loop by design, and before this change it would have been a dead-letter; capture the `error` field and report it. The list is widened or narrowed only by provoking the error against the pinned driver and reading what reaches the caller. Do not purge the work queue to stop it: a purged dispatch is not regenerated, because its outbox row is already stamped.
+
+Losing PostgreSQL **after** a won claim is unchanged and still dead-letters — `the job produced a result but could not be marked completed; dead-lettering and keeping its source` for a completion that would not commit, `the job did not reach a terminal state; dead-lettering` for a failure write that could not. The row is left `processing` with no live lease, and the sweeper requeues it at a fresh epoch once the 90-second lease TTL has lapsed and two 60-second sweeps have confirmed it (the `processing` symptom above). That dead-letter needs no replay.
+
+#### The dead-letter queue: inspection and replay
+
+`video.jobs.dead` is one sink for both topologies — dispatches `cmd/worker` rejects and terminal events `cmd/notifier` rejects — reached through the fanout exchange `video.jobs.dlx` and shared unversioned across every generation. **It is not an archive**: `x-message-ttl` 24 h, `x-max-length` 10 000 with `x-overflow drop-head`, forwarding nowhere. A message is gone a day after it arrives, or sooner when newer ones push it out.
+
+**A dependency outage no longer puts a dispatch here.** A claim PostgreSQL could not answer is requeued (above), and a failure after a won claim still dead-letters but leaves a `processing` row the sweeper recovers without the message. What remains is the permanent cases: an undecodable body, a missing source key, a malformed or unknown job, a lost claim, a fenced terminal write, a claim step that failed with an error the database *answered*, a completion that would not commit; and from the notifier, an undecodable body or an unrecognized event type. **Read each message as a defect to look at, not as work to replay.** Every worker dead-letter also has an `error`-level `component: job_dispatch` record carrying its `job_id`, which is usually the faster read; the message confirms what was actually sent.
+
+Depth, from a shell that can reach the broker's CLI (`docker compose exec rabbitmq` in front of it locally):
+
+```bash
+rabbitmqctl --vhost / list_queues name messages messages_ready messages_unacknowledged
+```
+
+`rabbitmqctl` cannot read a message body, and the Compose stack enables no management plugin, so read them over AMQP, the same way the generation retirement above deletes its exchange. The program below takes every dead-lettered message **without acknowledging it** and prints the queue it was dead-lettered from, why, and its body; when it exits, the broker returns all of them to the queue, marked redelivered, so reading consumes nothing. With `REPLAY_JOB_ID` set, it republishes the one dispatch naming that job to the exchange and routing key the relay uses, waits for the broker's confirm and checks nothing came back unroutable, and only then acknowledges the dead-lettered copy.
+
+```bash
+# Run from anywhere with the Go toolchain and network reach to the broker.
+cd "$(mktemp -d)"   # a fresh directory: a leftover go.mod fails `go mod init`
+cat > main.go <<'GO'
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"os"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+// Literals, so no other queue or exchange is reachable from here.
+const (
+	deadQueue    = "video.jobs.dead"
+	jobsQueue    = "video.jobs.queued.v2"
+	jobsExchange = "video.jobs.v2"
+	jobsKey      = "video_job.queued.v2"
+)
+
+func main() {
+	replay := os.Getenv("REPLAY_JOB_ID")
+
+	conn, err := amqp.Dial(os.Getenv("RABBITMQ_URL"))
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Every message taken below and not acknowledged goes back to the queue
+	// when this channel closes, so reading consumes nothing.
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("channel: %v", err)
+	}
+	defer ch.Close()
+	if err := ch.Confirm(false); err != nil {
+		log.Fatalf("confirm mode: %v", err)
+	}
+	returns := ch.NotifyReturn(make(chan amqp.Return, 1))
+
+	for {
+		msg, ok, err := ch.Get(deadQueue, false)
+		if err != nil {
+			log.Fatalf("get: %v", err)
+		}
+		if !ok {
+			if replay != "" {
+				log.Fatalf("no dead-lettered dispatch names job_id=%s", replay)
+			}
+			return
+		}
+
+		from, _ := msg.Headers["x-first-death-queue"].(string)
+		reason, _ := msg.Headers["x-first-death-reason"].(string)
+		var body struct {
+			Type  string `json:"type"`
+			JobID string `json:"job_id"`
+		}
+		_ = json.Unmarshal(msg.Body, &body)
+		log.Printf("from=%s reason=%s type=%s job_id=%s body=%s", from, reason, body.Type, body.JobID, msg.Body)
+
+		if replay == "" || from != jobsQueue || body.JobID != replay {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		confirm, err := ch.PublishWithDeferredConfirmWithContext(ctx, jobsExchange, jobsKey, true, false, amqp.Publishing{
+			ContentType:  msg.ContentType,
+			DeliveryMode: msg.DeliveryMode,
+			MessageId:    msg.MessageId,
+			Timestamp:    msg.Timestamp,
+			Body:         msg.Body,
+		})
+		if err != nil {
+			cancel()
+			log.Fatalf("publish: %v", err)
+		}
+		acked, err := confirm.WaitContext(ctx)
+		cancel()
+		if err != nil || !acked {
+			log.Fatalf("the broker did not confirm the replay (acked=%v, err=%v); the dead-lettered copy is kept", acked, err)
+		}
+		select {
+		case r := <-returns:
+			log.Fatalf("the replay was returned unroutable (%s); the dead-lettered copy is kept", r.ReplyText)
+		default:
+		}
+		if err := msg.Ack(false); err != nil {
+			log.Fatalf("replayed, but the dead-lettered copy could not be acknowledged and will be read again: %v", err)
+		}
+		log.Printf("replayed job_id=%s", replay)
+		return
+	}
+}
+GO
+go mod init dead-letters && go get github.com/rabbitmq/amqp091-go@v1.14.0
+RABBITMQ_URL='amqp://user:pass@broker-host:5672/' go run .                        # inspect
+RABBITMQ_URL='amqp://user:pass@broker-host:5672/' REPLAY_JOB_ID='<jobID>' go run .  # replay one dispatch
+```
+
+**Replay is for one case only: a dispatch whose job is still `queued` and whose cause has since been fixed** — in practice a claim step the database answered by refusing, such as a migration left half-applied or a privilege missing, now corrected. That job has nothing else able to advance it: the sweeper scans `processing` rows alone, and the dead-lettered copy is the only remaining trigger. Confirm both conditions first:
+
+```sql
+SELECT id, status, source_key, lease_epoch FROM video_jobs WHERE id = '<jobID>';
+```
+
+For every other case a replay only reproduces the rejection — an undecodable body fails identically, and an unknown job, a lost claim or a fenced write is dead-lettered again. That is harmless, because the claim is conditional on `queued`, but it is not recovery. The program refuses terminal events outright, since the notifier rejects only bodies it cannot decode and types it does not recognize, and a replay would not change either. Replaying republishes the dead-lettered copy as it was; it writes no outbox row and changes no status. That is what separates it from the manual dispatch the `processing` recovery above forbids, and why it is never the answer for a `processing` row.
 
 ### The e-mail channel
 

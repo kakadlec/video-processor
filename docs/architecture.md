@@ -148,8 +148,15 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
         │    ├─ StartProcessing → ClaimForProcessing
         │    │    UPDATE video_jobs SET status='processing'
         │    │      WHERE id=$1 AND status='queued' RETURNING lease_epoch
-        │    │    └─ no row affected → ErrJobClaimLost → Reject → DLQ,
-        │    │         touching nothing at all (another consumer owns it)
+        │    │    ├─ no row affected → ErrJobClaimLost → Reject → DLQ,
+        │    │    │    touching nothing at all (another consumer owns it)
+        │    │    └─ the claim, or the existence probe that follows a
+        │    │         zero-row claim, could not be answered (marked
+        │    │         ErrRepositoryUnavailable) → ErrJobClaimOutcomeUnknown
+        │    │         → Requeue, then a 5s pause; no lease, no source read,
+        │    │         no extraction. A claim that committed and lost its
+        │    │         result leaves the row `processing` with no lease:
+        │    │         the sweeper's input
         │    ├─ Acquire Redis lease at the returned epoch; renew every 30s
         │    │    for the run (errors fail open; an absent lease is
         │    │    reacquired, a newer epoch stops the heartbeat)
@@ -171,6 +178,10 @@ video.jobs.queued.v2  (prefetch 1, one delivery at a time)
         │    │    └─ FPutObject → bucket/frames_<jobID>.zip
         │    └─ FailJob if fetch, extraction, OR storage failed
         │         (processing → failed), conditional on the claimed epoch
+        ├─ any other error — a malformed or unknown job, a row that will
+        │    not reconstruct, a statement the database refused, or any
+        │    dependency failure after a won claim → Reject → DLQ. The
+        │    default: a won claim's row is left `processing` for the sweeper
         ├─ ErrJobFenced from failure or completion:
         │    └─ Reject → DLQ; keep source and idempotency key; release no
         │         lease; log held epoch and any result key
@@ -264,7 +275,7 @@ video.jobs.terminal.events.v1        cmd/notifier/main.go          internal/noti
   └─► Ack / Reject / Requeue
 ```
 
-**The disposition set is three-valued, and the third is a deliberate difference from `cmd/worker`.** What a situation is entitled to turns first on *whether this handler has attempted anything yet*:
+**The disposition set is three-valued — the same shape `cmd/worker`'s has, though the two apply it to different conditions.** What a situation is entitled to turns first on *whether this handler has attempted anything yet*:
 
 | Situation | Disposition |
 |---|---|
@@ -272,7 +283,7 @@ video.jobs.terminal.events.v1        cmd/notifier/main.go          internal/noti
 | Undecodable body, or an event type this consumer does not recognize | **Reject** → DLQ, never requeued |
 | Any repository failure **before an attempt is made** — `FindDeliverable`'s included — or a claim refused as **held by another** | **Requeue**, after a pause |
 
-`cmd/worker` has only the first two, and the difference is not an inconsistency. There, a requeued job meets a row that has moved past `queued` and can only lose the claim again, so redelivery loops rather than recovers. Here this handler has attempted nothing and the blocking condition — a database that is down, a claim another consumer holds — resolves itself, so dead-lettering would discard a user's notification because of a blip. The pause is what keeps that from becoming a hot loop.
+`cmd/worker` has had the same three since `fix-worker-dependency-outage-disposition`, and the two consumers now share the rule behind them: requeue only on a narrow condition whose every possible outcome is already owned by something that will resolve it — which for the notifier is a handler that has attempted nothing, and for the worker is not, since its claim may have committed. Where they apply it differs with what each can know. The worker requeues exactly one condition — its claim step could not learn whether the claim was won, because PostgreSQL could not answer — and dead-letters everything else, because once a claim is known to be won or lost a redelivery meets a row that has moved past `queued` and can only lose the claim again. Here this handler has attempted nothing and the blocking condition — a database that is down, a claim another consumer holds — resolves itself, so dead-lettering would discard a user's notification because of a blip. In both, the pause is what keeps a requeue from becoming a hot loop. The one place they still disagree is deliberate: this consumer requeues a claim held by another, because a delivery claim expires under the reclaim bound, while the worker never requeues a lost claim, which no later delivery can reopen.
 
 `ClaimHeldByAnother` requeueing rather than acking is the counter-intuitive one and is load-bearing: a crashed claimant's redelivery arrives within seconds, far inside the reclaim bound, so an ack there would strand a `pending` row nothing else will ever meet and drop the notification without a trace. The loop terminates — the holder either resolves it (the next refusal reads *already resolved*) or does not (the bound expires and the claim is granted). At prefetch 1 the accepted cost is head-of-line blocking bounded by the reclaim bound, which is why that bound is sized as a small multiple of one claimant's budget rather than a comfortable round number.
 
@@ -440,7 +451,7 @@ video-processor/
         cache/        # Redis-backed CachedVideoJobRepository decorator (implemented, Phase 4; epoch/status-aware write ordering added in Phase 6)
         lease/        # Epoch-scoped Redis worker lease (implemented, Phase 6 — add-worker-job-lock)
         storage/      # MinIO adapter (implemented, Phase 5) — Config/Open/Ping/EnsureBucket connection plumbing (add-minio-infrastructure) plus ResultStorage, the domain port carrying result artifacts into and out of the bucket (migrate-result-storage-to-minio)
-        messaging/    # This context's job-dispatch and terminal-event topologies, the outbox relays that publish into them, and the consumer that reads the dispatch queue (implemented, Phase 6 — add-rabbitmq-infrastructure for JobDispatchTopology(), add-videojob-source-key-and-outbox-relay for Publisher/Relay, migrate-upload-to-async-processing for Consumer; Phase 7's emit-videojob-terminal-events added TerminalEventsTopology(), NewTerminalRelay, and the JobCompleted/JobFailed message contracts): Publisher wraps a confirm-mode channel and publishes mandatory; Relay claims outbox rows of its own event-type set through postgres.OutboxRepository, publishes each under the routing key its event_type names, and stamps published_at — the dispatch relay started as a goroutine by cmd/video-api/main.go, the terminal relay by cmd/worker/main.go, each stopped and joined on shutdown; Consumer dials, redeclares the topology on every dial, sets prefetch 1, and hands each delivery to a Handler that returns Ack or Reject — it knows nothing about jobs, claims, or storage, and cmd/worker holds the whole decision table
+        messaging/    # This context's job-dispatch and terminal-event topologies, the outbox relays that publish into them, and the consumer that reads the dispatch queue (implemented, Phase 6 — add-rabbitmq-infrastructure for JobDispatchTopology(), add-videojob-source-key-and-outbox-relay for Publisher/Relay, migrate-upload-to-async-processing for Consumer; Phase 7's emit-videojob-terminal-events added TerminalEventsTopology(), NewTerminalRelay, and the JobCompleted/JobFailed message contracts): Publisher wraps a confirm-mode channel and publishes mandatory; Relay claims outbox rows of its own event-type set through postgres.OutboxRepository, publishes each under the routing key its event_type names, and stamps published_at — the dispatch relay started as a goroutine by cmd/video-api/main.go, the terminal relay by cmd/worker/main.go, each stopped and joined on shutdown; Consumer dials, redeclares the topology on every dial, sets prefetch 1, and hands each delivery to a Handler that returns Ack, Reject or Requeue — the third added by fix-worker-dependency-outage-disposition, a nack with requeue followed by a DefaultRequeuePause taken on the consumer's cancellable context — and it knows nothing about jobs, claims, or storage, and cmd/worker holds the whole decision table
     notification/                    # Implemented for the webhook channel (Phase 7 — add-notification-domain-and-preferences + add-notification-webhook-delivery), wired into cmd/notification-api and cmd/notifier
       dependency_rules_test.go  # Fails the build on an import of internal/video or internal/identity, across EVERY package of the context including infrastructure — the cross-context rule this context is built under
       domain/         # NotificationPreference (write intent / stored preference / read view, three shapes on purpose), its own UserID, the closed EventType and Channel sets, Destination, the non-disclosing Secret, and the PreferenceRepository port; plus TerminalEvent, the Delivery record with its three-valued ClaimOutcome, the DeliveryRepository and Deliverer ports, and DestinationPolicy — whose zero value is the restrictive posture, so a composition root that forgets to pass one fails closed
