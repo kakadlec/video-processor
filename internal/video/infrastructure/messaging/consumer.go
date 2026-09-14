@@ -288,10 +288,13 @@ func (c *Consumer) serve(ctx context.Context, conn *amqp.Connection) (bool, erro
 //
 // The Requeue pause is taken here, after the nack and before returning to the
 // select. A nacked message goes back toward the head of the queue and is
-// offered again at once, so this is the only position where the consumer
-// holds nothing and has not yet asked for more work — before the nack it
-// would withhold the message from every other replica for the whole pause,
-// and outside dispatch it would be an idle wait every disposition pays.
+// offered again at once, so this is the only position where the consumer is
+// handling no delivery and has not yet taken another off its channel. That is
+// not the same as holding nothing: the nack restores prefetch credit, so the
+// broker may push the requeued message into this consumer's buffer, where it
+// waits out the pause. Before the nack the consumer would withhold the message
+// from every other replica for the whole pause, and outside dispatch the pause
+// would be an idle wait every disposition pays.
 //
 // It observes ctx rather than the handler's detached context: by then the
 // handler has returned and nothing is in hand to lose, so a shutdown should

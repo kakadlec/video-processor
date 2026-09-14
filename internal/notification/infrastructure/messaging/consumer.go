@@ -65,11 +65,15 @@ const DefaultRequeuePause = 5 * time.Second
 // Disposition is a handler's verdict on one delivery.
 //
 // Three values, and since fix-worker-dependency-outage-disposition gave
-// internal/video/infrastructure/messaging its own third the two consumers
-// hold one rule: a handler that has changed nothing may ask for the message
-// again. Here that is a handler blocked before its first attempt — an
-// unreachable database, a claim held by a peer — by a condition that resolves
-// itself.
+// internal/video/infrastructure/messaging its own third, both consumers
+// requeue only on a narrowly defined condition whose every possible outcome is
+// already owned by something that will resolve it. Here that is a handler
+// blocked before its first attempt — an unreachable database, a claim held by
+// a peer — which has changed nothing and meets a condition that resolves
+// itself. The worker's condition is weaker and must not be read as this one:
+// it requeues a claim whose outcome it could not learn, which it cannot assume
+// left the row untouched, and is licensed only because a row left processing
+// without a lease is what its recovery sweeper exists to reach.
 //
 // Where they still differ is the claim. This consumer requeues one held by
 // another, because a claim here expires under a reclaim bound and can be
