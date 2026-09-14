@@ -125,7 +125,7 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("video: begin create transaction: %w", err)
+		return fmt.Errorf("video: begin create transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -146,7 +146,7 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 		job.CreatedAt(),
 		job.LeaseEpoch(),
 	); err != nil {
-		return fmt.Errorf("video: create video job: %w", err)
+		return fmt.Errorf("video: create video job: %w", markUnavailable(err))
 	}
 
 	const insertOutbox = `
@@ -159,11 +159,11 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 		payload,
 		job.CreatedAt(),
 	); err != nil {
-		return fmt.Errorf("video: record outbox event: %w", err)
+		return fmt.Errorf("video: record outbox event: %w", markUnavailable(err))
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("video: commit create transaction: %w", err)
+		return fmt.Errorf("video: commit create transaction: %w", markUnavailable(err))
 	}
 	return nil
 }
@@ -189,7 +189,7 @@ func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, off
 	`
 	rows, err := r.db.QueryContext(ctx, query, userID.String(), offset, limit)
 	if err != nil {
-		return nil, fmt.Errorf("video: list video jobs: %w", err)
+		return nil, fmt.Errorf("video: list video jobs: %w", markUnavailable(err))
 	}
 	defer rows.Close()
 
@@ -202,7 +202,7 @@ func (r *Repository) FindByUserID(ctx context.Context, userID domain.UserID, off
 		jobs = append(jobs, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("video: list video jobs: %w", err)
+		return nil, fmt.Errorf("video: list video jobs: %w", markUnavailable(err))
 	}
 	return jobs, nil
 }
@@ -220,7 +220,7 @@ func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.Us
 	`
 	rows, err := r.db.QueryContext(ctx, query, userID.String(), string(domain.JobStatusCompleted))
 	if err != nil {
-		return nil, fmt.Errorf("video: list completed video jobs: %w", err)
+		return nil, fmt.Errorf("video: list completed video jobs: %w", markUnavailable(err))
 	}
 	defer rows.Close()
 
@@ -233,7 +233,7 @@ func (r *Repository) FindCompletedByUserID(ctx context.Context, userID domain.Us
 		jobs = append(jobs, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("video: list completed video jobs: %w", err)
+		return nil, fmt.Errorf("video: list completed video jobs: %w", markUnavailable(err))
 	}
 	return jobs, nil
 }
@@ -332,7 +332,7 @@ func (r *Repository) Update(ctx context.Context, job *domain.VideoJob, epoch int
 func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.VideoJob, epoch int64, eventType string, payload []byte, occurredAt time.Time) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("video: begin terminal update transaction: %w", err)
+		return false, fmt.Errorf("video: begin terminal update transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -346,11 +346,11 @@ func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.Video
 		string(domain.JobStatusProcessing),
 	)
 	if err != nil {
-		return false, fmt.Errorf("video: update video job: %w", err)
+		return false, fmt.Errorf("video: update video job: %w", markUnavailable(err))
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("video: update video job: %w", err)
+		return false, fmt.Errorf("video: update video job: %w", markUnavailable(err))
 	}
 	if affected == 0 {
 		return false, nil
@@ -361,7 +361,7 @@ func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.Video
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("video: commit terminal update transaction: %w", err)
+		return false, fmt.Errorf("video: commit terminal update transaction: %w", markUnavailable(err))
 	}
 	return true, nil
 }
@@ -438,7 +438,7 @@ func (r *Repository) classifyRefusedUpdate(ctx context.Context, job *domain.Vide
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.ErrVideoJobNotFound
 		}
-		return fmt.Errorf("video: update video job: %w", err)
+		return fmt.Errorf("video: update video job: %w", markUnavailable(err))
 	}
 
 	if storedEpoch == epoch && isTerminalStatus(domain.JobStatus(statusValue)) {
@@ -485,7 +485,7 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("video: begin enqueue transaction: %w", err)
+		return fmt.Errorf("video: begin enqueue transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -496,7 +496,7 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 		job.StorageKey().String(),
 		job.ID().String(),
 	); err != nil {
-		return fmt.Errorf("video: enqueue video job: %w", err)
+		return fmt.Errorf("video: enqueue video job: %w", markUnavailable(err))
 	}
 
 	if err := insertOutboxEvent(ctx, tx, videoJobQueuedEventType, payload, occurredAt); err != nil {
@@ -504,7 +504,7 @@ func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("video: commit enqueue transaction: %w", err)
+		return fmt.Errorf("video: commit enqueue transaction: %w", markUnavailable(err))
 	}
 	return nil
 }
@@ -546,7 +546,7 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, eventType string, payloa
 		payload,
 		occurredAt,
 	); err != nil {
-		return fmt.Errorf("video: record outbox event: %w", err)
+		return fmt.Errorf("video: record outbox event: %w", markUnavailable(err))
 	}
 	return nil
 }
@@ -569,7 +569,7 @@ func (r *Repository) Requeue(ctx context.Context, job *domain.VideoJob, observed
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("video: begin requeue transaction: %w", err)
+		return false, fmt.Errorf("video: begin requeue transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -585,11 +585,11 @@ func (r *Repository) Requeue(ctx context.Context, job *domain.VideoJob, observed
 		observedEpoch,
 	)
 	if err != nil {
-		return false, fmt.Errorf("video: requeue video job: %w", err)
+		return false, fmt.Errorf("video: requeue video job: %w", markUnavailable(err))
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("video: requeue video job: %w", err)
+		return false, fmt.Errorf("video: requeue video job: %w", markUnavailable(err))
 	}
 	if affected == 0 {
 		// Another sweep won, or the job left processing between the scan
@@ -604,7 +604,7 @@ func (r *Repository) Requeue(ctx context.Context, job *domain.VideoJob, observed
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("video: commit requeue transaction: %w", err)
+		return false, fmt.Errorf("video: commit requeue transaction: %w", markUnavailable(err))
 	}
 	return true, nil
 }
@@ -648,7 +648,7 @@ func (r *Repository) ClaimForProcessing(ctx context.Context, job *domain.VideoJo
 		return true, epoch, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return false, 0, fmt.Errorf("video: claim video job for processing: %w", err)
+		return false, 0, fmt.Errorf("video: claim video job for processing: %w", markUnavailable(err))
 	}
 
 	const exists = `SELECT 1 FROM video_jobs WHERE id = $1`
@@ -657,7 +657,7 @@ func (r *Repository) ClaimForProcessing(ctx context.Context, job *domain.VideoJo
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, 0, domain.ErrVideoJobNotFound
 		}
-		return false, 0, fmt.Errorf("video: claim video job for processing: %w", err)
+		return false, 0, fmt.Errorf("video: claim video job for processing: %w", markUnavailable(err))
 	}
 	return false, 0, nil
 }
@@ -702,7 +702,7 @@ func (r *Repository) FindProcessing(ctx context.Context, after domain.VideoJobID
 		rows, err = r.db.QueryContext(ctx, afterCursor, string(domain.JobStatusProcessing), after.String(), limit)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("video: list processing video jobs: %w", err)
+		return nil, fmt.Errorf("video: list processing video jobs: %w", markUnavailable(err))
 	}
 	defer rows.Close()
 
@@ -715,7 +715,7 @@ func (r *Repository) FindProcessing(ctx context.Context, after domain.VideoJobID
 		jobs = append(jobs, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("video: list processing video jobs: %w", err)
+		return nil, fmt.Errorf("video: list processing video jobs: %w", markUnavailable(err))
 	}
 	return jobs, nil
 }
@@ -760,7 +760,7 @@ func (r *Repository) scanJobRow(row rowScanner) (*domain.VideoJob, error) {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("video: scan video job: %w", err)
+		return nil, fmt.Errorf("video: scan video job: %w", markUnavailable(err))
 	}
 
 	id, err := r.idParser.ParseVideoJobID(idValue)

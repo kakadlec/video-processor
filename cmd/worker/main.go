@@ -144,7 +144,7 @@ func run(ctx context.Context, deps *workerDeps, topology platformrabbitmq.Topolo
 		}
 	}()
 
-	consumer := videomessaging.NewConsumer(deps.rabbit, topology, consumerTag, func(handlerCtx context.Context, body []byte) videomessaging.Disposition {
+	consumer := videomessaging.NewConsumer(deps.rabbit, topology, consumerTag, videomessaging.DefaultRequeuePause, func(handlerCtx context.Context, body []byte) videomessaging.Disposition {
 		return deps.handle(handlerCtx, body, &inFlight)
 	})
 
@@ -368,10 +368,33 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 // handle is the whole message-disposition table, in one place.
 //
 // Ack means one thing only: this job reached a committed terminal state.
-// Every other outcome rejects without requeueing, so the message lands on the
-// dead-letter queue where it can be looked at. Requeueing is never right —
-// the job's row is past `queued` in most of these cases, so a redelivery
-// could only lose the claim and loop.
+//
+// Every other verdict turns on whether this worker learned its claim's
+// outcome. When it did — the claim was lost, or it was won and the run then
+// broke, was fenced, or could not commit — a redelivery can only lose the
+// claim, which admits a `queued` row alone. Those reject without requeueing,
+// so the message lands on the dead-letter queue where it can be looked at.
+// So does everything that never reached a claim worth retrying: a body that
+// will not decode, a job that does not exist, a row that will not
+// reconstruct, a statement the database answered by refusing it.
+//
+// Exactly one condition is retried, and it is identified positively by its
+// sentinel rather than inferred from an error's shape: the claim step could
+// not learn whether the claim was won, because the repository could not
+// answer. That dispatch is requeued, and the consumer paces the redelivery.
+// What licenses it is not that nothing changed — this worker cannot know
+// that — but that every state the claim could have reached is already owned
+// by something. A row still `queued` is decided by the same conditional
+// claim when the dispatch comes back. A row left `processing` holds no lease,
+// because none is taken until a claim is reported won, and an unleased
+// `processing` row is exactly what the recovery sweeper exists to reach; the
+// redelivery loses the claim and is dead-lettered like any other.
+//
+// Rejection stays the default, including for every failure nobody
+// enumerated. An unanticipated failure must behave as it always has rather
+// than enter a redelivery loop nobody reasoned about — which is why a
+// dependency failing after the claim was won is dead-lettered however
+// transient it is.
 //
 // No path acks a message it did not process.
 func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.Pointer[string]) videomessaging.Disposition {
@@ -402,6 +425,11 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		logger(componentJobDispatch).Error("the job was already claimed; dropping the duplicate dispatch",
 			slog.String("job_id", msg.JobID))
 		return videomessaging.Reject
+	case errors.Is(err, videodomain.ErrJobClaimOutcomeUnknown):
+		logger(componentJobDispatch).Warn("the claim outcome could not be learned; requeueing",
+			slog.String("job_id", msg.JobID),
+			slog.String("error", err.Error()))
+		return videomessaging.Requeue
 	case errors.Is(err, videodomain.ErrVideoJobNotFound):
 		logger(componentJobDispatch).Error("the dispatch names an unknown job; dead-lettering",
 			slog.String("job_id", msg.JobID))

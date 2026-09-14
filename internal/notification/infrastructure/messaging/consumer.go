@@ -64,12 +64,17 @@ const DefaultRequeuePause = 5 * time.Second
 
 // Disposition is a handler's verdict on one delivery.
 //
-// Three values where internal/video/infrastructure/messaging has two, and the
-// third is the point rather than an inconsistency. A requeued video job meets
-// a row that has already moved past queued and can only lose the claim again,
-// so redelivery loops instead of recovering. A requeued terminal event meets
-// a handler that has attempted nothing, blocked by a condition — an
-// unreachable database, a claim held by a peer — that resolves itself.
+// Three values, and since fix-worker-dependency-outage-disposition gave
+// internal/video/infrastructure/messaging its own third the two consumers
+// hold one rule: a handler that has changed nothing may ask for the message
+// again. Here that is a handler blocked before its first attempt — an
+// unreachable database, a claim held by a peer — by a condition that resolves
+// itself.
+//
+// Where they still differ is the claim. This consumer requeues one held by
+// another, because a claim here expires under a reclaim bound and can be
+// picked up again; the worker never requeues a lost claim, because there a
+// conditional transition decided it and no later delivery can re-open it.
 type Disposition int
 
 // Numbered from one, so the zero value is no disposition at all rather than

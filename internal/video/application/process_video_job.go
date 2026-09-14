@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -270,6 +271,16 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 
 	claim, err := uc.start.Execute(ctx, jobID)
 	if err != nil {
+		// The single site where the claim step's error is propagated, and
+		// therefore the single site where the repository being unable to
+		// answer means this call never learned its claim's outcome. The
+		// same condition raised after the claim has been won says nothing
+		// of the kind and is propagated unchanged, which is why this is a
+		// conversion here rather than a marker the caller branches on
+		// wherever it appears.
+		if errors.Is(err, domain.ErrRepositoryUnavailable) {
+			return ProcessVideoJobResult{}, fmt.Errorf("%w: %w", domain.ErrJobClaimOutcomeUnknown, err)
+		}
 		return ProcessVideoJobResult{}, err
 	}
 	epoch := claim.LeaseEpoch

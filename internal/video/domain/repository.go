@@ -20,6 +20,46 @@ var ErrVideoJobNotFound = errors.New("video: video job not found")
 // It is likewise distinct from ErrVideoJobNotFound: the job exists.
 var ErrJobClaimLost = errors.New("video: video job claim lost")
 
+// ErrJobClaimOutcomeUnknown reports that a claim attempt ended without this
+// call learning whether the claim was won, because the persistence layer
+// could not answer it.
+//
+// It is the sibling of ErrJobClaimLost and the contrast is the whole point:
+// a lost claim means another actor owns this job, while an unknown outcome
+// means this call cannot say who owns it — including whether this worker
+// does.
+//
+// What it asserts is only what holds on every branch it admits: the caller
+// acquired no lease, read no source object, ran no extraction, wrote no
+// event and attempted no terminal write. It asserts nothing whatever about
+// the stored row — neither that the transition happened nor that it did not
+// — and callers are written against that weaker guarantee. Resolving the
+// ambiguity with a follow-up read is not one of their options: a repository
+// that has just failed to answer is no likelier to answer, and an answer
+// would report only what was true at that instant.
+var ErrJobClaimOutcomeUnknown = errors.New("video: video job claim outcome unknown")
+
+// ErrRepositoryUnavailable reports that the persistence layer could not
+// answer: the connection could not be established, was lost while the
+// statement was in flight, or the server itself replied that it cannot serve
+// the request now.
+//
+// Two things it does not mean, both of which a caller will otherwise assume.
+//
+// It is not "the database answered and refused". An undefined column, an
+// insufficient privilege, a constraint violation and a row the aggregate
+// cannot be reconstructed from are all permanent on a running server and
+// carry no marker, so a caller that retries on this sentinel cannot be made
+// to retry forever by a half-applied migration or one unreadable row.
+//
+// It is not a promise that the statement had no effect. A connection lost in
+// flight leaves the outcome unknown — the statement may well have committed
+// — and what this sentinel asserts is only that *this caller could not learn
+// the outcome*. Every caller is written against that weaker guarantee, and a
+// caller reading it as "nothing happened" would be wrong on the branch that
+// matters most.
+var ErrRepositoryUnavailable = errors.New("video: repository unavailable")
+
 // ErrJobFenced reports that a write was refused because the caller no longer
 // holds the job: the stored row has moved past the lease epoch the caller was
 // working under, or another actor holding the same epoch already committed a

@@ -34,6 +34,10 @@ type fakeVideoJobRepository struct {
 	// caller's read and its own write.
 	claimLoses bool
 	claimErr   error
+	// findErr makes FindByID report a repository-level failure rather than
+	// a verdict about the row, so a test can drive the paths that reach a
+	// use case before any aggregate is loaded.
+	findErr error
 	// lastUpdateEpoch records the epoch the most recent Update was fenced
 	// against, so a test can assert the use case passed the claim's epoch
 	// rather than reading one off the job it loaded.
@@ -67,6 +71,9 @@ func (r *fakeVideoJobRepository) FindByID(_ context.Context, id domain.VideoJobI
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.findErr != nil {
+		return nil, r.findErr
+	}
 	job, ok := r.byID[id.String()]
 	if !ok {
 		return nil, domain.ErrVideoJobNotFound
