@@ -66,3 +66,52 @@ func TestStartProcessing_InvalidTransition_ReturnsError(t *testing.T) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrInvalidStatusTransition)
 	}
 }
+
+// TestStartProcessing_RepositoryUnavailable_PropagatesTheMarkerUnconverted
+// pins task 3.4's decision that this use case stays unchanged. It propagates
+// whatever the repository reported, marker and all; deciding that an
+// unanswerable claim means this caller never learned its outcome belongs to
+// ProcessVideoJob, which is the one component that knows the failure happened
+// at the claim step rather than after it. Converting here as well would put
+// that decision in two places, and the second one would apply to callers that
+// are not the worker.
+func TestStartProcessing_RepositoryUnavailable_PropagatesTheMarkerUnconverted(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(repo *fakeVideoJobRepository)
+	}{
+		{
+			name: "the load could not be answered",
+			setup: func(repo *fakeVideoJobRepository) {
+				repo.findErr = unavailable("dial tcp 127.0.0.1:5432: connect: connection refused")
+			},
+		},
+		{
+			name: "the claim could not be answered",
+			setup: func(repo *fakeVideoJobRepository) {
+				repo.claimErr = unavailable("unexpected EOF")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeVideoJobRepository()
+			newQueuedRepoJob(t, repo, "job-1", "user-1")
+			tc.setup(repo)
+
+			uc := application.NewStartProcessing(repo, repo, fakeVideoJobIDParser{})
+			_, err := uc.Execute(context.Background(), "job-1")
+
+			if !errors.Is(err, domain.ErrRepositoryUnavailable) {
+				t.Fatalf("error = %v, want it to carry %v", err, domain.ErrRepositoryUnavailable)
+			}
+			if errors.Is(err, domain.ErrJobClaimOutcomeUnknown) {
+				t.Fatalf("error = %v, want it not to carry %v — the conversion belongs to ProcessVideoJob alone", err, domain.ErrJobClaimOutcomeUnknown)
+			}
+			if errors.Is(err, domain.ErrJobClaimLost) {
+				t.Fatalf("error = %v, want it not to carry %v", err, domain.ErrJobClaimLost)
+			}
+		})
+	}
+}

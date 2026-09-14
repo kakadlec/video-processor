@@ -263,13 +263,17 @@ type workerTestEnv struct {
 	extractor *gatedExtractor
 }
 
-// envOptions carries the two seams a test may need: a gate on the extractor,
-// and a decorator around the repository. Both exist so a path that is
-// otherwise unreachable — a job held mid-extraction, a terminal write that
-// fails — can be produced without widening run() or handle().
+// envOptions carries the seams a test may need: a gate on the extractor, a
+// decorator around the repository, and decorators around the source storage
+// and the lease store. They exist so a path that is otherwise unreachable — a
+// job held mid-extraction, a terminal write that fails — can be produced, and
+// a read or acquisition that must not happen can be counted, without widening
+// run() or handle().
 type envOptions struct {
-	release  chan struct{}
-	decorate func(videodomain.VideoJobRepository) videodomain.VideoJobRepository
+	release     chan struct{}
+	decorate    func(videodomain.VideoJobRepository) videodomain.VideoJobRepository
+	wrapSources func(videodomain.SourceStorage) videodomain.SourceStorage
+	wrapLeases  func(videodomain.JobLeaseStore) videodomain.JobLeaseStore
 }
 
 func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
@@ -297,7 +301,10 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 	if err != nil {
 		t.Fatalf("open presigning client: %v", err)
 	}
-	sources := videostorage.NewSourceStorage(client, cfg.Bucket)
+	var sources videodomain.SourceStorage = videostorage.NewSourceStorage(client, cfg.Bucket)
+	if opts.wrapSources != nil {
+		sources = opts.wrapSources(sources)
+	}
 	results := videostorage.NewResultStorage(client, presigner, cfg.Bucket)
 
 	ids := videoidgen.New()
@@ -309,7 +316,10 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 	keys := videoidempotency.NewRedisStore(redisClient)
 	extractor := newGatedExtractor(opts.release)
 
-	leases := videolease.NewRedisStore(redisClient)
+	var leases videodomain.JobLeaseStore = videolease.NewRedisStore(redisClient)
+	if opts.wrapLeases != nil {
+		leases = opts.wrapLeases(leases)
+	}
 
 	deps := &workerDeps{
 		// Empty when RABBITMQ_TEST_URL is unset, which is fine: the tests

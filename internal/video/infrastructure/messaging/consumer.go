@@ -52,6 +52,26 @@ func ParseJobQueuedMessage(body []byte) (JobQueuedMessage, error) {
 	return msg, nil
 }
 
+// DefaultRequeuePause is the wait a Requeue disposition takes before the next
+// delivery is accepted. It is a suggestion to the composition root rather
+// than a value read from inside the Consumer, so a test can choose a shorter
+// one; see NewConsumer.
+//
+// Five seconds, which is notification's consumer's value too. The symmetry is
+// worth more than tuning either one: two consumers on one broker, one
+// constant, one reason — and whatever the value, a dispatch resumes within
+// one pause of the dependency coming back.
+//
+// It bounds each consumer's rate, not the message's, and the difference is
+// the number to check a change to it against. Across N replicas the message
+// is attempted up to N times per pause, so the average deployment-wide
+// redelivery interval is roughly this value divided by N — under two seconds
+// at the three workers docker-compose.yml runs. The attempts arrive as a
+// burst rather than evenly spaced: a consumer in its pause still has a free
+// prefetch slot, so the broker hands it the requeued message, which then
+// waits in that consumer's buffer until the pause ends.
+const DefaultRequeuePause = 5 * time.Second
+
 // Disposition is a handler's verdict on one delivery.
 type Disposition int
 
@@ -63,8 +83,23 @@ const (
 	// Reject drops the message to the dead-letter exchange without
 	// requeueing. Requeueing is never the right answer here: a redelivery
 	// of a job whose row is already past queued can only lose the claim
-	// again, so it would loop rather than recover.
+	// again, so it would loop rather than recover. It covers a message
+	// naming work this worker will never be able to perform, where Requeue
+	// covers work it could not perform on this attempt because the
+	// dependency it needed could not answer.
 	Reject
+	// Requeue returns the message to the queue and pauses before the next
+	// one is taken.
+	//
+	// Reachable only where the handler has learned nothing about its
+	// claim's outcome, having therefore run no extraction, acquired no
+	// lease, read no source object and written no event. What licenses it
+	// is that every state the claim could have reached is already owned: a
+	// row still queued, which the same conditional claim decides on
+	// redelivery, or a row left processing with no lease, which is what the
+	// recovery sweeper exists to reach. After a claim reported won neither
+	// holds, and Reject is the answer.
+	Requeue
 )
 
 // Handler decides what becomes of one delivery. It is given a context
@@ -83,26 +118,31 @@ type Handler func(ctx context.Context, body []byte) Disposition
 // reachability is not a startup gate, and an AMQP connection can drop at any
 // time regardless, so the dial/redial loop has to exist here either way.
 type Consumer struct {
-	config   rabbitmq.Config
-	topology rabbitmq.Topology
-	handle   Handler
-	tag      string
+	config       rabbitmq.Config
+	topology     rabbitmq.Topology
+	handle       Handler
+	tag          string
+	requeuePause time.Duration
 }
 
 // NewConsumer wires a Consumer to the broker it dials, the topology it
-// consumes from, and the handler it delivers to. tag names this consumer to
-// the broker; it appears in management listings and is otherwise inert.
+// consumes from, the pause a Requeue takes, and the handler it delivers to.
+// tag names this consumer to the broker; it appears in management listings
+// and is otherwise inert.
 //
-// The topology is a parameter rather than JobDispatchTopology() read from
-// inside, matching Relay: the names are a composition-root decision, and a
-// consumer that reached for the production names itself could only ever be
-// exercised against them.
-func NewConsumer(config rabbitmq.Config, topology rabbitmq.Topology, tag string, handle Handler) *Consumer {
+// The topology and the pause are parameters rather than JobDispatchTopology()
+// and DefaultRequeuePause read from inside. Both are composition-root
+// decisions, and a consumer that reached for the production values itself
+// could only ever be exercised against them — a Requeue's observable
+// behaviour includes its wait, so a test that could not shorten it would be
+// testing that Nack compiles.
+func NewConsumer(config rabbitmq.Config, topology rabbitmq.Topology, tag string, requeuePause time.Duration, handle Handler) *Consumer {
 	return &Consumer{
-		config:   config,
-		topology: topology,
-		handle:   handle,
-		tag:      tag,
+		config:       config,
+		topology:     topology,
+		handle:       handle,
+		tag:          tag,
+		requeuePause: requeuePause,
 	}
 }
 
@@ -245,21 +285,42 @@ func (c *Consumer) serve(ctx context.Context, conn *amqp.Connection) (bool, erro
 // kill an ffmpeg run or, worse, abort the database write that records its
 // outcome. Bounding how long the process waits for that is the caller's job,
 // not this loop's.
+//
+// The Requeue pause is taken here, after the nack and before returning to the
+// select. A nacked message goes back toward the head of the queue and is
+// offered again at once, so this is the only position where the consumer is
+// handling no delivery and has not yet taken another off its channel. That is
+// not the same as holding nothing: the nack restores prefetch credit, so the
+// broker may push the requeued message into this consumer's buffer, where it
+// waits out the pause. Before the nack the consumer would withhold the message
+// from every other replica for the whole pause, and outside dispatch the pause
+// would be an idle wait every disposition pays.
+//
+// It observes ctx rather than the handler's detached context: by then the
+// handler has returned and nothing is in hand to lose, so a shutdown should
+// abandon the pause instead of spending the worker's drain on it.
 func (c *Consumer) dispatch(ctx context.Context, delivery amqp.Delivery) {
 	disposition := c.handle(context.WithoutCancel(ctx), delivery.Body)
 
-	if disposition == Ack {
+	switch disposition {
+	case Ack:
 		if err := delivery.Ack(false); err != nil {
 			logger(componentJobConsumer).Error("acknowledging the delivery failed",
 				slog.String("error", err.Error()))
 		}
-		return
-	}
-	// requeue=false: the message goes to the dead-letter exchange, where it
-	// can be looked at, rather than back onto the queue that would hand it
-	// straight back.
-	if err := delivery.Reject(false); err != nil {
-		logger(componentJobConsumer).Error("rejecting the delivery failed",
-			slog.String("error", err.Error()))
+	case Requeue:
+		if err := delivery.Nack(false, true); err != nil {
+			logger(componentJobConsumer).Error("requeueing the delivery failed",
+				slog.String("error", err.Error()))
+		}
+		_ = sleepCtx(ctx, c.requeuePause)
+	default:
+		// requeue=false: the message goes to the dead-letter exchange, where it
+		// can be looked at, rather than back onto the queue that would hand it
+		// straight back.
+		if err := delivery.Reject(false); err != nil {
+			logger(componentJobConsumer).Error("rejecting the delivery failed",
+				slog.String("error", err.Error()))
+		}
 	}
 }
