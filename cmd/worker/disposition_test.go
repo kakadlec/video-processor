@@ -67,6 +67,38 @@ func (r *claimThrough) callTimes() []time.Time {
 	return append([]time.Time(nil), r.calls...)
 }
 
+// loadThrough sends the authoritative load, and nothing else, to loader. It
+// has to wrap the reader StartProcessing loads through — the undecorated
+// repository, as in setupWorker — because a decorator on the caching writer
+// would leave the load on the real database.
+type loadThrough struct {
+	videodomain.VideoJobRepository
+	loader videodomain.VideoJobRepository
+}
+
+func (r loadThrough) FindByID(ctx context.Context, id videodomain.VideoJobID) (*videodomain.VideoJob, error) {
+	return r.loader.FindByID(ctx, id)
+}
+
+// finalizedIdempotencyKey maps the job's content hash to the job, as a
+// completed upload leaves it, so a test can assert the key survives.
+func finalizedIdempotencyKey(t *testing.T, env *workerTestEnv, job *videodomain.VideoJob) videodomain.IdempotencyKey {
+	t.Helper()
+	ctx := context.Background()
+	key, err := videodomain.NewIdempotencyKey(job.UserID().String(), testContentHash)
+	if err != nil {
+		t.Fatalf("build idempotency key: %v", err)
+	}
+	token, reserved, err := env.keys.Reserve(ctx, key)
+	if err != nil || !reserved {
+		t.Fatalf("reserve idempotency key: reserved=%v err=%v", reserved, err)
+	}
+	if finalized, err := env.keys.Finalize(ctx, key, token, job.ID()); err != nil || !finalized {
+		t.Fatalf("finalize idempotency key: finalized=%v err=%v", finalized, err)
+	}
+	return key
+}
+
 // unreachableRepository is the real PostgreSQL adapter over a pool whose DSN
 // names a port nothing listens on, so its statements never reach a server
 // and fail through the adapter's own availability classifier.
@@ -163,8 +195,8 @@ func dispatchBody(t *testing.T, jobID, sourceKey string) []byte {
 }
 
 // TestHandle_DispositionTable asserts the disposition table as a whole, in
-// both directions. The requeue row alone would pass with the default branch
-// broken; the rows after it are the decision. Three of them separate the
+// both directions. The requeue rows alone would pass with the default branch
+// broken; the rows after them are the decision. Three of them separate the
 // rule from a call-site one: a claim the database itself refused, a row read
 // but not understood, and a dependency outage on the failure write after the
 // claim was won all still dead-letter. The completion-write outage looks like
@@ -193,6 +225,65 @@ func TestHandle_DispositionTable(t *testing.T) {
 				return env, body, func(t *testing.T) {
 					if status := statusOf(t, env, job); status != videodomain.JobStatusQueued {
 						t.Fatalf("status = %q, want %q", status, videodomain.JobStatusQueued)
+					}
+				}
+			},
+		},
+		{
+			name: "authoritative load unavailable before any claim",
+			want: videomessaging.Requeue,
+			build: func(t *testing.T) (*workerTestEnv, []byte, func(t *testing.T)) {
+				sources := &countingSources{}
+				leases := &countingLeases{}
+				claims := &claimThrough{}
+				env := newWorkerTestEnv(t, envOptions{
+					wrapReader: func(inner videodomain.VideoJobRepository) videodomain.VideoJobRepository {
+						return loadThrough{VideoJobRepository: inner, loader: unreachableRepository(t)}
+					},
+					// Passes the claim through to the real writer; it is
+					// here only to count that none was attempted.
+					decorate: func(inner videodomain.VideoJobRepository) videodomain.VideoJobRepository {
+						claims.VideoJobRepository = inner
+						claims.claimer = inner
+						return claims
+					},
+					wrapSources: func(inner videodomain.SourceStorage) videodomain.SourceStorage {
+						sources.SourceStorage = inner
+						return sources
+					},
+					wrapLeases: func(inner videodomain.JobLeaseStore) videodomain.JobLeaseStore {
+						leases.JobLeaseStore = inner
+						return leases
+					},
+				})
+				job, body := seedQueuedJob(t, env, []byte("never read"))
+				key := finalizedIdempotencyKey(t, env, job)
+				return env, body, func(t *testing.T) {
+					ctx := context.Background()
+					if n := len(claims.callTimes()); n != 0 {
+						t.Fatalf("claim statements = %d, want 0 — the load failed before any claim", n)
+					}
+					stored, err := env.repo.FindByID(ctx, job.ID())
+					if err != nil {
+						t.Fatalf("reload job: %v", err)
+					}
+					if stored.Status() != videodomain.JobStatusQueued || stored.LeaseEpoch() != job.LeaseEpoch() {
+						t.Fatalf("job = %q at epoch %d, want %q at epoch %d", stored.Status(), stored.LeaseEpoch(), videodomain.JobStatusQueued, job.LeaseEpoch())
+					}
+					if n := leases.acquires.Load(); n != 0 {
+						t.Fatalf("lease acquisitions = %d, want 0", n)
+					}
+					if n := sources.gets.Load(); n != 0 {
+						t.Fatalf("source object reads = %d, want 0", n)
+					}
+					if len(env.extractor.started) != 0 {
+						t.Fatal("an extraction started for a job whose load was never answered")
+					}
+					if !objectExists(t, env, job.SourceKey().String()) {
+						t.Fatal("the source object was deleted")
+					}
+					if mapped, found, err := env.keys.Lookup(ctx, key); err != nil || !found || mapped != job.ID() {
+						t.Fatalf("idempotency key: mapped=%v found=%v err=%v, want it to still name %v", mapped, found, err, job.ID())
 					}
 				}
 			},
@@ -344,9 +435,9 @@ func TestHandle_DispositionTable(t *testing.T) {
 }
 
 // TestWorker_RequeuesADispatchWhoseClaimCannotReachTheDatabase is the
-// definite pre-statement branch, through the running process and a real
-// broker. The claim statement never reaches a server, so here — and only
-// here — the job is provably untouched, and the test asserts it.
+// definite pre-statement branch of the claim, through the running process and
+// a real broker. The claim statement never reaches a server, so the job is
+// provably untouched, and the test asserts it.
 func TestWorker_RequeuesADispatchWhoseClaimCannotReachTheDatabase(t *testing.T) {
 	conn := openTestConn(t)
 	sources := &countingSources{}
@@ -372,17 +463,7 @@ func TestWorker_RequeuesADispatchWhoseClaimCannotReachTheDatabase(t *testing.T) 
 	ctx := context.Background()
 
 	job, body := seedQueuedJob(t, env, []byte("never read"))
-	key, err := videodomain.NewIdempotencyKey(job.UserID().String(), testContentHash)
-	if err != nil {
-		t.Fatalf("build idempotency key: %v", err)
-	}
-	token, reserved, err := env.keys.Reserve(ctx, key)
-	if err != nil || !reserved {
-		t.Fatalf("reserve idempotency key: reserved=%v err=%v", reserved, err)
-	}
-	if finalized, err := env.keys.Finalize(ctx, key, token, job.ID()); err != nil || !finalized {
-		t.Fatalf("finalize idempotency key: finalized=%v err=%v", finalized, err)
-	}
+	key := finalizedIdempotencyKey(t, env, job)
 
 	logs := captureLogs(t)
 	cancel, done := startWorker(t, env, topo, time.Second)

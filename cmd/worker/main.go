@@ -381,14 +381,17 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 // Exactly one condition is retried, and it is identified positively by its
 // sentinel rather than inferred from an error's shape: the claim step could
 // not learn whether the claim was won, because the repository could not
-// answer. That dispatch is requeued, and the consumer paces the redelivery.
-// What licenses it is not that nothing changed — this worker cannot know
-// that — but that every state the claim could have reached is already owned
-// by something. A row still `queued` is decided by the same conditional
-// claim when the dispatch comes back. A row left `processing` holds no lease,
-// because none is taken until a claim is reported won, and an unleased
-// `processing` row is exactly what the recovery sweeper exists to reach; the
-// redelivery loses the claim and is dead-lettered like any other.
+// answer — the authoritative load before the claim, the claim itself, or the
+// existence probe after a claim that affected no row. That dispatch is
+// requeued, and the consumer paces the redelivery. What licenses it is not
+// the state of the row — this worker cannot know it — but that this worker
+// produced no side effect, and a redelivery re-runs the same load and
+// conditional claim, which decide the row as for any dispatch: a `queued`
+// row is claimed, while a missing, `pending`, `processing` or terminal one
+// is dead-lettered. Only a claim that committed and lost its result
+// necessarily leaves a row behind: `processing` with no lease, because none
+// is taken until a claim is reported won, which is exactly what the recovery
+// sweeper exists to reach.
 //
 // Rejection stays the default, including for every failure nobody
 // enumerated. An unanticipated failure must behave as it always has rather
@@ -450,11 +453,14 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			slog.String("error", err.Error()))
 		return videomessaging.Reject
 	case err != nil:
-		// The run broke before any terminal state was committed. The job
-		// stays wherever it was and the source object stays put: leaking it
-		// is recoverable through the bucket's lifecycle rule, deleting an
-		// input that no terminal state accounts for is not. The row is left
+		// No terminal state was committed. Before a claim — a malformed
+		// identifier, a `pending` row, a row that will not reconstruct, a
+		// statement the database refused — the row is untouched. After a
+		// won claim whose failure could not be recorded, it is left
 		// `processing`, which the sweeper recovers once the lease lapses.
+		// Either way the source object stays put: leaking it is recoverable
+		// through the bucket's lifecycle rule, deleting an input that no
+		// terminal state accounts for is not.
 		logger(componentJobDispatch).Error("the job did not reach a terminal state; dead-lettering",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
@@ -569,14 +575,17 @@ func (d *workerDeps) completeWithRetry(ctx context.Context, result videoapplicat
 		if errors.Is(err, videodomain.ErrJobFenced) {
 			return err
 		}
+		// The last failure is the caller's to report, with the verdict it
+		// leads to.
+		if attempt == terminalWriteAttempts {
+			break
+		}
 		logger(componentJobDispatch).Warn("marking the job completed failed; retrying",
 			slog.String("job_id", result.JobID),
 			slog.Int("attempt", attempt),
 			slog.Int("max_attempts", terminalWriteAttempts),
 			slog.String("error", err.Error()))
-		if attempt < terminalWriteAttempts {
-			time.Sleep(time.Duration(attempt) * terminalWriteBackoff)
-		}
+		time.Sleep(time.Duration(attempt) * terminalWriteBackoff)
 	}
 	return err
 }
