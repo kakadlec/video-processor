@@ -97,6 +97,7 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │   dead-letter exchange)   │                    │
   │                        │  ProcessVideoJob:          │                   │
   │                        │    StartProcessing →       │                   │
+  │                        │    FindByID, then          │                   │
   │                        │    ClaimForProcessing      │                   │
   │                        │    UPDATE … WHERE id=$1     │                  │
   │                        │      AND status='queued'   │                   │
@@ -105,6 +106,16 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │    no row → ErrJobClaimLost │                  │
   │                        │    → Reject → DLQ, nothing  │                  │
   │                        │      touched at all         │                  │
+  │                        │    load, claim or probe     │                  │
+  │                        │    after a zero-row claim   │                  │
+  │                        │    could not be answered →  │                  │
+  │                        │    ErrJobClaimOutcomeUnknown│                  │
+  │                        │    → Requeue, 5s pause; no  │                  │
+  │                        │    lease, source read or    │                  │
+  │                        │    extraction. Row state is │                  │
+  │                        │    not known: may already be│                  │
+  │                        │    `processing` (claim      │                  │
+  │                        │    committed, result lost)  │                  │
   │                        │    acquire/renew Redis lease│                  │
   │                        │      at returned epoch      │                  │
   │                        │    SourceStorage.Get →      │                  │
@@ -125,6 +136,9 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │  ErrJobFenced: Reject → DLQ,│                  │
   │                        │    keep source and release  │                  │
   │                        │    no lease                 │                  │
+  │                        │  any other error: Reject →  │                  │
+  │                        │    DLQ (a won claim's row is│                  │
+  │                        │    left to the sweeper)     │                  │
   │                        │  on applied failure:        │                  │
   │                        │    delete the source object │                  │
   │                        │    clear the idempotency key│                  │
@@ -143,10 +157,10 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │    delete the source object │                  │
   │                        │──────────────────────────────────────────────►│
   │◄───────────────────────│    release lease → Ack      │                  │
-  │  ack / reject           │                            │                  │
+  │  ack / reject / requeue │                            │                  │
 ```
 
-An acknowledgement asserts that a **terminal outcome exists**, not that processing succeeded or that this call necessarily applied it. An applied failure is acked with cleanup; an identical failure already present is also acked, but this later run performs no second cleanup because it did not apply the outcome. A fenced run is rejected and performs no source, idempotency, or lease cleanup because this actor did not apply the terminal outcome.
+An acknowledgement asserts that a **terminal outcome exists**, not that processing succeeded or that this call necessarily applied it. An applied failure is acked with cleanup; an identical failure already present is also acked, but this later run performs no second cleanup because it did not apply the outcome. A fenced run is rejected and performs no source, idempotency, or lease cleanup because this actor did not apply the terminal outcome. A dispatch whose claim outcome the worker could not learn — PostgreSQL could not answer the load that precedes the claim, the claim, or the probe after a zero-row claim — is neither acknowledged nor dead-lettered: it is requeued, and the consumer pauses before its next delivery. Nothing is assumed about the row; the redelivery's own load and claim decide it. Every other failure without a terminal outcome is rejected.
 
 A sibling sweeper scans bounded batches of `processing` rows every 60 seconds. After two successful observations that no lease is held at the same epoch, it conditionally returns the row to `queued`, increments the epoch, and writes a fresh outbox dispatch in one transaction. After three requeues, or for a legacy row with no source key, it applies terminal abandonment instead. A Redis query error for that job resets its prior confirmation and takes over nothing.
 
