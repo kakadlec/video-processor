@@ -20,9 +20,11 @@ var ErrVideoJobNotFound = errors.New("video: video job not found")
 // It is likewise distinct from ErrVideoJobNotFound: the job exists.
 var ErrJobClaimLost = errors.New("video: video job claim lost")
 
-// ErrJobClaimOutcomeUnknown reports that a claim attempt ended without this
-// call learning whether the claim was won, because the persistence layer
-// could not answer it.
+// ErrJobClaimOutcomeUnknown reports that the claim step ended without this
+// call learning whether a claim was won, because the persistence layer could
+// not answer: the authoritative load that precedes the claim, where none was
+// attempted; the claim statement itself; or the existence probe that follows
+// a claim that affected no row.
 //
 // It is the sibling of ErrJobClaimLost and the contrast is the whole point:
 // a lost claim means another actor owns this job, while an unknown outcome

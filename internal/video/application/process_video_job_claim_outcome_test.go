@@ -37,32 +37,45 @@ func (r *claimThenFailRepository) ClaimForProcessing(ctx context.Context, job *d
 	return false, 0, r.err
 }
 
-// TestProcessVideoJob_ClaimOutcomeUnknown_StopsBeforeAnySideEffect covers both
-// branches the sentinel admits, because they differ in exactly one respect
-// and it is not one this use case may depend on: the first leaves the row
-// queued, the second leaves it processing, and Execute behaves identically
-// under both. What it asserts of both is the intersection — no lease, no
-// download, no extraction, no terminal write — which is the licence the
-// worker's disposition rests on.
+// TestProcessVideoJob_ClaimOutcomeUnknown_StopsBeforeAnySideEffect covers the
+// origins the sentinel admits, because they differ only in respects this use
+// case may not depend on: whether a claim was attempted at all, and what the
+// stored row carries afterwards. Execute behaves identically under each. What
+// it asserts of all of them is the intersection — no lease, no download, no
+// extraction, no terminal write — which is the licence the worker's
+// disposition rests on.
 func TestProcessVideoJob_ClaimOutcomeUnknown_StopsBeforeAnySideEffect(t *testing.T) {
 	cases := []struct {
 		name string
 		// repoFor wraps the seeded fake in whatever stands in for the
 		// unavailable server on this branch.
 		repoFor func(repo *fakeVideoJobRepository) domain.VideoJobRepository
+		// wantClaimCalls is how many claim statements were issued, which
+		// is what separates the load origin from the two claim ones.
+		wantClaimCalls int
 		// wantStatus is what the stored row carries afterwards. It pins
 		// the stub rather than the use case: Execute neither reads the
 		// row on this path nor asserts anything about it, and the value
-		// is here only to prove the two branches were really built.
+		// is here only to prove the claim branches were really built.
+		// Empty means the case asserts nothing about the row.
 		wantStatus domain.JobStatus
 	}{
+		{
+			name: "the authoritative load before the claim could not be answered",
+			repoFor: func(repo *fakeVideoJobRepository) domain.VideoJobRepository {
+				repo.findErr = unavailable("dial tcp 127.0.0.1:5432: connect: connection refused")
+				return repo
+			},
+			wantClaimCalls: 0,
+		},
 		{
 			name: "the claim statement never reached the server",
 			repoFor: func(repo *fakeVideoJobRepository) domain.VideoJobRepository {
 				repo.claimErr = unavailable("dial tcp 127.0.0.1:5432: connect: connection refused")
 				return repo
 			},
-			wantStatus: domain.JobStatusQueued,
+			wantClaimCalls: 1,
+			wantStatus:     domain.JobStatusQueued,
 		},
 		{
 			name: "the claim committed and its result was lost",
@@ -72,7 +85,8 @@ func TestProcessVideoJob_ClaimOutcomeUnknown_StopsBeforeAnySideEffect(t *testing
 					err:                    unavailable("unexpected EOF"),
 				}
 			},
-			wantStatus: domain.JobStatusProcessing,
+			wantClaimCalls: 1,
+			wantStatus:     domain.JobStatusProcessing,
 		},
 	}
 
@@ -103,6 +117,9 @@ func TestProcessVideoJob_ClaimOutcomeUnknown_StopsBeforeAnySideEffect(t *testing
 				t.Fatalf("error = %v, want it not to carry %v", err, domain.ErrJobClaimLost)
 			}
 
+			if repo.claimCalls != tc.wantClaimCalls {
+				t.Fatalf("repo.claimCalls = %d, want %d", repo.claimCalls, tc.wantClaimCalls)
+			}
 			if leases.acquires != 0 {
 				t.Fatalf("lease acquires = %d, want 0 — a claim whose outcome is unknown holds nothing", leases.acquires)
 			}
@@ -116,6 +133,9 @@ func TestProcessVideoJob_ClaimOutcomeUnknown_StopsBeforeAnySideEffect(t *testing
 				t.Fatalf("repo.updateCalls = %d, want 0 — no FailJob may be attempted here", repo.updateCalls)
 			}
 
+			if tc.wantStatus == "" {
+				return
+			}
 			job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
 			if err != nil {
 				t.Fatalf("unexpected error loading the job: %v", err)

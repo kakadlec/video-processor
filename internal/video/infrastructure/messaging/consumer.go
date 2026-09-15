@@ -94,11 +94,13 @@ const (
 	// Reachable only where the handler has learned nothing about its
 	// claim's outcome, having therefore run no extraction, acquired no
 	// lease, read no source object and written no event. What licenses it
-	// is that every state the claim could have reached is already owned: a
-	// row still queued, which the same conditional claim decides on
-	// redelivery, or a row left processing with no lease, which is what the
-	// recovery sweeper exists to reach. After a claim reported won neither
-	// holds, and Reject is the answer.
+	// is not the stored row's state, which the handler cannot know, but
+	// that a redelivery re-runs the same load and conditional claim, which
+	// decide the row as for any dispatch. Only a claim that committed and
+	// lost its result necessarily leaves a row behind — processing with no
+	// lease — and that is what the recovery sweeper exists to reach. After
+	// a claim reported won a redelivery could only lose the claim, and
+	// Reject is the answer.
 	Requeue
 )
 

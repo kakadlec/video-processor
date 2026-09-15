@@ -263,15 +263,16 @@ type workerTestEnv struct {
 	extractor *gatedExtractor
 }
 
-// envOptions carries the seams a test may need: a gate on the extractor, a
-// decorator around the repository, and decorators around the source storage
-// and the lease store. They exist so a path that is otherwise unreachable — a
+// envOptions carries the seams a test may need: a gate on the extractor,
+// decorators around the caching writer and the authoritative reader, and
+// decorators around the source storage and the lease store. They exist so a path that is otherwise unreachable — a
 // job held mid-extraction, a terminal write that fails — can be produced, and
 // a read or acquisition that must not happen can be counted, without widening
 // run() or handle().
 type envOptions struct {
 	release     chan struct{}
 	decorate    func(videodomain.VideoJobRepository) videodomain.VideoJobRepository
+	wrapReader  func(videodomain.VideoJobRepository) videodomain.VideoJobRepository
 	wrapSources func(videodomain.SourceStorage) videodomain.SourceStorage
 	wrapLeases  func(videodomain.JobLeaseStore) videodomain.JobLeaseStore
 }
@@ -313,6 +314,12 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 	if opts.decorate != nil {
 		repo = opts.decorate(repo)
 	}
+	// The authoritative reader the ownership use cases load through, as
+	// setupWorker's plainRepo is. env.repo stays undecorated for assertions.
+	var reader videodomain.VideoJobRepository = plain
+	if opts.wrapReader != nil {
+		reader = opts.wrapReader(reader)
+	}
 	keys := videoidempotency.NewRedisStore(redisClient)
 	extractor := newGatedExtractor(opts.release)
 
@@ -328,21 +335,21 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 		db:     db,
 		redis:  redisClient,
 		process: videoapplication.NewProcessVideoJob(
-			videoapplication.NewStartProcessing(plain, repo, ids),
-			videoapplication.NewFailJob(plain, repo, ids),
+			videoapplication.NewStartProcessing(reader, repo, ids),
+			videoapplication.NewFailJob(reader, repo, ids),
 			extractor,
 			sources,
 			results,
 			leases,
 			ids,
 		),
-		complete:  videoapplication.NewCompleteJob(plain, repo, ids),
-		fail:      videoapplication.NewFailJob(plain, repo, ids),
-		clearKey:  videoapplication.NewClearJobIdempotencyKey(plain, keys, ids),
+		complete:  videoapplication.NewCompleteJob(reader, repo, ids),
+		fail:      videoapplication.NewFailJob(reader, repo, ids),
+		clearKey:  videoapplication.NewClearJobIdempotencyKey(reader, keys, ids),
 		sources:   sources,
 		leases:    leases,
 		ids:       ids,
-		jobReader: plain,
+		jobReader: reader,
 		jobWriter: repo,
 	}
 

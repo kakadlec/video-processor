@@ -109,7 +109,20 @@ func TestOnlyTheSignerRevealsAStoredSecret(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || entry.Name() == "node_modules" {
+			if path == root {
+				return nil
+			}
+			// The exclusions `go help packages` states for "./...": names
+			// beginning with "." or "_", testdata, vendor, and any directory
+			// holding its own go.mod. The go.mod rule is what keeps a nested
+			// checkout — a git worktree, wherever it lives — from being read
+			// as a second copy of every call site.
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") ||
+				name == "testdata" || name == "vendor" || name == "node_modules" {
+				return fs.SkipDir
+			}
+			if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
 				return fs.SkipDir
 			}
 			return nil
