@@ -8,20 +8,24 @@ import (
 
 // TransitionResult describes a VideoJob's ID and status after a single
 // transition use case has run. It is shared by EnqueueVideoJob,
-// StartProcessing, CompleteJob, and FailJob.
+// StartProcessing, CompleteJob, FailJob, and RetryVideoJob.
 type TransitionResult struct {
 	JobID  string
 	Status string
 	// LeaseEpoch is the fence epoch the transition ran under. StartProcessing
 	// reports the epoch its claim returned, and the winner must carry that
-	// value through to its terminal write rather than re-reading it: a later
-	// read can only pick up a successor's.
+	// value through to its terminal write — or, for RetryVideoJob, into its
+	// own lease release — rather than re-reading it: a later read can only
+	// pick up a successor's.
 	LeaseEpoch int64
 	// Applied distinguishes "this call wrote the row" from "the row already
 	// carried exactly this outcome". Only the terminal writes can report
 	// false, and only for a caller finding its own earlier commit after a
 	// lost response — which is a success, but not one that licenses the
 	// one-shot cleanup of a job's source object and idempotency key.
+	// RetryVideoJob's write has no such idempotent-match case — its
+	// conditional statement either applies or is fenced — so it reports
+	// Applied true on every success.
 	Applied bool
 }
 

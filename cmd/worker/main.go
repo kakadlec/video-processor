@@ -336,11 +336,11 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 		redis:         redisClient,
 		terminalRelay: videomessaging.NewTerminalRelay(videopostgres.NewOutboxRepository(db), rabbitConfig),
 		process: videoapplication.NewProcessVideoJob(
-			// Reader undecorated, writer cached, for all three ownership
-			// use cases: a decision about who owns a job does not read a
-			// cache.
+			// Reader undecorated, writer cached, for all four ownership use
+			// cases: a decision about who owns a job does not read a cache.
 			videoapplication.NewStartProcessing(plainRepo, repo, ids),
 			failJob,
+			videoapplication.NewRetryVideoJob(plainRepo, repo, ids),
 			videoffmpeg.New(),
 			sourceStorage,
 			resultStorage,
@@ -367,7 +367,11 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 
 // handle is the whole message-disposition table, in one place.
 //
-// Ack means one thing only: this job reached a committed terminal state.
+// Ack means one of two things: this job reached a committed terminal state,
+// or ProcessVideoJob returned it to queued for another attempt after a
+// transient object-storage failure — a fresh dispatch for that row already
+// exists in the outbox, so this dispatch's job is done whether or not this
+// particular delivery is the one that finishes the row.
 //
 // Every other verdict turns on whether this worker learned its claim's
 // outcome. When it did — the claim was lost, or it was won and the run then
@@ -378,7 +382,8 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 // will not decode, a job that does not exist, a row that will not
 // reconstruct, a statement the database answered by refusing it.
 //
-// Exactly one condition is retried, and it is identified positively by its
+// Exactly one condition is retried at the message level — nacked with
+// requeue rather than acked — and it is identified positively by its
 // sentinel rather than inferred from an error's shape: the claim step could
 // not learn whether the claim was won, because the repository could not
 // answer — the authoritative load before the claim, the claim itself, or the
@@ -393,11 +398,22 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 // is taken until a claim is reported won, which is exactly what the recovery
 // sweeper exists to reach.
 //
+// A transient object-storage failure — a fetch or store that failed for any
+// reason other than the object simply not being there — is retried a
+// different way: bounded and paced inside ProcessVideoJob itself (see
+// retryOrFail in internal/video/application), which writes the job straight
+// back to queued at an advanced epoch rather than leaving this delivery's
+// disposition do the work. It never reaches the message level at all, which
+// is why it is not a fourth videomessaging.Disposition: unlike a claim whose
+// outcome is unknown, this worker knows exactly what happened and has
+// already acted on it by the time handle sees the sentinel.
+//
 // Rejection stays the default, including for every failure nobody
 // enumerated. An unanticipated failure must behave as it always has rather
 // than enter a redelivery loop nobody reasoned about — which is why a
 // dependency failing after the claim was won is dead-lettered however
-// transient it is.
+// transient it is, and why a missing source object fails the job outright
+// rather than retrying: no redelivery makes an absent object appear.
 //
 // No path acks a message it did not process.
 func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.Pointer[string]) videomessaging.Disposition {
@@ -452,6 +468,21 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			slog.Int64("lease_epoch", result.LeaseEpoch),
 			slog.String("error", err.Error()))
 		return videomessaging.Reject
+	case errors.Is(err, videodomain.ErrJobRequeuedForRetry):
+		// The row is queued again at an advanced epoch and a fresh dispatch
+		// already exists in the outbox; this delivery's own job is done.
+		// The source object and idempotency key are untouched — the next
+		// attempt still needs both — and only the lease this run held is
+		// released, conditional on this call's write being the one that
+		// applied, exactly as the failure path below gates its own cleanup.
+		logger(componentJobDispatch).Warn("a transient object-storage failure returned the job to queued for another attempt",
+			slog.String("job_id", msg.JobID),
+			slog.Int64("lease_epoch", result.LeaseEpoch),
+			slog.String("error", err.Error()))
+		if result.Applied {
+			d.releaseLease(ctx, msg.JobID, result.LeaseEpoch)
+		}
+		return videomessaging.Ack
 	case err != nil:
 		// No terminal state was committed. Before a claim — a malformed
 		// identifier, a `pending` row, a row that will not reconstruct, a

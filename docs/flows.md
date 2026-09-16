@@ -129,13 +129,30 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │                        │    ResultStorage.Put →      │                  │
   │                        │    bucket/frames_<jobID>.zip│                  │
   │                        │──────────────────────────────────────────────►│
-  │                        │    FailJob if fetch,        │                  │
-  │                        │    extraction OR storage    │                  │
-  │                        │    failed, fenced by epoch  │                  │
+  │                        │    FailJob if extraction    │                  │
+  │                        │    failed, OR fetch/store   │                  │
+  │                        │    failed with the source   │                  │
+  │                        │    genuinely absent, fenced │                  │
+  │                        │    by epoch                 │                  │
   │                        │───────────────────────────►│                  │
-  │                        │  ErrJobFenced: Reject → DLQ,│                  │
-  │                        │    keep source and release  │                  │
-  │                        │    no lease                 │                  │
+  │                        │    RetryVideoJob if fetch or│                  │
+  │                        │    store failed any other   │                  │
+  │                        │    way: processing → queued,│                  │
+  │                        │    epoch+1, fresh outbox row,│                 │
+  │                        │    fenced by epoch, bounded  │                 │
+  │                        │    by MaxJobRequeues (3),    │                 │
+  │                        │    paced by a 5s pause first │                 │
+  │                        │───────────────────────────►│                  │
+  │                        │  ErrJobFenced (failure,     │                  │
+  │                        │    completion, or a refused │                  │
+  │                        │    retry-requeue): Reject → │                  │
+  │                        │    DLQ, keep source and     │                  │
+  │                        │    release no lease         │                  │
+  │                        │  ErrJobRequeuedForRetry:     │                  │
+  │                        │    release held lease, keep  │                 │
+  │                        │    source and idempotency key │                │
+  │                        │    (the next attempt needs    │                │
+  │                        │    both) → Ack                │                │
   │                        │  any other error: Reject →  │                  │
   │                        │    DLQ (a won claim's row is│                  │
   │                        │    left to the sweeper)     │                  │
@@ -160,7 +177,7 @@ RabbitMQ            cmd/worker/main.go     internal/video/application   MinIO bu
   │  ack / reject / requeue │                            │                  │
 ```
 
-An acknowledgement asserts that a **terminal outcome exists**, not that processing succeeded or that this call necessarily applied it. An applied failure is acked with cleanup; an identical failure already present is also acked, but this later run performs no second cleanup because it did not apply the outcome. A fenced run is rejected and performs no source, idempotency, or lease cleanup because this actor did not apply the terminal outcome. A dispatch whose claim outcome the worker could not learn — PostgreSQL could not answer the load that precedes the claim, the claim, or the probe after a zero-row claim — is neither acknowledged nor dead-lettered: it is requeued, and the consumer pauses before its next delivery. Nothing is assumed about the row; the redelivery's own load and claim decide it. Every other failure without a terminal outcome is rejected.
+An acknowledgement asserts that a **terminal outcome exists, or that the job was voluntarily returned to queued for another attempt** — not that processing succeeded or that this call necessarily applied either outcome. An applied failure is acked with cleanup; an identical failure already present is also acked, but this later run performs no second cleanup because it did not apply the outcome. A fenced run is rejected and performs no source, idempotency, or lease cleanup because this actor did not apply the terminal outcome (or the retry-requeue). A dispatch whose claim outcome the worker could not learn — PostgreSQL could not answer the load that precedes the claim, the claim, or the probe after a zero-row claim — is neither acknowledged nor dead-lettered: it is requeued at the message level, and the consumer pauses before its next delivery. Nothing is assumed about the row; the redelivery's own load and claim decide it. Every other failure without a terminal outcome is rejected — except a transient `SourceStorage.Get`/`ResultStorage.Put` failure (any cause but a genuinely missing object), which is acked because `ProcessVideoJob` has already returned the job to `queued` at an advanced epoch and a fresh dispatch already exists in the outbox; that path is bounded by `domain.MaxJobRequeues` (3), so a storage backend that never recovers still ends the job rather than retrying it forever (`retry-transient-object-storage-failure`).
 
 A sibling sweeper scans bounded batches of `processing` rows every 60 seconds. After two successful observations that no lease is held at the same epoch, it conditionally returns the row to `queued`, increments the epoch, and writes a fresh outbox dispatch in one transaction. After three requeues, or for a legacy row with no source key, it applies terminal abandonment instead. A Redis query error for that job resets its prior confirmation and takes over nothing.
 

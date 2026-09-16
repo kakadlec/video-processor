@@ -32,6 +32,19 @@ const (
 	abandonedFailureReason = "video processing was interrupted and could not be recovered"
 )
 
+// storageRetryPause bounds how long a run pauses after a transient
+// object-storage failure before returning its job to queued for another
+// attempt. It mirrors internal/video/infrastructure/messaging.
+// DefaultRequeuePause's value without importing it — the application layer
+// does not depend on an infrastructure adapter, the same reason
+// leaseRenewInterval below is duplicated rather than imported — and gives
+// the object store a moment before the bounded number of attempts
+// domain.MaxJobRequeues allows runs out. It covers a momentary blip; a
+// sustained outage still exhausts the budget and fails the job, as an
+// outage that outlasts PostgreSQL's own already-accepted retry budget does
+// (see docs/roadmap.md's retry-transient-object-storage-failure row).
+const storageRetryPause = 5 * time.Second
+
 // leaseRenewInterval is how often a running extraction renews its job lease.
 // It must stay comfortably below the adapter's lease TTL
 // (internal/video/infrastructure/lease.TTL, 90s): the margin is what absorbs
@@ -65,13 +78,21 @@ type ProcessVideoJobResult struct {
 	StorageKey    string
 	FailureReason string
 	// LeaseEpoch is the fence epoch the claim won and this run held
-	// throughout. The caller carries it into its own terminal write.
+	// throughout. The caller carries it into its own terminal write — or,
+	// when Execute returns domain.ErrJobRequeuedForRetry, into its own
+	// release of the lease at this held epoch, since the write already
+	// advanced the stored epoch beyond it.
 	LeaseEpoch int64
-	// Applied reports whether the failure write this use case made is the
-	// one that landed, as opposed to matching a terminal row another actor
-	// had already committed. It is meaningful only when Success is false —
-	// the caller's cleanup of the source object and the idempotency key is
-	// one-shot and rides on it. A successful run makes no terminal write at
+	// Applied reports whether the write this use case made is the one that
+	// landed, as opposed to matching a terminal row another actor had
+	// already committed. It is meaningful when Success is false, and
+	// likewise when Execute returns domain.ErrJobRequeuedForRetry — in both
+	// cases the caller's one-shot cleanup (deleting the source and
+	// idempotency key, or releasing the lease) rides on it. A requeue write
+	// the fence refuses is never reported here as Applied false: it
+	// surfaces as domain.ErrJobFenced instead, because unlike a terminal
+	// write a refused requeue has no matching-outcome case to report — see
+	// RetryVideoJob's own doc. A successful run makes no terminal write at
 	// all; its caller reads CompleteJob's own outcome instead.
 	Applied bool
 	// ExtractionError is the error that caused Success to be false —
@@ -84,8 +105,11 @@ type ProcessVideoJobResult struct {
 }
 
 // ProcessVideoJob runs a VideoJob's start-processing/fetch/extract/store
-// sequence synchronously, in-process, failing the job if any of those steps
-// errors.
+// sequence synchronously, in-process, failing the job if extraction errors —
+// and, for a fetch or store step, retrying it first (see retryOrFail) rather
+// than failing outright, because a fetch or store failure can be the object
+// store having a moment, and a redelivery gains nothing once a terminal
+// state is already committed.
 //
 // It does not enqueue. The pending -> queued transition is the caller's, and
 // it moved there because that transition now writes an outbox row the relay
@@ -137,12 +161,17 @@ type ProcessVideoJobResult struct {
 type ProcessVideoJob struct {
 	start     *StartProcessing
 	fail      *FailJob
+	retry     *RetryVideoJob
 	extractor domain.FrameExtractor
 	sources   domain.SourceStorage
 	results   domain.ResultStorage
 	leases    domain.JobLeaseStore
 	idsFor    domain.VideoJobIDParser
 	newTicker LeaseTickerFunc
+	// sleep is the seam storageRetryPause blocks on, so a test can replace
+	// it with a fast fake rather than waiting out a real pause. Defaults to
+	// time.Sleep.
+	sleep func(time.Duration)
 }
 
 // LeaseTicker is the seam the lease heartbeat ticks on. It exists so a test
@@ -164,6 +193,13 @@ func WithLeaseTicker(newTicker LeaseTickerFunc) ProcessVideoJobOption {
 	return func(uc *ProcessVideoJob) { uc.newTicker = newTicker }
 }
 
+// WithSleepFunc replaces storageRetryPause's blocking call, so a test
+// exercising the transient-storage-retry path does not wait out a real
+// pause.
+func WithSleepFunc(sleep func(time.Duration)) ProcessVideoJobOption {
+	return func(uc *ProcessVideoJob) { uc.sleep = sleep }
+}
+
 type realLeaseTicker struct{ ticker *time.Ticker }
 
 func (t realLeaseTicker) Ticks() <-chan time.Time { return t.ticker.C }
@@ -174,16 +210,22 @@ func newRealLeaseTicker(d time.Duration) LeaseTicker {
 }
 
 // NewProcessVideoJob wires the ProcessVideoJob use case to its dependencies.
-func NewProcessVideoJob(start *StartProcessing, fail *FailJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, idsFor domain.VideoJobIDParser, opts ...ProcessVideoJobOption) *ProcessVideoJob {
+// retry is required, not optional through ProcessVideoJobOption: a
+// composition root that forgot it would nil-panic on the first transient
+// storage failure it happens to hit, at exactly the moment the object store
+// is already unwell.
+func NewProcessVideoJob(start *StartProcessing, fail *FailJob, retry *RetryVideoJob, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, idsFor domain.VideoJobIDParser, opts ...ProcessVideoJobOption) *ProcessVideoJob {
 	uc := &ProcessVideoJob{
 		start:     start,
 		fail:      fail,
+		retry:     retry,
 		extractor: extractor,
 		sources:   sources,
 		results:   results,
 		leases:    leases,
 		idsFor:    idsFor,
 		newTicker: newRealLeaseTicker,
+		sleep:     time.Sleep,
 	}
 	for _, opt := range opts {
 		opt(uc)
@@ -302,7 +344,15 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 		runLog.Error("fetching the source object failed",
 			slog.String("source_key", sourceKey.String()),
 			slog.String("error", err.Error()))
-		return uc.failWith(jobID, epoch, err, fetchFailureReason)
+		// A missing object is not a storage outage a retry could resolve —
+		// this job's source key names nothing under it, and requeueing
+		// would spend the retry budget losing to the identical NotFound
+		// every time. Everything else Get can fail with is a candidate for
+		// retry.
+		if errors.Is(err, domain.ErrSourceNotFound) {
+			return uc.failWith(jobID, epoch, err, fetchFailureReason)
+		}
+		return uc.retryOrFail(jobID, epoch, err, fetchFailureReason)
 	}
 	// Registered before extraction, not after: the extraction-error path
 	// below returns, so a defer set up afterwards would never run and the
@@ -334,7 +384,7 @@ func (uc *ProcessVideoJob) Execute(ctx context.Context, jobID string, sourceKey 
 		runLog.Error("storing the result object failed",
 			slog.String("storage_key", storageKey.String()),
 			slog.String("error", err.Error()))
-		return uc.failWith(jobID, epoch, err, storeFailureReason)
+		return uc.retryOrFail(jobID, epoch, err, storeFailureReason)
 	}
 
 	return ProcessVideoJobResult{
@@ -401,4 +451,48 @@ func (uc *ProcessVideoJob) failWith(jobID string, epoch int64, cause error, reas
 		LeaseEpoch:      epoch,
 		Applied:         failed.Applied,
 	}, nil
+}
+
+// retryOrFail decides how Execute responds to a failed SourceStorage.Get (any
+// cause other than domain.ErrSourceNotFound) or ResultStorage.Put: rather
+// than committing a terminal failure a redelivery can never undo, it returns
+// the claimed job to queued at an advanced epoch through RetryVideoJob — the
+// same processing -> queued edge and epoch fence the recovery sweep uses —
+// bounded by the identical domain.MaxJobRequeues so a storage backend that
+// never recovers still ends the job rather than retrying it forever.
+//
+// Exhausting the bound falls back to the ordinary terminal failure path with
+// the same reason a first failure would have carried, since ultimately the
+// same step — fetch or store — is what could not be made to succeed.
+func (uc *ProcessVideoJob) retryOrFail(jobID string, epoch int64, cause error, reason string) (ProcessVideoJobResult, error) {
+	lg := logger(componentJobProcessing).With(
+		slog.String("job_id", jobID),
+		slog.Int64("lease_epoch", epoch),
+	)
+
+	if epoch >= domain.MaxJobRequeues {
+		lg.Error("the job has exhausted its transient-storage-failure retries; failing it",
+			slog.String("error", cause.Error()))
+		return uc.failWith(jobID, epoch, cause, reason)
+	}
+
+	uc.sleep(storageRetryPause)
+
+	// A detached context, for the same reason failWith uses one: cause may
+	// itself be the result of the request context being canceled, and this
+	// write must still land so the job is not left processing indefinitely.
+	finalizeCtx, cancel := NewFinalizationContext()
+	defer cancel()
+	result, err := uc.retry.Execute(finalizeCtx, jobID, epoch)
+	if err != nil {
+		return ProcessVideoJobResult{JobID: jobID, LeaseEpoch: epoch}, err
+	}
+
+	lg.Warn("a transient object-storage failure returned the job to queued for another attempt",
+		slog.String("error", cause.Error()))
+	return ProcessVideoJobResult{
+		JobID:      jobID,
+		LeaseEpoch: epoch,
+		Applied:    result.Applied,
+	}, fmt.Errorf("%w: %w", domain.ErrJobRequeuedForRetry, cause)
 }

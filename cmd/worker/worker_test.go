@@ -337,11 +337,15 @@ func newWorkerTestEnv(t *testing.T, opts envOptions) *workerTestEnv {
 		process: videoapplication.NewProcessVideoJob(
 			videoapplication.NewStartProcessing(reader, repo, ids),
 			videoapplication.NewFailJob(reader, repo, ids),
+			videoapplication.NewRetryVideoJob(reader, repo, ids),
 			extractor,
 			sources,
 			results,
 			leases,
 			ids,
+			// A test that hits the transient-storage-retry path should not
+			// pay a real storageRetryPause.
+			videoapplication.WithSleepFunc(func(time.Duration) {}),
 		),
 		complete:  videoapplication.NewCompleteJob(reader, repo, ids),
 		fail:      videoapplication.NewFailJob(reader, repo, ids),
