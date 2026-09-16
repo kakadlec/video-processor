@@ -48,13 +48,13 @@ The worker SHALL serve no HTTP route other than the metrics-only listener `servi
 - **WHEN** the worker processes it
 - **THEN** it fetches exactly that key, and does not derive a key from the job's original filename or identifier
 
-### Requirement: Prefetch Is One, and Acknowledgement Follows the Terminal Write
+### Requirement: Prefetch Is One, and Acknowledgement Follows a Committed Transition
 
-The worker SHALL set a consumer prefetch of exactly one unacknowledged message and SHALL acknowledge a message only after the transition that makes its job terminal has been committed.
+The worker SHALL set a consumer prefetch of exactly one unacknowledged message and SHALL acknowledge a message only after a transition that settles its dispatch has been committed: the one that makes its job terminal, or — for a transient object-storage retry — the `processing → queued` transition that commits a fresh dispatch in the same transaction.
 
 Prefetch above one SHALL NOT be configured. The unit of work is a full extraction — seconds to minutes of `ffmpeg`, not microseconds — so buffering buys no throughput. What it costs is availability of the buffered work: a prefetched message is held by this consumer and is not offered to any other, so it waits behind work of unbounded duration while an idle worker elsewhere has nothing to take. The messages themselves are not lost — a prefetched delivery has not been handled, its job is still `queued`, and the broker requeues it when this consumer's connection closes — so the reason for the bound is fairness and latency, not durability.
 
-Acknowledging before the terminal write SHALL NOT be done: a crash between the acknowledgement and the commit destroys the only remaining record that the job needs processing.
+Acknowledging before that commit SHALL NOT be done: a crash between the acknowledgement and the commit destroys the only remaining record that the job needs processing. The retry transition satisfies this for the same reason a terminal write does — once it commits, the outbox row it wrote is that record.
 
 #### Scenario: Only one message is outstanding at a time
 
@@ -408,7 +408,7 @@ The pause SHALL be taken on the consumer's own cancellable context, not on the d
 
 When `ProcessVideoJob` returns the requeued-for-retry sentinel, the worker SHALL acknowledge the message.
 
-This is an acknowledgement rule on its own footing — it selects the consumer's existing `Ack` for a distinct sentinel and adds no disposition value — and not an exception to either of the requirements above, and it SHALL NOT be read as weakening them. The message is not one the worker cannot act on, so dead-lettering it would put a healthy job's history in the place reserved for anomalies; and it is not a message whose outcome the worker failed to learn, so requeueing it would put a second dispatch for the same job on the queue beside the one the retry write already committed. **This delivery is spent because a committed write superseded it**: the row is `queued` at an advanced epoch and a fresh dispatch row exists in the outbox, so the relay, not this message, carries the job forward. The rule that rejection is the default for any failure nobody enumerated SHALL be unaffected — the acknowledgement is keyed on the sentinel alone, and a retry write that failed for any other reason reaches the default.
+This is an acknowledgement rule on its own footing — it selects the consumer's existing `Ack` for a distinct sentinel and adds no disposition value, and it is the non-terminal committed transition the prefetch requirement above names — and not an exception to either the dead-letter or the unknown-claim requirement, and it SHALL NOT be read as weakening them. The message is not one the worker cannot act on, so dead-lettering it would put a healthy job's history in the place reserved for anomalies; and it is not a message whose outcome the worker failed to learn, so requeueing it would put a second dispatch for the same job on the queue beside the one the retry write already committed. **This delivery is spent because a committed write superseded it**: the row is `queued` at an advanced epoch and a fresh dispatch row exists in the outbox, so the relay, not this message, carries the job forward. The rule that rejection is the default for any failure nobody enumerated SHALL be unaffected — the acknowledgement is keyed on the sentinel alone, and a retry write that failed for any other reason reaches the default.
 
 On acknowledging, the worker SHALL release the lease it held only when this run's retry write was the one applied, gated exactly as the failure path gates its cleanup. It SHALL NOT delete the source object and SHALL NOT clear the idempotency key: the next attempt reads the one, and the other, where a reservation was made and has not expired, keeps answering a resubmission of identical content with this job rather than creating a second.
 

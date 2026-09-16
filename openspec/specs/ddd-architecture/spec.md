@@ -62,9 +62,9 @@ The `VideoJob` SHALL be the aggregate root of the Video Processing bounded conte
 
 ### Requirement: Valid State Machine Transitions Only
 
-The `VideoJob` status SHALL only advance through the defined state machine. Undefined transitions SHALL be rejected as domain errors, and backwards transitions SHALL be rejected with **one named exception**: `processing → queued`, the edge by which a job abandoned by a dead worker is returned to the queue for another one (`videojob-lease-recovery`). No other backwards edge SHALL exist; `completed` and `failed` remain terminal, with no outgoing transitions at all.
+The `VideoJob` status SHALL only advance through the defined state machine. Undefined transitions SHALL be rejected as domain errors, and backwards transitions SHALL be rejected with **one named exception**: `processing → queued`, the edge by which a job is returned to the queue for another attempt — either because its worker died (`videojob-lease-recovery`) or because the run holding it met a transient object-storage failure (`videojob-execution`). No other backwards edge SHALL exist; `completed` and `failed` remain terminal, with no outgoing transitions at all.
 
-The exception is deliberately narrow, and its narrowness is the requirement. It exists because a job whose worker died mid-extraction is otherwise unrecoverable — the claim predicate refuses a `processing` row and the broker's redelivery arrives too early to help — and it SHALL NOT be generalised into a retry facility, an operator-triggered re-run, or a way to undo a claim a live worker still holds. Its use is confined to a job whose lease has been observed as lapsed.
+The exception is deliberately narrow, and its narrowness is the requirement. It exists because a job whose worker died mid-extraction is otherwise unrecoverable — the claim predicate refuses a `processing` row and the broker's redelivery arrives too early to help — and because a job whose object store failed for a moment would otherwise be committed `failed` for a fault that was not its own. Its use SHALL be confined to those two callers: the sweeper, for a job whose lease has been observed as lapsed, and the run that holds the job's claim, for a transient object-storage failure, fenced at the epoch that run won. Both SHALL be bounded by the one `domain.MaxJobRequeues` budget the job's epoch counts. It SHALL NOT be generalised into a retry facility for any other failure, an operator-triggered re-run, a way to revive a terminal job, or a way to undo a claim a live worker still holds.
 
 `Enqueue` SHALL additionally require a non-empty source key. That is a precondition on the aggregate rather than an edge in the state machine — a job with no stored source object cannot be processed, so queueing it would record a dispatch no worker could ever act on. `videojob-lifecycle` owns the invariant's full statement, including why it is deliberately absent from `RestoreVideoJob`. The requeue edge SHALL carry the same precondition, for the same reason.
 
@@ -103,6 +103,12 @@ The exception is deliberately narrow, and its narrowness is the requirement. It 
 - **GIVEN** a `VideoJob` in `processing` state whose worker's lease has lapsed
 - **WHEN** the sweeper requeues it
 - **THEN** the job transitions to `queued` and is dispatched again
+
+#### Scenario: A job whose object store failed transiently returns from processing to queued
+
+- **GIVEN** a `VideoJob` in `processing` state whose run could not read its source or store its result because the object store failed, with its requeue budget not spent
+- **WHEN** that run requeues it at the epoch it holds
+- **THEN** the job transitions to `queued` at the next epoch and is dispatched again
 
 #### Scenario: Backwards transition is rejected
 

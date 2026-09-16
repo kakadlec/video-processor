@@ -301,7 +301,7 @@ It SHALL be idempotent under re-execution, like every other migration this repos
 
 The `video_jobs` table SHALL carry a `lease_epoch BIGINT NOT NULL DEFAULT 0` column. Application transitions SHALL generate non-negative values by initializing at zero and incrementing on requeue; the database schema carries no additional `CHECK`, and restoration SHALL accept the stored integer. The column is added additively with no backfill, declared inline for a database created from scratch and applied through `ADD COLUMN IF NOT EXISTS` for one that already exists, exactly as `source_key` and `content_hash` are.
 
-The default SHALL be the correct value for every pre-existing row rather than a placeholder: the epoch counts how many times a job has been returned to the queue after abandonment, and a row written before this column existed has been returned zero times. A `processing` row carrying the default is therefore an ordinary abandonment candidate, which is precisely the backlog this change is meant to recover.
+The default SHALL be the correct value for every pre-existing row rather than a placeholder: the epoch counts how many times a job has been returned to the queue — after abandonment or by a transient object-storage retry — and a row written before this column existed has been returned zero times. A `processing` row carrying the default is therefore an ordinary abandonment candidate, which is precisely the backlog this change is meant to recover.
 
 `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID` SHALL round-trip the value, and `domain.RestoreVideoJob` SHALL accept it. Reconstitution SHALL NOT reject a stored row solely because of a status/epoch pairing. Normal transitions create `pending` only at epoch zero and may reach `queued`, `processing`, or a terminal status at epoch zero or later, but the restoration boundary validates the persisted fields independently rather than inventing a cross-field invariant.
 
@@ -325,9 +325,9 @@ Only the requeue path SHALL advance it. `Create`, `Enqueue`, `Update`, and `Clai
 - **WHEN** it is claimed, then completed
 - **THEN** its stored epoch is the same value it started with
 
-### Requirement: Requeue Persists the Abandonment Transition and Its Event Transactionally
+### Requirement: Requeue Persists the Return-to-Queue Transition and Its Event Transactionally
 
-`domain.VideoJobRepository` SHALL expose a requeue method, and `internal/video/infrastructure/postgres.Repository` SHALL implement it by updating the job's row to `queued`, advancing `lease_epoch` by one, and inserting a `video_job_outbox` row describing that dispatch, **in a single database transaction** — so an abandoned job and the event that re-dispatches it are never observably inconsistent, exactly as `Enqueue` already guarantees for the first dispatch.
+`domain.VideoJobRepository` SHALL expose a requeue method, and `internal/video/infrastructure/postgres.Repository` SHALL implement it by updating the job's row to `queued`, advancing `lease_epoch` by one, and inserting a `video_job_outbox` row describing that dispatch, **in a single database transaction** — so a job returned to the queue, whether abandoned or retried after a transient object-storage failure, and the event that re-dispatches it are never observably inconsistent, exactly as `Enqueue` already guarantees for the first dispatch.
 
 The update SHALL be conditional on the row still being in `processing` status **and** still carrying the epoch its caller observed, and the method SHALL report whether a row was affected. Affecting no row SHALL be reported as a distinct outcome rather than as success or as an error: another sweeper won, or the job has since finished. The whole transaction, including the outbox insert, SHALL be rolled back in that case.
 

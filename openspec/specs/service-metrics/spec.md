@@ -256,7 +256,7 @@ It is accepted on the same ground the readiness transition record is: the reader
 
 ### Requirement: The Metrics Endpoint Is Recorded Like Any Other Route
 
-A request to the metrics endpoint SHALL yield an access record, exactly as a request to any non-probe route does. It SHALL NOT be added to the closed exemption the logging capability grants to the two probe route templates.
+A request to the metrics endpoint of any of the three HTTP services SHALL yield an access record, exactly as a request to any non-probe route does. It SHALL NOT be added to the closed exemption the logging capability grants to the two probe route templates.
 
 The exemption's justification does not transfer. It rests on volume from a prober arriving at a fixed interval forever, and on a replacement record that carries more than the one it removes. Neither holds with the weight the probes carry. The local stack's scraper collects each HTTP service every **15 seconds** — about 5,760 access records a day per service — which is the same order of magnitude as the probe traffic already exempted, so volume alone does not separate the two; but a scrape has no verdict, so there is no transition record to offer in exchange, and extending the closed exemption would remove a record without replacing it with one that says more. There is also a positive reason to record it — it is an unauthenticated request from outside the process whose handler runs every registered collector — on the Video Processing service, a scrape-time query against its database — so its status and duration are the only evidence that a scrape happened and how long collection took.
 
@@ -266,7 +266,7 @@ Conversely, the per-request metric SHALL cover **every** route the router serves
 
 #### Scenario: A scrape is served
 
-- **WHEN** the metrics endpoint is requested
+- **WHEN** the metrics endpoint of one of the three HTTP services is requested
 - **THEN** one access record is emitted for it, in the same format and carrying the same fields as any other served route
 
 #### Scenario: A probe is metered though it is not recorded
