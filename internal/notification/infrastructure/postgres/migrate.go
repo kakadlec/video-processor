@@ -34,9 +34,10 @@ const (
 // startup means a replica that refuses to boot. The lock makes the second one wait and then find the
 // table present.
 //
-// This is deliberately stricter than the identity and video adapters, which
-// take no lock. That is a latent race in those two rather than a reason to
-// copy them.
+// This is deliberately stricter than the identity adapter, which takes no
+// lock. That is a latent race there rather than a reason to copy it.
+// internal/video/infrastructure/postgres's Migrate takes the same kind of
+// lock this one does, under object 2 above.
 //
 // schema.sql holds more than one statement, and PostgreSQL runs a
 // multi-statement string only over the simple query protocol. pgx forces
