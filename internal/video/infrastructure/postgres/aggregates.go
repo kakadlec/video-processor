@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"time"
 )
 
 // InFlightCountBound is where a count saturates, and it is normative here
@@ -51,17 +50,23 @@ func RelayedEventTypes() []string {
 // Aggregate is one entry of a bounded aggregate: a count, and the age of the
 // oldest row behind it.
 //
-// OldestValid is carried rather than inferred from a zero timestamp, because
-// the absence of an age is load-bearing. The collector reading these
+// The age is seconds computed by the database rather than a timestamp
+// subtracted from Go's clock. Both read the same when the two clocks agree,
+// and only this one keeps reading the same when they do not: a gauge derived
+// across two clocks reports a negative age under modest skew, which is a
+// value no age can take and which nothing downstream would think to expect.
+//
+// OldestAgeValid is carried rather than inferred from a zero age, because the
+// absence of an age is load-bearing. The collector reading these
 // distinguishes nothing is waiting from the value could not be computed by
 // emitting a sample in the first case and none in the second, so an empty set
 // has to arrive as a count of zero with no age — not as a missing entry, and
-// not as an age of whenever the zero time is.
+// not as an age of zero, which is what a row written this instant has.
 type Aggregate struct {
-	Key         string
-	Count       int
-	Oldest      time.Time
-	OldestValid bool
+	Key            string
+	Count          int
+	OldestAge      float64
+	OldestAgeValid bool
 }
 
 // Each in-flight state's predicate is written as a literal, one UNION ALL
@@ -72,9 +77,9 @@ type Aggregate struct {
 // partial indexes this change adds.
 //
 // The oldest-age lookup is written as an explicitly ordered single row rather
-// than as min(created_at): the two plan the same way here, and this form says
-// what the index is for at the call site instead of relying on a planner
-// transformation to say it.
+// than as min(created_at), so what the index is for is visible at the call
+// site rather than resting on a planner transformation. Its plan is asserted
+// rather than assumed — see the EXPLAIN test beside this file.
 //
 // The count is taken over a bounded subquery, which is what makes it
 // saturate. The bound is a parameter because it bounds the read rather than
@@ -83,11 +88,11 @@ type Aggregate struct {
 const inFlightAggregateQuery = `
 SELECT 'queued' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_jobs WHERE status = 'queued' LIMIT $1) AS bounded) AS total,
-       (SELECT created_at FROM video_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1) AS oldest
+       (SELECT EXTRACT(EPOCH FROM now() - created_at) FROM video_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1) AS oldest_age
 UNION ALL
 SELECT 'processing' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_jobs WHERE status = 'processing' LIMIT $1) AS bounded) AS total,
-       (SELECT created_at FROM video_jobs WHERE status = 'processing' ORDER BY created_at ASC LIMIT 1) AS oldest`
+       (SELECT EXTRACT(EPOCH FROM now() - created_at) FROM video_jobs WHERE status = 'processing' ORDER BY created_at ASC LIMIT 1) AS oldest_age`
 
 // The outbox aggregate, restricted to the relayed event types by the same
 // device and for the same reason: one literal branch per type, so each is
@@ -96,15 +101,15 @@ SELECT 'processing' AS key,
 const unpublishedOutboxAggregateQuery = `
 SELECT 'video_job.queued.v2' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_job_outbox WHERE event_type = 'video_job.queued.v2' AND published_at IS NULL LIMIT $1) AS bounded) AS total,
-       (SELECT occurred_at FROM video_job_outbox WHERE event_type = 'video_job.queued.v2' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest
+       (SELECT EXTRACT(EPOCH FROM now() - occurred_at) FROM video_job_outbox WHERE event_type = 'video_job.queued.v2' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age
 UNION ALL
 SELECT 'video_job.completed.v1' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_job_outbox WHERE event_type = 'video_job.completed.v1' AND published_at IS NULL LIMIT $1) AS bounded) AS total,
-       (SELECT occurred_at FROM video_job_outbox WHERE event_type = 'video_job.completed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest
+       (SELECT EXTRACT(EPOCH FROM now() - occurred_at) FROM video_job_outbox WHERE event_type = 'video_job.completed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age
 UNION ALL
 SELECT 'video_job.failed.v1' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_job_outbox WHERE event_type = 'video_job.failed.v1' AND published_at IS NULL LIMIT $1) AS bounded) AS total,
-       (SELECT occurred_at FROM video_job_outbox WHERE event_type = 'video_job.failed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest`
+       (SELECT EXTRACT(EPOCH FROM now() - occurred_at) FROM video_job_outbox WHERE event_type = 'video_job.failed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age`
 
 // InFlightJobAggregate reports how many jobs are in each in-flight state and
 // how old the oldest of each is.
@@ -141,13 +146,13 @@ func (r *Repository) aggregate(ctx context.Context, query, what string) ([]Aggre
 	var aggregates []Aggregate
 	for rows.Next() {
 		var (
-			entry  Aggregate
-			oldest sql.NullTime
+			entry Aggregate
+			age   sql.NullFloat64
 		)
-		if err := rows.Scan(&entry.Key, &entry.Count, &oldest); err != nil {
+		if err := rows.Scan(&entry.Key, &entry.Count, &age); err != nil {
 			return nil, fmt.Errorf("video: scan the %s: %w", what, markUnavailable(err))
 		}
-		entry.Oldest, entry.OldestValid = oldest.Time, oldest.Valid
+		entry.OldestAge, entry.OldestAgeValid = age.Float64, age.Valid
 		aggregates = append(aggregates, entry)
 	}
 	if err := rows.Err(); err != nil {

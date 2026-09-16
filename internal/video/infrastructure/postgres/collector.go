@@ -28,13 +28,12 @@ const collectTimeout = 2 * time.Second
 // which is least visible in a level.
 type PipelineCollector struct {
 	repo *Repository
-	now  func() time.Time
 }
 
 // NewPipelineCollector builds the collector over the pool the exposing
 // process already holds.
 func NewPipelineCollector(repo *Repository) *PipelineCollector {
-	return &PipelineCollector{repo: repo, now: time.Now}
+	return &PipelineCollector{repo: repo}
 }
 
 var (
@@ -106,7 +105,6 @@ func (c *PipelineCollector) collectInFlight(ctx context.Context, ch chan<- prome
 		return
 	}
 	byKey := index(entries)
-	now := c.now()
 
 	// One block per member of the closed set, each passing its own label as a
 	// literal. Rendering the key into the label instead would be exactly the
@@ -114,14 +112,14 @@ func (c *PipelineCollector) collectInFlight(ctx context.Context, ch chan<- prome
 	// is what makes it closed in the source rather than in a comment.
 	queued := byKey[InFlightStateQueued]
 	ch <- prometheus.MustNewConstMetric(jobsInStateDesc, prometheus.GaugeValue, float64(queued.Count), "queued")
-	if queued.OldestValid {
-		ch <- prometheus.MustNewConstMetric(oldestJobInStateDesc, prometheus.GaugeValue, now.Sub(queued.Oldest).Seconds(), "queued")
+	if queued.OldestAgeValid {
+		ch <- prometheus.MustNewConstMetric(oldestJobInStateDesc, prometheus.GaugeValue, queued.OldestAge, "queued")
 	}
 
 	processing := byKey[InFlightStateProcessing]
 	ch <- prometheus.MustNewConstMetric(jobsInStateDesc, prometheus.GaugeValue, float64(processing.Count), "processing")
-	if processing.OldestValid {
-		ch <- prometheus.MustNewConstMetric(oldestJobInStateDesc, prometheus.GaugeValue, now.Sub(processing.Oldest).Seconds(), "processing")
+	if processing.OldestAgeValid {
+		ch <- prometheus.MustNewConstMetric(oldestJobInStateDesc, prometheus.GaugeValue, processing.OldestAge, "processing")
 	}
 }
 
@@ -136,24 +134,23 @@ func (c *PipelineCollector) collectOutbox(ctx context.Context, ch chan<- prometh
 		return
 	}
 	byKey := index(entries)
-	now := c.now()
 
 	queued := byKey[videoJobQueuedEventType]
 	ch <- prometheus.MustNewConstMetric(unpublishedOutboxDesc, prometheus.GaugeValue, float64(queued.Count), "video_job.queued.v2")
-	if queued.OldestValid {
-		ch <- prometheus.MustNewConstMetric(oldestUnpublishedOutboxDesc, prometheus.GaugeValue, now.Sub(queued.Oldest).Seconds(), "video_job.queued.v2")
+	if queued.OldestAgeValid {
+		ch <- prometheus.MustNewConstMetric(oldestUnpublishedOutboxDesc, prometheus.GaugeValue, queued.OldestAge, "video_job.queued.v2")
 	}
 
 	completed := byKey[videoJobCompletedEventType]
 	ch <- prometheus.MustNewConstMetric(unpublishedOutboxDesc, prometheus.GaugeValue, float64(completed.Count), "video_job.completed.v1")
-	if completed.OldestValid {
-		ch <- prometheus.MustNewConstMetric(oldestUnpublishedOutboxDesc, prometheus.GaugeValue, now.Sub(completed.Oldest).Seconds(), "video_job.completed.v1")
+	if completed.OldestAgeValid {
+		ch <- prometheus.MustNewConstMetric(oldestUnpublishedOutboxDesc, prometheus.GaugeValue, completed.OldestAge, "video_job.completed.v1")
 	}
 
 	failed := byKey[videoJobFailedEventType]
 	ch <- prometheus.MustNewConstMetric(unpublishedOutboxDesc, prometheus.GaugeValue, float64(failed.Count), "video_job.failed.v1")
-	if failed.OldestValid {
-		ch <- prometheus.MustNewConstMetric(oldestUnpublishedOutboxDesc, prometheus.GaugeValue, now.Sub(failed.Oldest).Seconds(), "video_job.failed.v1")
+	if failed.OldestAgeValid {
+		ch <- prometheus.MustNewConstMetric(oldestUnpublishedOutboxDesc, prometheus.GaugeValue, failed.OldestAge, "video_job.failed.v1")
 	}
 }
 
