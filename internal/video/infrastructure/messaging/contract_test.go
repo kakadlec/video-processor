@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"testing"
-	"time"
 
 	"video-processor/internal/platform/rabbitmq"
 	"video-processor/internal/video/domain"
@@ -44,8 +43,7 @@ func TestJobQueuedMessageDecodesTheOutboxPayload(t *testing.T) {
 	}
 	const contentHash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 
-	createdAt := time.Now().UTC().Truncate(time.Microsecond)
-	job, err := domain.NewVideoJob(ids, userID, filename, sourceKey, contentHash, createdAt)
+	job, err := domain.NewVideoJob(ids, userID, filename, sourceKey, contentHash)
 	if err != nil {
 		t.Fatalf("NewVideoJob: %v", err)
 	}
@@ -264,7 +262,7 @@ func seedProcessingJob(t *testing.T, repo *postgres.Repository, ids domain.Video
 		t.Fatalf("NewStorageKey: %v", err)
 	}
 
-	job, err := domain.NewVideoJob(ids, userID, filename, sourceKey, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", time.Now().UTC().Truncate(time.Microsecond))
+	job, err := domain.NewVideoJob(ids, userID, filename, sourceKey, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
 	if err != nil {
 		t.Fatalf("NewVideoJob: %v", err)
 	}

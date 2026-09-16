@@ -63,7 +63,20 @@ func (r *fakeVideoJobRepository) Create(_ context.Context, job *domain.VideoJob)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.byID[job.ID().String()] = cloneVideoJob(job)
+	stored := job
+	// Mirrors the real adapter: domain.NewVideoJob leaves CreatedAt zero and
+	// PostgreSQL mints it on Create, so a job arriving here with a zero
+	// CreatedAt is stamped rather than stored as the caller built it. A job
+	// restored with an explicit CreatedAt (most tests seed state this way,
+	// bypassing NewVideoJob) is stored unchanged.
+	if job.CreatedAt().IsZero() {
+		minted, err := domain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), time.Now(), job.LeaseEpoch())
+		if err != nil {
+			return err
+		}
+		stored = minted
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(stored)
 	return nil
 }
 
@@ -410,15 +423,6 @@ func (f fakeVideoJobIDParser) ParseVideoJobID(value string) (domain.VideoJobID, 
 		return domain.VideoJobID{}, f.err
 	}
 	return domain.NewVideoJobID(value)
-}
-
-// fakeClock always returns the same pre-set time, for deterministic assertions.
-type fakeClock struct {
-	now time.Time
-}
-
-func (f fakeClock) Now() time.Time {
-	return f.now
 }
 
 // fakeResultStorage is an in-memory domain.ResultStorage for use-case tests,

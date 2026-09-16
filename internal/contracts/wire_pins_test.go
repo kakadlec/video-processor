@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	notificationdomain "video-processor/internal/notification/domain"
 	notificationmessaging "video-processor/internal/notification/infrastructure/messaging"
@@ -241,7 +240,7 @@ func seedProcessingVideoJob(t *testing.T, repo *videopostgres.Repository, ids vi
 	}
 
 	job, err := videodomain.NewVideoJob(ids, userID, filename, sourceKey,
-		"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", time.Now().UTC().Truncate(time.Microsecond))
+		"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
 	if err != nil {
 		t.Fatalf("NewVideoJob: %v", err)
 	}

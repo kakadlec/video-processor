@@ -100,11 +100,19 @@ type VideoJob struct {
 // NewVideoJob creates a brand-new VideoJob, minting its VideoJobID through
 // the supplied generator. It always produces status pending, FrameCount 0,
 // an empty ErrorReason, and an unset StorageKey.
-func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, sourceKey StorageKey, contentHash string, createdAt time.Time) (*VideoJob, error) {
+//
+// CreatedAt is left zero rather than taken from a caller-supplied clock:
+// PostgreSQL mints it when Repository.Create persists the row, and the
+// caller learns the real value by reading the row back (see
+// application.CreateVideoJob.Execute). A domain-side timestamp here would
+// only ever be overwritten, and comparing it against PostgreSQL's own now()
+// anywhere in this context is exactly the two-clock problem this design
+// avoids.
+func NewVideoJob(generator VideoJobIDGenerator, userID UserID, filename OriginalFilename, sourceKey StorageKey, contentHash string) (*VideoJob, error) {
 	if generator == nil {
 		return nil, ErrVideoJobIDGeneratorRequired
 	}
-	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, contentHash, StorageKey{}, 0, "", JobStatusPending, createdAt, 0)
+	return RestoreVideoJob(generator.NewVideoJobID(), userID, filename, sourceKey, contentHash, StorageKey{}, 0, "", JobStatusPending, time.Time{}, 0)
 }
 
 // RestoreVideoJob reconstructs a VideoJob from already-known, already-validated values, e.g. from storage.

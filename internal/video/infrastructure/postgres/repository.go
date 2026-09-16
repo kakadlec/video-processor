@@ -109,25 +109,48 @@ type videoJobFailedPayload struct {
 	OccurredAt  time.Time `json:"occurred_at"`
 }
 
-// Create persists a new VideoJob and, in the same transaction, an outbox row
-// describing its creation — the two are never observably inconsistent.
-func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
-	payload, err := json.Marshal(videoJobCreatedPayload{
-		Type:             videoJobCreatedEventType,
-		JobID:            job.ID().String(),
-		UserID:           job.UserID().String(),
-		OriginalFilename: job.OriginalFilename().String(),
-		OccurredAt:       job.CreatedAt(),
-	})
-	if err != nil {
-		return fmt.Errorf("video: marshal outbox payload: %w", err)
+// transactionNow returns PostgreSQL's own transaction_timestamp() — the
+// instant every statement in tx agrees on for the transaction's whole
+// lifetime — so a caller that needs the same instant in a JSON payload and
+// in a column gets one value from one authority instead of computing it
+// twice or racing a second round trip against the write it accompanies.
+//
+// It is why nothing in this package calls time.Now() any more: PostgreSQL,
+// not this process, mints created_at and occurred_at. See docs/roadmap.md's
+// mint-videojob-timestamps-in-database entry.
+func transactionNow(ctx context.Context, tx *sql.Tx) (time.Time, error) {
+	var now time.Time
+	if err := tx.QueryRowContext(ctx, "SELECT now()").Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("video: read transaction timestamp: %w", markUnavailable(err))
 	}
+	return now.UTC(), nil
+}
 
+// Create persists a new VideoJob and, in the same transaction, an outbox row
+// describing its creation — the two are never observably inconsistent, and
+// both carry the same PostgreSQL-minted instant as the row's created_at.
+func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("video: begin create transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	createdAt, err := transactionNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	payload, err := json.Marshal(videoJobCreatedPayload{
+		Type:             videoJobCreatedEventType,
+		JobID:            job.ID().String(),
+		UserID:           job.UserID().String(),
+		OriginalFilename: job.OriginalFilename().String(),
+		OccurredAt:       createdAt,
+	})
+	if err != nil {
+		return fmt.Errorf("video: marshal outbox payload: %w", err)
+	}
 
 	const insertJob = `
 		INSERT INTO video_jobs (id, user_id, original_filename, status, frame_count, error_reason, source_key, content_hash, storage_key, created_at, lease_epoch)
@@ -143,23 +166,14 @@ func (r *Repository) Create(ctx context.Context, job *domain.VideoJob) error {
 		job.SourceKey().String(),
 		job.ContentHash(),
 		job.StorageKey().String(),
-		job.CreatedAt(),
+		createdAt,
 		job.LeaseEpoch(),
 	); err != nil {
 		return fmt.Errorf("video: create video job: %w", markUnavailable(err))
 	}
 
-	const insertOutbox = `
-		INSERT INTO video_job_outbox (id, event_type, payload, occurred_at)
-		VALUES ($1, $2, $3, $4)
-	`
-	if _, err := tx.ExecContext(ctx, insertOutbox,
-		uuid.NewString(),
-		videoJobCreatedEventType,
-		payload,
-		job.CreatedAt(),
-	); err != nil {
-		return fmt.Errorf("video: record outbox event: %w", markUnavailable(err))
+	if err := insertOutboxEvent(ctx, tx, videoJobCreatedEventType, payload, createdAt); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -303,17 +317,12 @@ const updateTerminalJobStatement = `
 // Zero rows affected has three readings, told apart by a follow-up lookup the
 // way ClaimForProcessing already tells a lost claim from an unknown job.
 func (r *Repository) Update(ctx context.Context, job *domain.VideoJob, epoch int64) (bool, error) {
-	// Truncated to the precision PostgreSQL stores, so the instant in the
-	// payload and the instant in the row's occurred_at column are the same
-	// value rather than one rounded copy of the other. A consumer correlating
-	// the two would otherwise see them disagree in the last three digits.
-	occurredAt := time.Now().UTC().Truncate(time.Microsecond)
-	eventType, payload, err := marshalTerminalOutboxPayload(job, occurredAt)
+	eventType, err := terminalEventType(job)
 	if err != nil {
 		return false, err
 	}
 
-	applied, err := r.writeTerminalOutcome(ctx, job, epoch, eventType, payload, occurredAt)
+	applied, err := r.writeTerminalOutcome(ctx, job, epoch, eventType)
 	if err != nil {
 		return false, err
 	}
@@ -329,12 +338,25 @@ func (r *Repository) Update(ctx context.Context, job *domain.VideoJob, epoch int
 // writeTerminalOutcome runs the fenced statement and, only when it affected a
 // row, the outbox insert alongside it. Affecting no row rolls the whole thing
 // back and reports that to Update, which classifies the refusal.
-func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.VideoJob, epoch int64, eventType string, payload []byte, occurredAt time.Time) (bool, error) {
+//
+// occurredAt is read from the transaction itself (see transactionNow) after
+// BeginTx, before the payload is built — the payload embeds it inline, so it
+// has to exist before the INSERT that carries both, not after.
+func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.VideoJob, epoch int64, eventType string) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("video: begin terminal update transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	occurredAt, err := transactionNow(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	payload, err := marshalTerminalOutboxPayload(job, eventType, occurredAt)
+	if err != nil {
+		return false, err
+	}
 
 	result, err := tx.ExecContext(ctx, updateTerminalJobStatement,
 		string(job.Status()),
@@ -366,23 +388,33 @@ func (r *Repository) writeTerminalOutcome(ctx context.Context, job *domain.Video
 	return true, nil
 }
 
-// marshalTerminalOutboxPayload selects the event type and payload shape from
-// the job's own status, generating occurred_at once so the payload's field
-// and the row's column carry the same instant.
-//
-// A status that is neither completed nor failed is refused here, before any
-// statement runs. The fenced statement's status = processing conjunct would
-// stop such a write anyway, but it would stop it as a fence — reporting a
-// lost race for what is a caller defect, and doing so only after a round
-// trip.
-func marshalTerminalOutboxPayload(job *domain.VideoJob, occurredAt time.Time) (string, []byte, error) {
-	var (
-		eventType string
-		body      any
-	)
+// terminalEventType selects the outbox event type from job's own status,
+// refusing any status that is not terminal before any statement runs. The
+// fenced statement's status = processing conjunct would stop such a write
+// anyway, but it would stop it as a fence — reporting a lost race for what
+// is a caller defect, and doing so only after a round trip. Splitting this
+// out of payload construction is what lets Update reject a caller defect
+// before opening a transaction, while the payload itself still needs a
+// transaction open to learn occurred_at.
+func terminalEventType(job *domain.VideoJob) (string, error) {
 	switch job.Status() {
 	case domain.JobStatusCompleted:
-		eventType = videoJobCompletedEventType
+		return videoJobCompletedEventType, nil
+	case domain.JobStatusFailed:
+		return videoJobFailedEventType, nil
+	default:
+		return "", fmt.Errorf("video: update video job: %q is not a terminal status", job.Status())
+	}
+}
+
+// marshalTerminalOutboxPayload builds the payload for eventType (already
+// validated by terminalEventType), embedding occurredAt so the payload's
+// field and the row's occurred_at column carry the same PostgreSQL-minted
+// instant.
+func marshalTerminalOutboxPayload(job *domain.VideoJob, eventType string, occurredAt time.Time) ([]byte, error) {
+	var body any
+	switch eventType {
+	case videoJobCompletedEventType:
 		body = videoJobCompletedPayload{
 			Type:       videoJobCompletedEventType,
 			JobID:      job.ID().String(),
@@ -391,8 +423,7 @@ func marshalTerminalOutboxPayload(job *domain.VideoJob, occurredAt time.Time) (s
 			StorageKey: job.StorageKey().String(),
 			OccurredAt: occurredAt,
 		}
-	case domain.JobStatusFailed:
-		eventType = videoJobFailedEventType
+	case videoJobFailedEventType:
 		body = videoJobFailedPayload{
 			Type:        videoJobFailedEventType,
 			JobID:       job.ID().String(),
@@ -401,14 +432,14 @@ func marshalTerminalOutboxPayload(job *domain.VideoJob, occurredAt time.Time) (s
 			OccurredAt:  occurredAt,
 		}
 	default:
-		return "", nil, fmt.Errorf("video: update video job: %q is not a terminal status", job.Status())
+		return nil, fmt.Errorf("video: marshal outbox payload: %q is not a terminal event type", eventType)
 	}
 
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", nil, fmt.Errorf("video: marshal outbox payload: %w", err)
+		return nil, fmt.Errorf("video: marshal outbox payload: %w", err)
 	}
-	return eventType, payload, nil
+	return payload, nil
 }
 
 // classifyRefusedUpdate reads the row Update could not write and decides what
@@ -475,19 +506,24 @@ func isTerminalStatus(status domain.JobStatus) bool {
 //
 // occurred_at is the moment of the enqueue, not job.CreatedAt(): the outbox
 // is ordered by it, and reusing the creation timestamp would place a job
-// enqueued long after it was created behind rows that were queued first.
+// enqueued long after it was created behind rows that were queued first. It
+// is PostgreSQL's own transaction timestamp (see transactionNow), fetched
+// after BeginTx and before the payload is built.
 func (r *Repository) Enqueue(ctx context.Context, job *domain.VideoJob) error {
-	occurredAt := time.Now().UTC()
-	payload, err := marshalQueuedOutboxPayload(job, occurredAt)
-	if err != nil {
-		return err
-	}
-
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("video: begin enqueue transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	occurredAt, err := transactionNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	payload, err := marshalQueuedOutboxPayload(job, occurredAt)
+	if err != nil {
+		return err
+	}
 
 	if _, err := tx.ExecContext(ctx, enqueueJobStatement,
 		string(job.Status()),
@@ -561,17 +597,20 @@ func insertOutboxEvent(ctx context.Context, tx *sql.Tx, eventType string, payloa
 // the previous holder's terminal write names the old epoch and can no longer
 // apply.
 func (r *Repository) Requeue(ctx context.Context, job *domain.VideoJob, observedEpoch int64) (bool, error) {
-	occurredAt := time.Now().UTC()
-	payload, err := marshalQueuedOutboxPayload(job, occurredAt)
-	if err != nil {
-		return false, err
-	}
-
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("video: begin requeue transaction: %w", markUnavailable(err))
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	occurredAt, err := transactionNow(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	payload, err := marshalQueuedOutboxPayload(job, occurredAt)
+	if err != nil {
+		return false, err
+	}
 
 	const requeueStatement = `
 		UPDATE video_jobs

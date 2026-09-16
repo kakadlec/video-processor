@@ -16,13 +16,14 @@ func TestCreateVideoJob_Execute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
-	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id}, fakeClock{now: now})
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id})
 
+	before := time.Now()
 	result, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
 		UserID:           "user-1",
 		OriginalFilename: "movie.mp4",
 	})
+	after := time.Now()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -32,8 +33,12 @@ func TestCreateVideoJob_Execute(t *testing.T) {
 	if result.Status != string(domain.JobStatusPending) {
 		t.Fatalf("Status = %q, want %q", result.Status, domain.JobStatusPending)
 	}
-	if !result.CreatedAt.Equal(now) {
-		t.Fatalf("CreatedAt = %v, want %v", result.CreatedAt, now)
+	// CreatedAt comes from fakeVideoJobRepository.Create's own mint — which
+	// stands in for PostgreSQL's — not from a clock this use case holds, so
+	// the assertion is that it is a real, recent timestamp rather than a
+	// specific one this test dictated.
+	if result.CreatedAt.Before(before) || result.CreatedAt.After(after) {
+		t.Fatalf("CreatedAt = %v, want between %v and %v", result.CreatedAt, before, after)
 	}
 
 	userID, err := domain.NewUserID("user-1")
@@ -58,7 +63,7 @@ func TestCreateVideoJob_Execute(t *testing.T) {
 func TestCreateVideoJob_InvalidOriginalFilename(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id}, fakeClock{now: time.Now()})
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id})
 
 	_, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
 		UserID:           "user-1",
@@ -72,7 +77,7 @@ func TestCreateVideoJob_InvalidOriginalFilename(t *testing.T) {
 func TestCreateVideoJob_InvalidUserID(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id}, fakeClock{now: time.Now()})
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id})
 
 	_, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
 		UserID:           "",
@@ -96,7 +101,7 @@ func TestCreateVideoJob_RepositoryFailure_IsPropagated(t *testing.T) {
 	repoErr := errors.New("boom")
 	repo := &failingCreateRepository{fakeVideoJobRepository: newFakeVideoJobRepository(), err: repoErr}
 	id, _ := domain.NewVideoJobID("3fa85f64-5717-4562-b3fc-2c963f66afa6")
-	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id}, fakeClock{now: time.Now()})
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: id})
 
 	_, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
 		UserID:           "user-1",
@@ -111,7 +116,7 @@ func TestCreateVideoJob_RepositoryFailure_IsPropagated(t *testing.T) {
 // supplies and the worker cannot reconstruct.
 func TestCreateVideoJob_RoundTripsSourceKey(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: newTestVideoJobID(t, "job-1")}, fakeClock{now: time.Now()})
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: newTestVideoJobID(t, "job-1")})
 
 	sourceKey := domain.SourceStorageKey("upload-1", "movie.mp4")
 	if _, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
@@ -140,7 +145,7 @@ func TestCreateVideoJob_RoundTripsSourceKey(t *testing.T) {
 // which creates a job from a filename with no stored object at all.
 func TestCreateVideoJob_EmptySourceKeyIsValid(t *testing.T) {
 	repo := newFakeVideoJobRepository()
-	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: newTestVideoJobID(t, "job-1")}, fakeClock{now: time.Now()})
+	uc := application.NewCreateVideoJob(repo, fakeVideoJobIDGenerator{id: newTestVideoJobID(t, "job-1")})
 
 	if _, err := uc.Execute(context.Background(), application.CreateVideoJobInput{
 		UserID:           "user-1",
