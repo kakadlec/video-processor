@@ -15,9 +15,10 @@ var schemaSQL string
 // purpose every context shares, the object names the context.
 //
 // 0x46494158 is "FIAX" in ASCII, distinctive enough not to collide with
-// another application sharing the server. Nothing else in this repository
-// takes an advisory lock today; a second context adding one takes a new
-// object id under the same class, and this comment is the registry.
+// another application sharing the server. internal/video/infrastructure/postgres's
+// Migrate shares this class under object 2; a further context adding one
+// takes the next object id under the same class, and this comment plus
+// video's own are the registry.
 const (
 	schemaMigrationLockClass  = 0x46494158
 	notificationSchemaLockObj = 1
