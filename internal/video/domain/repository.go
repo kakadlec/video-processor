@@ -76,6 +76,31 @@ var ErrRepositoryUnavailable = errors.New("video: repository unavailable")
 // errors.Is, which only works while they stay disjoint.
 var ErrJobFenced = errors.New("video: video job fenced")
 
+// ErrJobRequeuedForRetry reports that a run returned its claimed job to
+// queued after a transient object-storage failure (SourceStorage.Get or
+// ResultStorage.Put), rather than committing a terminal failure. It is
+// returned by ProcessVideoJob.Execute wrapping the storage error that caused
+// it, so a caller can still log or classify the cause with errors.Is/As.
+//
+// It is deliberately not ErrJobFenced: nothing took this job away, and the
+// caller who wrote the requeue is the same one reporting it. It is not a
+// dead-letter condition either — see cmd/worker's handle, which acknowledges
+// the current dispatch because the requeue's own outbox row already
+// announces a fresh one.
+var ErrJobRequeuedForRetry = errors.New("video: video job requeued for retry")
+
+// MaxJobRequeues bounds how many times a job may walk the processing ->
+// queued edge (VideoJob.Requeue, VideoJobRepository.Requeue) before whatever
+// is requeueing it gives up and fails the job instead.
+//
+// It is one bound shared by every caller of that edge — the recovery sweep
+// confirming an abandoned lease (cmd/worker/sweeper.go), and
+// ProcessVideoJob's own retry of a transient object-storage failure — because
+// both act on the same fence, VideoJob's lease_epoch. A job cannot be allowed
+// more attempts by one caller than by the other without the two callers
+// racing to different conclusions about how many chances a job has left.
+const MaxJobRequeues = 3
+
 // VideoJobRepository is the persistence port for the VideoJob aggregate.
 // FindByUserID orders results by CreatedAt descending, with VideoJobID as a
 // tie-breaker for equal CreatedAt values. Callers pass already-validated

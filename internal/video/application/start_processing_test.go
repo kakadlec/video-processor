@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"video-processor/internal/video/application"
 	"video-processor/internal/video/domain"
@@ -20,6 +21,41 @@ func newQueuedRepoJob(t *testing.T, repo *fakeVideoJobRepository, jobID, userID 
 	job := newPendingRepoJob(t, repo, jobID, userID)
 	if err := job.Enqueue(); err != nil {
 		t.Fatalf("unexpected error enqueuing job: %v", err)
+	}
+	repo.seed(job)
+	return job
+}
+
+// claimRepoJob runs the real StartProcessing use case against repo's own
+// queued row and returns the epoch its claim won. It exists so a test that
+// needs a genuinely processing row — not merely one whose in-memory pointer
+// was transitioned without ever reaching the repository's own conditional
+// write — gets one the same way any real caller does.
+func claimRepoJob(t *testing.T, repo *fakeVideoJobRepository, jobID string) int64 {
+	t.Helper()
+	claim, err := application.NewStartProcessing(repo, repo, fakeVideoJobIDParser{}).Execute(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("claim %s: %v", jobID, err)
+	}
+	return claim.LeaseEpoch
+}
+
+// newQueuedRepoJobAtEpoch persists a queued job that has already been
+// requeued epoch times, standing in for a job about to be claimed for
+// another attempt after that many prior recoveries or storage retries. It is
+// built through domain.RestoreVideoJob directly, bypassing Enqueue/Requeue,
+// because there is no transition sequence that reaches a nonzero epoch
+// without also visiting processing in between, which would leave the row in
+// the wrong status for this helper's one purpose: seeding a bound test.
+func newQueuedRepoJobAtEpoch(t *testing.T, repo *fakeVideoJobRepository, jobID, userID string, epoch int64) *domain.VideoJob {
+	t.Helper()
+	filename, err := domain.NewOriginalFilename("movie.mp4")
+	if err != nil {
+		t.Fatalf("unexpected error building filename: %v", err)
+	}
+	job, err := domain.RestoreVideoJob(newTestVideoJobID(t, jobID), newTestVideoUserID(t, userID), filename, testSourceKey(t), "", domain.StorageKey{}, 0, "", domain.JobStatusQueued, time.Now(), epoch)
+	if err != nil {
+		t.Fatalf("unexpected error building job: %v", err)
 	}
 	repo.seed(job)
 	return job

@@ -12,16 +12,20 @@ import (
 // the same reasoning as the lease TTL and the status cache's entry TTL: these
 // are correctness margins, not deployment preferences.
 //
-// sweepInterval is how often the scan runs, sweepBatchSize how many
-// processing rows one cycle examines, and maxRequeues how many times a single
-// job may be re-dispatched before the sweep gives up on it. The bound is what
-// keeps an input that reliably kills its worker — one that exhausts memory,
-// say — from being re-dispatched forever and taking down each replica in
-// turn.
+// sweepInterval is how often the scan runs and sweepBatchSize how many
+// processing rows one cycle examines. maxRequeues — how many times a single
+// job may be re-dispatched before the sweep gives up on it — is
+// videodomain.MaxJobRequeues under its own name here rather than a second
+// literal 3: ProcessVideoJob's own retry of a transient object-storage
+// failure walks the identical processing -> queued edge and must be bounded
+// by the same number, or the two callers would disagree about how many
+// chances a job has left. The bound is what keeps an input that reliably
+// kills its worker — one that exhausts memory, say — from being re-dispatched
+// forever and taking down each replica in turn.
 const (
 	sweepInterval  = 60 * time.Second
 	sweepBatchSize = 50
-	maxRequeues    = 3
+	maxRequeues    = videodomain.MaxJobRequeues
 )
 
 // sweeper returns jobs abandoned by a dead worker to the queue, and fails the
