@@ -55,7 +55,7 @@ func TestRepository_Enqueue_StillDispatchesAfterTheStatementSplit(t *testing.T) 
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("Create: %v", err)
 	}

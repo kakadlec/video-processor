@@ -68,7 +68,7 @@ func TestAnUnreachableDatabaseCarriesTheUnavailabilitySentinel(t *testing.T) {
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 
 	if _, err := repo.FindByID(ctx, job.ID()); !errors.Is(err, domain.ErrRepositoryUnavailable) {
 		t.Errorf("FindByID: expected the unavailability sentinel, got %v", err)
@@ -114,7 +114,7 @@ func TestAConnectionRefusedByTheServerIsNotUnavailability(t *testing.T) {
 	}
 
 	ids := idgen.New()
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 
 	for name, tc := range cases {
 		db, err := postgres.Open(postgres.Config{DSN: tc.dsn})
@@ -157,7 +157,7 @@ func TestACancelledContextIsNotUnavailability(t *testing.T) {
 	db := testDB(t)
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -216,7 +216,7 @@ func TestAServerAnsweredRefusalIsNotUnavailability(t *testing.T) {
 
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 
 	_, findErr := repo.FindByID(ctx, job.ID())
 	if findErr == nil {
@@ -294,7 +294,7 @@ func TestAnUnknownIDIsNotUnavailability(t *testing.T) {
 
 	// The same ordering on the claim step's existence probe, which is its
 	// own statement and its own wrap site.
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 	_, _, claimErr := repo.ClaimForProcessing(ctx, job)
 	if !errors.Is(claimErr, domain.ErrVideoJobNotFound) {
 		t.Fatalf("expected ErrVideoJobNotFound from the claim probe, got %v", claimErr)

@@ -221,7 +221,19 @@ func cloneVideoJob(job *videodomain.VideoJob) *videodomain.VideoJob {
 func (r *inMemoryVideoJobRepository) Create(_ context.Context, job *videodomain.VideoJob) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.byID[job.ID().String()] = cloneVideoJob(job)
+
+	stored := job
+	// Mirrors the real adapter: domain.NewVideoJob leaves CreatedAt zero and
+	// PostgreSQL mints it on Create, so a job arriving here with a zero
+	// CreatedAt is stamped rather than stored as the caller built it.
+	if job.CreatedAt().IsZero() {
+		minted, err := videodomain.RestoreVideoJob(job.ID(), job.UserID(), job.OriginalFilename(), job.SourceKey(), job.ContentHash(), job.StorageKey(), job.FrameCount(), job.ErrorReason(), job.Status(), time.Now(), job.LeaseEpoch())
+		if err != nil {
+			return err
+		}
+		stored = minted
+	}
+	r.byID[job.ID().String()] = cloneVideoJob(stored)
 	return nil
 }
 
@@ -555,7 +567,7 @@ func newTestVideoModuleWithBothStorages(t *testing.T) (*videoModule, *inMemoryVi
 	ids := videoidgen.New()
 	sources, results := newTestStorages(t)
 	module := newVideoModule(
-		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewCreateVideoJob(repo, ids),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
@@ -968,7 +980,7 @@ func newIdempotencyTestVideoModule() (*videoModule, *fakeIdempotencyStore, *inMe
 	ids := videoidgen.New()
 	store := newFakeIdempotencyStore()
 	module := newVideoModule(
-		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewCreateVideoJob(repo, ids),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
@@ -1008,7 +1020,7 @@ func newIdempotencyTestVideoModuleWithRepoAndStorage(repo videodomain.VideoJobRe
 	ids := videoidgen.New()
 	store := newFakeIdempotencyStore()
 	module := newVideoModule(
-		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewCreateVideoJob(repo, ids),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
@@ -1689,7 +1701,7 @@ func startSourceStorageTestServer(t *testing.T) (srv *httptest.Server, token, us
 	ids := videoidgen.New()
 	sources, results, inspector := newTestStoragesWithInspector(t)
 	module = newVideoModule(
-		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewCreateVideoJob(repo, ids),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
@@ -1761,7 +1773,7 @@ func newEnqueueTestVideoModule() (*videoModule, *fakeIdempotencyStore, *inMemory
 	ids := videoidgen.New()
 	store := newFakeIdempotencyStore()
 	module := newVideoModule(
-		videoapplication.NewCreateVideoJob(repo, ids, systemClock{}),
+		videoapplication.NewCreateVideoJob(repo, ids),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
