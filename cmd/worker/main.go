@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -98,6 +99,20 @@ func main() {
 
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
+
+	// The one HTTP surface this process is permitted (see
+	// http_surface_test.go): unauthenticated GET /metrics on a port neither
+	// the gateway proxies nor docker-compose.yml publishes to the host, so it
+	// is reachable only from inside the compose network. Bound before run so
+	// a listener failure is fatal at startup rather than a silently-missing
+	// scrape target for the rest of the process's life.
+	metricsListener, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		logger(componentProcessStartup).Error("the metrics listener could not be bound",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	go serveMetrics(signalCtx, newMetricsServer(), metricsListener)
 
 	run(signalCtx, deps, videomessaging.JobDispatchTopology(), drainTimeout, sweepInterval)
 
@@ -421,6 +436,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	if err != nil {
 		logger(componentJobDispatch).Error("the dispatch could not be decoded; dead-lettering",
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("undecodable_dispatch", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -429,6 +445,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		logger(componentJobDispatch).Error("the dispatch names no source object; dead-lettering",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("missing_source_key", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -443,15 +460,18 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		// other consumer is very likely reading right now.
 		logger(componentJobDispatch).Error("the job was already claimed; dropping the duplicate dispatch",
 			slog.String("job_id", msg.JobID))
+		dispatchOutcomes.WithLabelValues("claim_lost", "reject").Inc()
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrJobClaimOutcomeUnknown):
 		logger(componentJobDispatch).Warn("the claim outcome could not be learned; requeueing",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("claim_outcome_unknown", "requeue").Inc()
 		return videomessaging.Requeue
 	case errors.Is(err, videodomain.ErrVideoJobNotFound):
 		logger(componentJobDispatch).Error("the dispatch names an unknown job; dead-lettering",
 			slog.String("job_id", msg.JobID))
+		dispatchOutcomes.WithLabelValues("job_not_found", "reject").Inc()
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrJobFenced):
 		// This run was taken over while it was working: the sweep decided
@@ -467,6 +487,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			slog.String("job_id", msg.JobID),
 			slog.Int64("lease_epoch", result.LeaseEpoch),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("fenced_before_completion", "reject").Inc()
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrJobRequeuedForRetry):
 		// The row is queued again at an advanced epoch and a fresh dispatch
@@ -482,6 +503,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		if result.Applied {
 			d.releaseLease(ctx, msg.JobID, result.LeaseEpoch)
 		}
+		dispatchOutcomes.WithLabelValues("requeued_for_retry", "ack").Inc()
 		return videomessaging.Ack
 	case err != nil:
 		// No terminal state was committed. Before a claim — a malformed
@@ -495,6 +517,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		logger(componentJobDispatch).Error("the job did not reach a terminal state; dead-lettering",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("processing_error", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -513,6 +536,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			d.deleteSource(ctx, msg.JobID, sourceKey)
 			d.clearIdempotencyKey(ctx, msg.JobID)
 		}
+		dispatchOutcomes.WithLabelValues("failed", "ack").Inc()
 		return videomessaging.Ack
 	}
 
@@ -523,6 +547,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 				slog.String("storage_key", result.StorageKey),
 				slog.Int64("lease_epoch", result.LeaseEpoch),
 				slog.String("error", err.Error()))
+			dispatchOutcomes.WithLabelValues("fenced_after_completion", "reject").Inc()
 			return videomessaging.Reject
 		}
 		// The artifact is stored and the row still says `processing`. Both
@@ -535,6 +560,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			slog.String("job_id", msg.JobID),
 			slog.String("storage_key", result.StorageKey),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("completion_not_recorded", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -548,6 +574,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		slog.String("job_id", msg.JobID),
 		slog.String("storage_key", result.StorageKey),
 		slog.Int("frames", result.FrameCount))
+	dispatchOutcomes.WithLabelValues("completed", "ack").Inc()
 	return videomessaging.Ack
 }
 
