@@ -58,9 +58,12 @@ COPY --from=builder /out/notifier /app/notifier
 USER appuser
 # Every HTTP service in this image listens here; none of them publishes it,
 # because the gateway is the only service that publishes a host port. The
-# worker and the notifier listen on nothing — each is reached only through
-# the broker.
+# worker and the notifier are reached for real work only through the broker,
+# but each also runs a second, metrics-only listener on :9102 — see
+# cmd/worker/metricsserver.go and cmd/notifier/metricsserver.go — which
+# docker-compose.yml likewise never publishes to the host.
 EXPOSE 8080
+EXPOSE 9102
 # The Video API, because it is the service that serves the frontend and is
 # therefore the least surprising thing a bare `docker run` should start.
 # Every other process is named explicitly by whatever runs it.
