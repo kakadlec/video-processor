@@ -6,7 +6,7 @@ Define `cmd/worker`, the process that turns a dispatched `video_job.queued` mess
 
 It is the consumer that `videojob-messaging`'s topology and `videojob-outbox-relay`'s publishing were built for. The extraction sequence it runs is `videojob-execution`'s `ProcessVideoJob`; the transitions it drives are `videojob-lifecycle`'s; the conditional claim underneath them is `videojob-persistence`'s. This capability owns only what the worker process itself decides — it makes no access-control decision (`video-processing-access`) and serves no HTTP beyond the metrics-only listener `service-metrics` defines.
 ## Requirements
-### Requirement: cmd/worker Consumes the Job Queue and Runs Each Dispatch to a Terminal State
+### Requirement: cmd/worker Consumes the Job Queue and Settles Each Dispatch
 
 A `cmd/worker` entrypoint SHALL consume the job-dispatch queue defined by `videojob-messaging` and, for each message, run `ProcessVideoJob` against the `job_id` and `source_key` the message carries, driving the job to `completed` or `failed` — or, for a transient object-storage failure within its bound, back to `queued` with a fresh dispatch of its own (see the acknowledgement requirement below).
 

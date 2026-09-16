@@ -305,7 +305,7 @@ The default SHALL be the correct value for every pre-existing row rather than a 
 
 `Create`, `FindByID`, `FindByUserID`, and `FindCompletedByUserID` SHALL round-trip the value, and `domain.RestoreVideoJob` SHALL accept it. Reconstitution SHALL NOT reject a stored row solely because of a status/epoch pairing. Normal transitions create `pending` only at epoch zero and may reach `queued`, `processing`, or a terminal status at epoch zero or later, but the restoration boundary validates the persisted fields independently rather than inventing a cross-field invariant.
 
-Only the requeue path SHALL advance it. `Create`, `Enqueue`, `Update`, and `ClaimForProcessing` SHALL leave it as they found it, so the stored value reads unambiguously as the job's abandonment count and can be used as the bound `videojob-lease-recovery` requires.
+Only the requeue path SHALL advance it. `Create`, `Enqueue`, `Update`, and `ClaimForProcessing` SHALL leave it as they found it, so the stored value reads unambiguously as the job's total requeue count — abandonments recovered by the sweeper plus transient object-storage retries, which advance it through the same path — and can be used as the one bound `videojob-lease-recovery` and `videojob-execution` share.
 
 #### Scenario: A pre-migration row loads at epoch zero
 
