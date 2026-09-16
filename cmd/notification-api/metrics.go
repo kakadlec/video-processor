@@ -14,12 +14,24 @@ import (
 // have to agree with the router about it.
 const metricsRoutePath = "/metrics"
 
-// requestDurationBuckets reaches 60s rather than taking the client library's
-// default ceiling of 10s. POST /upload streams the request body into the
-// bucket before it answers, so its handler duration includes the client's own
-// transfer — a property of the route rather than a defect. A bucket set
-// ending at 10s would put every real upload in the overflow bucket and report
-// nothing while looking healthy.
+// requestDurationBuckets is identical in all three services, deliberately,
+// and reaches 60s rather than taking the client library's default ceiling of
+// 10s.
+//
+// Identical because a histogram is only aggregable across scrape targets when
+// every target shares a bucket set: a service with buckets of its own
+// produces a family that cannot be summed with the others, and the three
+// services sit behind one gateway and answer for one system. So the set is a
+// property of the family rather than of whichever routes this binary happens
+// to serve.
+//
+// 60s because the set has to hold the longest legitimate duration anywhere in
+// that family, and that is POST /upload on the Video API: it streams the
+// request body into the bucket before it answers, so its handler duration
+// includes the client's own transfer — a property of the route rather than a
+// defect. A set ending at 10s would put every real upload in the overflow
+// bucket and report nothing while looking healthy. The services that serve no
+// such route pay only for empty buckets.
 var requestDurationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
 
 // The two per-request families, declared here because this is the process

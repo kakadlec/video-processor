@@ -52,20 +52,52 @@ var vectorConstructor = map[string]bool{
 // The declared vector types, for a receiver written as a field or a typed
 // variable rather than assigned from a constructor.
 var vectorType = map[string]bool{
-	"prometheus.CounterVec":   true,
-	"prometheus.GaugeVec":     true,
-	"prometheus.HistogramVec": true,
-	"prometheus.SummaryVec":   true,
+	"CounterVec":   true,
+	"GaugeVec":     true,
+	"HistogramVec": true,
+	"SummaryVec":   true,
+}
+
+// The methods a metric vector carries that provably accept no label value.
+// Every other method on a settled vector receiver is judged, so the whole
+// label-accepting surface — WithLabelValues, With, GetMetricWith,
+// GetMetricWithLabelValues, CurryWith, MustCurryWith, Delete,
+// DeleteLabelValues, DeletePartialMatch — is covered by construction rather
+// than by an enumeration that a later release can outgrow.
+var vectorMethodWithoutLabels = map[string]bool{
+	"Describe": true,
+	"Collect":  true,
+	"Reset":    true,
+}
+
+// The const-metric constructors, mapped to the number of leading arguments
+// before their trailing label values. A NewConst… name absent from this table
+// fails outright rather than passing: the arity is what says where the labels
+// start, and a constructor whose arity this walk does not know is one whose
+// labels it cannot find.
+var constMetricLabelOffset = map[string]int{
+	"NewConstMetric":                            3,
+	"MustNewConstMetric":                        3,
+	"NewConstMetricWithCreatedTimestamp":        4,
+	"MustNewConstMetricWithCreatedTimestamp":    4,
+	"NewConstHistogram":                         4,
+	"MustNewConstHistogram":                     4,
+	"NewConstHistogramWithCreatedTimestamp":     5,
+	"MustNewConstHistogramWithCreatedTimestamp": 5,
+	"NewConstSummary":                           4,
+	"MustNewConstSummary":                       4,
+	"NewConstSummaryWithCreatedTimestamp":       5,
+	"MustNewConstSummaryWithCreatedTimestamp":   5,
 }
 
 // The options structs whose Name and Help are a series' identity. Every
 // scalar field of one is held to rule 2.
 var optionsType = map[string]bool{
-	"prometheus.CounterOpts":   true,
-	"prometheus.GaugeOpts":     true,
-	"prometheus.HistogramOpts": true,
-	"prometheus.SummaryOpts":   true,
-	"prometheus.Opts":          true,
+	"CounterOpts":   true,
+	"GaugeOpts":     true,
+	"HistogramOpts": true,
+	"SummaryOpts":   true,
+	"Opts":          true,
 }
 
 // The fields of those structs that name a series. ConstLabels is absent: it
@@ -93,7 +125,7 @@ var defaultRegistryName = map[string]bool{
 // anywhere else at all — a conversion, a declared variable, a parameter, a
 // result — which fails, because a Labels value this walk did not see built
 // carries label names and values it cannot read.
-const labelsTypeName = "prometheus.Labels"
+const labelsTypeName = "Labels"
 
 type findings struct {
 	files      int
@@ -230,12 +262,12 @@ func (s *fileScan) collectVectors() {
 	}
 
 	declare := func(names []*ast.Ident, typ ast.Expr) {
-		rendered := strings.TrimPrefix(types.ExprString(typ), "*")
-		if !vectorType[rendered] {
+		name, ok := s.prometheusTypeName(typ)
+		if !ok || !vectorType[name] {
 			return
 		}
-		for _, name := range names {
-			s.vectors[name.Name] = true
+		for _, ident := range names {
+			s.vectors[ident.Name] = true
 		}
 	}
 
@@ -292,7 +324,10 @@ func (s *fileScan) collectVectors() {
 func (s *fileScan) collectLabelsLiterals() {
 	ast.Inspect(s.file, func(node ast.Node) bool {
 		lit, ok := node.(*ast.CompositeLit)
-		if ok && lit.Type != nil && types.ExprString(lit.Type) == labelsTypeName {
+		if !ok || lit.Type == nil {
+			return true
+		}
+		if name, isPrometheus := s.prometheusTypeName(lit.Type); isPrometheus && name == labelsTypeName {
 			s.labelsLiteral[lit.Type.Pos()] = true
 		}
 		return true
@@ -412,49 +447,54 @@ func (s *fileScan) checkName(arg ast.Expr, what string) {
 		fmt.Sprintf("%s: %s is %s, not a string literal", s.position(arg.Pos()), what, types.ExprString(arg)))
 }
 
-// checkLabelSite holds rule 1 at the three positions a label value occupies
-// in a call, plus the fourth this repository would otherwise be bypassed
-// through.
+// checkLabelSite holds rule 1 wherever a label value or a label set can
+// reach the client library, and it reaches that surface by two devices rather
+// than by listing the calls that exist today.
 //
-// WithLabelValues and MustNewConstMetric are judged wherever they appear:
-// both names belong to the client library and to nothing else here. With is
-// judged only on a receiver settled as a metric vector, because it is also
-// the name every logger in this repository binds attributes with, and a rule
-// that judged both would either fail hundreds of legitimate records or be
-// weakened until it judged neither. The residual — a With on a vector whose
-// provenance this file does not carry — is what the Labels rule below closes
-// from the other side: the argument has to be a Labels value, and every
-// appearance of that type other than a composite literal fails.
+// The first is the receiver: **every** method on a value settled as a metric
+// vector is judged, except the three that provably accept no label value. The
+// vector's label-accepting surface is wider than the two calls this
+// repository happens to make — WithLabelValues, With, GetMetricWith,
+// GetMetricWithLabelValues, CurryWith, MustCurryWith, Delete,
+// DeleteLabelValues, DeletePartialMatch — and an enumeration of the two would
+// have left the other seven passing arbitrary values while all three rules
+// stayed green. Judging by receiver covers the ones a later release adds too.
+//
+// The second is the constructor table: a prometheus-qualified NewConst… name
+// is judged from the arity that says where its trailing labels begin, and a
+// name absent from that table **fails outright**. A constructor whose arity
+// this walk does not know is one whose labels it cannot find, which is the
+// same condition as an argument form it cannot resolve.
+//
+// WithLabelValues and DeleteLabelValues are additionally judged wherever they
+// appear, whatever the receiver: both names belong to the client library and
+// to nothing else here, so they cover a vector whose provenance this file
+// does not carry. What that leaves is a Labels-taking method on such a
+// receiver, and the Labels rule closes it from the other side — the argument
+// has to be a Labels value, and every appearance of that type other than a
+// composite literal fails.
+//
+// With is deliberately not judged on an unsettled receiver: it is also the
+// name every logger in this repository binds attributes with, and a rule that
+// judged both would either fail hundreds of legitimate records or be weakened
+// until it judged neither.
 func (s *fileScan) checkLabelSite(call *ast.CallExpr) {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return
 	}
 
-	var values []ast.Expr
-	switch {
-	case sel.Sel.Name == "WithLabelValues":
-		values = call.Args
-	case sel.Sel.Name == "MustNewConstMetric":
-		if len(call.Args) > 3 {
-			values = call.Args[3:]
-		} else {
-			values = nil
-		}
-	case sel.Sel.Name == "With" && s.isVectorReceiver(sel.X):
-		// The argument is a Labels value. A composite literal is judged
-		// by checkCompositeLit; anything else is a value this walk did not
-		// see built.
-		for _, arg := range call.Args {
-			if lit, isLit := unparenthesize(arg).(*ast.CompositeLit); isLit && lit.Type != nil && types.ExprString(lit.Type) == labelsTypeName {
-				continue
-			}
-			s.found.unboundedLabel = append(s.found.unboundedLabel,
-				fmt.Sprintf("%s: %s is a label set this walk cannot read; write the labels as a literal", s.position(arg.Pos()), types.ExprString(arg)))
-		}
-		s.found.labelSites++
+	if s.isPrometheusSelector(sel) && strings.Contains(sel.Sel.Name, "NewConst") {
+		s.checkConstMetric(call, sel.Sel.Name)
 		return
-	default:
+	}
+
+	onVector := s.isVectorReceiver(sel.X)
+	if onVector && vectorMethodWithoutLabels[sel.Sel.Name] {
+		return
+	}
+	byName := sel.Sel.Name == "WithLabelValues" || sel.Sel.Name == "DeleteLabelValues"
+	if !onVector && !byName {
 		return
 	}
 
@@ -464,7 +504,41 @@ func (s *fileScan) checkLabelSite(call *ast.CallExpr) {
 			fmt.Sprintf("%s: label values are spread from a slice, so this walk cannot read them", s.position(call.Pos())))
 		return
 	}
-	for _, value := range values {
+	for _, arg := range call.Args {
+		s.checkLabelArgument(arg)
+	}
+}
+
+// checkLabelArgument judges one argument of a call on a metric vector. It is
+// either a label value, or the whole label set as a Labels composite literal,
+// which checkCompositeLit judges element by element.
+func (s *fileScan) checkLabelArgument(arg ast.Expr) {
+	if lit, isLiteral := unparenthesize(arg).(*ast.CompositeLit); isLiteral && lit.Type != nil {
+		if name, isPrometheus := s.prometheusTypeName(lit.Type); isPrometheus && name == labelsTypeName {
+			return
+		}
+	}
+	s.checkLabelValue(arg)
+}
+
+func (s *fileScan) checkConstMetric(call *ast.CallExpr, name string) {
+	offset, known := constMetricLabelOffset[name]
+	if !known {
+		s.found.unboundedLabel = append(s.found.unboundedLabel,
+			fmt.Sprintf("%s: prometheus.%s is a constant-metric constructor this walk does not know the arity of, so it cannot find its label values", s.position(call.Pos()), name))
+		return
+	}
+
+	s.found.labelSites++
+	if call.Ellipsis.IsValid() {
+		s.found.unboundedLabel = append(s.found.unboundedLabel,
+			fmt.Sprintf("%s: label values are spread from a slice, so this walk cannot read them", s.position(call.Pos())))
+		return
+	}
+	if len(call.Args) <= offset {
+		return
+	}
+	for _, value := range call.Args[offset:] {
 		s.checkLabelValue(value)
 	}
 }
@@ -500,10 +574,13 @@ func (s *fileScan) checkCompositeLit(lit *ast.CompositeLit) {
 	if lit.Type == nil {
 		return
 	}
-	rendered := types.ExprString(lit.Type)
+	name, ok := s.prometheusTypeName(lit.Type)
+	if !ok {
+		return
+	}
 
 	switch {
-	case rendered == labelsTypeName:
+	case name == labelsTypeName:
 		s.found.labelSites++
 		for _, element := range lit.Elts {
 			kv, ok := element.(*ast.KeyValueExpr)
@@ -517,7 +594,7 @@ func (s *fileScan) checkCompositeLit(lit *ast.CompositeLit) {
 			s.checkName(kv.Key, "a label name written at a call site")
 			s.checkLabelValue(kv.Value)
 		}
-	case optionsType[rendered]:
+	case optionsType[name]:
 		for _, element := range lit.Elts {
 			kv, ok := element.(*ast.KeyValueExpr)
 			if !ok {
@@ -564,6 +641,26 @@ func (s *fileScan) isPrometheusCall(call *ast.CallExpr, names map[string]bool) b
 		return false
 	}
 	return s.isPrometheusSelector(sel) && names[sel.Sel.Name]
+}
+
+// prometheusTypeName resolves a type expression to the bare name it has in
+// the client library, or reports that it is not one of that package's types.
+//
+// Resolution goes through this file's import table rather than through the
+// rendered spelling, because an aliased import renders as prom.CounterOpts
+// and would slip past every rule keyed on the canonical spelling — which is
+// a one-line bypass of the metric-name rule and of the Labels rule the
+// failing default leans on.
+func (s *fileScan) prometheusTypeName(expr ast.Expr) (string, bool) {
+	unwrapped := unparenthesize(expr)
+	if star, ok := unwrapped.(*ast.StarExpr); ok {
+		unwrapped = unparenthesize(star.X)
+	}
+	sel, ok := unwrapped.(*ast.SelectorExpr)
+	if !ok || !s.isPrometheusSelector(sel) {
+		return "", false
+	}
+	return sel.Sel.Name, true
 }
 
 func (s *fileScan) isPrometheusSelector(sel *ast.SelectorExpr) bool {
@@ -839,6 +936,71 @@ func f(c prometheus.Collector) { prometheus.DefaultRegisterer.Unregister(c) }`,
 			src: `package p
 import "github.com/prometheus/client_golang/prometheus"
 func f(registry *prometheus.Registry, c prometheus.Collector) { registry.MustRegister(c) }`,
+		},
+		{
+			name: "the vector's other label-taking readers, which an enumeration of two would miss",
+			src: `package p
+import "github.com/prometheus/client_golang/prometheus"
+var c = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "n", Help: "h"}, []string{"user"})
+func f(userID string) {
+	c.GetMetricWithLabelValues(userID)
+	c.DeleteLabelValues(userID)
+}`,
+			unboundedLabel: 2,
+			labelSites:     2,
+		},
+		{
+			name: "currying a vector, which returns a vector carrying the label",
+			src: `package p
+import "github.com/prometheus/client_golang/prometheus"
+var c = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "n", Help: "h"}, []string{"job", "route"})
+func f(id string) { c.MustCurryWith(prometheus.Labels{"job": id}) }`,
+			unboundedLabel: 1,
+			labelSites:     2,
+		},
+		{
+			name: "a vector's own collector methods, which take no label value",
+			src: `package p
+import "github.com/prometheus/client_golang/prometheus"
+var c = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "n", Help: "h"}, []string{"a"})
+func f(descs chan<- *prometheus.Desc, metrics chan<- prometheus.Metric) {
+	c.Describe(descs)
+	c.Collect(metrics)
+	c.Reset()
+}`,
+		},
+		{
+			name: "the error-returning constant-metric constructor, which the Must form's name does not cover",
+			src: `package p
+import "github.com/prometheus/client_golang/prometheus"
+var desc = prometheus.NewDesc("fiapx_n", "h", []string{"state"}, nil)
+func f(state string) (prometheus.Metric, error) {
+	return prometheus.NewConstMetric(desc, prometheus.GaugeValue, 1, state)
+}`,
+			unboundedLabel: 1,
+			labelSites:     1,
+		},
+		{
+			name: "a constant histogram, whose labels begin one argument later",
+			src: `package p
+import "github.com/prometheus/client_golang/prometheus"
+var desc = prometheus.NewDesc("fiapx_n", "h", []string{"state"}, nil)
+func f(buckets map[float64]uint64, state string) prometheus.Metric {
+	return prometheus.MustNewConstHistogram(desc, 1, 1.5, buckets, state)
+}`,
+			unboundedLabel: 1,
+			labelSites:     1,
+		},
+		{
+			name: "an aliased import, which the canonical spelling would not recognize",
+			src: `package p
+import prom "github.com/prometheus/client_golang/prometheus"
+var name = "fiapx_" + "n"
+var c = prom.NewCounterVec(prom.CounterOpts{Name: name, Help: "h"}, []string{"job"})
+func f(id string) { c.With(prom.Labels{"job": id}) }`,
+			unboundedLabel: 1,
+			assembledName:  1,
+			labelSites:     2,
 		},
 		{
 			name: "the logger's With, which is not a label site",

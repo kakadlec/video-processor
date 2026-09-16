@@ -50,11 +50,23 @@ func RelayedEventTypes() []string {
 // Aggregate is one entry of a bounded aggregate: a count, and the age of the
 // oldest row behind it.
 //
-// The age is seconds computed by the database rather than a timestamp
-// subtracted from Go's clock. Both read the same when the two clocks agree,
-// and only this one keeps reading the same when they do not: a gauge derived
-// across two clocks reports a negative age under modest skew, which is a
-// value no age can take and which nothing downstream would think to expect.
+// The age is seconds computed by the statement, and the reason is **not**
+// that it puts the arithmetic on one clock — it does not, and an earlier
+// comment here claimed otherwise. Both timestamps it reads are minted by the
+// application: created_at comes from the domain Clock (systemClock.Now) and
+// occurred_at from time.Now in this very package, so subtracting either from
+// PostgreSQL's now() compares the writer's clock with the database's exactly
+// as a Go-side subtraction would compare the writer's with the reader's. No
+// arrangement of the subtraction removes that while the application mints the
+// timestamp; moving the mint into the database would, and that is a change to
+// what a VideoJob's CreatedAt means rather than to this aggregate.
+//
+// What the statement's form does buy is that the count and the age describe
+// the same instant, since now() is fixed for the transaction — and the clamp
+// below keeps the value inside an age's domain whatever the skew. A negative
+// age is a value no age can take, and nothing reading these gauges would
+// think to expect one; a clamped zero reads as "the oldest is brand new",
+// which is wrong by at most the skew rather than nonsensical.
 //
 // OldestAgeValid is carried rather than inferred from a zero age, because the
 // absence of an age is load-bearing. The collector reading these
@@ -88,11 +100,11 @@ type Aggregate struct {
 const inFlightAggregateQuery = `
 SELECT 'queued' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_jobs WHERE status = 'queued' LIMIT $1) AS bounded) AS total,
-       (SELECT EXTRACT(EPOCH FROM now() - created_at) FROM video_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1) AS oldest_age
+       (SELECT GREATEST(EXTRACT(EPOCH FROM now() - created_at), 0) FROM video_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1) AS oldest_age
 UNION ALL
 SELECT 'processing' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_jobs WHERE status = 'processing' LIMIT $1) AS bounded) AS total,
-       (SELECT EXTRACT(EPOCH FROM now() - created_at) FROM video_jobs WHERE status = 'processing' ORDER BY created_at ASC LIMIT 1) AS oldest_age`
+       (SELECT GREATEST(EXTRACT(EPOCH FROM now() - created_at), 0) FROM video_jobs WHERE status = 'processing' ORDER BY created_at ASC LIMIT 1) AS oldest_age`
 
 // The outbox aggregate, restricted to the relayed event types by the same
 // device and for the same reason: one literal branch per type, so each is
@@ -101,15 +113,15 @@ SELECT 'processing' AS key,
 const unpublishedOutboxAggregateQuery = `
 SELECT 'video_job.queued.v2' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_job_outbox WHERE event_type = 'video_job.queued.v2' AND published_at IS NULL LIMIT $1) AS bounded) AS total,
-       (SELECT EXTRACT(EPOCH FROM now() - occurred_at) FROM video_job_outbox WHERE event_type = 'video_job.queued.v2' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age
+       (SELECT GREATEST(EXTRACT(EPOCH FROM now() - occurred_at), 0) FROM video_job_outbox WHERE event_type = 'video_job.queued.v2' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age
 UNION ALL
 SELECT 'video_job.completed.v1' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_job_outbox WHERE event_type = 'video_job.completed.v1' AND published_at IS NULL LIMIT $1) AS bounded) AS total,
-       (SELECT EXTRACT(EPOCH FROM now() - occurred_at) FROM video_job_outbox WHERE event_type = 'video_job.completed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age
+       (SELECT GREATEST(EXTRACT(EPOCH FROM now() - occurred_at), 0) FROM video_job_outbox WHERE event_type = 'video_job.completed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age
 UNION ALL
 SELECT 'video_job.failed.v1' AS key,
        (SELECT count(*) FROM (SELECT 1 FROM video_job_outbox WHERE event_type = 'video_job.failed.v1' AND published_at IS NULL LIMIT $1) AS bounded) AS total,
-       (SELECT EXTRACT(EPOCH FROM now() - occurred_at) FROM video_job_outbox WHERE event_type = 'video_job.failed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age`
+       (SELECT GREATEST(EXTRACT(EPOCH FROM now() - occurred_at), 0) FROM video_job_outbox WHERE event_type = 'video_job.failed.v1' AND published_at IS NULL ORDER BY occurred_at ASC LIMIT 1) AS oldest_age`
 
 // InFlightJobAggregate reports how many jobs are in each in-flight state and
 // how old the oldest of each is.
