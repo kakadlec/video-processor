@@ -875,7 +875,7 @@ Verified by stopping each backing service in turn: with PostgreSQL down all thre
 
 The three HTTP services serve `GET /metrics` in the Prometheus text exposition format. **`cmd/worker` and `cmd/notifier` serve nothing**, for the reason given under "Health and readiness probes" above: they acquire no HTTP surface for any observability purpose. What is known about them from outside is under "What these metrics do not see" below.
 
-**There is no scraper in this repository.** The endpoint is served, tested, and parses, and nothing collects it: the local stack runs no Prometheus server, so no time series exists anywhere unless an operator points one at the services. That was a deliberate default, recorded in `docs/roadmap.md` as `add-local-metrics-scraper`.
+**The local stack now runs a scraper.** `add-local-metrics-scraper` added a `prometheus` service to `docker-compose.yml` (`docker/prometheus/prometheus.yml`, one job per HTTP service, 15s interval), so `docker compose up --build` produces real time series against these families without an operator pointing anything at the services by hand; its UI is at <http://127.0.0.1:9090>, loopback-only like the mail catcher. `cmd/worker` and `cmd/notifier` are not scraped, since they serve nothing to scrape. Outside this repository's own compose stack, nothing is provided — pointing a Prometheus server at a real deployment's three HTTP services is still an operator's own setup.
 
 #### Reaching it
 
@@ -887,7 +887,7 @@ docker compose exec video-api wget -qO- http://localhost:8080/metrics
 
 It is unauthenticated and outside the rate limiter. A scrape carries no subject for the limiter to key on and would eventually be answered `429`, which a scraper reads as the service being down; one of the three services mounts no bearer authentication at all; and requiring a token would make Identity a dependency of every other service's observability. **No environment variable enables, disables, relocates or reformats it.**
 
-**A scrape is access-logged like any other request.** The probe routes are exempt from the access record because a prober arrives at a fixed interval forever; with no scraper, that volume is zero, and the exemption was not widened in anticipation of it. A scraper at a 15s interval would write 5,760 records a day per service, and the change that adds one is the one that should revisit this.
+**A scrape is access-logged like any other request.** The probe routes are exempt from the access record because a prober arrives at a fixed interval forever; the local stack's Prometheus server scrapes at 15s, which is 5,760 records a day per service — the same order of magnitude as the already-exempted probe traffic. `add-local-metrics-scraper` revisited the exemption with that real number rather than leaving it for later and left it as is: extending the exemption to `/metrics` is a source change to three `logging.go` files and their tests, not a change to the local stack, so it stayed out of that change's scope. `/metrics` stays access-logged.
 
 #### The families
 
@@ -947,7 +947,7 @@ Health and readiness left `cmd/worker` and `cmd/notifier` with no liveness signa
 - **Still invisible:** how long an extraction takes, which branch a dispatch took (completed, failed, fenced, dead-lettered), how often the recovery sweeper requeues, and how close a notification delivery comes to its `MaxClaimHold()` budget. Those can only be recorded inside the worker and the notifier, which serve nothing.
 - **Not covered from outside at all:** the notifier. Its delivery records live in the Notification database, which `video-api` holds no pool for; a stopped notifier shows up only indirectly, as a backlog on `video.jobs.terminal.events.v1` in the broker.
 
-Closing the rest is `expose-worker-and-notifier-metrics` in `docs/roadmap.md`. It needs changes to two capabilities that forbid those processes any port, and it should follow a scraper — an endpoint on a process nobody scrapes buys nothing.
+Closing the rest is `expose-worker-and-notifier-metrics` in `docs/roadmap.md`. It needs changes to two capabilities that forbid those processes any port, and it follows `add-local-metrics-scraper` — an endpoint on a process nobody scrapes buys nothing, and the local stack now has a scraper for the three HTTP services (`docker-compose.yml`'s `prometheus` service); extending its scrape config to the worker and the notifier once either has a port is that follow-up row's own small remaining piece.
 
 ---
 
@@ -959,6 +959,6 @@ Closing the rest is `expose-worker-and-notifier-metrics` in `docs/roadmap.md`. I
 
 ### Observability — Implemented (Phase 8)
 
-**Phase 8 is complete; nothing about observability remains planned.** All three of its changes shipped and are documented above: `add-structured-logging` under "Logging", `add-health-and-readiness-endpoints` under "Health and readiness probes", and `add-prometheus-metrics` under "Metrics". What they deliberately did not do — a local metrics scraper, and metrics recorded inside `cmd/worker` and `cmd/notifier` — is recorded in `docs/roadmap.md` as backlog rows, not as planned infrastructure, because neither is committed to.
+**Phase 8 is complete; nothing about observability remains planned.** All three of its changes shipped and are documented above: `add-structured-logging` under "Logging", `add-health-and-readiness-endpoints` under "Health and readiness probes", and `add-prometheus-metrics` under "Metrics". What Phase 8 deliberately did not do — a local metrics scraper — has since shipped too, as the follow-up `add-local-metrics-scraper` (see "Metrics" above); metrics recorded inside `cmd/worker` and `cmd/notifier` remains open, recorded in `docs/roadmap.md` as a backlog row rather than as planned infrastructure, because it is not committed to.
 
 `docker-compose.yml` used to be listed here as Phase 8 work. It is not: the full local stack was built up change by change, is documented in `docs/development.md`, and `docs/roadmap.md` records it as delivered.

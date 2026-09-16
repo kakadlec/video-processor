@@ -1,6 +1,6 @@
 # FIAP X — Video Frame Processor
 
-A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous across five processes behind an nginx gateway: one HTTP service per bounded context — `cmd/identity-api` (accounts and tokens), `cmd/video-api` (upload, status, download, and the frontend) and `cmd/notification-api` (delivery preferences) — plus a worker (`cmd/worker`) that does the extraction off a RabbitMQ queue and a notifier (`cmd/notifier`) that announces each outcome to whatever webhook its owner registered. The gateway is the only process that publishes a host port, so a client still sees one origin. Built as the code deliverable for a POSTECH/FIAP hackathon.
+A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous across five processes behind an nginx gateway: one HTTP service per bounded context — `cmd/identity-api` (accounts and tokens), `cmd/video-api` (upload, status, download, and the frontend) and `cmd/notification-api` (delivery preferences) — plus a worker (`cmd/worker`) that does the extraction off a RabbitMQ queue and a notifier (`cmd/notifier`) that announces each outcome to whatever webhook its owner registered. The gateway is the only *application* process that publishes a host port, so a client still sees one origin; the local Compose stack's mail catcher and Prometheus server each publish their own development-only support port too, neither on the application's path. Built as the code deliverable for a POSTECH/FIAP hackathon.
 
 ## Prerequisites
 
@@ -24,12 +24,17 @@ cd video-processor
 make dev-keys
 
 # 3. Run the full stack (gateway + three HTTP services + three workers +
-#    notifier + PostgreSQL + Redis + MinIO + RabbitMQ, all configured)
+#    notifier + PostgreSQL + Redis + MinIO + RabbitMQ + a Mailpit mail
+#    catcher + a Prometheus server scraping the three HTTP services, all
+#    configured)
 docker compose up --build
 # The gateway listens on http://127.0.0.1:8080 and is the only service that
-# publishes a host port. It routes /api/auth/ to identity-api,
-# /api/notification-preferences to notification-api, and everything else to
-# video-api, so the split is invisible from the browser.
+# publishes a host port for the application. It routes /api/auth/ to
+# identity-api, /api/notification-preferences to notification-api, and
+# everything else to video-api, so the split is invisible from the browser.
+# Two more loopback ports back development-only support UIs: the mail
+# catcher's inbox at http://127.0.0.1:8025 and Prometheus's UI at
+# http://127.0.0.1:9090, neither reached through the gateway.
 # Seven application containers — the three HTTP services, three workers and
 # the notifier — all run from the same image with their commands overridden. Three workers start by default, so several videos are
 # processed at the same time: each worker holds exactly one job at a time by

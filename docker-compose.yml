@@ -606,16 +606,18 @@ services:
   # service above: this data is diagnostic and non-authoritative, so it does
   # not need postgres_data's or minio_data's durability. The image itself
   # declares a VOLUME at /prometheus, so a container still gets one — an
-  # anonymous one Docker creates and attaches per container rather than one
-  # this file names and reopens, exactly like redis's own /data. A recreate
-  # (a fresh `docker compose up` after `down`, or `--build`) therefore starts
-  # against an empty volume rather than the previous run's, since nothing
-  # reattaches an anonymous volume to a new container; the orphaned
-  # predecessor is only reclaimed by `docker volume prune` or `down -v`,
-  # never automatically. --storage.tsdb.retention.time bounds what a single
-  # long-running container accumulates in its own volume, in case one is
-  # left up for a while, rather than leaving it at Prometheus's 15-day
-  # default.
+  # anonymous one Docker creates rather than one this file names, exactly
+  # like redis's own /data. Verified rather than assumed: Compose *inherits*
+  # an anonymous volume across an ordinary recreate (a plain `docker compose
+  # up`/`up --build`, even with --force-recreate) by copying it from the
+  # container being replaced, so a normal iteration loop keeps this data —
+  # it is not reset on every `--build`. Only `docker compose down` (which
+  # removes the container outright, leaving nothing to copy from) or an
+  # explicit `up --renew-anon-volumes` starts a genuinely empty one; a `down`
+  # also orphans the old volume rather than deleting it; `docker volume
+  # prune` or `down -v` reclaims it. --storage.tsdb.retention.time bounds
+  # what a long-running (or long-iterated-on) container accumulates, rather
+  # than leaving it at Prometheus's 15-day default.
   #
   # The scrape interval (15s, docker/prometheus/prometheus.yml) is the number
   # add-structured-logging's probe exemption was waiting for: at 15s across
