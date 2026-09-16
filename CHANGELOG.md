@@ -1,5 +1,25 @@
 # Changelog
 
+## [4.1.0](https://github.com/kakadlec/video-processor/compare/v4.0.0...v4.1.0) (2026-09-16)
+
+
+### Features
+
+* **compose:** add a local Prometheus server scraping the three HTTP services ([#272](https://github.com/kakadlec/video-processor/issues/272)) ([bedd16c](https://github.com/kakadlec/video-processor/commit/bedd16c0b7ddcb28b3f8c0bf95b5a6dbeb67452f))
+* log every process through slog as structured JSON records ([#253](https://github.com/kakadlec/video-processor/issues/253)) ([48e80a0](https://github.com/kakadlec/video-processor/commit/48e80a0beffffa5e04d27775604c10e58bd7cc48))
+* **metrics:** expose Prometheus metrics on the three HTTP services ([#269](https://github.com/kakadlec/video-processor/issues/269)) ([d0e9617](https://github.com/kakadlec/video-processor/commit/d0e9617bf4e6c0e40822c602e3d7b564bfd028ae))
+* serve liveness and readiness probes on the three HTTP services ([#259](https://github.com/kakadlec/video-processor/issues/259)) ([c94d223](https://github.com/kakadlec/video-processor/commit/c94d2233f9f17b5353156da468f776ae71f62d9f))
+
+
+### Bug Fixes
+
+* **ci:** pull the MinIO image from quay.io instead of Docker Hub ([#258](https://github.com/kakadlec/video-processor/issues/258)) ([c101955](https://github.com/kakadlec/video-processor/commit/c10195564fdec328b2409c2769ef377ca2becf7c))
+* report each HTTP server's own errors at error severity ([#256](https://github.com/kakadlec/video-processor/issues/256)) ([b3937e1](https://github.com/kakadlec/video-processor/commit/b3937e1c94c7d18139cc75a6ea2176fdc4f8c056))
+* **video:** serialize the video schema migration ([#271](https://github.com/kakadlec/video-processor/issues/271)) ([6bc046c](https://github.com/kakadlec/video-processor/commit/6bc046cebc441a78ece2ab5c4fe3d4783f42a087))
+* **worker:** pin the load-unavailable requeue and drop a false retry log ([#266](https://github.com/kakadlec/video-processor/issues/266)) ([08cda86](https://github.com/kakadlec/video-processor/commit/08cda86022972a8e605d931592e774eff75d43ce))
+* **worker:** requeue a dispatch whose claim outcome could not be learned ([#264](https://github.com/kakadlec/video-processor/issues/264)) ([327978a](https://github.com/kakadlec/video-processor/commit/327978ad22048280495252c4b10b7a6889d6f47e))
+* **worker:** retry a transient object-storage failure instead of failing the job ([#273](https://github.com/kakadlec/video-processor/issues/273)) ([3091b5d](https://github.com/kakadlec/video-processor/commit/3091b5dfb060ce83168079b6f449edd8b40b6745))
+
 ## [4.0.0](https://github.com/kakadlec/video-processor/compare/v3.0.0...v4.0.0) (2026-09-08)
 
 
