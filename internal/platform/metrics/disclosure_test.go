@@ -407,6 +407,9 @@ func (s *fileScan) checkDeclaration(call *ast.CallExpr) {
 
 	switch {
 	case vectorConstructor[sel.Sel.Name]:
+		if len(call.Args) > 0 {
+			s.checkOptions(call.Args[0])
+		}
 		if len(call.Args) > 1 {
 			s.checkNameList(call.Args[1])
 		}
@@ -418,6 +421,22 @@ func (s *fileScan) checkDeclaration(call *ast.CallExpr) {
 			s.checkNameList(call.Args[2])
 		}
 	}
+}
+
+// checkOptions judges the options value a vector constructor is handed. An
+// options struct assembled anywhere but here is one whose Name this walk
+// never reads, which is the same defect as a label-name list that is not a
+// literal — and it fails loudly for the same reason, rather than being
+// quietly unchecked.
+func (s *fileScan) checkOptions(arg ast.Expr) {
+	lit, ok := unparenthesize(arg).(*ast.CompositeLit)
+	if ok && lit.Type != nil {
+		if name, isPrometheus := s.prometheusTypeName(lit.Type); isPrometheus && optionsType[name] {
+			return
+		}
+	}
+	s.found.assembledName = append(s.found.assembledName,
+		fmt.Sprintf("%s: the options are %s, not a literal this walk can read the metric name out of", s.position(arg.Pos()), types.ExprString(arg)))
 }
 
 // checkNameList judges a label-name list. A list that is not a composite
@@ -1001,6 +1020,16 @@ func f(id string) { c.With(prom.Labels{"job": id}) }`,
 			unboundedLabel: 1,
 			assembledName:  1,
 			labelSites:     2,
+		},
+		{
+			name: "options assembled elsewhere, whose metric name this walk never reads",
+			src: `package p
+import "github.com/prometheus/client_golang/prometheus"
+func build(suffix string) prometheus.CounterOpts {
+	return prometheus.CounterOpts{Name: "fiapx_" + suffix, Help: "h"}
+}
+var c = prometheus.NewCounterVec(build("http"), []string{"a"})`,
+			assembledName: 2,
 		},
 		{
 			name: "the logger's With, which is not a label site",
