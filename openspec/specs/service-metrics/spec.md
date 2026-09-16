@@ -1,10 +1,10 @@
 # service-metrics Specification
 
 ## Purpose
-Defines what this system counts and how it may be counted: which processes expose a metrics endpoint — the three HTTP services — and why the worker and the notifier are answered with none, derived from a prohibition `service-health-probes` already holds rather than restated as a preference; that the endpoint is unauthenticated, refused at the ingress, configured by nothing, and recorded in the access log like any other route; the label rule, and why it is stricter than the rule logging applies to a record — no identifier in a label at all, because a label value is a series that persists — enforced against the source as a permission with a failing default rather than as a list of forbidden forms; the two variable labels, the matched route and the request method, bounded by the router's own route table so the number of series is a product the build fixes; that a metric family is declared where it is recorded and registered in one explicit registry, never the client library's default; which families exist and the action each informs, with the standing rule that a metric nobody would act on is not added; and how a gauge over persistent state is collected — on scrape, never cached, reporting a failed collection as an error rather than a zero and an empty state as a zero rather than an absence. Neighbouring concerns belong elsewhere: the aggregates those gauges read and the indexes that serve them are defined by `videojob-persistence`; the record format and the probe exemption this endpoint is deliberately not added to by `structured-logging`; and the rule that the worker and the notifier acquire no HTTP surface by `service-health-probes` and `container-image`.
+Defines what this system counts and how it may be counted: which processes expose a metrics endpoint — the three HTTP services on their application port, and the worker and the notifier on a metrics-only listener of their own, with the argument for that listener made rather than cited; that the endpoint is unauthenticated, refused at the ingress, configured by nothing, and recorded in the access log like any other route; the label rule, and why it is stricter than the rule logging applies to a record — no identifier in a label at all, because a label value is a series that persists — enforced against the source as a permission with a failing default rather than as a list of forbidden forms; the two variable labels, the matched route and the request method, bounded by the router's own route table so the number of series is a product the build fixes; that a metric family is declared where it is recorded and registered in one explicit registry, never the client library's default; which families exist and the action each informs, with the standing rule that a metric nobody would act on is not added; and how a gauge over persistent state is collected — on scrape, never cached, reporting a failed collection as an error rather than a zero and an empty state as a zero rather than an absence. Neighbouring concerns belong elsewhere: the aggregates those gauges read and the indexes that serve them are defined by `videojob-persistence`; the record format and the probe exemption this endpoint is deliberately not added to by `structured-logging`; and the narrow rule that the metrics-only listener is the worker's and the notifier's only HTTP surface by `service-health-probes` and `container-image`.
 
 ## Requirements
-### Requirement: Exactly the HTTP Services Expose a Metrics Endpoint
+### Requirement: Every Application Process Exposes a Metrics Endpoint
 
 Each of this repository's three HTTP services — `cmd/identity-api`, `cmd/video-api`, and `cmd/notification-api` — SHALL expose its collected metrics for scraping at `GET /metrics`, in the Prometheus text exposition format.
 
@@ -12,11 +12,13 @@ The endpoint SHALL be registered on the engine, outside the bearer-authenticatio
 
 The endpoint SHALL be served unconditionally and SHALL NOT be selected, enabled, disabled or reshaped by any environment variable. This follows the record-format rule this system already applies to its logs: one format in every environment, chosen by nothing.
 
-**The two non-HTTP processes — `cmd/worker` and `cmd/notifier` — SHALL expose no metrics endpoint and SHALL acquire no HTTP surface for it.** This is not decided here. `service-health-probes` already requires that each "acquire no HTTP surface for this or any other observability purpose", and `container-image` already requires that each expose no port at all; each package additionally carries a source-level test asserting that its own non-test sources construct no HTTP server and import no HTTP framework. Relaxing this requires a delta to each of those capabilities and an argument made rather than cited, and this capability does not make one.
+**The two non-HTTP processes — `cmd/worker` and `cmd/notifier` — SHALL each expose `GET /metrics` on a metrics-only listener on port `9102`**, served by the standard library's server with no framework, no probe, no bearer group and no limiter, and SHALL serve nothing else on it. That port SHALL NOT be published to the host and SHALL NOT be routed by the ingress, and the address SHALL be a constant rather than configuration, on the same reasoning that fixes the HTTP services' `8080`. The listener SHALL be bound before the process starts consuming, and a failure to bind it SHALL be fatal at startup, so a missing scrape target is never a silent state that lasts the life of the process. Its errors after startup SHALL be logged and SHALL NOT stop the process, and on shutdown it SHALL be closed within a short bound of its own that does not extend the drain of the work in hand.
 
-No push-based exposition SHALL be introduced as a way around that prohibition. A push gateway would satisfy its letter — pushing needs no listener — and defeat it in this deployment specifically: the worker runs as multiple replicas whose instance identity is resolved per process construction, so every restart of every replica would leave a metric group behind permanently, the count of stale groups growing with the deployment's age rather than with anything real. It would additionally destroy the liveness signal a scrape gives for free and place a single point of failure between the workers and any scrape.
+The argument for relaxing the prohibition this capability previously held is made here rather than cited. The measurements an operator most needs — how long an extraction takes, how a dispatch was disposed of, how often the recovery sweeper acts, how long a delivery takes against its claim budget — are observable only at sites these two processes alone run, and neither process emits any record on an idle stack, so without an endpoint an idle-but-wedged process is indistinguishable from an idle-and-healthy one from inside it. What the prohibition protected is preserved: neither process is reachable from outside the deployment, neither serves an application route or a probe, and the source-level test each carries still fails on any HTTP server constructed anywhere else in the package and on the HTTP framework anywhere at all (see `service-health-probes`).
 
-**The consequence SHALL be recorded rather than implied.** The measurements an operator would most want from this system — how long an extraction takes, how a dispatch was disposed of, how often the recovery sweeper requeues, how long a delivery attempt takes against its budget — are recorded by no process that serves, and this capability does not provide them. What it provides instead is the next requirement's set of aggregates, seen from a service that is allowed to serve.
+No push-based exposition SHALL be introduced instead. A push gateway would avoid the listener and defeat the purpose in this deployment specifically: the worker runs as multiple replicas whose instance identity is resolved per process construction, so every restart of every replica would leave a metric group behind permanently, the count of stale groups growing with the deployment's age rather than with anything real. It would additionally destroy the liveness signal a scrape gives for free and place a single point of failure between the workers and any scrape.
+
+**Those measurements SHALL exist as families declared in the package that records them:** an extraction-duration histogram labelled by outcome, in the frame-extraction adapter; a counter over the worker's dispatch decision table labelled by outcome and message disposition, covering every branch that table distinguishes including the acknowledgement of a dispatch returned to `queued` for a transient object-storage failure; a counter over the recovery sweeper's actions labelled by action, and a histogram of the fence epoch at which a job is requeued, so how much of the bounded requeue budget recovery spends is visible; a histogram of how long the notifier takes to handle one terminal event, labelled by whether it was handled or deferred; and a gauge publishing the notifier's configured maximum claim hold, so that duration can be read against the budget it must stay under. The delivery histogram measures the handling of a whole event rather than each channel's attempt, because the attempt runs inside the Notification application layer, which SHALL NOT import the metrics package and SHALL NOT be handed an instrument through its constructor for that purpose alone — the same reason a logger is not threaded through a constructor that needs one for no other reason.
 
 #### Scenario: A scrape arrives without credentials
 
@@ -29,10 +31,17 @@ No push-based exposition SHALL be introduced as a way around that prohibition. A
 - **WHEN** `GET /metrics` is requested on the same service
 - **THEN** it answers `200` rather than `429`
 
-#### Scenario: The non-HTTP processes expose nothing
+#### Scenario: The non-HTTP processes expose only their metrics listener
 
-- **WHEN** a source-level test reads the non-test sources of `cmd/worker` and of `cmd/notifier`
-- **THEN** it finds neither an HTTP server construction nor an import of the HTTP framework in either, and fails naming the file and line if it does
+- **GIVEN** a running worker or notifier
+- **WHEN** `GET /metrics` is requested on its port `9102` from inside the deployment network
+- **THEN** it answers `200` with the exposition, any other path on that port is not found, the same port is unreachable from the host, and no request to it passes through the ingress
+
+#### Scenario: The metrics listener cannot be bound
+
+- **GIVEN** a worker or notifier whose metrics port is already in use
+- **WHEN** the process starts
+- **THEN** it exits with an error record before it consumes any message, rather than running without a scrape target
 
 #### Scenario: The endpoint is not configurable
 
@@ -127,7 +136,7 @@ The shared package holding the registry, the exposition handler and the label co
 Three consequences follow and SHALL be accepted rather than worked around:
 
 - The per-request families are declared once per HTTP composition root, because one composition root cannot import another. This is a bounded duplication of the same kind the bearer-authentication, rate-limit, access-log and probe middlewares already carry, and each copy SHALL carry its own tests. The source rules above are enforced across every copy by one walk, which is what keeps the duplication from becoming three independent vocabularies.
-- A family declared in a package that more than one process links SHALL be recorded in every one of them, including processes that expose no endpoint. Those counters are incremented and never served. That cost is an atomic increment on a path that already performs I/O, and the benefit is that exposing them later is the addition of a handler rather than a re-instrumentation.
+- A family declared in a package that more than one process links SHALL be registered and recorded in every one of them, and each process's endpoint SHALL serve every family that process registered, including a family whose instrumented path that process never exercises. Such a family is served with no series, which costs nothing a scraper stores and keeps registration unconditional rather than a per-process decision.
 - A test that reads what a family recorded manipulates process-global state and SHALL NOT be parallel — the same cost the logging capability already names and accepts for its own process-global default.
 
 #### Scenario: A context's family is placed in the shared platform package
@@ -135,11 +144,11 @@ Three consequences follow and SHALL be accepted rather than worked around:
 - **WHEN** the platform package's dependency test reads its sources
 - **THEN** it fails if a metric family named for a bounded context is declared there
 
-#### Scenario: A shared package records in a process that exposes nothing
+#### Scenario: A shared package records in whichever process exercises it
 
-- **GIVEN** a package linked by both an HTTP service and a non-HTTP process
-- **WHEN** the non-HTTP process exercises the instrumented path
-- **THEN** the counter is incremented in that process and is exposed by no endpoint, which is expected rather than a defect
+- **GIVEN** a package linked by more than one process
+- **WHEN** one of those processes exercises the instrumented path
+- **THEN** the sample is recorded in that process's registry and served by that process's own endpoint, and every other process linking the package serves the family without that sample, which is expected rather than a defect
 
 ### Requirement: A Metric Exists Only for a Question Someone Would Act On
 
@@ -245,9 +254,9 @@ It is accepted on the same ground the readiness transition record is: the reader
 
 A request to the metrics endpoint SHALL yield an access record, exactly as a request to any non-probe route does. It SHALL NOT be added to the closed exemption the logging capability grants to the two probe route templates.
 
-The exemption's justification does not transfer. It rests on volume from a prober arriving at a fixed interval forever, and on a replacement record that carries more than the one it removes. Neither holds: **no scraper exists in this repository**, so the volume is presently zero and claiming it would be reasoning from a consumer that does not exist; and a scrape has no verdict, so there is no transition record to offer in exchange. There is also a positive reason to record it — it is an unauthenticated request from outside the process whose handler queries a database, so its status and duration are the only evidence that a scrape happened and how long collection took.
+The exemption's justification does not transfer. It rests on volume from a prober arriving at a fixed interval forever, and on a replacement record that carries more than the one it removes. Neither holds with the weight the probes carry. The local stack's scraper collects each HTTP service every **15 seconds** — about 5,760 access records a day per service — which is the same order of magnitude as the probe traffic already exempted, so volume alone does not separate the two; but a scrape has no verdict, so there is no transition record to offer in exchange, and extending the closed exemption would remove a record without replacing it with one that says more. There is also a positive reason to record it — it is an unauthenticated request from outside the process whose handler queries a database, so its status and duration are the only evidence that a scrape happened and how long collection took.
 
-If a scraper is later introduced at a fixed interval, revisiting the exemption SHALL be the work of the change that introduces it, which is the change that can put a real interval into the arithmetic.
+That arithmetic was done when the scraper was introduced, and the endpoint stays recorded. It SHALL be revisited if a deployment's scrape volume — a shorter interval or many more replicas — makes these records the majority of what a service emits, and that revision SHALL be a change to `structured-logging`'s closed exemption, never a mechanism local to this endpoint. The metrics listener of the worker and the notifier emits no access record at all: neither process has an access log, and this requirement does not create one.
 
 Conversely, the per-request metric SHALL cover **every** route the router serves, including the probe routes and this endpoint, with no exemption list of its own. Three additional route values cost a handful of series, an exemption list is a mechanism that grows, and metering the probes returns in the metric a signal the access record deliberately gave up.
 

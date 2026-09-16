@@ -6,7 +6,19 @@ Define the `ProcessVideoJob` application-layer orchestration use case and the `F
 ## Requirements
 ### Requirement: ProcessVideoJob Runs a VideoJob's Start/Extract Sequence Synchronously
 
-The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID and a **source storage key**, call `StartProcessing`, then download the source object to a transient local path through the `SourceStorage` port, then `FrameExtractor.ExtractFrames` against that local path, then store the extracted zip through `ResultStorage`, synchronously and in-process. On a download failure, an extraction failure, or a storage failure it SHALL call `FailJob` and leave the job `failed`. On success it SHALL NOT call `CompleteJob` itself — the job SHALL remain `processing`, and the caller completes it.
+The `ProcessVideoJob` application-layer use case SHALL, given a `VideoJob` ID and a **source storage key**, call `StartProcessing`, then download the source object to a transient local path through the `SourceStorage` port, then `FrameExtractor.ExtractFrames` against that local path, then store the extracted zip through `ResultStorage`, synchronously and in-process. On an extraction failure, or a download failure because the source object does not exist, it SHALL call `FailJob` and leave the job `failed`. On any other download failure or result-storage failure it SHALL follow the transient object-storage retry below. On success it SHALL NOT call `CompleteJob` itself — the job SHALL remain `processing`, and the caller completes it.
+
+**A transient object-storage failure SHALL return the job to `queued` rather than fail it, within the same bound recovery uses.** A `SourceStorage.Get` failure other than the domain's not-found sentinel, or any `ResultStorage.Put` failure, is a property of the object store at that moment rather than of the job, and committing `failed` for it would turn a momentary outage into a permanent outcome no message disposition can undo, because the terminal row is written before the caller ever sees the failure. `ProcessVideoJob` SHALL therefore:
+
+- when the epoch its claim won is already at `domain.MaxJobRequeues`, call `FailJob` exactly as for any other failure — the bound is spent;
+- otherwise pause for a fixed `storageRetryPause` of 5 seconds, so the object store gets a moment before a fresh dispatch is attempted, and then call `RetryVideoJob` with the epoch it holds, which performs the same fenced `processing → queued` write, epoch advance and transactional dispatch row that `videojob-lease-recovery`'s sweeper performs, through the same repository operation;
+- on an applied retry, return the domain's requeued-for-retry sentinel together with the held epoch and whether the write was applied, calling neither `FailJob` nor `CompleteJob`;
+- when the retry write is refused because the row is no longer `processing` at the held epoch, return the fence sentinel, exactly as a refused `FailJob` does;
+- when the retry write fails for any other reason, return that error unchanged, leaving the row `processing` for the sweeper.
+
+The bound SHALL be the single constant `domain.MaxJobRequeues`, shared with the sweeper, because both callers advance the same fence epoch and a job cannot have more attempts left according to one than to the other. The pause SHALL be a constant rather than configuration, and a test SHALL pin both its value and that it is taken only on the retry path. `ProcessVideoJob` SHALL NOT delete the source object or clear the idempotency key on this path: the next attempt needs both.
+
+This covers a momentary outage, not a sustained one. With the relay polling every few seconds and workers idle, the bound can be spent in well under a minute, after which the job is failed as before. Widening the pause or the bound SHALL be argued as its own change rather than tuned here.
 
 "Synchronously and in-process" describes this use case's own control flow, not the system's. Its caller is `cmd/worker`, consuming a dispatched message (see `videojob-worker`); the sequence blocks that consumer for the duration of the extraction and returns a result rather than a promise. An implementer SHALL NOT introduce internal concurrency, a callback, or a queue between these steps.
 
@@ -118,11 +130,29 @@ The original justification for the `CompleteJob` split no longer holds and SHALL
 - **WHEN** `ProcessVideoJob.Execute` is called with that job's ID and the key
 - **THEN** it calls `FailJob`, the job's persisted status is `failed`, and the recorded reason names neither the storage endpoint nor the bucket
 
-#### Scenario: A result that cannot be stored fails the job
+#### Scenario: A result that cannot be stored returns the job to queued
 
-- **GIVEN** a `VideoJob` in `queued` status whose frames extract successfully but whose zip cannot be stored
+- **GIVEN** a `VideoJob` in `queued` status at an epoch below `domain.MaxJobRequeues`, whose frames extract successfully but whose zip cannot be stored
 - **WHEN** `ProcessVideoJob.Execute` is called
-- **THEN** it calls `FailJob`, the job's persisted status is `failed`, and no `StorageKey` is reported
+- **THEN** after the retry pause it returns the requeued-for-retry sentinel, `FailJob` is not called, the job's persisted status is `queued` at the next epoch with a new dispatch row written in the same transaction, and no `StorageKey` is reported
+
+#### Scenario: A source object that cannot be fetched for a transient reason returns the job to queued
+
+- **GIVEN** a `VideoJob` in `queued` status at an epoch below `domain.MaxJobRequeues`, whose source object exists but cannot be read because the object store is failing
+- **WHEN** `ProcessVideoJob.Execute` is called
+- **THEN** it returns the requeued-for-retry sentinel, `ffmpeg` is not invoked, `FailJob` is not called, and the job's persisted status is `queued` at the next epoch
+
+#### Scenario: A transient storage failure with the retry bound spent fails the job
+
+- **GIVEN** a claimed `VideoJob` whose held epoch equals `domain.MaxJobRequeues` and whose zip cannot be stored
+- **WHEN** `ProcessVideoJob.Execute` is called
+- **THEN** it calls `FailJob` without pausing, the job's persisted status is `failed`, and no further dispatch row is written
+
+#### Scenario: A retry write refused by the fence is reported as fenced
+
+- **GIVEN** a claimed `VideoJob` whose zip cannot be stored and whose epoch advanced while this run held it
+- **WHEN** `ProcessVideoJob.Execute` reaches its retry write
+- **THEN** it returns the fence sentinel, the job is not moved to `queued` by this run, and no unfenced write is attempted
 
 #### Scenario: An extraction error with no message still yields a non-empty failure reason
 

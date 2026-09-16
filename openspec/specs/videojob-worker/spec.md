@@ -8,11 +8,11 @@ It is the consumer that `videojob-messaging`'s topology and `videojob-outbox-rel
 ## Requirements
 ### Requirement: cmd/worker Consumes the Job Queue and Runs Each Dispatch to a Terminal State
 
-A `cmd/worker` entrypoint SHALL consume the job-dispatch queue defined by `videojob-messaging` and, for each message, run `ProcessVideoJob` against the `job_id` and `source_key` the message carries, driving the job to `completed` or `failed`.
+A `cmd/worker` entrypoint SHALL consume the job-dispatch queue defined by `videojob-messaging` and, for each message, run `ProcessVideoJob` against the `job_id` and `source_key` the message carries, driving the job to `completed` or `failed` — or, for a transient object-storage failure within its bound, back to `queued` with a fresh dispatch of its own (see the acknowledgement requirement below).
 
 It SHALL call `CompleteJob` on success **only**, and only after `ProcessVideoJob` has reported that the result is stored in the bucket. Because storing the result is part of `ProcessVideoJob`'s own sequence, a result reporting success is itself the durability guarantee the worker waits for; the worker SHALL NOT record any additional ownership artifact before completing the job. If `ProcessVideoJob` reports failure, the worker SHALL NOT call `CompleteJob`, so a job's persisted status never claims `completed` for a result that was not stored.
 
-It SHALL NOT call `FailJob`: `ProcessVideoJob` already fails the job itself for a fetch, extraction, or storage failure, so a worker that also called it would ask the domain for a rejected `failed → failed` transition. An implementer SHALL NOT add a failure call "for symmetry".
+It SHALL NOT call `FailJob` or `RetryVideoJob`: `ProcessVideoJob` already fails the job itself for an extraction failure, a missing source object, or a storage failure whose retry bound is spent, and returns it to `queued` itself for a transient storage failure within that bound, so a worker that also called either would ask the domain for a transition it refuses. An implementer SHALL NOT add a failure call "for symmetry".
 
 **The terminal write can fail after the result is already durable, and the worker SHALL have a policy for it rather than discovering one.** `CompleteJob` returns its repository error and leaves the stored job in `processing`, so a transient database failure at that moment produces a job with a usable result that no listing shows. The worker SHALL retry the terminal write a bounded number of times with backoff, on a context detached from any cancellation that may have caused the failure, because the overwhelmingly likely cause is transient and one more attempt costs nothing next to a re-extraction.
 
@@ -22,7 +22,7 @@ This orphan class is not introduced here — the synchronous pipeline produced t
 
 The worker SHALL take the source location from the message rather than reconstructing it. `ProcessVideoJob` accepts a source `StorageKey` precisely so a process that shares no filesystem with the HTTP handler can run it, and the key embeds a generated upload identifier that is not derivable from any other field.
 
-The worker SHALL NOT serve HTTP, SHALL NOT be reachable from outside the deployment, and SHALL NOT perform an access-control decision (see `video-processing-access`).
+The worker SHALL serve no HTTP route other than the metrics-only listener `service-metrics` defines, SHALL NOT be reachable from outside the deployment, and SHALL NOT perform an access-control decision (see `video-processing-access`).
 
 #### Scenario: A dispatched job is processed to completion
 
@@ -38,7 +38,7 @@ The worker SHALL NOT serve HTTP, SHALL NOT be reachable from outside the deploym
 
 #### Scenario: A result that was not stored leaves the job failed, not completed
 
-- **GIVEN** a dispatched job whose frames extract successfully but whose zip cannot be stored
+- **GIVEN** a dispatched job whose frames extract successfully but whose zip cannot be stored, on an attempt at which its retry bound is spent
 - **WHEN** the worker finishes the message
 - **THEN** the job's persisted status is `failed`, not `completed`, and `GetJobStatus` never reports a `StorageKey` for an object that is not in the bucket
 
@@ -82,7 +82,7 @@ When the worker cannot act on a message, it SHALL reject the message **without r
 
 It SHALL NOT requeue a message that falls under this requirement: none of these conditions is transient, so requeueing produces an unbounded redelivery loop against a message that will never succeed. A fenced result means either a newer epoch was re-dispatched and may have a live successor, or another actor committed a different terminal outcome at the same epoch. Requeueing is wrong in both cases: it would add a competing delivery in the first and can never claim the already-terminal row in the second.
 
-This SHALL also cover every failure that occurs **after** the claim has been won, including a terminal write whose own transaction could not reach the database. Such a message SHALL be dead-lettered rather than requeued even though its failure is transient, because by then the row is `processing` and the claim predicate admits `queued` alone: a redelivery could only lose the claim. Recovery for that row belongs to `videojob-lease-recovery`'s sweeper, which reaches it because it is `processing`, and the disposition SHALL NOT be changed on the argument that the underlying failure was temporary.
+This SHALL also cover every failure that occurs **after** the claim has been won, including a terminal write whose own transaction could not reach the database. Such a message SHALL be dead-lettered rather than requeued even though its failure is transient, because by then the row is `processing` and the claim predicate admits `queued` alone: a redelivery could only lose the claim. The one post-claim failure this does not cover is a transient object-storage failure that `ProcessVideoJob` has already returned to `queued`: that message is neither requeued nor dead-lettered but acknowledged, under its own requirement below, because the work it named has already been dispatched again by a committed write. Recovery for that row belongs to `videojob-lease-recovery`'s sweeper, which reaches it because it is `processing`, and the disposition SHALL NOT be changed on the argument that the underlying failure was temporary.
 
 It SHALL NOT acknowledge such a message either. An acknowledged message is gone from the broker, which would leave nothing to enumerate afterwards — the dead-letter queue is the only place these anomalies remain visible, and `videojob-messaging` keeps it unversioned so there is one place to look.
 
@@ -403,3 +403,31 @@ The pause SHALL be taken on the consumer's own cancellable context, not on the d
 - **GIVEN** a dispatch requeued after a claim that had in fact committed
 - **WHEN** the redelivery arrives and finds the row `processing`
 - **THEN** it is refused by the claim and dead-lettered under the requirement above, and the row — `processing` with no lease — is recovered by the sweeper on its ordinary two-observation path, at the cost of one of its bounded requeues
+
+### Requirement: A Dispatch Superseded by a Transient Object-Storage Retry Is Acknowledged
+
+When `ProcessVideoJob` returns the requeued-for-retry sentinel, the worker SHALL acknowledge the message.
+
+This is a third disposition on its own footing, not an exception to either of the requirements above, and it SHALL NOT be read as weakening them. The message is not one the worker cannot act on, so dead-lettering it would put a healthy job's history in the place reserved for anomalies; and it is not a message whose outcome the worker failed to learn, so requeueing it would put a second dispatch for the same job on the queue beside the one the retry write already committed. **This delivery is spent because a committed write superseded it**: the row is `queued` at an advanced epoch and a fresh dispatch row exists in the outbox, so the relay, not this message, carries the job forward. The rule that rejection is the default for any failure nobody enumerated SHALL be unaffected — the acknowledgement is keyed on the sentinel alone, and a retry write that failed for any other reason reaches the default.
+
+On acknowledging, the worker SHALL release the lease it held only when this run's retry write was the one applied, gated exactly as the failure path gates its cleanup. It SHALL NOT delete the source object and SHALL NOT clear the idempotency key: the next attempt reads the one, and a resubmission of identical content during the retry SHALL still be answered with this job.
+
+A retry write refused by the fence SHALL be handled as any other fenced outcome under the dead-letter requirement above.
+
+#### Scenario: A transient storage failure acknowledges the dispatch and keeps the job's inputs
+
+- **GIVEN** a dispatched job whose source object cannot be read because the object store is failing, at an epoch below the retry bound
+- **WHEN** the worker finishes the message
+- **THEN** the message is acknowledged rather than requeued or dead-lettered, the job is `queued` at the next epoch with a new dispatch row, the source object and the idempotency key still exist, and this run's lease is released
+
+#### Scenario: The superseded dispatch is not the one that carries the job forward
+
+- **GIVEN** a job returned to `queued` by a transient storage retry whose message was acknowledged
+- **WHEN** the dispatch relay publishes the new dispatch row and the object store has recovered
+- **THEN** a worker claims the job at its new epoch and runs it to a terminal state, and no second delivery for the superseded epoch exists
+
+#### Scenario: A missing source object is not retried
+
+- **GIVEN** a dispatched job whose source key names no stored object
+- **WHEN** the worker finishes the message
+- **THEN** the job is `failed`, the message is acknowledged after the ordinary failure cleanup, and no dispatch row is written for another attempt

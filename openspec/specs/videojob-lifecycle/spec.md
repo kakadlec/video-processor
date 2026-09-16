@@ -6,7 +6,9 @@ Define the `VideoJob` aggregate's full lifecycle behavior in the Video Processin
 ## Requirements
 ### Requirement: CreateVideoJob Persists a New Job in Pending State
 
-The `CreateVideoJob` use case SHALL create a `VideoJob` with a freshly minted `VideoJobID`, the caller-supplied `UserID`, `OriginalFilename`, and **source `StorageKey`**, a `CreatedAt` timestamp, `JobStatus: pending`, `FrameCount: 0`, and an empty `ErrorReason`, and SHALL persist it via the `VideoJobRepository` port before returning.
+The `CreateVideoJob` use case SHALL create a `VideoJob` with a freshly minted `VideoJobID`, the caller-supplied `UserID`, `OriginalFilename`, and **source `StorageKey`**, `JobStatus: pending`, `FrameCount: 0`, and an empty `ErrorReason`, and SHALL persist it via the `VideoJobRepository` port before returning.
+
+**The use case SHALL NOT mint the job's `CreatedAt`, and the application layer SHALL hold no clock port for it.** Creation time is minted by the database when the row is written (see `videojob-persistence`), so every age later computed against the database's own clock compares one clock with itself. Because the job the use case constructs carries no creation time of its own, it SHALL report the persisted value by reloading the job after `Create` succeeds. A failure of that reload SHALL be returned as the use case's error, and a caller SHALL treat it as it treats a failed `Create`, accepting that the `pending` row it wrote remains — a state a `pending` job already occupies harmlessly, since nothing dispatches it.
 
 The source key is the object key of the uploaded video, distinct from the result `StorageKey` set at completion, and it is accepted here because this is the only point at which it is known: `POST /upload` streams the upload into the bucket before creating the job, and the key embeds a generated `uploadID` that exists nowhere else. A process that later has to fetch the source — a worker, in particular — cannot reconstruct it from any other column.
 
@@ -16,7 +18,7 @@ The source key MAY be empty. `POST /api/video-jobs` creates a job from a JSON fi
 
 - **GIVEN** a valid `UserID`, `OriginalFilename`, and source `StorageKey`
 - **WHEN** `CreateVideoJob.Execute` is called
-- **THEN** it returns a result describing a `VideoJob` in `pending` state, and a subsequent `VideoJobRepository.FindByID` for that job's ID returns the same job, carrying the same source key
+- **THEN** it returns a result describing a `VideoJob` in `pending` state whose `CreatedAt` is the value the repository persisted, and a subsequent `VideoJobRepository.FindByID` for that job's ID returns the same job, carrying the same source key and the same `CreatedAt`
 
 #### Scenario: Creation without a source key is allowed
 

@@ -22,7 +22,7 @@ Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bo
 
 - **GIVEN** the Notification DSN, the broker URL, and each channel's send configuration are set and no other application variable is
 - **WHEN** `cmd/notifier` starts
-- **THEN** it starts and begins consuming, opening no port
+- **THEN** it starts and begins consuming, opening no port other than its metrics-only listener (see `service-metrics`)
 
 #### Scenario: A missing required variable fails startup
 

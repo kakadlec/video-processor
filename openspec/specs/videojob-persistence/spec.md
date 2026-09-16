@@ -23,7 +23,7 @@ The absence of pagination is deliberate and is the reason this method exists sep
 - **GIVEN** a `VideoJob` persisted via `Repository.Create`
 - **WHEN** `Repository.FindByID` is called with that job's ID
 - **THEN** it returns a `*domain.VideoJob` with the same `ID`, `UserID`, `OriginalFilename`, source key, content hash, `StorageKey`, `FrameCount`, `ErrorReason`, and `Status`
-- **AND** a non-zero `CreatedAt` PostgreSQL minted at persist time — not one the caller supplied, since `Create` no longer accepts one (see `mint-videojob-timestamps-in-database` in `docs/roadmap.md`)
+- **AND** a non-zero `CreatedAt` PostgreSQL minted at persist time — not one the caller supplied, since `Create` ignores any creation time the domain object carries (see the requirement below on database-minted times)
 
 #### Scenario: A pre-migration row loads with an empty source key and content hash
 
@@ -72,6 +72,46 @@ The absence of pagination is deliberate and is the reason this method exists sep
 - **GIVEN** `completed` jobs belonging to two different users
 - **WHEN** `Repository.FindCompletedByUserID` is called for one of them
 - **THEN** only that user's jobs are returned
+
+### Requirement: The Database Mints Job Creation and Event Occurrence Times
+
+`video_jobs.created_at` and `video_job_outbox.occurred_at` SHALL be minted by PostgreSQL, not by the application. Every repository operation that writes either column — `Create`, `Enqueue`, `Requeue` and `Update` — SHALL read the writing transaction's own timestamp once, immediately after the transaction begins, and SHALL use that one value for the column and for the `occurred_at` field of any payload written in the same transaction, so the stored column and the published payload are the same instant. `Create` SHALL ignore any creation time the domain object carries.
+
+The reason is that these values are subtracted from the database's clock. The in-flight aggregates (see the requirement below on bounded aggregates) report the age of the oldest job and of the oldest unpublished event by comparing against the database's `now()`; a value minted by an application host would make that age a difference of two clocks, negative under ordinary skew. With both sides from one clock, the age is non-negative by construction, and the clamp at zero the aggregates apply is a defensive bound rather than a correction.
+
+Both columns SHALL also default to `now()` in the schema, set by the same idempotent migration for a database that already exists, as a safety net for a write that names neither column. The repository's own inserts SHALL still name them explicitly, because a default cannot give a payload the value its row received.
+
+#### Scenario: A caller-supplied creation time is discarded
+
+- **GIVEN** a `VideoJob` whose `CreatedAt` is set to a value far from the database's clock
+- **WHEN** it is persisted via `Repository.Create` and read back
+- **THEN** the stored `CreatedAt` is the database's transaction time, not the supplied value
+
+#### Scenario: A payload's occurred_at equals its row's column
+
+- **GIVEN** any repository operation that writes a `video_job_outbox` row
+- **WHEN** the row is read back
+- **THEN** the payload's `occurred_at` and the row's `occurred_at` column are the same instant
+
+### Requirement: The Schema Migration Is Serialized Across Concurrent First Starts
+
+The Video Processing context's migration SHALL run inside one transaction that first takes a transaction-scoped PostgreSQL advisory lock, and SHALL apply the whole schema under that lock. The lock SHALL use the lock class the Notification context's migration already uses and an object identifier owned by this context and distinct from Notification's, so the two contexts never serialize against each other and neither can block the other's start.
+
+`CREATE … IF NOT EXISTS` is idempotent once an object exists but does not serialize two creates of an object that does not yet exist: two replicas starting against an unmigrated database can race to a catalog uniqueness violation, and the replica that loses refuses to boot. `cmd/video-api` and `cmd/worker` both migrate, and the compose stack starts several workers at once, so this is the ordinary first start rather than an edge case.
+
+Index creation SHALL NOT be moved to a concurrent build to avoid the lock. A concurrent index build cannot run inside a transaction block, which the multi-statement migration already is; building indexes without blocking writes on a large existing table would need a non-transactional migration step, which is a separate change to argue on its own.
+
+#### Scenario: Two replicas starting together both migrate successfully
+
+- **GIVEN** a database where the Video Processing schema does not yet exist
+- **WHEN** two migrations run concurrently against it
+- **THEN** both succeed and each table exists exactly once
+
+#### Scenario: Starting again against a migrated database succeeds
+
+- **GIVEN** a database where the Video Processing schema already exists
+- **WHEN** a process using the context starts again against it
+- **THEN** the migration succeeds and existing jobs and outbox rows are preserved
 
 ### Requirement: VideoJobCreated Is Recorded to an Outbox Transactionally With Job Creation
 
