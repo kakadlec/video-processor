@@ -245,7 +245,10 @@ func (j *VideoJob) StartProcessing() error {
 //
 // It deliberately does not route through Enqueue. The two edges differ in
 // origin status and in who may walk them — a submitter queues a pending job,
-// only the recovery sweep requeues a processing one.
+// while a processing one is requeued either by the recovery sweep, for an
+// abandoned lease, or by ProcessVideoJob itself, for a transient
+// object-storage failure it decided not to fail the job over. Both callers
+// are bounded by the same domain.MaxJobRequeues.
 //
 // The origin status is checked here rather than left to the transition
 // table, which cannot express it: the table's queued row is reachable from

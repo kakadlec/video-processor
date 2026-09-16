@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"video-processor/internal/video/application"
 	"video-processor/internal/video/domain"
@@ -45,15 +47,21 @@ func newProcessVideoJobUseCase(repo *fakeVideoJobRepository, extractor domain.Fr
 
 func newProcessVideoJobUseCaseWithLeases(repo domain.VideoJobRepository, extractor domain.FrameExtractor, sources domain.SourceStorage, results domain.ResultStorage, leases domain.JobLeaseStore, opts ...application.ProcessVideoJobOption) *application.ProcessVideoJob {
 	parser := fakeVideoJobIDParser{}
+	// A no-op sleep by default: most tests here have no interest in
+	// storageRetryPause and must not pay it in wall-clock time. A test that
+	// does care passes its own application.WithSleepFunc after this one,
+	// which wins because options apply in order.
+	allOpts := append([]application.ProcessVideoJobOption{application.WithSleepFunc(func(time.Duration) {})}, opts...)
 	return application.NewProcessVideoJob(
 		application.NewStartProcessing(repo, repo, parser),
 		application.NewFailJob(repo, repo, parser),
+		application.NewRetryVideoJob(repo, repo, parser),
 		extractor,
 		sources,
 		results,
 		leases,
 		parser,
-		opts...,
+		allOpts...,
 	)
 }
 
@@ -208,15 +216,148 @@ func TestProcessVideoJob_ExtractionFailure_EmptyErrorMessage_UsesFallbackReason(
 	}
 }
 
-// TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip covers the
-// failure mode this change introduces: extraction succeeded, so a zip exists
-// on disk, but it could not be stored. The job must end failed rather than
-// reporting a StorageKey for an object that was never written, and the local
-// zip must not survive — the cleanup is registered before the store attempt
-// precisely so this path still runs it.
-func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T) {
+// recordingSleep captures every duration a use case's pause seam receives,
+// so a test can pin the pacing itself — that it ran, once, for the intended
+// duration — rather than merely that a code path that happens to also pause
+// eventually returned. A no-op default sleep everywhere else would let this
+// call be deleted or its duration changed with the suite staying green.
+type recordingSleep struct {
+	mu    sync.Mutex
+	calls []time.Duration
+}
+
+func (r *recordingSleep) record(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, d)
+}
+
+func (r *recordingSleep) durations() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]time.Duration(nil), r.calls...)
+}
+
+// TestProcessVideoJob_StorageRetryPause pins storageRetryPause itself: it
+// must run exactly once, for exactly five seconds, on the path that
+// retries — and not at all on the two paths that fail immediately, where a
+// pause would only delay a verdict a retry could never change.
+func TestProcessVideoJob_StorageRetryPause(t *testing.T) {
+	const wantPause = 5 * time.Second
+
+	cases := []struct {
+		name      string
+		getErr    error
+		atEpoch   int64
+		wantCalls []time.Duration
+	}{
+		{
+			name:      "transient fetch failure at the first attempt",
+			getErr:    errors.New("dial tcp 10.0.0.5:9000: connection refused"),
+			atEpoch:   0,
+			wantCalls: []time.Duration{wantPause},
+		},
+		{
+			name:      "source genuinely not found",
+			getErr:    domain.ErrSourceNotFound,
+			atEpoch:   0,
+			wantCalls: nil,
+		},
+		{
+			name:      "transient fetch failure with retries exhausted",
+			getErr:    errors.New("dial tcp 10.0.0.5:9000: connection refused"),
+			atEpoch:   domain.MaxJobRequeues,
+			wantCalls: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeVideoJobRepository()
+			if tc.atEpoch == 0 {
+				newQueuedRepoJob(t, repo, "job-1", "user-1")
+			} else {
+				newQueuedRepoJobAtEpoch(t, repo, "job-1", "user-1", tc.atEpoch)
+			}
+
+			sources := newFakeSourceStorage()
+			sources.getErr = tc.getErr
+			sleep := &recordingSleep{}
+
+			uc := newProcessVideoJobUseCaseWithLeases(repo, &countingFrameExtractor{}, sources, newFakeResultStorage(), newFakeJobLeaseStore(),
+				application.WithSleepFunc(sleep.record),
+			)
+			// Every case here fails or retries — never succeeds — but a
+			// permanent failure reports that through result.Success rather
+			// than a Go error, so this test asserts only on the pause.
+			_, _ = uc.Execute(context.Background(), "job-1", testSourceKey(t))
+
+			got := sleep.durations()
+			if len(got) != len(tc.wantCalls) {
+				t.Fatalf("sleep calls = %v, want %v", got, tc.wantCalls)
+			}
+			for i, d := range got {
+				if d != tc.wantCalls[i] {
+					t.Fatalf("sleep calls = %v, want %v", got, tc.wantCalls)
+				}
+			}
+		})
+	}
+}
+
+// TestProcessVideoJob_TransientStorageFailure_RequeuesJobAndRemovesLocalZip
+// covers the retry-transient-object-storage-failure fix: a Put failure that
+// is not a permanent condition must not commit a terminal state that no
+// redelivery could ever undo. The job goes back to queued at an advanced
+// epoch instead, and the local zip still does not survive — that cleanup is
+// registered before the store attempt and runs on every path through it,
+// requeue included.
+func TestProcessVideoJob_TransientStorageFailure_RequeuesJobAndRemovesLocalZip(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newQueuedRepoJob(t, repo, "job-1", "user-1")
+
+	zipPath := writeTestZip(t)
+	extractor := fakeFrameExtractor{zipPath: zipPath, frameCount: 3, imageNames: []string{"frame_0001.png"}}
+	sources := seededSources(t)
+	results := newFakeResultStorage()
+	results.putErr = errors.New("dial tcp 10.0.0.5:9000: connection refused, bucket \"video-results\"")
+
+	uc := newProcessVideoJobUseCase(repo, extractor, sources, results)
+	result, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+	if !errors.Is(err, domain.ErrJobRequeuedForRetry) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrJobRequeuedForRetry)
+	}
+	if !result.Applied {
+		t.Fatalf("result.Applied = false, want true")
+	}
+
+	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusQueued {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusQueued)
+	}
+	if job.LeaseEpoch() != 1 {
+		t.Fatalf("job.LeaseEpoch() = %d, want 1", job.LeaseEpoch())
+	}
+	if !job.StorageKey().IsZero() {
+		t.Fatalf("job.StorageKey() = %q, want unset — the result was never stored", job.StorageKey().String())
+	}
+
+	if _, err := os.Stat(zipPath); !os.IsNotExist(err) {
+		t.Fatalf("expected the local zip at %s to be removed on the storage-retry path, os.Stat err = %v", zipPath, err)
+	}
+}
+
+// TestProcessVideoJob_StorageFailure_ExhaustedRetries_FailsJob covers the
+// bound: a job that has already been requeued domain.MaxJobRequeues times
+// falls back to the ordinary terminal failure this use case always had, with
+// the same reason a first failure would have carried and none of the
+// adapter's own error text.
+func TestProcessVideoJob_StorageFailure_ExhaustedRetries_FailsJob(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	newQueuedRepoJobAtEpoch(t, repo, "job-1", "user-1", domain.MaxJobRequeues)
 
 	zipPath := writeTestZip(t)
 	extractor := fakeFrameExtractor{zipPath: zipPath, frameCount: 3, imageNames: []string{"frame_0001.png"}}
@@ -235,9 +376,6 @@ func TestProcessVideoJob_StorageFailure_FailsJobAndRemovesLocalZip(t *testing.T)
 	if result.StorageKey != "" {
 		t.Fatalf("result.StorageKey = %q, want empty for an unstored result", result.StorageKey)
 	}
-	// The reason is persisted on the job and echoed to the uploader, so it
-	// must carry none of the adapter's own error text — that names the
-	// endpoint and bucket.
 	if result.FailureReason == "" {
 		t.Fatal("expected a non-empty FailureReason")
 	}
@@ -304,13 +442,86 @@ func TestProcessVideoJob_ExtractionFailure_RemovesDownloadedSource(t *testing.T)
 	}
 }
 
-// TestProcessVideoJob_FetchFailure_FailsJobWithoutInvokingFfmpeg covers the
-// step this change adds ahead of extraction. The job must fail, ffmpeg must
-// never run, and the persisted reason must carry none of the adapter's own
-// error text — which names the endpoint and bucket.
-func TestProcessVideoJob_FetchFailure_FailsJobWithoutInvokingFfmpeg(t *testing.T) {
+// TestProcessVideoJob_TransientFetchFailure_RequeuesJobWithoutInvokingFfmpeg
+// covers the retry-transient-object-storage-failure fix on the fetch side: a
+// Get failure that is not domain.ErrSourceNotFound must not commit a
+// terminal state a redelivery could never undo. ffmpeg must still never run,
+// since the source was never downloaded.
+func TestProcessVideoJob_TransientFetchFailure_RequeuesJobWithoutInvokingFfmpeg(t *testing.T) {
 	repo := newFakeVideoJobRepository()
 	newQueuedRepoJob(t, repo, "job-1", "user-1")
+
+	extractor := &countingFrameExtractor{}
+	sources := newFakeSourceStorage()
+	sources.getErr = errors.New("dial tcp 10.0.0.5:9000: connection refused, bucket \"video-results\"")
+
+	uc := newProcessVideoJobUseCase(repo, extractor, sources, newFakeResultStorage())
+	result, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+	if !errors.Is(err, domain.ErrJobRequeuedForRetry) {
+		t.Fatalf("error = %v, want %v", err, domain.ErrJobRequeuedForRetry)
+	}
+	if !result.Applied {
+		t.Fatalf("result.Applied = false, want true")
+	}
+	if extractor.calls != 0 {
+		t.Fatalf("ExtractFrames called %d times, want 0 — a source that could not be fetched must never reach ffmpeg", extractor.calls)
+	}
+
+	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusQueued {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusQueued)
+	}
+	if job.LeaseEpoch() != 1 {
+		t.Fatalf("job.LeaseEpoch() = %d, want 1", job.LeaseEpoch())
+	}
+}
+
+// TestProcessVideoJob_FetchFailure_SourceNotFound_FailsJobImmediately covers
+// the one Get failure this change deliberately does not retry: the object
+// simply is not there, which no redelivery can change. It must still fail on
+// the very first attempt, at epoch 0, with none of the adapter's own error
+// text in the persisted reason.
+func TestProcessVideoJob_FetchFailure_SourceNotFound_FailsJobImmediately(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	newQueuedRepoJob(t, repo, "job-1", "user-1")
+
+	extractor := &countingFrameExtractor{}
+	sources := newFakeSourceStorage() // holds no object under testSourceKey
+
+	uc := newProcessVideoJobUseCase(repo, extractor, sources, newFakeResultStorage())
+	result, err := uc.Execute(context.Background(), "job-1", testSourceKey(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Fatalf("expected Success=false, got %+v", result)
+	}
+	if extractor.calls != 0 {
+		t.Fatalf("ExtractFrames called %d times, want 0 — a source that could not be fetched must never reach ffmpeg", extractor.calls)
+	}
+
+	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if job.Status() != domain.JobStatusFailed {
+		t.Fatalf("job.Status() = %v, want %v", job.Status(), domain.JobStatusFailed)
+	}
+	if job.ErrorReason() == "" {
+		t.Fatal("expected a non-empty ErrorReason")
+	}
+}
+
+// TestProcessVideoJob_FetchFailure_ExhaustedRetries_FailsJob mirrors the
+// storage-side bound test: a job already at domain.MaxJobRequeues falls back
+// to the ordinary terminal failure, with none of the adapter's own error
+// text leaked into the persisted reason.
+func TestProcessVideoJob_FetchFailure_ExhaustedRetries_FailsJob(t *testing.T) {
+	repo := newFakeVideoJobRepository()
+	newQueuedRepoJobAtEpoch(t, repo, "job-1", "user-1", domain.MaxJobRequeues)
 
 	extractor := &countingFrameExtractor{}
 	sources := newFakeSourceStorage()
@@ -325,7 +536,7 @@ func TestProcessVideoJob_FetchFailure_FailsJobWithoutInvokingFfmpeg(t *testing.T
 		t.Fatalf("expected Success=false, got %+v", result)
 	}
 	if extractor.calls != 0 {
-		t.Fatalf("ExtractFrames called %d times, want 0 — a source that could not be fetched must never reach ffmpeg", extractor.calls)
+		t.Fatalf("ExtractFrames called %d times, want 0", extractor.calls)
 	}
 
 	job, err := repo.FindByID(context.Background(), newTestVideoJobID(t, "job-1"))

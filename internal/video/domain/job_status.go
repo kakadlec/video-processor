@@ -20,7 +20,9 @@ const (
 // names queued alone so it refuses the processing row, and the broker's
 // redelivery arrives long before any lease can lapse, so nothing else can
 // ever move it. Re-dispatching it is the only way back, and Requeue is the
-// only transition that walks this edge.
+// only transition that walks this edge — walked by the recovery sweep for an
+// abandoned lease, and by ProcessVideoJob itself for a transient
+// object-storage failure it chooses to retry rather than fail outright.
 //
 // No other backwards transition exists and no state may be skipped.
 // completed and failed remain terminal: nothing leaves them.
