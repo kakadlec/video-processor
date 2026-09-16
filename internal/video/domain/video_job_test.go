@@ -34,13 +34,12 @@ func TestNewVideoJob(t *testing.T) {
 	gen := stubVideoJobIDGenerator{id: id}
 	userID := validVideoJobUserID(t)
 	filename := validVideoJobFilename(t)
-	now := time.Now()
 	sourceKey, err := domain.NewStorageKey("uploads/upload-1_input.mp4")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	job, err := domain.NewVideoJob(gen, userID, filename, sourceKey, "", now)
+	job, err := domain.NewVideoJob(gen, userID, filename, sourceKey, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -71,13 +70,15 @@ func TestNewVideoJob(t *testing.T) {
 	if !job.SourceKey().Equal(sourceKey) {
 		t.Fatalf("job.SourceKey() = %v, want %v", job.SourceKey(), sourceKey)
 	}
-	if !job.CreatedAt().Equal(now) {
-		t.Fatalf("job.CreatedAt() = %v, want %v", job.CreatedAt(), now)
+	// PostgreSQL mints CreatedAt on Create, not this constructor — see
+	// NewVideoJob's doc comment.
+	if !job.CreatedAt().IsZero() {
+		t.Fatalf("job.CreatedAt() = %v, want the zero value", job.CreatedAt())
 	}
 }
 
 func TestNewVideoJob_NilGenerator(t *testing.T) {
-	_, err := domain.NewVideoJob(nil, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, "", time.Now())
+	_, err := domain.NewVideoJob(nil, validVideoJobUserID(t), validVideoJobFilename(t), domain.StorageKey{}, "")
 	if !errors.Is(err, domain.ErrVideoJobIDGeneratorRequired) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobIDGeneratorRequired)
 	}

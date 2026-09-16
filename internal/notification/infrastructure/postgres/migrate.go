@@ -15,9 +15,10 @@ var schemaSQL string
 // purpose every context shares, the object names the context.
 //
 // 0x46494158 is "FIAX" in ASCII, distinctive enough not to collide with
-// another application sharing the server. Nothing else in this repository
-// takes an advisory lock today; a second context adding one takes a new
-// object id under the same class, and this comment is the registry.
+// another application sharing the server. internal/video/infrastructure/postgres's
+// Migrate shares this class under object 2; a further context adding one
+// takes the next object id under the same class, and this comment plus
+// video's own are the registry.
 const (
 	schemaMigrationLockClass  = 0x46494158
 	notificationSchemaLockObj = 1
@@ -33,9 +34,10 @@ const (
 // startup means a replica that refuses to boot. The lock makes the second one wait and then find the
 // table present.
 //
-// This is deliberately stricter than the identity and video adapters, which
-// take no lock. That is a latent race in those two rather than a reason to
-// copy them.
+// This is deliberately stricter than the identity adapter, which takes no
+// lock. That is a latent race there rather than a reason to copy it.
+// internal/video/infrastructure/postgres's Migrate takes the same kind of
+// lock this one does, under object 2 above.
 //
 // schema.sql holds more than one statement, and PostgreSQL runs a
 // multi-statement string only over the simple query protocol. pgx forces

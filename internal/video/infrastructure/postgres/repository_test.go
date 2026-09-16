@@ -45,14 +45,20 @@ func testDB(t *testing.T) *sql.DB {
 	return db
 }
 
-func newTestJob(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename string, createdAt time.Time) *domain.VideoJob {
+func newTestJob(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename string) *domain.VideoJob {
 	t.Helper()
-	return newTestJobWithSourceKey(t, ids, userID, filename, "uploads/"+filename, createdAt)
+	return newTestJobWithSourceKey(t, ids, userID, filename, "uploads/"+filename)
 }
 
 // newTestJobWithSourceKey builds a job whose source key is set explicitly,
 // including to "" for a job with no stored source (POST /api/video-jobs).
-func newTestJobWithSourceKey(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename, sourceKey string, createdAt time.Time) *domain.VideoJob {
+//
+// It builds the aggregate only — CreatedAt is left zero, as NewVideoJob
+// leaves it, and PostgreSQL mints it once the caller persists the job via
+// Repository.Create. A test that needs a specific CreatedAt sets it
+// explicitly afterward with backdateCreatedAt, since Create no longer
+// accepts one.
+func newTestJobWithSourceKey(t *testing.T, ids domain.VideoJobIDGenerator, userID, filename, sourceKey string) *domain.VideoJob {
 	t.Helper()
 
 	uid, err := domain.NewUserID(userID)
@@ -70,11 +76,25 @@ func newTestJobWithSourceKey(t *testing.T, ids domain.VideoJobIDGenerator, userI
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
-	job, err := domain.NewVideoJob(ids, uid, fn, key, "", createdAt)
+	job, err := domain.NewVideoJob(ids, uid, fn, key, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return job
+}
+
+// backdateCreatedAt overwrites a persisted job's created_at directly,
+// bypassing the mint Repository.Create performs. Tests use it to establish a
+// deterministic ordering PostgreSQL's own clock cannot be asked to produce
+// on demand — an identical value across several rows, or a value strictly
+// before another row's. created_at is written once by Create and touched by
+// no other statement, so backdating it after any amount of the job's
+// lifecycle has run is safe.
+func backdateCreatedAt(t *testing.T, db *sql.DB, id domain.VideoJobID, createdAt time.Time) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `UPDATE video_jobs SET created_at = $1 WHERE id = $2`, createdAt, id.String()); err != nil {
+		t.Fatalf("unexpected error backdating created_at: %v", err)
+	}
 }
 
 func TestRepository_CreateAndFindByID(t *testing.T) {
@@ -83,12 +103,7 @@ func TestRepository_CreateAndFindByID(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	// See schema.sql's comment on video_jobs.created_at: TIMESTAMPTZ is
-	// microsecond-precision, so an untruncated time.Now() would not
-	// round-trip exactly and this test's own CreatedAt assertion below
-	// would fail on a real (not fake) precision boundary, not a bug.
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	job := newTestJob(t, ids, "user-1", "video.mp4", now)
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -119,8 +134,53 @@ func TestRepository_CreateAndFindByID(t *testing.T) {
 	if !found.StorageKey().IsZero() {
 		t.Fatalf("StorageKey = %v, want zero value", found.StorageKey())
 	}
-	if !found.CreatedAt().Equal(now) {
-		t.Fatalf("CreatedAt = %v, want %v", found.CreatedAt(), now)
+	// PostgreSQL, not this test, minted CreatedAt: assert only that Create
+	// persisted a real instant rather than leaving the column at the zero
+	// value NewVideoJob built.
+	if found.CreatedAt().IsZero() {
+		t.Fatal("CreatedAt is zero, want a PostgreSQL-minted instant")
+	}
+}
+
+// TestRepository_Create_IgnoresACallerSuppliedCreatedAt pins the invariant
+// this change introduced: Create mints created_at from the writing
+// transaction's own now() unconditionally, rather than trusting whatever the
+// aggregate handed to it carries. Without this test, reverting Create to
+// insert job.CreatedAt() verbatim would pass every other test in this file —
+// none of them ever hands it a CreatedAt that both differs from "now" and
+// survives to be compared.
+func TestRepository_Create_IgnoresACallerSuppliedCreatedAt(t *testing.T) {
+	db := testDB(t)
+	ids := idgen.New()
+	repo := postgres.NewRepository(db, ids)
+	ctx := context.Background()
+
+	unmintedJob := newTestJob(t, ids, "user-1", "video.mp4")
+	// RestoreVideoJob is the only constructor that still accepts an explicit
+	// CreatedAt; NewVideoJob (what newTestJob calls) always leaves it zero.
+	// This obviously-wrong instant stands in for whatever an aggregate might
+	// carry by the time it reaches Create.
+	wrongCreatedAt := time.Date(1999, 1, 1, 0, 0, 0, 0, time.UTC)
+	job, err := domain.RestoreVideoJob(unmintedJob.ID(), unmintedJob.UserID(), unmintedJob.OriginalFilename(), unmintedJob.SourceKey(), unmintedJob.ContentHash(), unmintedJob.StorageKey(), 0, "", domain.JobStatusPending, wrongCreatedAt, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	before := time.Now().UTC()
+	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	after := time.Now().UTC()
+
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found.CreatedAt().Equal(wrongCreatedAt) {
+		t.Fatalf("CreatedAt = %v, want it not to equal the caller-supplied instant", found.CreatedAt())
+	}
+	if found.CreatedAt().Before(before) || found.CreatedAt().After(after) {
+		t.Fatalf("CreatedAt = %v, want between %v and %v (PostgreSQL's own now())", found.CreatedAt(), before, after)
 	}
 }
 
@@ -145,14 +205,18 @@ func TestRepository_FindByUserID_OrdersByCreatedAtDescending(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	older := newTestJob(t, ids, "user-1", "older.mp4", time.Now().UTC().Add(-time.Hour))
-	newer := newTestJob(t, ids, "user-1", "newer.mp4", time.Now().UTC())
+	older := newTestJob(t, ids, "user-1", "older.mp4")
+	newer := newTestJob(t, ids, "user-1", "newer.mp4")
 	if err := repo.Create(ctx, older); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := repo.Create(ctx, newer); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// Create mints created_at from PostgreSQL's own clock, so the two
+	// creations above are not guaranteed to land far enough apart to assert
+	// ordering on; backdating older makes the relative order deterministic.
+	backdateCreatedAt(t, db, older.ID(), time.Now().UTC().Add(-time.Hour))
 
 	userID, err := domain.NewUserID("user-1")
 	if err != nil {
@@ -177,18 +241,22 @@ func TestRepository_FindByUserID_TieBreaksByAscendingIDAndPaginates(t *testing.T
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	other := newTestJob(t, ids, "other-user", "other.mp4", time.Now().UTC())
+	other := newTestJob(t, ids, "other-user", "other.mp4")
 	if err := repo.Create(ctx, other); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	// Create mints created_at from PostgreSQL's own clock, so three
+	// successive creations are not guaranteed to tie on it; backdating all
+	// three to the same instant forces the tie the test exercises.
 	tied := time.Now().UTC().Truncate(time.Microsecond)
 	var mine []*domain.VideoJob
 	for range 3 {
-		job := newTestJob(t, ids, "user-1", "video.mp4", tied)
+		job := newTestJob(t, ids, "user-1", "video.mp4")
 		if err := repo.Create(ctx, job); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		backdateCreatedAt(t, db, job.ID(), tied)
 		mine = append(mine, job)
 	}
 
@@ -233,10 +301,14 @@ func TestRepository_Create_RecordsOutboxEvent(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	job := newTestJob(t, ids, "user-1", "video.mp4", now)
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 
 	if err := repo.Create(ctx, job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found, err := repo.FindByID(ctx, job.ID())
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -278,8 +350,10 @@ func TestRepository_Create_RecordsOutboxEvent(t *testing.T) {
 	if payload.OriginalFilename != job.OriginalFilename().String() {
 		t.Fatalf("payload.OriginalFilename = %q, want %q", payload.OriginalFilename, job.OriginalFilename().String())
 	}
-	if !payload.OccurredAt.Equal(now) {
-		t.Fatalf("payload.OccurredAt = %v, want %v", payload.OccurredAt, now)
+	// The outbox row's occurred_at is the same PostgreSQL-minted instant as
+	// the job row's created_at, not a separately captured app-side value.
+	if !payload.OccurredAt.Equal(found.CreatedAt()) {
+		t.Fatalf("payload.OccurredAt = %v, want %v (job's CreatedAt)", payload.OccurredAt, found.CreatedAt())
 	}
 }
 
@@ -289,7 +363,7 @@ func TestRepository_Create_DuplicateID_LeavesNoOutboxRow(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	first := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
+	first := newTestJob(t, ids, "user-1", "video.mp4")
 	if err := repo.Create(ctx, first); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -334,7 +408,7 @@ func TestRepository_Create_OutboxInsertFailure_RollsBackJobRow(t *testing.T) {
 		}
 	})
 
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 	if err := repo.Create(ctx, job); err == nil {
 		t.Fatal("expected an error when the outbox insert fails, got nil")
 	}
@@ -355,7 +429,7 @@ func TestRepository_Update_PersistsTransitionedState(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -403,7 +477,7 @@ func TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds(t *testi
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
 
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 	if err := repo.Create(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -439,13 +513,22 @@ func TestRepository_Update_CanceledContext_FailsButFreshContextSucceeds(t *testi
 // completeTestJob drives a fresh job through its full transition sequence
 // and persists the result, so a test can seed genuinely completed rows
 // rather than hand-crafting invalid aggregate state.
-func completeTestJob(t *testing.T, repo *postgres.Repository, ids domain.VideoJobIDGenerator, userID, filename string, createdAt time.Time) *domain.VideoJob {
+//
+// createdAt backdates the row after creation when non-zero — Create mints
+// created_at from PostgreSQL's own clock and no longer accepts a caller
+// value, but created_at is written once and touched by no later statement in
+// the sequence this helper drives, so overwriting it afterward is safe and
+// is how a test still controls relative ordering.
+func completeTestJob(t *testing.T, db *sql.DB, repo *postgres.Repository, ids domain.VideoJobIDGenerator, userID, filename string, createdAt time.Time) *domain.VideoJob {
 	t.Helper()
 	ctx := context.Background()
 
-	job := newTestJob(t, ids, userID, filename, createdAt)
+	job := newTestJob(t, ids, userID, filename)
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if !createdAt.IsZero() {
+		backdateCreatedAt(t, db, job.ID(), createdAt)
 	}
 	epoch := driveCreatedJobToProcessing(t, repo, job)
 	if err := job.Complete(domain.ResultStorageKey(job.ID()), 3); err != nil {
@@ -463,12 +546,12 @@ func TestRepository_FindCompletedByUserID_ReturnsOnlyCompletedJobsForThatUser(t 
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	completed := completeTestJob(t, repo, ids, "user-1", "done.mp4", time.Now().UTC())
+	completed := completeTestJob(t, db, repo, ids, "user-1", "done.mp4", time.Time{})
 	// A pending job for the same user, and a completed job for another one.
-	if err := repo.Create(ctx, newTestJob(t, ids, "user-1", "pending.mp4", time.Now().UTC())); err != nil {
+	if err := repo.Create(ctx, newTestJob(t, ids, "user-1", "pending.mp4")); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	completeTestJob(t, repo, ids, "user-2", "someone-else.mp4", time.Now().UTC())
+	completeTestJob(t, db, repo, ids, "user-2", "someone-else.mp4", time.Time{})
 
 	userID, err := domain.NewUserID("user-1")
 	if err != nil {
@@ -500,10 +583,11 @@ func TestRepository_FindCompletedByUserID_NonCompletedJobsDoNotHideCompletedOnes
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	base := time.Now().UTC()
-	completed := completeTestJob(t, repo, ids, "user-1", "done.mp4", base.Add(-time.Hour))
-	for i := range 5 {
-		newer := newTestJob(t, ids, "user-1", "pending.mp4", base.Add(time.Duration(i)*time.Minute))
+	// FindCompletedByUserID filters on status, not on created_at, so the
+	// jobs' relative ages are immaterial to this test — only membership is.
+	completed := completeTestJob(t, db, repo, ids, "user-1", "done.mp4", time.Time{})
+	for range 5 {
+		newer := newTestJob(t, ids, "user-1", "pending.mp4")
 		if err := repo.Create(ctx, newer); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -532,11 +616,12 @@ func TestRepository_FindCompletedByUserID_HasNoImplicitLimit(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	// More than ListUserJobs' maximum page size of 100.
+	// More than ListUserJobs' maximum page size of 100. Order is not under
+	// test here, only that no limit is silently applied, so every job shares
+	// whatever instant PostgreSQL mints for it.
 	const total = 101
-	base := time.Now().UTC()
-	for i := range total {
-		completeTestJob(t, repo, ids, "user-1", "done.mp4", base.Add(time.Duration(i)*time.Second))
+	for range total {
+		completeTestJob(t, db, repo, ids, "user-1", "done.mp4", time.Time{})
 	}
 
 	userID, err := domain.NewUserID("user-1")
@@ -559,8 +644,8 @@ func TestRepository_FindCompletedByUserID_OrdersNewestFirst(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	older := completeTestJob(t, repo, ids, "user-1", "older.mp4", time.Now().UTC().Add(-time.Hour))
-	newer := completeTestJob(t, repo, ids, "user-1", "newer.mp4", time.Now().UTC())
+	older := completeTestJob(t, db, repo, ids, "user-1", "older.mp4", time.Now().UTC().Add(-time.Hour))
+	newer := completeTestJob(t, db, repo, ids, "user-1", "newer.mp4", time.Now().UTC())
 
 	userID, err := domain.NewUserID("user-1")
 	if err != nil {
@@ -592,7 +677,7 @@ func TestRepository_SourceKeyRoundTripsThroughEveryReadMethod(t *testing.T) {
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	job := newTestJobWithSourceKey(t, ids, "user-1", "movie.mp4", "uploads/upload-1_movie.mp4", time.Now().UTC())
+	job := newTestJobWithSourceKey(t, ids, "user-1", "movie.mp4", "uploads/upload-1_movie.mp4")
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -695,7 +780,7 @@ func seedJobInStatusAtEpoch(t *testing.T, repo *postgres.Repository, ids domain.
 	t.Helper()
 	ctx := context.Background()
 
-	job := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC().Truncate(time.Microsecond))
+	job := newTestJob(t, ids, "user-1", "video.mp4")
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -925,7 +1010,7 @@ func TestRepository_ClaimForProcessing_UnknownIDIsDistinctFromALostClaim(t *test
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	unknown := newTestJob(t, ids, "user-1", "video.mp4", time.Now().UTC())
+	unknown := newTestJob(t, ids, "user-1", "video.mp4")
 	claimed, _, err := repo.ClaimForProcessing(ctx, unknown)
 	if !errors.Is(err, domain.ErrVideoJobNotFound) {
 		t.Fatalf("error = %v, want %v", err, domain.ErrVideoJobNotFound)

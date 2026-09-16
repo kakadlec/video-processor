@@ -43,7 +43,7 @@ func enqueuedJob(t *testing.T, db *sql.DB, userID, filename string) *domain.Vide
 	repo := postgres.NewRepository(db, ids)
 	ctx := context.Background()
 
-	job := newTestJob(t, ids, userID, filename, time.Now().UTC())
+	job := newTestJob(t, ids, userID, filename)
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestRepository_Enqueue_OutboxFailureRollsBackTheStatus(t *testing.T) {
 	ids := idgen.New()
 	repo := postgres.NewRepository(db, ids)
 
-	job := newTestJob(t, ids, "user-1", "movie.mp4", time.Now().UTC())
+	job := newTestJob(t, ids, "user-1", "movie.mp4")
 	if err := repo.Create(ctx, job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

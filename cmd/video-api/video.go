@@ -32,13 +32,6 @@ import (
 	videostorage "video-processor/internal/video/infrastructure/storage"
 )
 
-// systemClock is the production Clock for this process's Video module. It
-// lived in the Identity module's file while one process served both
-// contexts; it comes here with the only module that still asks for one.
-type systemClock struct{}
-
-func (systemClock) Now() time.Time { return time.Now() }
-
 // closeDB closes db, logging any failure — used on setup-failure paths where
 // a different, more relevant error is already being returned to the caller,
 // and on shutdown, where nothing is left to return it to.
@@ -261,12 +254,11 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 
 	repo := videocache.NewCachedVideoJobRepository(authoritativeRepo, redisClient, ids)
 	relay := videomessaging.NewRelay(videopostgres.NewOutboxRepository(db), rabbitConfig)
-	clock := systemClock{}
 	// No extractor, no ProcessVideoJob, no CompleteJob, no FailJob. This
 	// process hands work to cmd/worker and reads the outcome back; the
 	// ffmpeg adapter is not wired here at all.
 	module := newVideoModule(
-		videoapplication.NewCreateVideoJob(repo, ids, clock),
+		videoapplication.NewCreateVideoJob(repo, ids),
 		videoapplication.NewGetJobStatus(repo, ids),
 		videoapplication.NewListUserJobs(repo),
 		videoapplication.NewEnqueueVideoJob(repo, ids),
