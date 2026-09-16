@@ -1,0 +1,25 @@
+# Scrapes GET /metrics on the three HTTP services inside the compose
+# network, by container name and their fixed internal port (8080) — the same
+# addresses the gateway itself proxies to. cmd/worker and cmd/notifier are
+# deliberately absent: they serve no HTTP surface at all (container-image,
+# service-health-probes), so there is nothing here for them until
+# expose-worker-and-notifier-metrics changes that. Add a job per service,
+# following the pattern below, rather than restructuring this file.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: identity-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["identity-api:8080"]
+
+  - job_name: video-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["video-api:8080"]
+
+  - job_name: notification-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["notification-api:8080"]

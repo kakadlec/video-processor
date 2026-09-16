@@ -135,7 +135,7 @@ go build -o notifier ./cmd/notifier
 
 `cmd/worker` creates `temp/` in its working directory at startup and exits if it cannot. **No other process creates a directory at all**: extraction lives in the worker, so nothing else touches the filesystem. Neither uploaded source videos nor processed ZIP results are written to disk — both go to the MinIO bucket named by `VIDEO_MINIO_BUCKET`, which `cmd/video-api` and `cmd/worker` both require at startup and the Video API creates if absent. `temp/` holds per-job scratch only: the source copy downloaded for `ffmpeg`, the extracted frames, and the zip built from them, all removed before the job finishes. Running several processes from the same working directory is fine — only the worker uses it.
 
-To skip the manual wiring entirely, use `docker compose up --build`, which starts all five services plus the gateway and a mail catcher inside Docker with everything already configured — see "Docker Workflow" below. The mail catcher (`mail`) accepts every message and delivers none onward; its inbox is at <http://127.0.0.1:8025>, which is the second and last host port the stack publishes. It is reached directly rather than through the gateway: the gateway serves the application's own surface, and a route there for a development-only UI would exist in no deployment.
+To skip the manual wiring entirely, use `docker compose up --build`, which starts all five services plus the gateway, a mail catcher, and a Prometheus server inside Docker with everything already configured — see "Docker Workflow" below. The mail catcher (`mail`) accepts every message and delivers none onward; its inbox is at <http://127.0.0.1:8025>. Prometheus (`prometheus`) scrapes `GET /metrics` on the three HTTP services every 15s; its UI is at <http://127.0.0.1:9090>. These are the second and third host ports the stack publishes — both reached directly rather than through the gateway, which serves the application's own surface and would make a route for either a development-only UI that exists in no deployment.
 
 ## Running Tests
 
@@ -233,12 +233,20 @@ docker compose up --build
 # `worker` and `notifier` are started from the same image, so uploads are
 # actually processed and finished jobs are actually announced.
 #
-# The one other published port is the mail catcher's inbox, at
-# http://127.0.0.1:8025. Register an email preference through
+# The two other published ports are the mail catcher's inbox, at
+# http://127.0.0.1:8025 — register an email preference through
 # PUT /api/notification-preferences and every notification for that user
-# lands there instead of being sent anywhere real. It is a development-only
-# support service, so it publishes its own loopback-bound port rather than
-# taking a route on the gateway.
+# lands there instead of being sent anywhere real — and Prometheus's UI, at
+# http://127.0.0.1:9090, scraping GET /metrics on the three HTTP services
+# every 15s (docker/prometheus/prometheus.yml). cmd/worker and cmd/notifier
+# serve nothing, so they are deliberately absent from that scrape config
+# until expose-worker-and-notifier-metrics changes that. Both are
+# development-only support services, so each publishes its own loopback-
+# bound port rather than taking a route on the gateway; Prometheus's own data
+# has no named volume (24h retention besides), for the same reason redis's
+# does not — diagnostic and non-authoritative, so a recreate starting
+# against an empty anonymous volume rather than the previous run's is a
+# correctness non-event, not a loss.
 #
 # Three workers start by default (docker-compose.yml's `deploy.replicas`),
 # so this stack processes several videos at the same time. Prefetch is 1, so
