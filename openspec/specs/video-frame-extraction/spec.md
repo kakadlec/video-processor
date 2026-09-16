@@ -139,7 +139,7 @@ The deletion is an obligation to attempt, not a guarantee of absence — `videoj
 
 This inverts the behavior the removed "Uploaded File Retained On Processing Failure" requirement documented. Retention was a known leak, tolerable only because a local file is reclaimed when its container is replaced; the same leak in object storage would be durable and unbounded, with nothing in this system to reap it.
 
-A job that `videojob-execution`'s transient object-storage retry returned to `queued` has not failed, so this requirement does not reach it: its source object and idempotency key are kept for the attempt its new dispatch carries, and deletion is attempted only if a later attempt applies the `failed` outcome.
+A job that `videojob-execution`'s transient object-storage retry returned to `queued` has not failed, so this requirement does not reach it: its source object and idempotency key are kept for the attempt its new dispatch carries, and source deletion is attempted only once a later attempt applies a terminal outcome — under this requirement if that outcome is `failed`, and under `videojob-worker`'s source-ownership rule if it is `completed`.
 
 Two consequences, both accepted deliberately. The system does not retry a job that has failed from the original bytes; a retry after failure is a fresh submission, which the worker attempts to unblock promptly by clearing the failed job's idempotency key. And a job that fails *before* any component claims it — one whose dispatch was never delivered — is not covered by this requirement at all: nothing processes it, so nothing deletes its source, and the object-storage lifecycle rule is what reclaims it.
 

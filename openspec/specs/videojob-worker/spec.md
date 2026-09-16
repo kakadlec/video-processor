@@ -410,7 +410,7 @@ When `ProcessVideoJob` returns the requeued-for-retry sentinel, the worker SHALL
 
 This is an acknowledgement rule on its own footing — it selects the consumer's existing `Ack` for a distinct sentinel and adds no disposition value — and not an exception to either of the requirements above, and it SHALL NOT be read as weakening them. The message is not one the worker cannot act on, so dead-lettering it would put a healthy job's history in the place reserved for anomalies; and it is not a message whose outcome the worker failed to learn, so requeueing it would put a second dispatch for the same job on the queue beside the one the retry write already committed. **This delivery is spent because a committed write superseded it**: the row is `queued` at an advanced epoch and a fresh dispatch row exists in the outbox, so the relay, not this message, carries the job forward. The rule that rejection is the default for any failure nobody enumerated SHALL be unaffected — the acknowledgement is keyed on the sentinel alone, and a retry write that failed for any other reason reaches the default.
 
-On acknowledging, the worker SHALL release the lease it held only when this run's retry write was the one applied, gated exactly as the failure path gates its cleanup. It SHALL NOT delete the source object and SHALL NOT clear the idempotency key: the next attempt reads the one, and a resubmission of identical content during the retry SHALL still be answered with this job.
+On acknowledging, the worker SHALL release the lease it held only when this run's retry write was the one applied, gated exactly as the failure path gates its cleanup. It SHALL NOT delete the source object and SHALL NOT clear the idempotency key: the next attempt reads the one, and the other, where a reservation was made and has not expired, keeps answering a resubmission of identical content with this job rather than creating a second.
 
 A retry write refused by the fence SHALL be handled as any other fenced outcome under the dead-letter requirement above.
 
@@ -418,13 +418,13 @@ A retry write refused by the fence SHALL be handled as any other fenced outcome 
 
 - **GIVEN** a dispatched job whose source object cannot be read because the object store is failing, at an epoch below the retry bound
 - **WHEN** the worker finishes the message
-- **THEN** the message is acknowledged rather than requeued or dead-lettered, the job is `queued` at the next epoch with a new dispatch row, the source object and the idempotency key still exist, and this run's lease is released
+- **THEN** the message is acknowledged rather than requeued or dead-lettered, the job is `queued` at the next epoch with a new dispatch row, the source object still exists, the idempotency key was not cleared, and this run's lease is released
 
 #### Scenario: The superseded dispatch is not the one that carries the job forward
 
 - **GIVEN** a job returned to `queued` by a transient storage retry whose message was acknowledged
 - **WHEN** the dispatch relay publishes the new dispatch row and the object store has recovered
-- **THEN** a worker claims the job at its new epoch and runs it to a terminal state, and no second delivery for the superseded epoch exists
+- **THEN** a worker claims the job at its new epoch and runs it to a terminal state, and if at-least-once delivery produces a duplicate of either dispatch, exactly one delivery wins the conditional claim and every other is dead-lettered as a lost claim without modifying the job
 
 #### Scenario: A missing source object is not retried
 
