@@ -596,6 +596,67 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  # A Prometheus server scraping GET /metrics on the three HTTP services and,
+  # since expose-worker-and-notifier-metrics, on the worker and the notifier
+  # as well — so the endpoints add-prometheus-metrics and that change shipped
+  # produce series somewhere in this repository. Like the mail catcher above,
+  # it is a development-only support service: built from an image this
+  # repository does not produce, serving no application route, and present
+  # in no deployment.
+  #
+  # No named volume, deliberately, and for the same reason as the redis
+  # service above: this data is diagnostic and non-authoritative, so it does
+  # not need postgres_data's or minio_data's durability. The image itself
+  # declares a VOLUME at /prometheus, so a container still gets one — an
+  # anonymous one Docker creates rather than one this file names, exactly
+  # like redis's own /data. Verified rather than assumed: Compose *inherits*
+  # an anonymous volume across an ordinary recreate (a plain `docker compose
+  # up`/`up --build`, even with --force-recreate) by copying it from the
+  # container being replaced, so a normal iteration loop keeps this data —
+  # it is not reset on every `--build`. Only `docker compose down` (which
+  # removes the container outright, leaving nothing to copy from) or an
+  # explicit `up --renew-anon-volumes` starts a genuinely empty one; a `down`
+  # also orphans the old volume rather than deleting it; `docker volume
+  # prune` or `down -v` reclaims it. --storage.tsdb.retention.time bounds
+  # what a long-running (or long-iterated-on) container accumulates, rather
+  # than leaving it at Prometheus's 15-day default.
+  #
+  # The scrape interval (15s, docker/prometheus/prometheus.yml) is the number
+  # add-structured-logging's probe exemption was waiting for: at 15s across
+  # the three HTTP targets, the access-log volume /metrics now adds is the
+  # same order of magnitude as the already-exempted GET /health/GET /ready
+  # traffic (10s healthchecks x 3 services below). The exemption is
+  # deliberately NOT extended to /metrics by this change — that is a source
+  # change to three logging.go files and their tests, not a compose one —
+  # see CLAUDE.md's "GET /metrics is served..." paragraph for the decision as
+  # recorded there. The worker and notifier jobs carry no such record at all:
+  # neither process keeps an access log, by the same "acquires no HTTP
+  # surface" requirement that used to keep both out of this file entirely.
+  #
+  # cmd/worker and cmd/notifier were absent from the scrape config until
+  # expose-worker-and-notifier-metrics gave each a metrics-only listener on
+  # its own port (9102) — one neither the gateway proxies nor this file
+  # publishes to the host, reachable only from inside this network. See
+  # docker/prometheus/prometheus.yml for why "worker" is a dns_sd_configs
+  # job (three replicas, one DNS name) while "notifier" stays a static one.
+  prometheus:
+    image: prom/prometheus:v3.13.3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      # Loopback-only, like the mail catcher above: a development-only
+      # support service's own inspection port, never the application's.
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - identity-api
+      - video-api
+      - notification-api
+      - worker
+      - notifier
+
 volumes:
   postgres_data:
   minio_data:

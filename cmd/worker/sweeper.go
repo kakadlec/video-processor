@@ -180,6 +180,7 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 	if job.SourceKey().IsZero() {
 		logger(componentRecoverySweeper).Error("the job is processing with no source object; failing it",
 			slog.String("job_id", job.ID().String()))
+		recoverySweepActions.WithLabelValues("abandoned_no_source").Inc()
 		s.abandon(ctx, job, epoch)
 		return
 	}
@@ -187,6 +188,7 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 		logger(componentRecoverySweeper).Error("the job has been requeued too often; failing it",
 			slog.String("job_id", job.ID().String()),
 			slog.Int64("lease_epoch", epoch))
+		recoverySweepActions.WithLabelValues("abandoned_exhausted").Inc()
 		s.abandon(ctx, job, epoch)
 		return
 	}
@@ -195,6 +197,7 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 		logger(componentRecoverySweeper).Warn("the job refused the requeue transition",
 			slog.String("job_id", job.ID().String()),
 			slog.String("error", err.Error()))
+		recoverySweepActions.WithLabelValues("requeue_refused").Inc()
 		return
 	}
 	requeued, err := s.deps.jobWriter.Requeue(ctx, job, epoch)
@@ -202,6 +205,7 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 		logger(componentRecoverySweeper).Warn("requeueing the job failed",
 			slog.String("job_id", job.ID().String()),
 			slog.String("error", err.Error()))
+		recoverySweepActions.WithLabelValues("requeue_error").Inc()
 		return
 	}
 	if !requeued {
@@ -210,9 +214,12 @@ func (s *sweeper) recover(ctx context.Context, job *videodomain.VideoJob, epoch 
 		logger(componentRecoverySweeper).Info("the job was no longer at the observed epoch; leaving it alone",
 			slog.String("job_id", job.ID().String()),
 			slog.Int64("lease_epoch", epoch))
+		recoverySweepActions.WithLabelValues("requeue_raced").Inc()
 		return
 	}
 	delete(s.marks, job.ID())
+	recoverySweepActions.WithLabelValues("requeued").Inc()
+	recoverySweepRequeueEpoch.Observe(float64(job.LeaseEpoch()))
 	logger(componentRecoverySweeper).Info("the job was requeued",
 		slog.String("job_id", job.ID().String()),
 		slog.Int64("lease_epoch", job.LeaseEpoch()))

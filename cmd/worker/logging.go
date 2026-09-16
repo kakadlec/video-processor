@@ -14,6 +14,7 @@ const (
 	componentJobCleanup      = "job_cleanup"
 	componentTerminalRelay   = "terminal_relay"
 	componentRecoverySweeper = "recovery_sweeper"
+	componentMetricsServer   = "metrics_server"
 )
 
 // logger returns the process logger with component bound. It resolves the
