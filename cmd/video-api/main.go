@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"video-processor/internal/platform/logging"
+	"video-processor/internal/platform/metrics"
 	platformratelimit "video-processor/internal/platform/ratelimit"
 )
 
@@ -216,6 +217,13 @@ func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter, r
 	// as an outage the limiter itself manufactured.
 	newProbeEndpoints(readiness).registerRoutes(r)
 
+	// The exposition endpoint joins them there, outside the group below for
+	// the same three reasons: a scrape carries no subject for the limiter to
+	// key on, a scrape refused 429 reads to a scraper as the service being
+	// down, and requiring a token would make Identity a dependency of every
+	// other service's observability.
+	registerMetricsRoute(r)
+
 	// videoRoutes holds every route that serves or accepts video-processing
 	// artifacts. All of them require a valid bearer token and are subject to
 	// per-user rate limiting.
@@ -228,6 +236,14 @@ func setupRouter(auth *authenticator, video *videoModule, limiter rateLimiter, r
 	// entitlement from the VideoJob row — GET /download/:filename for
 	// results, and nothing at all for sources, which no route exposes.
 	video.registerRoutes(videoRoutes)
+
+	// Last, after every route above is registered: gin reports the table by
+	// walking its trees at the moment of the call, so binding it earlier
+	// would leave a real route resolving to the unmatched value for the life
+	// of the process. The endpoint registered above is in the table it binds,
+	// which is what makes a scrape counted under its own template rather than
+	// as unmatched traffic.
+	metrics.BindRoutes(routeEntries(r))
 
 	return r
 }

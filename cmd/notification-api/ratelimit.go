@@ -48,15 +48,18 @@ func rateLimitMiddleware(limiter rateLimiter) gin.HandlerFunc {
 			// Fail open: an infrastructure hiccup in the rate limiter must not
 			// take down otherwise-healthy request handling.
 			logger(componentRateLimit).Warn("the rate limit check failed; the request is allowed", slog.String("error", err.Error()))
+			rateLimitDecisions.WithLabelValues("failed_open").Inc()
 			c.Next()
 			return
 		}
 		if !allowed {
+			rateLimitDecisions.WithLabelValues("denied").Inc()
 			c.Header("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
 			c.AbortWithStatusJSON(429, gin.H{"error": "rate limit exceeded, try again later"})
 			return
 		}
 
+		rateLimitDecisions.WithLabelValues("allowed").Inc()
 		c.Next()
 	}
 }

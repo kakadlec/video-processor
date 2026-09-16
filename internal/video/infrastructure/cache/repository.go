@@ -235,9 +235,15 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 	key := cacheKey(id)
 	raw, err := r.client.Get(ctx, key).Result()
 	if errors.Is(err, redis.Nil) {
+		// An absent entry is a miss. Every other failure below is an error:
+		// the entry was there and could not be used, which says something
+		// about the dependency's health rather than about this job's
+		// presence, and folding the two together would hide exactly that.
+		statusCacheLookups.WithLabelValues("miss").Inc()
 		return nil, false
 	}
 	if err != nil {
+		statusCacheLookups.WithLabelValues("error").Inc()
 		cacheLogger().Warn("reading the cache entry failed",
 			slog.String("job_id", id.String()),
 			slog.String("error", err.Error()))
@@ -254,6 +260,7 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 		cacheLogger().Warn("decoding the cache entry failed",
 			slog.String("job_id", id.String()),
 			slog.String("error", err.Error()))
+		statusCacheLookups.WithLabelValues("error").Inc()
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
@@ -262,6 +269,7 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 			slog.String("job_id", id.String()),
 			slog.String("cache_key", key),
 			slog.String("stored_job_id", rec.ID))
+		statusCacheLookups.WithLabelValues("error").Inc()
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
@@ -270,9 +278,11 @@ func (r *CachedVideoJobRepository) readCache(ctx context.Context, id domain.Vide
 		cacheLogger().Warn("reconstructing the job from the cache entry failed",
 			slog.String("job_id", id.String()),
 			slog.String("error", err.Error()))
+		statusCacheLookups.WithLabelValues("error").Inc()
 		r.deleteMalformedIfUnchanged(ctx, key, raw)
 		return nil, false
 	}
+	statusCacheLookups.WithLabelValues("hit").Inc()
 	return job, true
 }
 

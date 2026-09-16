@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"video-processor/internal/platform/logging"
+	"video-processor/internal/platform/metrics"
 	platformratelimit "video-processor/internal/platform/ratelimit"
 	platformredis "video-processor/internal/platform/redis"
 )
@@ -204,6 +205,13 @@ func setupRouter(auth *authenticator, notification *notificationModule, limiter 
 	// as an outage the limiter itself manufactured.
 	newProbeEndpoints(readiness).registerRoutes(r)
 
+	// The exposition endpoint joins them there, outside the group below for
+	// the same three reasons: a scrape carries no subject for the limiter to
+	// key on, a scrape refused 429 reads to a scraper as the service being
+	// down, and requiring a token would make Identity a dependency of every
+	// other service's observability.
+	registerMetricsRoute(r)
+
 	// Bearer authentication, then the limiter, in that order. The pair and
 	// its order are the invariant — the limiter keys on the authenticated
 	// subject, so it has nothing to key on ahead of the middleware that
@@ -213,6 +221,14 @@ func setupRouter(auth *authenticator, notification *notificationModule, limiter 
 	notificationRoutes.Use(auth.requireBearerAuth())
 	notificationRoutes.Use(rateLimitMiddleware(limiter))
 	notification.registerRoutes(notificationRoutes)
+
+	// Last, after every route above is registered: gin reports the table by
+	// walking its trees at the moment of the call, so binding it earlier
+	// would leave a real route resolving to the unmatched value for the life
+	// of the process. The endpoint registered above is in the table it binds,
+	// which is what makes a scrape counted under its own template rather than
+	// as unmatched traffic.
+	metrics.BindRoutes(routeEntries(r))
 
 	return r
 }
