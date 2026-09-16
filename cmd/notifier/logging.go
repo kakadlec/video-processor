@@ -10,6 +10,7 @@ const (
 	componentProcessShutdown       = "process_shutdown"
 	componentTerminalEventConsumer = "terminal_event_consumer"
 	componentTerminalEventDispatch = "terminal_event_dispatch"
+	componentMetricsServer         = "metrics_server"
 )
 
 // logger returns the process logger with component bound. It resolves the
