@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -108,6 +109,20 @@ func main() {
 
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
+
+	// The one HTTP surface this process is permitted (see
+	// http_surface_test.go): unauthenticated GET /metrics on a port neither
+	// the gateway proxies nor docker-compose.yml publishes to the host, so it
+	// is reachable only from inside the compose network. Bound before run so
+	// a listener failure is fatal at startup rather than a silently-missing
+	// scrape target for the rest of the process's life.
+	metricsListener, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		logger(componentProcessStartup).Error("the metrics listener could not be bound",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	go serveMetrics(signalCtx, newMetricsServer(), metricsListener)
 
 	consumer := notificationmessaging.NewConsumer(
 		deps.rabbit,
@@ -209,6 +224,7 @@ func setupNotifier(ctx context.Context) (*notifierDeps, error) {
 	if err != nil {
 		return nil, err
 	}
+	recordDeliveryMaxClaimHold(config)
 
 	db, err := notificationpostgres.Open(postgresConfig)
 	if err != nil {
@@ -394,11 +410,18 @@ func (d *notifierDeps) handle(ctx context.Context, eventType string, body []byte
 		return notificationmessaging.Reject
 	}
 
+	start := time.Now()
 	disposition, err := d.deliver.Execute(ctx, event)
+	elapsed := time.Since(start).Seconds()
 	switch disposition {
 	case notificationapplication.DeliveryHandled:
+		// The label is a literal at this call site, never a variable carrying
+		// one: internal/platform/metrics/disclosure_test.go's label rule
+		// judges the argument at the call, not what it was assigned from.
+		deliveryDuration.WithLabelValues("handled").Observe(elapsed)
 		return notificationmessaging.Ack
 	case notificationapplication.DeliveryDeferred:
+		deliveryDuration.WithLabelValues("deferred").Observe(elapsed)
 		if err != nil {
 			logger(componentTerminalEventDispatch).Warn("the delivery was deferred; requeueing",
 				slog.String("event_type", eventType),
