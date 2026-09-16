@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -212,6 +213,95 @@ func TestProcessVideoJob_ExtractionFailure_EmptyErrorMessage_UsesFallbackReason(
 	}
 	if job.ErrorReason() == "" {
 		t.Fatalf("expected a non-empty ErrorReason on the persisted job")
+	}
+}
+
+// recordingSleep captures every duration a use case's pause seam receives,
+// so a test can pin the pacing itself — that it ran, once, for the intended
+// duration — rather than merely that a code path that happens to also pause
+// eventually returned. A no-op default sleep everywhere else would let this
+// call be deleted or its duration changed with the suite staying green.
+type recordingSleep struct {
+	mu    sync.Mutex
+	calls []time.Duration
+}
+
+func (r *recordingSleep) record(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, d)
+}
+
+func (r *recordingSleep) durations() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]time.Duration(nil), r.calls...)
+}
+
+// TestProcessVideoJob_StorageRetryPause pins storageRetryPause itself: it
+// must run exactly once, for exactly five seconds, on the path that
+// retries — and not at all on the two paths that fail immediately, where a
+// pause would only delay a verdict a retry could never change.
+func TestProcessVideoJob_StorageRetryPause(t *testing.T) {
+	const wantPause = 5 * time.Second
+
+	cases := []struct {
+		name      string
+		getErr    error
+		atEpoch   int64
+		wantCalls []time.Duration
+	}{
+		{
+			name:      "transient fetch failure at the first attempt",
+			getErr:    errors.New("dial tcp 10.0.0.5:9000: connection refused"),
+			atEpoch:   0,
+			wantCalls: []time.Duration{wantPause},
+		},
+		{
+			name:      "source genuinely not found",
+			getErr:    domain.ErrSourceNotFound,
+			atEpoch:   0,
+			wantCalls: nil,
+		},
+		{
+			name:      "transient fetch failure with retries exhausted",
+			getErr:    errors.New("dial tcp 10.0.0.5:9000: connection refused"),
+			atEpoch:   domain.MaxJobRequeues,
+			wantCalls: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeVideoJobRepository()
+			if tc.atEpoch == 0 {
+				newQueuedRepoJob(t, repo, "job-1", "user-1")
+			} else {
+				newQueuedRepoJobAtEpoch(t, repo, "job-1", "user-1", tc.atEpoch)
+			}
+
+			sources := newFakeSourceStorage()
+			sources.getErr = tc.getErr
+			sleep := &recordingSleep{}
+
+			uc := newProcessVideoJobUseCaseWithLeases(repo, &countingFrameExtractor{}, sources, newFakeResultStorage(), newFakeJobLeaseStore(),
+				application.WithSleepFunc(sleep.record),
+			)
+			// Every case here fails or retries — never succeeds — but a
+			// permanent failure reports that through result.Success rather
+			// than a Go error, so this test asserts only on the pause.
+			_, _ = uc.Execute(context.Background(), "job-1", testSourceKey(t))
+
+			got := sleep.durations()
+			if len(got) != len(tc.wantCalls) {
+				t.Fatalf("sleep calls = %v, want %v", got, tc.wantCalls)
+			}
+			for i, d := range got {
+				if d != tc.wantCalls[i] {
+					t.Fatalf("sleep calls = %v, want %v", got, tc.wantCalls)
+				}
+			}
+		})
 	}
 }
 
