@@ -596,11 +596,13 @@ services:
       rabbitmq:
         condition: service_healthy
 
-  # A Prometheus server scraping the three HTTP services' GET /metrics, so
-  # the endpoint add-prometheus-metrics shipped produces series somewhere in
-  # this repository. Like the mail catcher above, it is a development-only
-  # support service: built from an image this repository does not produce,
-  # serving no application route, and present in no deployment.
+  # A Prometheus server scraping GET /metrics on the three HTTP services and,
+  # since expose-worker-and-notifier-metrics, on the worker and the notifier
+  # as well — so the endpoints add-prometheus-metrics and that change shipped
+  # produce series somewhere in this repository. Like the mail catcher above,
+  # it is a development-only support service: built from an image this
+  # repository does not produce, serving no application route, and present
+  # in no deployment.
   #
   # No named volume, deliberately, and for the same reason as the redis
   # service above: this data is diagnostic and non-authoritative, so it does
@@ -621,17 +623,22 @@ services:
   #
   # The scrape interval (15s, docker/prometheus/prometheus.yml) is the number
   # add-structured-logging's probe exemption was waiting for: at 15s across
-  # three targets, the access-log volume /metrics now adds is the same order
-  # of magnitude as the already-exempted GET /health/GET /ready traffic (10s
-  # healthchecks x 3 services below). The exemption is deliberately NOT
-  # extended to /metrics by this change — that is a source change to three
-  # logging.go files and their tests, not a compose one — see CLAUDE.md's
-  # "GET /metrics is served..." paragraph for the decision as recorded there.
+  # the three HTTP targets, the access-log volume /metrics now adds is the
+  # same order of magnitude as the already-exempted GET /health/GET /ready
+  # traffic (10s healthchecks x 3 services below). The exemption is
+  # deliberately NOT extended to /metrics by this change — that is a source
+  # change to three logging.go files and their tests, not a compose one —
+  # see CLAUDE.md's "GET /metrics is served..." paragraph for the decision as
+  # recorded there. The worker and notifier jobs carry no such record at all:
+  # neither process keeps an access log, by the same "acquires no HTTP
+  # surface" requirement that used to keep both out of this file entirely.
   #
-  # cmd/worker and cmd/notifier are absent from the scrape config on purpose:
-  # they serve nothing (container-image, service-health-probes). Adding them
-  # is expose-worker-and-notifier-metrics, which the config's one-job-per-
-  # service layout is meant to extend, not restructure.
+  # cmd/worker and cmd/notifier were absent from the scrape config until
+  # expose-worker-and-notifier-metrics gave each a metrics-only listener on
+  # its own port (9102) — one neither the gateway proxies nor this file
+  # publishes to the host, reachable only from inside this network. See
+  # docker/prometheus/prometheus.yml for why "worker" is a dns_sd_configs
+  # job (three replicas, one DNS name) while "notifier" stays a static one.
   prometheus:
     image: prom/prometheus:v3.13.3
     command:
@@ -647,6 +654,8 @@ services:
       - identity-api
       - video-api
       - notification-api
+      - worker
+      - notifier
 
 volumes:
   postgres_data:

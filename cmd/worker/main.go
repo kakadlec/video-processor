@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -98,6 +99,20 @@ func main() {
 
 	signalCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
+
+	// The one HTTP surface this process is permitted (see
+	// http_surface_test.go): unauthenticated GET /metrics on a port neither
+	// the gateway proxies nor docker-compose.yml publishes to the host, so it
+	// is reachable only from inside the compose network. Bound before run so
+	// a listener failure is fatal at startup rather than a silently-missing
+	// scrape target for the rest of the process's life.
+	metricsListener, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		logger(componentProcessStartup).Error("the metrics listener could not be bound",
+			slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	go serveMetrics(signalCtx, newMetricsServer(), metricsListener)
 
 	run(signalCtx, deps, videomessaging.JobDispatchTopology(), drainTimeout, sweepInterval)
 
@@ -336,11 +351,11 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 		redis:         redisClient,
 		terminalRelay: videomessaging.NewTerminalRelay(videopostgres.NewOutboxRepository(db), rabbitConfig),
 		process: videoapplication.NewProcessVideoJob(
-			// Reader undecorated, writer cached, for all three ownership
-			// use cases: a decision about who owns a job does not read a
-			// cache.
+			// Reader undecorated, writer cached, for all four ownership use
+			// cases: a decision about who owns a job does not read a cache.
 			videoapplication.NewStartProcessing(plainRepo, repo, ids),
 			failJob,
+			videoapplication.NewRetryVideoJob(plainRepo, repo, ids),
 			videoffmpeg.New(),
 			sourceStorage,
 			resultStorage,
@@ -367,7 +382,11 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 
 // handle is the whole message-disposition table, in one place.
 //
-// Ack means one thing only: this job reached a committed terminal state.
+// Ack means one of two things: this job reached a committed terminal state,
+// or ProcessVideoJob returned it to queued for another attempt after a
+// transient object-storage failure — a fresh dispatch for that row already
+// exists in the outbox, so this dispatch's job is done whether or not this
+// particular delivery is the one that finishes the row.
 //
 // Every other verdict turns on whether this worker learned its claim's
 // outcome. When it did — the claim was lost, or it was won and the run then
@@ -378,7 +397,8 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 // will not decode, a job that does not exist, a row that will not
 // reconstruct, a statement the database answered by refusing it.
 //
-// Exactly one condition is retried, and it is identified positively by its
+// Exactly one condition is retried at the message level — nacked with
+// requeue rather than acked — and it is identified positively by its
 // sentinel rather than inferred from an error's shape: the claim step could
 // not learn whether the claim was won, because the repository could not
 // answer — the authoritative load before the claim, the claim itself, or the
@@ -393,11 +413,22 @@ func setupWorker(ctx context.Context) (*workerDeps, error) {
 // is taken until a claim is reported won, which is exactly what the recovery
 // sweeper exists to reach.
 //
+// A transient object-storage failure — a fetch or store that failed for any
+// reason other than the object simply not being there — is retried a
+// different way: bounded and paced inside ProcessVideoJob itself (see
+// retryOrFail in internal/video/application), which writes the job straight
+// back to queued at an advanced epoch rather than leaving this delivery's
+// disposition do the work. It never reaches the message level at all, which
+// is why it is not a fourth videomessaging.Disposition: unlike a claim whose
+// outcome is unknown, this worker knows exactly what happened and has
+// already acted on it by the time handle sees the sentinel.
+//
 // Rejection stays the default, including for every failure nobody
 // enumerated. An unanticipated failure must behave as it always has rather
 // than enter a redelivery loop nobody reasoned about — which is why a
 // dependency failing after the claim was won is dead-lettered however
-// transient it is.
+// transient it is, and why a missing source object fails the job outright
+// rather than retrying: no redelivery makes an absent object appear.
 //
 // No path acks a message it did not process.
 func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.Pointer[string]) videomessaging.Disposition {
@@ -405,6 +436,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 	if err != nil {
 		logger(componentJobDispatch).Error("the dispatch could not be decoded; dead-lettering",
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("undecodable_dispatch", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -413,6 +445,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		logger(componentJobDispatch).Error("the dispatch names no source object; dead-lettering",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("missing_source_key", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -427,15 +460,18 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		// other consumer is very likely reading right now.
 		logger(componentJobDispatch).Error("the job was already claimed; dropping the duplicate dispatch",
 			slog.String("job_id", msg.JobID))
+		dispatchOutcomes.WithLabelValues("claim_lost", "reject").Inc()
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrJobClaimOutcomeUnknown):
 		logger(componentJobDispatch).Warn("the claim outcome could not be learned; requeueing",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("claim_outcome_unknown", "requeue").Inc()
 		return videomessaging.Requeue
 	case errors.Is(err, videodomain.ErrVideoJobNotFound):
 		logger(componentJobDispatch).Error("the dispatch names an unknown job; dead-lettering",
 			slog.String("job_id", msg.JobID))
+		dispatchOutcomes.WithLabelValues("job_not_found", "reject").Inc()
 		return videomessaging.Reject
 	case errors.Is(err, videodomain.ErrJobFenced):
 		// This run was taken over while it was working: the sweep decided
@@ -451,7 +487,24 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			slog.String("job_id", msg.JobID),
 			slog.Int64("lease_epoch", result.LeaseEpoch),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("fenced_before_completion", "reject").Inc()
 		return videomessaging.Reject
+	case errors.Is(err, videodomain.ErrJobRequeuedForRetry):
+		// The row is queued again at an advanced epoch and a fresh dispatch
+		// already exists in the outbox; this delivery's own job is done.
+		// The source object and idempotency key are untouched — the next
+		// attempt still needs both — and only the lease this run held is
+		// released, conditional on this call's write being the one that
+		// applied, exactly as the failure path below gates its own cleanup.
+		logger(componentJobDispatch).Warn("a transient object-storage failure returned the job to queued for another attempt",
+			slog.String("job_id", msg.JobID),
+			slog.Int64("lease_epoch", result.LeaseEpoch),
+			slog.String("error", err.Error()))
+		if result.Applied {
+			d.releaseLease(ctx, msg.JobID, result.LeaseEpoch)
+		}
+		dispatchOutcomes.WithLabelValues("requeued_for_retry", "ack").Inc()
+		return videomessaging.Ack
 	case err != nil:
 		// No terminal state was committed. Before a claim — a malformed
 		// identifier, a `pending` row, a row that will not reconstruct, a
@@ -464,6 +517,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		logger(componentJobDispatch).Error("the job did not reach a terminal state; dead-lettering",
 			slog.String("job_id", msg.JobID),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("processing_error", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -482,6 +536,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			d.deleteSource(ctx, msg.JobID, sourceKey)
 			d.clearIdempotencyKey(ctx, msg.JobID)
 		}
+		dispatchOutcomes.WithLabelValues("failed", "ack").Inc()
 		return videomessaging.Ack
 	}
 
@@ -492,6 +547,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 				slog.String("storage_key", result.StorageKey),
 				slog.Int64("lease_epoch", result.LeaseEpoch),
 				slog.String("error", err.Error()))
+			dispatchOutcomes.WithLabelValues("fenced_after_completion", "reject").Inc()
 			return videomessaging.Reject
 		}
 		// The artifact is stored and the row still says `processing`. Both
@@ -504,6 +560,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 			slog.String("job_id", msg.JobID),
 			slog.String("storage_key", result.StorageKey),
 			slog.String("error", err.Error()))
+		dispatchOutcomes.WithLabelValues("completion_not_recorded", "reject").Inc()
 		return videomessaging.Reject
 	}
 
@@ -517,6 +574,7 @@ func (d *workerDeps) handle(ctx context.Context, body []byte, inFlight *atomic.P
 		slog.String("job_id", msg.JobID),
 		slog.String("storage_key", result.StorageKey),
 		slog.Int("frames", result.FrameCount))
+	dispatchOutcomes.WithLabelValues("completed", "ack").Inc()
 	return videomessaging.Ack
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"video-processor/internal/video/domain"
 )
@@ -50,7 +51,26 @@ func New() *Extractor {
 // that directory, and always removes the directory before returning. The
 // returned zip path belongs to the caller, which is responsible for
 // removing it once it has been stored.
+//
+// It records extractionDuration around the whole call, by outcome, before
+// returning -- the one instrumentation point in this package, timing the one
+// step no HTTP service ever runs.
 func (e *Extractor) ExtractFrames(ctx context.Context, jobID domain.VideoJobID, videoPath string) (string, int, []string, error) {
+	start := time.Now()
+	zipPath, frameCount, imageNames, err := e.extractFrames(ctx, jobID, videoPath)
+	elapsed := time.Since(start).Seconds()
+	// The label value is a literal at each call site, never a variable
+	// carrying one: internal/platform/metrics/disclosure_test.go's label
+	// rule judges the argument at the call, not what it was assigned from.
+	if err != nil {
+		extractionDuration.WithLabelValues("failure").Observe(elapsed)
+	} else {
+		extractionDuration.WithLabelValues("success").Observe(elapsed)
+	}
+	return zipPath, frameCount, imageNames, err
+}
+
+func (e *Extractor) extractFrames(ctx context.Context, jobID domain.VideoJobID, videoPath string) (string, int, []string, error) {
 	tempDir := filepath.Join(tempDirName, jobID.String())
 	if err := os.MkdirAll(tempDir, 0750); err != nil {
 		return "", 0, nil, fmt.Errorf("video: create temp directory: %w", err)

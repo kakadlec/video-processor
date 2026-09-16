@@ -1,10 +1,10 @@
 # Scrapes GET /metrics on the three HTTP services inside the compose
 # network, by container name and their fixed internal port (8080) — the same
-# addresses the gateway itself proxies to. cmd/worker and cmd/notifier are
-# deliberately absent: they serve no HTTP surface at all (container-image,
-# service-health-probes), so there is nothing here for them until
-# expose-worker-and-notifier-metrics changes that. Add a job per service,
-# following the pattern below, rather than restructuring this file.
+# addresses the gateway itself proxies to — plus, since
+# expose-worker-and-notifier-metrics, cmd/worker and cmd/notifier on their own
+# fixed internal port (9102), which the gateway never proxies and this file
+# never publishes to the host. Add a job per service, following the pattern
+# below, rather than restructuring this file.
 global:
   scrape_interval: 15s
 
@@ -23,3 +23,30 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["notification-api:8080"]
+
+  # docker-compose.yml runs three replicas of "worker" behind one service
+  # name, and plain `docker compose up` (no Swarm) gives that name multiple
+  # DNS A records rather than a single virtual IP — verified against the
+  # running stack, each of the three container IPs answers its own scrape.
+  # static_configs with one target would therefore see only whichever
+  # replica the container runtime's DNS happened to return first, silently
+  # dropping the other two; dns_sd_configs re-resolves the name on
+  # refresh_interval and creates one target per address it gets back, which
+  # is what makes all three visible. --scale worker=<n> is covered by the
+  # same job with no edit here, for the same reason.
+  - job_name: worker
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9102
+        refresh_interval: 15s
+
+  # "notifier" is not replicated (docs/roadmap.md: delivery is not this
+  # stack's throughput bottleneck), so one static target names it exactly —
+  # dns_sd_configs would work here too, but a fixed job answers "why does
+  # this one job look different from worker's" before it is asked.
+  - job_name: notifier
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["notifier:9102"]

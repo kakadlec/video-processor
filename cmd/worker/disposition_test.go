@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -30,6 +31,20 @@ type countingSources struct {
 func (s *countingSources) Get(ctx context.Context, key videodomain.StorageKey, localPath string) error {
 	s.gets.Add(1)
 	return s.SourceStorage.Get(ctx, key, localPath)
+}
+
+// failingSourceGet makes every SourceStorage.Get fail with err, standing in
+// for a MinIO outage (a generic transport error) or a genuinely missing
+// object (videodomain.ErrSourceNotFound), depending on what a test sets err
+// to. Put and Delete still reach the real adapter, so seedQueuedJob's own
+// upload and any cleanup this test asserts on both still work.
+type failingSourceGet struct {
+	videodomain.SourceStorage
+	err error
+}
+
+func (s failingSourceGet) Get(context.Context, videodomain.StorageKey, string) error {
+	return s.err
 }
 
 // countingLeases counts lease acquisitions for the same reason.
@@ -399,6 +414,82 @@ func TestHandle_DispositionTable(t *testing.T) {
 					}
 					if status := statusOf(t, env, job); status != videodomain.JobStatusQueued {
 						t.Fatalf("status = %q, want %q", status, videodomain.JobStatusQueued)
+					}
+				}
+			},
+		},
+		{
+			name: "transient source fetch failure",
+			want: videomessaging.Ack,
+			build: func(t *testing.T) (*workerTestEnv, []byte, func(t *testing.T)) {
+				env := newWorkerTestEnv(t, envOptions{
+					wrapSources: func(inner videodomain.SourceStorage) videodomain.SourceStorage {
+						return failingSourceGet{SourceStorage: inner, err: errors.New("dial tcp 10.0.0.5:9000: connection refused, bucket \"video-uploads\"")}
+					},
+				})
+				job, body := seedQueuedJob(t, env, []byte("never read"))
+				key := finalizedIdempotencyKey(t, env, job)
+				return env, body, func(t *testing.T) {
+					ctx := context.Background()
+					stored, err := env.repo.FindByID(ctx, job.ID())
+					if err != nil {
+						t.Fatalf("reload job: %v", err)
+					}
+					if stored.Status() != videodomain.JobStatusQueued || stored.LeaseEpoch() != 1 {
+						t.Fatalf("job = %q at epoch %d, want %q at epoch 1 — a transient fetch failure must requeue, not fail, the job", stored.Status(), stored.LeaseEpoch(), videodomain.JobStatusQueued)
+					}
+					if !objectExists(t, env, job.SourceKey().String()) {
+						t.Fatal("the source object was deleted; the next attempt still needs it")
+					}
+					if _, found, err := env.keys.Lookup(ctx, key); err != nil || !found {
+						t.Fatalf("the idempotency key was cleared: found=%v err=%v", found, err)
+					}
+				}
+			},
+		},
+		{
+			name: "source object genuinely not found",
+			want: videomessaging.Ack,
+			build: func(t *testing.T) (*workerTestEnv, []byte, func(t *testing.T)) {
+				env := newWorkerTestEnv(t, envOptions{
+					wrapSources: func(inner videodomain.SourceStorage) videodomain.SourceStorage {
+						return failingSourceGet{SourceStorage: inner, err: videodomain.ErrSourceNotFound}
+					},
+				})
+				job, body := seedQueuedJob(t, env, []byte("never read"))
+				key := finalizedIdempotencyKey(t, env, job)
+				return env, body, func(t *testing.T) {
+					ctx := context.Background()
+					if status := statusOf(t, env, job); status != videodomain.JobStatusFailed {
+						t.Fatalf("status = %q, want %q — a missing object is not retryable", status, videodomain.JobStatusFailed)
+					}
+					if _, found, err := env.keys.Lookup(ctx, key); err != nil || found {
+						t.Fatalf("the idempotency key survived a failure this run applied: found=%v err=%v", found, err)
+					}
+				}
+			},
+		},
+		{
+			name: "transient fetch failure with retries already exhausted",
+			want: videomessaging.Ack,
+			build: func(t *testing.T) (*workerTestEnv, []byte, func(t *testing.T)) {
+				env := newWorkerTestEnv(t, envOptions{
+					wrapSources: func(inner videodomain.SourceStorage) videodomain.SourceStorage {
+						return failingSourceGet{SourceStorage: inner, err: errors.New("dial tcp 10.0.0.5:9000: connection refused, bucket \"video-uploads\"")}
+					},
+				})
+				job, body := seedQueuedJob(t, env, []byte("never read"))
+				if _, err := env.db.ExecContext(context.Background(),
+					`UPDATE video_jobs SET lease_epoch = $1 WHERE id = $2`, maxRequeues, job.ID().String(),
+				); err != nil {
+					t.Fatalf("bump lease_epoch to the bound: %v", err)
+				}
+				return env, body, func(t *testing.T) {
+					if status := statusOf(t, env, job); status != videodomain.JobStatusFailed {
+						t.Fatalf("status = %q, want %q — the retry budget is exhausted", status, videodomain.JobStatusFailed)
+					}
+					if objectExists(t, env, job.SourceKey().String()) {
+						t.Fatal("the source object was kept for a job this run permanently failed")
 					}
 				}
 			},

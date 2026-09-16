@@ -45,26 +45,55 @@ var serverNamesByImportPath = map[string]map[string]bool{
 	},
 }
 
-// The notifier serves nothing, by requirement rather than by omission:
-// container-image says the worker and the notifier SHALL each expose no port
-// at all, which is why add-health-and-readiness-endpoints gave /health and
-// /ready to the three HTTP services and to neither of these two.
+// permittedServerConstructionFile is the one file in this package allowed to
+// construct an HTTP server, and permittedServerConstructionNames is exactly
+// what it may construct there -- expose-worker-and-notifier-metrics's answer
+// to the design question the doc comment below used to close outright. Only
+// these two net/http names are permitted, and only inside this one file:
+// nothing else in serverNamesByImportPath is exempted, and
+// httpFrameworkImportPrefixes (gin) is not consulted here at all, so a gin
+// import in this file would still fail exactly as it would anywhere else.
+const permittedServerConstructionFile = "metricsserver.go"
+
+var permittedServerConstructionNames = map[string]bool{
+	"Server":      true,
+	"NewServeMux": true,
+}
+
+// The notifier served nothing at all, by requirement rather than by
+// omission, until expose-worker-and-notifier-metrics: container-image
+// originally said the worker and the notifier SHALL each expose no port at
+// all, which is why add-health-and-readiness-endpoints gave /health and
+// /ready to the three HTTP services and to neither of these two. That row
+// narrowed the rule rather than dropping it, and this test is amended to
+// match rather than silently weakened: metricsserver.go alone may construct
+// the one surface permittedServerConstructionNames above names -- an
+// unauthenticated GET /metrics on metricsAddr, a port neither the gateway
+// proxies nor docker-compose.yml publishes to the host, so it is reachable
+// only from inside the compose network and only by Prometheus. Everything
+// else this process does, in every other file, must still construct no HTTP
+// server at all -- including every other name net/http exports, which stays
+// denied even inside metricsserver.go, and the HTTP framework import ban
+// below, which this exception does not touch: the metrics surface is built
+// on net/http alone, never gin.
 //
-// This test is deliberately stronger than that requirement, rather than a
-// mis-transcription of it. Exposing no port is observable at run time and
-// only of the process as configured; constructing no server and importing no
-// HTTP framework is a claim about source, which no behavioural test can hold
-// -- a listener wired here would pass every other test in this package.
+// This test is deliberately stronger than the requirement it now amends,
+// rather than a mis-transcription of it. Exposing no port beyond the one
+// named exception is observable at run time and only of the process as
+// configured; constructing no server anywhere else and importing no HTTP
+// framework anywhere at all is a claim about source, which no behavioural
+// test can hold -- a second listener wired into any other file would pass
+// every other test in this package.
 //
-// It does not ban net/http outright. An http.Client is not an http.Server:
-// the webhook deliverer's client lives in the Notification context's own
-// infrastructure, not in this root, so no client is built here today -- but
-// a blanket import ban would also forbid the day one belongs here, and would
-// then be weakened to allow it, which is the same as not having the test at
-// all.
-// What that costs is that a raw net.Listen is out of scope; this pins the
-// HTTP half of "no port", which is the half a copy from one of the three API
-// composition roots would introduce.
+// It does not ban net/http outright, and did not before this amendment
+// either. An http.Client is not an http.Server: the webhook deliverer's
+// client lives in the Notification context's own infrastructure, not in
+// this root, so no client is built here today -- but a blanket import ban
+// would also forbid the day one belongs here, and would then be weakened to
+// allow it, which is the same as not having the test at all. What that
+// costs is that a raw net.Listen is out of scope; this pins the HTTP half of
+// "no port outside the one named exception", which is the half a copy from
+// one of the three API composition roots would introduce.
 //
 // Same idiom as TestOnlyTheIdentityServiceConstructsATokenIssuer, and one
 // deliberate copy per package rather than one cross-root scan: package main
@@ -82,9 +111,16 @@ func TestTheNotifierConstructsNoHTTPServer(t *testing.T) {
 	if !slices.Contains(parsed, "main.go") {
 		t.Fatalf("parsed %v, which does not include main.go: this scan walked a tree other than cmd/notifier", parsed)
 	}
+	// A third vacuity guard, specific to the permitted exception: without it,
+	// renaming or removing metricsserver.go would leave the permission above
+	// silently inert and this test would report the rule clean while no
+	// longer exercising the one file it exists to narrow around.
+	if !slices.Contains(parsed, permittedServerConstructionFile) {
+		t.Fatalf("parsed %v, which does not include %s: the permitted exception above is not being exercised", parsed, permittedServerConstructionFile)
+	}
 
 	for _, finding := range findings {
-		t.Errorf("%s: cmd/notifier must construct no HTTP server and import no HTTP framework", finding)
+		t.Errorf("%s: cmd/notifier must construct no HTTP server and import no HTTP framework outside %s", finding, permittedServerConstructionFile)
 	}
 }
 
@@ -142,8 +178,9 @@ func scanForAnHTTPServerSurface(t *testing.T, dir string) (findings, parsed []st
 			}
 			return fmt.Errorf("parse %s: %w", path, parseErr)
 		}
-		parsed = append(parsed, filepath.Base(path))
-		findings = append(findings, httpServerSurfaceIn(fset, file)...)
+		base := filepath.Base(path)
+		parsed = append(parsed, base)
+		findings = append(findings, httpServerSurfaceIn(fset, file, base)...)
 		return nil
 	})
 	if err != nil {
@@ -152,7 +189,7 @@ func scanForAnHTTPServerSurface(t *testing.T, dir string) (findings, parsed []st
 	return findings, parsed
 }
 
-func httpServerSurfaceIn(fset *token.FileSet, file *ast.File) []string {
+func httpServerSurfaceIn(fset *token.FileSet, file *ast.File, base string) []string {
 	findings := make([]string, 0)
 
 	// deniedByIdentifier maps the identifier this file refers to a scanned
@@ -196,9 +233,13 @@ func httpServerSurfaceIn(fset *token.FileSet, file *ast.File) []string {
 		if !ok {
 			return true
 		}
-		if deniedByIdentifier[identifier.Name][selector.Sel.Name] {
-			findings = append(findings, fmt.Sprintf("%s names %s.%s", fset.Position(selector.Sel.Pos()), identifier.Name, selector.Sel.Name))
+		if !deniedByIdentifier[identifier.Name][selector.Sel.Name] {
+			return true
 		}
+		if base == permittedServerConstructionFile && permittedServerConstructionNames[selector.Sel.Name] {
+			return true
+		}
+		findings = append(findings, fmt.Sprintf("%s names %s.%s", fset.Position(selector.Sel.Pos()), identifier.Name, selector.Sel.Name))
 		return true
 	})
 
