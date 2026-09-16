@@ -9,17 +9,28 @@ CREATE TABLE IF NOT EXISTS video_jobs (
     source_key TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL DEFAULT '',
     lease_epoch BIGINT NOT NULL DEFAULT 0,
-    -- PostgreSQL's TIMESTAMPTZ has microsecond resolution, one order of
-    -- magnitude coarser than Go's time.Time (nanosecond). A CreatedAt with a
-    -- non-zero sub-microsecond component will not round-trip exactly through
-    -- this column — the same latent constraint identity's created_at column
-    -- already has. No code currently depends on sub-microsecond CreatedAt
-    -- equality; whichever future change wires a real (non-fake) Clock for
-    -- this context should truncate to microsecond precision at that source,
-    -- not here, so the in-memory aggregate and the persisted row agree from
-    -- the moment the timestamp is minted.
-    created_at TIMESTAMPTZ NOT NULL
+    -- Minted by PostgreSQL, not by the application: Repository.Create no
+    -- longer accepts a caller-supplied instant (see
+    -- docs/roadmap.md's mint-videojob-timestamps-in-database entry), which
+    -- is also what retires the earlier microsecond-truncation concern this
+    -- comment used to raise — nothing outside this database ever proposes a
+    -- value for the column to round-trip. The DEFAULT is a safety net rather
+    -- than the mechanism in ordinary use: every INSERT this package issues
+    -- names created_at explicitly, reading it back from the same
+    -- transaction's own now() (see transactionNow in repository.go) so the
+    -- row and its video_job.created outbox payload agree bit for bit. Only a
+    -- statement outside this package's control — a hand-run INSERT, a future
+    -- caller that forgets the column — would ever fall back to it.
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- CREATE TABLE IF NOT EXISTS above is a no-op against a database that
+-- already has this table, so it never applies a DEFAULT added after the
+-- table's first creation. This ALTER is what reaches such a database; it is
+-- idempotent (setting an identical default twice is a no-op) and touches no
+-- existing row, since a DEFAULT only ever applies to a future INSERT that
+-- omits the column.
+ALTER TABLE video_jobs ALTER COLUMN created_at SET DEFAULT now();
 
 -- source_key is also declared above, for a database created from scratch.
 -- This ALTER is what reaches a database that already exists, where the
@@ -111,9 +122,18 @@ CREATE TABLE IF NOT EXISTS video_job_outbox (
     id UUID PRIMARY KEY,
     event_type TEXT NOT NULL,
     payload JSONB NOT NULL,
-    occurred_at TIMESTAMPTZ NOT NULL,
+    -- Minted by PostgreSQL, like video_jobs.created_at above and for the
+    -- same reason: every INSERT this package issues names occurred_at
+    -- explicitly, read from the writing transaction's own now() so the
+    -- column and the instant embedded in payload agree exactly. The DEFAULT
+    -- is the same safety net, not the mechanism in ordinary use.
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     published_at TIMESTAMPTZ
 );
+
+-- Mirrors the created_at ALTER above, for the same reason: CREATE TABLE IF
+-- NOT EXISTS does not apply a DEFAULT added after a table's first creation.
+ALTER TABLE video_job_outbox ALTER COLUMN occurred_at SET DEFAULT now();
 
 -- The relay's claim query, ordered by occurred_at within a single
 -- event_type. event_type leads on purpose: with occurred_at first it is

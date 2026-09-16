@@ -413,7 +413,7 @@ func seedQueuedJob(t *testing.T, env *workerTestEnv, sourceVideo []byte) (*video
 		t.Fatalf("store source object: %v", err)
 	}
 
-	job, err := videodomain.NewVideoJob(env.ids, userID, filename, sourceKey, testContentHash, time.Now().UTC())
+	job, err := videodomain.NewVideoJob(env.ids, userID, filename, sourceKey, testContentHash)
 	if err != nil {
 		t.Fatalf("build video job: %v", err)
 	}

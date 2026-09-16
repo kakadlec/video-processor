@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"video-processor/internal/video/domain"
@@ -36,15 +37,18 @@ type CreateVideoJobResult struct {
 // CreateVideoJob creates a new VideoJob in pending state and persists it. It
 // depends only on domain ports, so it can be tested with fakes and is
 // agnostic to the concrete ID scheme and storage engine.
+//
+// It carries no Clock: CreatedAt is minted by PostgreSQL when jobs.Create
+// persists the row, not by this use case, so there is nothing here for a
+// clock port to supply.
 type CreateVideoJob struct {
-	jobs  domain.VideoJobRepository
-	ids   domain.VideoJobIDGenerator
-	clock Clock
+	jobs domain.VideoJobRepository
+	ids  domain.VideoJobIDGenerator
 }
 
 // NewCreateVideoJob wires the CreateVideoJob use case to its ports.
-func NewCreateVideoJob(jobs domain.VideoJobRepository, ids domain.VideoJobIDGenerator, clock Clock) *CreateVideoJob {
-	return &CreateVideoJob{jobs: jobs, ids: ids, clock: clock}
+func NewCreateVideoJob(jobs domain.VideoJobRepository, ids domain.VideoJobIDGenerator) *CreateVideoJob {
+	return &CreateVideoJob{jobs: jobs, ids: ids}
 }
 
 // Execute runs the job creation use case.
@@ -70,7 +74,7 @@ func (uc *CreateVideoJob) Execute(ctx context.Context, input CreateVideoJobInput
 		}
 	}
 
-	job, err := domain.NewVideoJob(uc.ids, userID, filename, sourceKey, input.ContentHash, uc.clock.Now())
+	job, err := domain.NewVideoJob(uc.ids, userID, filename, sourceKey, input.ContentHash)
 	if err != nil {
 		return CreateVideoJobResult{}, err
 	}
@@ -79,11 +83,20 @@ func (uc *CreateVideoJob) Execute(ctx context.Context, input CreateVideoJobInput
 		return CreateVideoJobResult{}, err
 	}
 
+	// job.CreatedAt() is still the zero value NewVideoJob left it at: Create
+	// persisted PostgreSQL's own now(), not the aggregate's field. Reading
+	// the row back is how this use case learns the value the database
+	// actually minted, rather than reporting a timestamp of its own.
+	persisted, err := uc.jobs.FindByID(ctx, job.ID())
+	if err != nil {
+		return CreateVideoJobResult{}, fmt.Errorf("video: reload created video job: %w", err)
+	}
+
 	return CreateVideoJobResult{
 		JobID:            job.ID().String(),
 		UserID:           job.UserID().String(),
 		OriginalFilename: job.OriginalFilename().String(),
 		Status:           string(job.Status()),
-		CreatedAt:        job.CreatedAt(),
+		CreatedAt:        persisted.CreatedAt(),
 	}, nil
 }

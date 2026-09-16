@@ -50,23 +50,22 @@ func RelayedEventTypes() []string {
 // Aggregate is one entry of a bounded aggregate: a count, and the age of the
 // oldest row behind it.
 //
-// The age is seconds computed by the statement, and the reason is **not**
-// that it puts the arithmetic on one clock — it does not, and an earlier
-// comment here claimed otherwise. Both timestamps it reads are minted by the
-// application: created_at comes from the domain Clock (systemClock.Now) and
-// occurred_at from time.Now in this very package, so subtracting either from
-// PostgreSQL's now() compares the writer's clock with the database's exactly
-// as a Go-side subtraction would compare the writer's with the reader's. No
-// arrangement of the subtraction removes that while the application mints the
-// timestamp; moving the mint into the database would, and that is a change to
-// what a VideoJob's CreatedAt means rather than to this aggregate.
+// The age is seconds computed by the statement, subtracting created_at or
+// occurred_at from this statement's own now(). Both of those columns are now
+// minted by PostgreSQL itself — Repository.Create, Enqueue, Requeue, and
+// Update all read the writing transaction's own now() rather than an
+// application clock (see transactionNow in repository.go) — so this
+// subtraction compares PostgreSQL against PostgreSQL, not a writer's clock
+// against a reader's. An earlier version of this comment recorded the
+// opposite; that was the two-clock problem docs/roadmap.md's
+// mint-videojob-timestamps-in-database entry closed.
 //
-// What the statement's form does buy is that the count and the age describe
-// the same instant, since now() is fixed for the transaction — and the clamp
-// below keeps the value inside an age's domain whatever the skew. A negative
-// age is a value no age can take, and nothing reading these gauges would
-// think to expect one; a clamped zero reads as "the oldest is brand new",
-// which is wrong by at most the skew rather than nonsensical.
+// The GREATEST(…, 0) clamp below is kept anyway, now as a defensive bound
+// rather than a load-bearing one: nothing in ordinary operation should ever
+// produce a negative age once both sides of the subtraction are PostgreSQL's
+// own clock, but a negative age is still a value no age can take, and a
+// clamped zero reads as "the oldest is brand new" rather than surfacing an
+// impossible number to whatever reads the gauge.
 //
 // OldestAgeValid is carried rather than inferred from a zero age, because the
 // absence of an age is load-bearing. The collector reading these

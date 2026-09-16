@@ -22,7 +22,8 @@ The absence of pagination is deliberate and is the reason this method exists sep
 
 - **GIVEN** a `VideoJob` persisted via `Repository.Create`
 - **WHEN** `Repository.FindByID` is called with that job's ID
-- **THEN** it returns a `*domain.VideoJob` with the same `ID`, `UserID`, `OriginalFilename`, source key, content hash, `StorageKey`, `FrameCount`, `ErrorReason`, `Status`, and `CreatedAt`
+- **THEN** it returns a `*domain.VideoJob` with the same `ID`, `UserID`, `OriginalFilename`, source key, content hash, `StorageKey`, `FrameCount`, `ErrorReason`, and `Status`
+- **AND** a non-zero `CreatedAt` PostgreSQL minted at persist time — not one the caller supplied, since `Create` no longer accepts one (see `mint-videojob-timestamps-in-database` in `docs/roadmap.md`)
 
 #### Scenario: A pre-migration row loads with an empty source key and content hash
 
