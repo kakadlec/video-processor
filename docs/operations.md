@@ -871,6 +871,84 @@ Each of the three HTTP services carries a healthcheck against `/ready` — `inte
 Verified by stopping each backing service in turn: with PostgreSQL down all three report unhealthy and the gateway does not; with MinIO down `video-api` reports unhealthy and the other two do not; with Redis down all three stay healthy. That last one is what proves the criterion was implemented rather than merely written down.
 
 
+### Metrics — Implemented (Phase 8)
+
+The three HTTP services serve `GET /metrics` in the Prometheus text exposition format. **`cmd/worker` and `cmd/notifier` serve nothing**, for the reason given under "Health and readiness probes" above: they acquire no HTTP surface for any observability purpose. What is known about them from outside is under "What these metrics do not see" below.
+
+**There is no scraper in this repository.** The endpoint is served, tested, and parses, and nothing collects it: the local stack runs no Prometheus server, so no time series exists anywhere unless an operator points one at the services. That was a deliberate default, recorded in `docs/roadmap.md` as `add-local-metrics-scraper`.
+
+#### Reaching it
+
+The same way as a probe. The gateway refuses `/metrics` with a third exact-match `location = /metrics { return 404; }` beside the two probe refusals, proxying nothing, so the refused request reaches no service and runs no query. From inside the network:
+
+```bash
+docker compose exec video-api wget -qO- http://localhost:8080/metrics
+```
+
+It is unauthenticated and outside the rate limiter. A scrape carries no subject for the limiter to key on and would eventually be answered `429`, which a scraper reads as the service being down; one of the three services mounts no bearer authentication at all; and requiring a token would make Identity a dependency of every other service's observability. **No environment variable enables, disables, relocates or reformats it.**
+
+**A scrape is access-logged like any other request.** The probe routes are exempt from the access record because a prober arrives at a fixed interval forever; with no scraper, that volume is zero, and the exemption was not widened in anticipation of it. A scraper at a 15s interval would write 5,760 records a day per service, and the change that adds one is the one that should revisit this.
+
+#### The families
+
+| Family | Where | Labels | What it is for |
+|---|---|---|---|
+| `fiapx_http_requests_total` | all three | `method`, `route`, `status_class` | Traffic and error rate per route. `status_class` is `2xx`…`5xx` or `other`, never the numeric code, which is in that request's access record. |
+| `fiapx_http_request_duration_seconds` | all three | `method`, `route` | Latency per route. Buckets reach **60s** and are identical in all three services so the histogram aggregates across them; `POST /upload` streams the body into the bucket, so its duration includes the client's transfer. |
+| `fiapx_rate_limit_decisions_total` | `video-api`, `notification-api` | `decision` = `allowed` / `denied` / `failed_open` | **A non-zero `failed_open` rate means abuse control is off right now.** The limiter allows the request when Redis fails, and it used to report that only as a warning per request. The budget is one per user across the system, so **sum** this across both services. |
+| `fiapx_upload_idempotency_reservations_total` | `video-api` | `outcome` = `reserved` / `duplicate` / `conflict` / `failed_open` | `duplicate` is deduplication working; `failed_open` is deduplication off and repeat uploads running `ffmpeg` again; a rising `conflict` (the `409`) means reservation holders are dying between reserving and finalizing. The four sum to the uploads that reached the reservation. |
+| `fiapx_job_status_cache_lookups_total` | `video-api` | `outcome` = `hit` / `miss` / `error` | The hit ratio is the evidence the cache earns its complexity; `error` is Redis health without making Redis a readiness dependency. `error` is an entry that was there and could not be used, distinct from a `miss`. |
+| `fiapx_video_jobs_in_state` | `video-api` | `state` = `queued` / `processing` | How much work is in flight. |
+| `fiapx_video_jobs_oldest_in_state_age_seconds` | `video-api` | `state` | **Whether anything is moving.** |
+| `fiapx_video_job_outbox_unpublished` | `video-api` | `event_type` (the three relayed types) | How much is committed and unannounced, per relay. |
+| `fiapx_video_job_outbox_oldest_unpublished_age_seconds` | `video-api` | `event_type` | Whether a relay has stopped — including the terminal relay inside the worker. |
+| `go_*`, `process_*` | all three | fixed | Goroutine leaks, heap growth, GC pressure, descriptor exhaustion. |
+
+**Two things read wrong at a glance and are not defects.** The cache counter is also incremented inside `cmd/worker`, which links the decorator and exposes nothing, so those increments are recorded and never served. And a CORS preflight is counted as `method="UNRECOGNIZED"`, `route="<unmatched>"`: no `OPTIONS` route is registered, and the method label's domain is the router's own route table, not the set of methods that exist.
+
+#### Reading the pipeline gauges
+
+The four gauges are the reason this section exists, and they have rules a dashboard author needs:
+
+- **They are queried on every scrape and never cached.** A value from a different moment is least visible in a level.
+- **A failed query emits no sample and fails the scrape — never a zero.** `fiapx_video_jobs_in_state{state="queued"} 0` means *nothing is waiting*, the most reassuring thing the endpoint can say, and it is never produced by a database that did not answer.
+- **An empty state emits a zero count and no age at all.** So a healthy idle system reads as every count at `0` and every age absent, and that pair is the signature of idle. A count that vanishes is a failed collection, not an empty queue.
+- **Counts saturate at 10,000; ages do not.** A saturated count means *at least this many*, and past it the age says how bad it is. A queued count of 40 means little on its own; an oldest-queued age of eleven minutes means the workers are gone.
+- **An age is clamped at zero.** Both timestamps it reads are minted by the application while the subtraction uses PostgreSQL's clock, so under clock skew the raw value could go negative. The clamp bounds the error at the skew; `docs/roadmap.md` records moving the mint into the database as `mint-videojob-timestamps-in-database`.
+- **They are reported per replica.** They describe shared database state, so each `video-api` replica reports the same fact. Aggregate with `max by (state)`, never `sum` — with one replica today this is invisible, and scaling the service would silently multiply a summed queue depth.
+
+**The condition to alert on** is the oldest-`queued` age climbing while `/ready` answers `200` on every service. Verified by stopping all three workers and uploading: the age climbed while all three readiness endpoints stayed `200`. Readiness asks whether a service can serve; this asks whether the system is moving, and the two diverge exactly when the workers stop.
+
+The queries are served by two partial indexes added for them — `(created_at) WHERE status = 'queued'` and `(created_at) WHERE status = 'processing'` — plus the outbox's existing `video_job_outbox_unpublished_idx`. **The sweeper's `video_jobs_processing_id_idx` does not serve the processing age:** it is keyed by `id` for the sweep's keyset cursor, so it finds processing rows but cannot give the oldest without reading all of them. Each state's predicate is a literal rather than a parameter, which is what lets PostgreSQL match the partial index, and the plans were verified with `EXPLAIN (ANALYZE)` on a realistic distribution: no sequential scan, and each oldest-age lookup reads one row. Each collection is bounded at **2s**, which must stay below whatever scrape timeout is configured — reversed, a slow database makes the whole endpoint look down.
+
+#### The label rule
+
+**No label, and no metric name, ever carries a user, job or delivery identifier, a storage or source key, a content hash, a webhook destination, an e-mail address, an error message, or a request path.** This is stricter than logging, which allows `job_id` and `user_id` in a record, because a record ages out and a label value is a series that persists for the retention period: one job id in a label is one series per job, forever, in a process nobody thinks to inspect.
+
+It is enforced against the source by `internal/platform/metrics/disclosure_test.go`, over every non-test file under `cmd/` and `internal/`:
+
+1. Every label value is a string literal or a call to `metrics.Route` / `metrics.Method`. A domain value becomes a label through a `switch` whose every branch passes a literal, never by rendering it.
+2. Every metric name, help string and label name is a string literal, and a vector's options are a literal the walk can read.
+3. The client library's default registry is never used: no `promauto`, no `prometheus.MustRegister`, `Register`, `DefaultRegisterer` or `DefaultGatherer`. Everything registers into one explicit registry, so what the endpoint exposes can be read off this repository.
+
+**Rule 1 fails anything it cannot resolve**, rather than listing the forms it rejects. Every method on a metric vector is judged, except the three that take no label, and a constant-metric constructor whose arity the walk does not know fails outright. A legitimate new form therefore has to be admitted by editing the walk — deliberately the right direction for it to be wrong in.
+
+`metrics.Route` and `metrics.Method` resolve against the route table each service reads from its own router at startup and collapse anything else to `<unmatched>` and `UNRECOGNIZED`, so **the number of series is fixed by the build**: (routes + 1) × (methods + 1) × 5 status classes, a few hundred across the stack. An unmatched path is never a label, not even truncated — the access record keeps a 256-byte path, and a metric may not copy it, because truncation bounds length, not the number of distinct values.
+
+#### What an unauthenticated scrape discloses
+
+More than a probe does, and on purpose. A readiness body names no dependency; this body is an inventory — every route template, each route's error rate, the health of the cache and the limiter, the depth of the pipeline, and the Go toolchain version through `go_info`. It is accepted because the reader is already inside the deployment network, and the gateway refusal is the only control. **What it can never disclose is anything about one user, job, delivery or destination** — that is the label rule, and it is enforced rather than promised.
+
+#### What these metrics do not see
+
+Health and readiness left `cmd/worker` and `cmd/notifier` with no liveness signal and nothing emitted on an idle stack, so an idle-but-wedged process looked exactly like an idle-and-healthy one. This change narrowed that gap **from outside, and only partly**:
+
+- **Now visible:** a worker that stopped consuming (the oldest-`queued` age climbs), a worker stuck on a job (the oldest-`processing` age climbs past any extraction's length), and a stopped terminal relay inside the worker (the oldest unpublished `video_job.completed.v1` / `.failed.v1` age climbs). All of it read by `video-api` from the video database.
+- **Still invisible:** how long an extraction takes, which branch a dispatch took (completed, failed, fenced, dead-lettered), how often the recovery sweeper requeues, and how close a notification delivery comes to its `MaxClaimHold()` budget. Those can only be recorded inside the worker and the notifier, which serve nothing.
+- **Not covered from outside at all:** the notifier. Its delivery records live in the Notification database, which `video-api` holds no pool for; a stopped notifier shows up only indirectly, as a backlog on `video.jobs.terminal.events.v1` in the broker.
+
+Closing the rest is `expose-worker-and-notifier-metrics` in `docs/roadmap.md`. It needs changes to two capabilities that forbid those processes any port, and it should follow a scraper — an endpoint on a process nobody scrapes buys nothing.
+
 ---
 
 ## Planned Infrastructure (Not Yet Implemented)
@@ -879,14 +957,8 @@ Verified by stopping each backing service in turn: with PostgreSQL down all thre
 
 **E-mail delivery is no longer planned — it shipped** (`add-notification-email-delivery`) and is documented above: the relay variables under "Environment Variables", the local mail catcher under "Docker", and the operational notes under "The e-mail channel", at the end of the implemented-infrastructure section above.
 
-### Observability — Only metrics remain (Phase 8)
+### Observability — Implemented (Phase 8)
 
-**Two of Phase 8's three changes have shipped and are documented above**, not here. `add-structured-logging` is under "Logging", alongside `LOG_LEVEL` in the environment-variable tables; it went first because it is the only one of the three that touches every file the other two will. `add-health-and-readiness-endpoints` is under "Health and readiness probes", with the per-service readiness matrix and the one constraint that spans two files.
-
-**What remains is metrics alone**: Prometheus counters, gauges and latency histograms at `/metrics`. It is not decomposed yet, and it inherits logging's non-disclosure question in the form of label cardinality — an identifier in a label is unbounded cardinality as well as a possible disclosure.
-
-**The question the two remaining changes used to share is now answered, and the answer has a cost worth stating.** `cmd/worker` and `cmd/notifier` acquire **no** HTTP surface — not for probing, not for anything — and that is now a requirement rather than an omission: `container-image` already forbids either of them to expose a port, and each carries an in-package source test asserting something stronger still, that its own non-test sources construct no HTTP server and import no HTTP framework. A raw `net.Listen` is the stated residual neither test catches.
-
-The cost is that **neither process has a liveness signal of any kind**, and no log record fires on an idle stack for either one. The worker's recovery sweeper logs only when it finds something; the notifier's records are all per-message, and a healthy connected consumer is silent. So an idle-but-wedged worker is indistinguishable from an idle-and-healthy one — both are a running container emitting nothing — and the same holds for the notifier. What an operator has instead is indirect and lagging: jobs that stay `queued`, or a `video.jobs.terminal.events.v1` backlog that stops draining. Metrics are where that gap is closed if it is closed, and closing it is not a reason to give either process a port.
+**Phase 8 is complete; nothing about observability remains planned.** All three of its changes shipped and are documented above: `add-structured-logging` under "Logging", `add-health-and-readiness-endpoints` under "Health and readiness probes", and `add-prometheus-metrics` under "Metrics". What they deliberately did not do — a local metrics scraper, and metrics recorded inside `cmd/worker` and `cmd/notifier` — is recorded in `docs/roadmap.md` as backlog rows, not as planned infrastructure, because neither is committed to.
 
 `docker-compose.yml` used to be listed here as Phase 8 work. It is not: the full local stack was built up change by change, is documented in `docs/development.md`, and `docs/roadmap.md` records it as delivered.
