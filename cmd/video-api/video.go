@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"video-processor/internal/platform/metrics"
 	platformrabbitmq "video-processor/internal/platform/rabbitmq"
 	platformredis "video-processor/internal/platform/redis"
 	videoapplication "video-processor/internal/video/application"
@@ -248,6 +249,16 @@ func setupVideo(ctx context.Context) (*videoModule, *sql.DB, *redis.Client, *vid
 	// PostgreSQL read is negligible next to streaming a zip, so nothing is
 	// lost by skipping the cache on this path.
 	authoritativeRepo := videopostgres.NewRepository(db, ids)
+
+	// The pipeline collector is registered here and in no other process. It
+	// reads this pool, which cmd/worker also holds — and cmd/worker exposes
+	// no endpoint, so registering it there would put a query per scrape on a
+	// process nothing scrapes. It is built on the undecorated repository for
+	// the same reason the download entitlement lookup is, and here that is a
+	// compile-time property: the decorator does not carry the aggregate
+	// methods and cannot be passed where they are required.
+	metrics.MustRegister(videopostgres.NewPipelineCollector(authoritativeRepo))
+
 	repo := videocache.NewCachedVideoJobRepository(authoritativeRepo, redisClient, ids)
 	relay := videomessaging.NewRelay(videopostgres.NewOutboxRepository(db), rabbitConfig)
 	clock := systemClock{}
@@ -671,11 +682,17 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 	var hasReservation bool
 	switch {
 	case err != nil:
+		// Counted at the point the decision is taken rather than at the
+		// response: the family describes the reservation's outcome, and every
+		// branch of this switch reaches it exactly once, so its sum is the
+		// number of uploads that got this far.
+		uploadReservations.WithLabelValues("failed_open").Inc()
 		logger(componentVideoUpload).Warn("reserving the idempotency key failed; proceeding without a reservation",
 			slog.String("source_key", sourceKey.String()),
 			slog.String("error", err.Error()))
 	case !reserved:
 		if jobID, found := m.waitForFinalizedIdempotencyKey(c.Request.Context(), idemKey); found {
+			uploadReservations.WithLabelValues("duplicate").Inc()
 			status, err := m.getJobStatus.Execute(c.Request.Context(), videoapplication.GetJobStatusInput{
 				RequestingUserID: userID.String(),
 				JobID:            jobID.String(),
@@ -701,12 +718,14 @@ func (m *videoModule) handleVideoUpload(c *gin.Context) {
 		// The reservation never resolved within the bound — a genuine
 		// edge case (the original request is abnormally slow or crashed
 		// before finalizing/clearing), not the common duplicate path.
+		uploadReservations.WithLabelValues("conflict").Inc()
 		c.JSON(http.StatusConflict, ProcessingResult{
 			Success: false,
 			Message: "Identical content is already being processed for this user; try again shortly.",
 		})
 		return
 	default:
+		uploadReservations.WithLabelValues("reserved").Inc()
 		hasReservation = true
 	}
 

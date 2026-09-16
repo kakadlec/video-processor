@@ -91,6 +91,14 @@ func accessLogMiddleware() gin.HandlerFunc {
 
 		c.Next()
 
+		elapsed := time.Since(start)
+
+		// Metered before the exemption below and not after it: what the
+		// exemption covers is the routine per-request record, and the
+		// per-request metric carries no exemption list of its own — the two
+		// probe routes are counted while staying unrecorded.
+		recordRequest(c, elapsed)
+
 		// After the chain rather than before it: what is exempt is the
 		// record, not the request. Returning ahead of c.Next() happens to
 		// work — gin's own loop advances past a middleware that did not call
@@ -104,7 +112,7 @@ func accessLogMiddleware() gin.HandlerFunc {
 		record := requestLocation(logger(componentHTTPAccess), c).With(
 			slog.String("method", recordedMethod(c.Request.Method)),
 			slog.Int("status", c.Writer.Status()),
-			slog.Duration("duration", time.Since(start)),
+			slog.Duration("duration", elapsed),
 			slog.Int("size", responseSize(c)),
 		)
 		// The record is written after the chain has run, so the subject

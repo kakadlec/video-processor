@@ -68,6 +68,35 @@ CREATE INDEX IF NOT EXISTS video_jobs_processing_id_idx
     ON video_jobs (id)
     WHERE status = 'processing';
 
+-- The in-flight aggregates' two lookups, one partial index per state, shaped
+-- like the sweep's above and justified by the same sentence: these statements
+-- run on every scrape for the life of the deployment, and a scan whose cost
+-- grows with total job history is what a partial index over a transient
+-- predicate exists to avoid.
+--
+-- Keyed by created_at rather than by id, because the question is the age of
+-- the oldest row and not which rows match. The processing one is therefore
+-- NOT redundant with video_jobs_processing_id_idx above: that index is keyed
+-- by id to match the sweep's keyset cursor, so it finds the processing rows
+-- and cannot order them by created_at — an oldest-age lookup over it reads
+-- every matching row instead of one. A processing row consequently carries
+-- two partial index entries rather than one, which is the price of two
+-- questions no single key order answers.
+--
+-- The set is the in-flight states and no other. pending is excluded on a
+-- stronger footing than cost: a job created through the job-lifecycle API has
+-- no processing trigger and stays pending permanently by design, so a count
+-- of them climbs monotonically and describes nothing. The terminal states are
+-- excluded because the interesting quantity for a state a job enters once is
+-- a rate, which is owed by the process that writes the transition.
+CREATE INDEX IF NOT EXISTS video_jobs_queued_created_at_idx
+    ON video_jobs (created_at)
+    WHERE status = 'queued';
+
+CREATE INDEX IF NOT EXISTS video_jobs_processing_created_at_idx
+    ON video_jobs (created_at)
+    WHERE status = 'processing';
+
 -- Transactional outbox: Repository.Create and Repository.Enqueue each write
 -- a row here in the same transaction as their video_jobs write, so a reader
 -- can never observe a job without the event describing that write, or vice

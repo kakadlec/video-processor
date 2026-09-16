@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"video-processor/internal/platform/logging"
+	"video-processor/internal/platform/metrics"
 )
 
 // shutdownTimeout bounds how long in-flight requests get to finish once a
@@ -150,10 +151,24 @@ func setupRouter(identity *identityModule, readiness *readinessChecker) *gin.Eng
 	// authentication rule nobody chose.
 	newProbeEndpoints(readiness).registerRoutes(r)
 
+	// The exposition endpoint joins them there, for the same three reasons
+	// and with one of its own: this service mounts no limiter at all, so
+	// authenticating a scrape would be a policy on two services and an
+	// accident on the third.
+	registerMetricsRoute(r)
+
 	// No bearer-auth group and no rate limiter, matching what the single API
 	// did for these two routes: they are how a caller obtains a token, so
 	// requiring one would be circular.
 	identity.registerRoutes(r)
+
+	// Last, after every route above is registered: gin reports the table by
+	// walking its trees at the moment of the call, so binding it earlier
+	// would leave a real route resolving to the unmatched value for the life
+	// of the process. The endpoint registered above is in the table it binds,
+	// which is what makes a scrape counted under its own template rather than
+	// as unmatched traffic.
+	metrics.BindRoutes(routeEntries(r))
 
 	return r
 }
