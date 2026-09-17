@@ -274,7 +274,7 @@ The page SHALL tell the user that a notification covers outcomes that occur afte
 
 #### Scenario: The page reflects stored subscriptions
 
-- **GIVEN** a signed-in user with an enabled `email` preference for `video_job.failed.v1`
+- **GIVEN** a signed-in user with an enabled `email` preference for `video_job.failed.v1` and no enabled `email` preference for `video_job.completed.v1`
 - **WHEN** the page loads or they sign in
 - **THEN** the failure option is shown selected, the completion option unselected, and the address field shows the stored address
 
