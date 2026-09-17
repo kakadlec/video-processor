@@ -37,10 +37,10 @@ const metricsShutdownTimeout = 5 * time.Second
 // consults no readiness dependency the way the three HTTP services do. A
 // path other than /metrics answers the mux's own 404 rather than the
 // exposition, so a stray probe here reads as "not found" instead of as a
-// scrape.
+// scrape, and a method other than GET or HEAD answers 405.
 func newMetricsHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics.Handler())
+	mux.Handle("GET /metrics", metrics.Handler())
 	return mux
 }
 

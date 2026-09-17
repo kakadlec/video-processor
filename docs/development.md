@@ -33,8 +33,8 @@ There are **five** `go run` targets, one per composition root, and each requires
 | `go run ./cmd/identity-api` | `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`, `IDENTITY_JWT_KEY_ID`, `IDENTITY_JWT_PUBLIC_KEYS` | `POST /api/auth/register`, `POST /api/auth/login` on `:8080` |
 | `go run ./cmd/video-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | the frontend, `POST /upload`, `GET /download/:filename`, `GET /api/status`, `/api/video-jobs` on `:8080` |
 | `go run ./cmd/notification-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR` | `GET`/`PUT /api/notification-preferences` on `:8080` |
-| `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | only `/metrics` on `:9102` |
-| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL`, `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | only `/metrics` on `:9102` |
+| `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | only `GET /metrics` on `:9102` |
+| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL`, `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | only `GET /metrics` on `:9103` |
 
 **All three HTTP services hardcode `:8080` and read no `PORT` variable**, so a bare `go run` supports **one HTTP service at a time** on a host — there is no supported port override, and running them together needs one container or host each. In the compose stack each has its own container and the gateway is the only thing publishing a port, which is why `docker compose up --build` is the simplest local path (see "Docker Workflow" below). What follows is the manual route: pick the HTTP service you need, plus the worker and the notifier, which listen on nothing and can always run alongside it.
 
@@ -110,8 +110,8 @@ go run ./cmd/worker
 # NOTIFICATION_POSTGRES_DSN, RABBITMQ_URL, and the destination relaxation —
 # it needs a relay to send e-mail through, and refuses to start without one:
 # a notifier that cannot send would store e-mail preferences and silently
-# honour none. Like the worker it binds only :9102 for /metrics, with no way to
-# change that, so stop the worker first or run one of the two in a container.
+# honour none. It binds only its metrics listener, on :9103 — a different
+# fixed port from the worker's :9102, so the two run side by side here.
 #
 # The compose stack's mail catcher is NOT reachable from the host: it accepts
 # SMTP on the compose network only (mail:1025), and the single port it
@@ -243,7 +243,7 @@ docker compose up --build
 # notification for that user lands there instead of being sent anywhere real
 # — and Prometheus's UI, at http://127.0.0.1:9090, scraping GET /metrics on
 # the three HTTP services every 15s (docker/prometheus/prometheus.yml), plus
-# cmd/worker and cmd/notifier on their own metrics-only port (9102, never
+# cmd/worker and cmd/notifier on their own metrics-only ports (9102 and 9103, never
 # published to the host and never proxied by the gateway) since
 # expose-worker-and-notifier-metrics. Prometheus's own data has no named volume (24h retention besides),
 # for the same reason redis's does not — diagnostic and non-authoritative,

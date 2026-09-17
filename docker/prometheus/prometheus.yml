@@ -2,7 +2,7 @@
 # network, by container name and their fixed internal port (8080) — the same
 # addresses the gateway itself proxies to — plus, since
 # expose-worker-and-notifier-metrics, cmd/worker and cmd/notifier on their own
-# fixed internal port (9102), which the gateway never proxies and this file
+# fixed internal ports (9102 and 9103 respectively), which the gateway never proxies and this file
 # never publishes to the host. Add a job per service, following the pattern
 # below, rather than restructuring this file.
 global:
@@ -49,4 +49,4 @@ scrape_configs:
   - job_name: notifier
     metrics_path: /metrics
     static_configs:
-      - targets: ["notifier:9102"]
+      - targets: ["notifier:9103"]

@@ -147,7 +147,7 @@ The five processes have deliberately different configuration surfaces. The absen
 | `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | not read | not read | **not read** — it validates an address, it sends nothing | not read | **required** |
 | `NOTIFICATION_SMTP_USERNAME`, `NOTIFICATION_SMTP_PASSWORD` | not read | not read | not read | not read | optional, and only **together** — one without the other fails startup |
 | `RATE_LIMIT_*` | not read — its two routes are how a caller obtains a token, so limiting them would be circular | optional | optional | not read | not read |
-| `PORT` | as below | as below | as below | not read — `:9102`'s metrics listener is a fixed constant, not configurable, the same way the three HTTP services' `:8080` is | not read — same |
+| `PORT` | as below | as below | as below | not read — `:9102`/`:9103`'s metrics listener is a fixed constant, not configurable, the same way the three HTTP services' `:8080` is | not read — same |
 | `GIN_MODE` | **read by gin, then overridden** — see below | same | same | not read — no gin; the metrics-only listener is stdlib `net/http`, never gin | not read — same |
 | `LOG_LEVEL` | optional | optional | optional | optional | optional |
 
@@ -873,7 +873,7 @@ Verified by stopping each backing service in turn: with PostgreSQL down all thre
 
 ### Metrics — Implemented (Phase 8, extended by `expose-worker-and-notifier-metrics`)
 
-The three HTTP services serve `GET /metrics` in the Prometheus text exposition format on their existing gin route table. **`cmd/worker` and `cmd/notifier` now serve it too**, but not on that table and not on `:8080`: each runs a second, minimal `net/http` listener on `:9102`, carrying that one path and nothing else — no probe, no bearer group, no limiter, because neither process authenticates a caller or consults a readiness dependency the way the three HTTP services do. That listener is the one exception to "acquires no HTTP surface for any observability purpose" under "Health and readiness probes" above; the two in-package source tests that used to forbid it outright now permit exactly that one construction, in exactly one file (`cmd/worker/metricsserver.go`, `cmd/notifier/metricsserver.go`), and fail on any other. It is never proxied by the gateway and never published to the host by `docker-compose.yml` — reachable only from inside the compose network, by Prometheus and nothing else.
+The three HTTP services serve `GET /metrics` in the Prometheus text exposition format on their existing gin route table. **`cmd/worker` and `cmd/notifier` now serve it too**, but not on that table and not on `:8080`: each runs a second, minimal `net/http` listener — `:9102` for the worker, `:9103` for the notifier — carrying that one path and nothing else — no probe, no bearer group, no limiter, because neither process authenticates a caller or consults a readiness dependency the way the three HTTP services do. That listener is the one exception to "acquires no HTTP surface for any observability purpose" under "Health and readiness probes" above; the two in-package source tests that used to forbid it outright now permit exactly that one construction, in exactly one file (`cmd/worker/metricsserver.go`, `cmd/notifier/metricsserver.go`), and fail on any other. It is never proxied by the gateway and never published to the host by `docker-compose.yml` — reachable only from inside the compose network, by Prometheus and nothing else.
 
 **The local stack now runs a scraper.** `add-local-metrics-scraper` added a `prometheus` service to `docker-compose.yml` (`docker/prometheus/prometheus.yml`), and `expose-worker-and-notifier-metrics` extended its scrape config rather than restructuring it: one job per HTTP service (`static_configs`, `:8080`) unchanged, plus one job for `worker` (`dns_sd_configs` against the service name, because `docker-compose.yml` runs three replicas behind it and plain `docker compose up` gives that name multiple DNS `A` records rather than a Swarm-style virtual IP — a `static_configs` target would see only whichever replica the container runtime's DNS answered with first) and one for `notifier` (`static_configs`, since it is not replicated). `docker compose up --build` now produces real time series against every family in this section without an operator pointing anything at any of the five processes by hand; the UI is at <http://127.0.0.1:9090>, loopback-only like the mail catcher. Outside this repository's own compose stack, nothing is provided — pointing a Prometheus server at a real deployment's five processes is still an operator's own setup.
 
@@ -889,7 +889,7 @@ The worker and the notifier answer the same way, on their own port and with no g
 
 ```bash
 docker compose exec worker wget -qO- http://localhost:9102/metrics
-docker compose exec notifier wget -qO- http://localhost:9102/metrics
+docker compose exec notifier wget -qO- http://localhost:9103/metrics
 ```
 
 It is unauthenticated and outside the rate limiter. A scrape carries no subject for the limiter to key on and would eventually be answered `429`, which a scraper reads as the service being down; one of the three services mounts no bearer authentication at all; and requiring a token would make Identity a dependency of every other service's observability. **No environment variable enables, disables, relocates or reformats it.**

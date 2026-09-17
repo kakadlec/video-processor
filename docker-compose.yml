@@ -635,7 +635,7 @@ services:
   #
   # cmd/worker and cmd/notifier were absent from the scrape config until
   # expose-worker-and-notifier-metrics gave each a metrics-only listener on
-  # its own port (9102) — one neither the gateway proxies nor this file
+  # its own port (9102 for the worker, 9103 for the notifier) — one neither the gateway proxies nor this file
   # publishes to the host, reachable only from inside this network. See
   # docker/prometheus/prometheus.yml for why "worker" is a dns_sd_configs
   # job (three replicas, one DNS name) while "notifier" stays a static one.
