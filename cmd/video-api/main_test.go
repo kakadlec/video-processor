@@ -837,6 +837,8 @@ func TestFrontend_StaticRoutes_ServeExpectedContent(t *testing.T) {
 		{"/", "text/html", "FIAP X - Processador de Vídeos"},
 		{"/styles.css", "text/css", ".upload-form"},
 		{"/app.js", "application/javascript", "function loadFilesList"},
+		{"/", "text/html", `id="notificationPanel"`},
+		{"/app.js", "application/javascript", "/api/notification-preferences"},
 	}
 
 	for _, tc := range cases {
