@@ -93,6 +93,15 @@ const NOTIFICATION_EVENTS = [
 // unchecked box has a stored preference that should be written disabled.
 let storedEmailPreferences = null;
 
+// Every read and save is bound to the token that started it and to a
+// generation bumped on each new read, so a response arriving after a
+// sign-out, a sign-in as someone else, or a newer read changes nothing.
+let notificationGeneration = 0;
+
+function isCurrentNotificationRequest(token, generation) {
+    return getAccessToken() === token && notificationGeneration === generation;
+}
+
 function showNotificationMessage(message, type) {
     const el = document.getElementById('notificationMessage');
     el.textContent = message;
@@ -100,16 +109,27 @@ function showNotificationMessage(message, type) {
 }
 
 async function loadNotificationPreferences() {
+    const generation = ++notificationGeneration;
     storedEmailPreferences = null;
-    if (!getAccessToken()) {
+    const token = getAccessToken();
+    if (!token) {
         return;
     }
     showNotificationMessage('');
     let response;
+    let data;
     try {
-        response = await fetch('/api/notification-preferences', { headers: authHeaders() });
+        response = await fetch('/api/notification-preferences', {
+            headers: { 'Authorization': 'Bearer ' + token }
+        });
+        data = response.ok ? await response.json() : null;
     } catch (error) {
-        showNotificationMessage('Erro de conexão: ' + error.message, 'error');
+        if (isCurrentNotificationRequest(token, generation)) {
+            showNotificationMessage('Erro de conexão: ' + error.message, 'error');
+        }
+        return;
+    }
+    if (!isCurrentNotificationRequest(token, generation)) {
         return;
     }
     if (response.status === 401) {
@@ -120,7 +140,6 @@ async function loadNotificationPreferences() {
         showNotificationMessage('Erro ao carregar as preferências de notificação.', 'error');
         return;
     }
-    const data = await response.json();
 
     const stored = {};
     (data.preferences || []).forEach(function(preference) {
@@ -151,20 +170,23 @@ async function saveNotificationPreferences() {
         showNotificationMessage('Não foi possível carregar suas preferências. Recarregue a página.', 'error');
         return;
     }
+    const token = getAccessToken();
+    const generation = notificationGeneration;
+    const stored = storedEmailPreferences;
     const destination = document.getElementById('notificationEmail').value.trim();
 
     for (const event of NOTIFICATION_EVENTS) {
         const enabled = document.getElementById(event.checkboxId).checked;
         // An unchecked box with nothing stored is left alone: saving must not
         // create a preference the user did not ask for.
-        if (!enabled && !storedEmailPreferences[event.eventType]) {
+        if (!enabled && !stored[event.eventType]) {
             continue;
         }
         let response;
         try {
             response = await fetch('/api/notification-preferences', {
                 method: 'PUT',
-                headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
                 body: JSON.stringify({
                     event_type: event.eventType,
                     channel: 'email',
@@ -173,7 +195,12 @@ async function saveNotificationPreferences() {
                 })
             });
         } catch (error) {
-            showNotificationMessage('Erro de conexão: ' + error.message, 'error');
+            if (isCurrentNotificationRequest(token, generation)) {
+                showNotificationMessage('Erro de conexão: ' + error.message, 'error');
+            }
+            return;
+        }
+        if (!isCurrentNotificationRequest(token, generation)) {
             return;
         }
         if (response.status === 401) {
@@ -196,11 +223,19 @@ async function saveNotificationPreferences() {
     }
 
     await loadNotificationPreferences();
-    showNotificationMessage('Preferências salvas.', '');
+    if (getAccessToken() === token) {
+        showNotificationMessage('Preferências salvas.', '');
+    }
 }
 
-document.getElementById('saveNotificationsBtn').addEventListener('click', function() {
-    saveNotificationPreferences();
+document.getElementById('saveNotificationsBtn').addEventListener('click', async function() {
+    const button = this;
+    button.disabled = true;
+    try {
+        await saveNotificationPreferences();
+    } finally {
+        button.disabled = false;
+    }
 });
 
 async function downloadFile(filename) {
