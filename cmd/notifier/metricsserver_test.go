@@ -33,6 +33,12 @@ func TestMetricsHandler_ServesTheExpositionAndNothingElse(t *testing.T) {
 		t.Fatalf("GET / = %d, want %d — this surface carries one route", recorder.Code, http.StatusNotFound)
 	}
 
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/metrics", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HEAD /metrics = %d, want %d — a GET pattern also serves HEAD", recorder.Code, http.StatusOK)
+	}
+
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
 		recorder = httptest.NewRecorder()
 		handler.ServeHTTP(recorder, httptest.NewRequest(method, "/metrics", nil))

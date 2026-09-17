@@ -38,6 +38,12 @@ func TestMetricsHandler_ServesTheExpositionAndNothingElse(t *testing.T) {
 		t.Fatalf("GET / = %d, want %d — this surface carries one route", recorder.Code, http.StatusNotFound)
 	}
 
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/metrics", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HEAD /metrics = %d, want %d — a GET pattern also serves HEAD", recorder.Code, http.StatusOK)
+	}
+
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
 		recorder = httptest.NewRecorder()
 		handler.ServeHTTP(recorder, httptest.NewRequest(method, "/metrics", nil))
@@ -136,7 +142,15 @@ func TestTheWorkerAndNotifierBindDifferentMetricsPorts(t *testing.T) {
 	if notifierAddr == "" {
 		t.Fatalf("no string-literal metricsAddr constant found in %s", path)
 	}
-	if notifierAddr == metricsAddr {
-		t.Fatalf("the worker and the notifier both bind %s for /metrics", metricsAddr)
+	_, workerPort, err := net.SplitHostPort(metricsAddr)
+	if err != nil {
+		t.Fatalf("split the worker's metricsAddr %q: %v", metricsAddr, err)
+	}
+	_, notifierPort, err := net.SplitHostPort(notifierAddr)
+	if err != nil {
+		t.Fatalf("split the notifier's metricsAddr %q: %v", notifierAddr, err)
+	}
+	if workerPort == notifierPort {
+		t.Fatalf("the worker (%s) and the notifier (%s) both bind port %s for /metrics", metricsAddr, notifierAddr, workerPort)
 	}
 }
