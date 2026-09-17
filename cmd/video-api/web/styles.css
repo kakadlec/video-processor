@@ -100,3 +100,18 @@ button:hover { background: #0056b3; }
     justify-content: space-between;
     align-items: center;
 }
+.notification-panel label {
+    font-size: 14px;
+}
+.notification-hint {
+    font-size: 13px;
+    color: #666;
+}
+.notification-warning {
+    font-size: 13px;
+    color: #856404;
+    background: #fff3cd;
+    border: 1px solid #ffeeba;
+    border-radius: 4px;
+    padding: 8px;
+}

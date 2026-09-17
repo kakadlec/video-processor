@@ -29,6 +29,24 @@
             <div class="auth-message" id="authMessage"></div>
         </div>
 
+        <div class="auth-panel notification-panel" id="notificationPanel" style="display: none;">
+            <p><strong>📧 Notificações por e-mail</strong></p>
+            <label for="notificationEmail">Enviar para:</label>
+            <input type="email" id="notificationEmail" placeholder="Email">
+            <div>
+                <label><input type="checkbox" id="notifyFailed"> Quando o processamento falhar</label>
+            </div>
+            <div>
+                <label><input type="checkbox" id="notifyCompleted"> Quando o processamento for concluído</label>
+            </div>
+            <p class="notification-hint">A notificação vale para vídeos cujo processamento terminar depois que você ativá-la pela primeira vez.</p>
+            <p class="notification-warning" id="notificationWarning" style="display: none;">
+                ⚠️ Você tem endereços diferentes cadastrados para cada notificação. Ao salvar, o endereço acima será usado para as duas.
+            </p>
+            <button type="button" id="saveNotificationsBtn">💾 Salvar preferências</button>
+            <div class="auth-message" id="notificationMessage" role="status" aria-live="polite"></div>
+        </div>
+
         <form id="uploadForm" class="upload-form">
             <p><strong>Selecione um arquivo de vídeo:</strong></p>
             <input type="file" id="videoFile" accept="video/*" required>

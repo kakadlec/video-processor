@@ -26,6 +26,7 @@ function updateAuthUI() {
     const token = getAccessToken();
     document.getElementById('authForms').style.display = token ? 'none' : 'block';
     document.getElementById('authLoggedIn').style.display = token ? 'flex' : 'none';
+    document.getElementById('notificationPanel').style.display = token ? 'block' : 'none';
     if (token) {
         document.getElementById('authEmailDisplay').textContent =
             'Autenticado como ' + localStorage.getItem(ACCOUNT_EMAIL_KEY);
@@ -60,6 +61,7 @@ async function submitAuth(path) {
         setSession(data.access_token, email);
         showAuthMessage('');
         loadFilesList();
+        loadNotificationPreferences();
     } catch (error) {
         showAuthMessage('Erro de conexão: ' + error.message, 'error');
     }
@@ -76,6 +78,164 @@ document.getElementById('registerBtn').addEventListener('click', function() {
 document.getElementById('logoutBtn').addEventListener('click', function() {
     clearSession();
     loadFilesList();
+    loadNotificationPreferences();
+});
+
+// The two terminal event types a user can subscribe to by e-mail. Webhook
+// preferences are managed through the API only.
+const NOTIFICATION_EVENTS = [
+    { eventType: 'video_job.failed.v1', checkboxId: 'notifyFailed' },
+    { eventType: 'video_job.completed.v1', checkboxId: 'notifyCompleted' }
+];
+
+// Which e-mail preferences existed on the last successful read, keyed by
+// event type. Null until a read succeeds, so a save never guesses whether an
+// unchecked box has a stored preference that should be written disabled.
+let storedEmailPreferences = null;
+
+// Every read and save is bound to the token that started it and to a
+// generation bumped on each new read, so a response arriving after a
+// sign-out, a sign-in as someone else, or a newer read changes nothing.
+let notificationGeneration = 0;
+
+function isCurrentNotificationRequest(token, generation) {
+    return getAccessToken() === token && notificationGeneration === generation;
+}
+
+function showNotificationMessage(message, type) {
+    const el = document.getElementById('notificationMessage');
+    el.textContent = message;
+    el.className = 'auth-message' + (type ? ' ' + type : '');
+}
+
+async function loadNotificationPreferences() {
+    const generation = ++notificationGeneration;
+    storedEmailPreferences = null;
+    const token = getAccessToken();
+    if (!token) {
+        return;
+    }
+    showNotificationMessage('');
+    let response;
+    let data;
+    try {
+        response = await fetch('/api/notification-preferences', {
+            headers: { 'Authorization': 'Bearer ' + token }
+        });
+        data = response.ok ? await response.json() : null;
+    } catch (error) {
+        if (isCurrentNotificationRequest(token, generation)) {
+            showNotificationMessage('Erro de conexão: ' + error.message, 'error');
+        }
+        return;
+    }
+    if (!isCurrentNotificationRequest(token, generation)) {
+        return;
+    }
+    if (response.status === 401) {
+        clearSession();
+        return;
+    }
+    if (!response.ok) {
+        showNotificationMessage('Erro ao carregar as preferências de notificação.', 'error');
+        return;
+    }
+
+    const stored = {};
+    (data.preferences || []).forEach(function(preference) {
+        if (preference.channel === 'email') {
+            stored[preference.event_type] = preference;
+        }
+    });
+    storedEmailPreferences = stored;
+
+    NOTIFICATION_EVENTS.forEach(function(event) {
+        const preference = stored[event.eventType];
+        document.getElementById(event.checkboxId).checked = Boolean(preference && preference.enabled);
+    });
+
+    const failed = stored['video_job.failed.v1'];
+    const completed = stored['video_job.completed.v1'];
+    const storedAddress = (failed || completed || {}).destination;
+    document.getElementById('notificationEmail').value =
+        storedAddress || localStorage.getItem(ACCOUNT_EMAIL_KEY) || '';
+    // One field serves both preferences, so a save would replace a distinct
+    // address stored through the API; say so before it happens.
+    document.getElementById('notificationWarning').style.display =
+        failed && completed && failed.destination !== completed.destination ? 'block' : 'none';
+}
+
+async function saveNotificationPreferences() {
+    if (storedEmailPreferences === null) {
+        showNotificationMessage('Não foi possível carregar suas preferências. Recarregue a página.', 'error');
+        return;
+    }
+    const token = getAccessToken();
+    const generation = notificationGeneration;
+    const stored = storedEmailPreferences;
+    const destination = document.getElementById('notificationEmail').value.trim();
+
+    for (const event of NOTIFICATION_EVENTS) {
+        const enabled = document.getElementById(event.checkboxId).checked;
+        // An unchecked box with nothing stored is left alone: saving must not
+        // create a preference the user did not ask for.
+        if (!enabled && !stored[event.eventType]) {
+            continue;
+        }
+        let response;
+        try {
+            response = await fetch('/api/notification-preferences', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+                body: JSON.stringify({
+                    event_type: event.eventType,
+                    channel: 'email',
+                    enabled: enabled,
+                    destination: destination
+                })
+            });
+        } catch (error) {
+            if (isCurrentNotificationRequest(token, generation)) {
+                showNotificationMessage('Erro de conexão: ' + error.message, 'error');
+            }
+            return;
+        }
+        if (!isCurrentNotificationRequest(token, generation)) {
+            return;
+        }
+        if (response.status === 401) {
+            clearSession();
+            showResult('Sessão expirada. Faça login novamente.', 'error');
+            return;
+        }
+        if (response.status === 400) {
+            showNotificationMessage('Endereço de e-mail inválido.', 'error');
+            return;
+        }
+        if (response.status === 429) {
+            showNotificationMessage('Muitas requisições. Tente novamente em instantes.', 'error');
+            return;
+        }
+        if (!response.ok) {
+            showNotificationMessage('Erro ao salvar as preferências de notificação.', 'error');
+            return;
+        }
+    }
+
+    await loadNotificationPreferences();
+    if (getAccessToken() === token) {
+        showNotificationMessage('Preferências salvas.', '');
+    }
+}
+
+document.getElementById('saveNotificationsBtn').addEventListener('click', async function() {
+    const button = this;
+    button.disabled = true;
+    try {
+        await saveNotificationPreferences();
+    } finally {
+        button.disabled = false;
+    }
 });
 
 async function downloadFile(filename) {
@@ -332,3 +492,4 @@ function formatFileSize(bytes) {
 // Carregar estado de autenticação e lista de arquivos ao inicializar
 updateAuthUI();
 loadFilesList();
+loadNotificationPreferences();
