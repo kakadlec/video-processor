@@ -238,8 +238,9 @@ docker compose up --build
 # Two more loopback ports back the stack's development-only support UIs (the
 # compose file also publishes PostgreSQL, Redis, MinIO and RabbitMQ's own
 # ports for local inspection — a separate, pre-existing thing from either of
-# these): the mail catcher's inbox, at http://127.0.0.1:8025 — register an
-# email preference through PUT /api/notification-preferences and every
+# these): the mail catcher's inbox, at http://127.0.0.1:8025 — subscribe on
+# the page's "Notificações por e-mail" section (or register an email
+# preference through PUT /api/notification-preferences) and every
 # notification for that user lands there instead of being sent anywhere real
 # — and Prometheus's UI, at http://127.0.0.1:9090, scraping GET /metrics on
 # the three HTTP services every 15s (docker/prometheus/prometheus.yml), plus
