@@ -4,11 +4,11 @@ The hackathon brief (`docs/project-requirements.pdf`) requires that "em caso de 
 
 ## What Changes
 
-- **A "Notificações por e-mail" section on the web page**, shown only while signed in: one address field (pre-filled with the signed-in account's e-mail) and two checkboxes, "quando o processamento falhar" and "quando o processamento for concluído", plus a save button.
+- **A "Notificações por e-mail" section on the web page**, shown only while signed in: one address field (pre-filled with the signed-in account's e-mail) and two checkboxes, "quando o processamento falhar" and "quando o processamento for concluído", plus a save button. The address field applies to both event types; when the two stored addresses differ, the page says so before a save would unify them.
 - **On sign-in (and on page load with a session) the section reads `GET /api/notification-preferences`** and reflects the caller's stored `email` preferences: a checkbox is checked when its preference exists and is enabled, and the address field shows a stored address when one exists.
 - **Saving writes through the existing `PUT /api/notification-preferences`**, one request per event type, with channel `email` and no secret. A request is sent for a checked box, or for an unchecked box whose preference already exists (writing it disabled). An unchecked box with no stored preference sends nothing, so saving never creates a preference the user did not ask for.
 - **Webhook stays API-only.** The page offers no webhook form; nothing about the webhook channel changes.
-- No Go code, no route, no API contract, no schema, and no compose change. The gateway already routes `/api/notification-preferences` to `notification-api` on the page's own origin, and the shared CORS policy already allows `PUT` for exactly this write.
+- No production Go code, no route, no API contract, no schema, and no compose change. The gateway already routes `/api/notification-preferences` to `notification-api` on the page's own origin, and the shared CORS policy already allows `PUT` for exactly this write.
 
 Not breaking: the page gains a section; every existing request it makes is unchanged.
 

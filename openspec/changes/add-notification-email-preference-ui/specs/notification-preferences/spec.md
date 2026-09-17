@@ -6,7 +6,9 @@ The web page served by `GET /` SHALL let a signed-in user subscribe to e-mail on
 
 The page SHALL NOT create a preference the user did not select: saving SHALL write a preference only for an event type the user selected, or for one whose preference already exists (writing it disabled when deselected). The address SHALL default to the signed-in account's e-mail when no `email` preference is stored, and SHALL be editable.
 
-The page SHALL tell the user that a subscription applies to outcomes that occur after it is saved, because delivery ignores events that precede a preference's creation.
+The page SHALL NOT replace a stored address without the user seeing it: when the two stored `email` preferences carry different addresses, the page SHALL show that before a save applies the address in the form to both.
+
+The page SHALL tell the user that a notification covers outcomes that occur after the subscription was first created. It SHALL NOT promise that only outcomes after the latest save are delivered, because a preference's creation time is stable across later writes and re-enabling a disabled preference keeps its original enrolment boundary.
 
 #### Scenario: A signed-in user subscribes to failures
 
@@ -25,6 +27,12 @@ The page SHALL tell the user that a subscription applies to outcomes that occur 
 - **GIVEN** a signed-in user with an enabled `email` preference for `video_job.failed.v1` and none for `video_job.completed.v1`
 - **WHEN** they deselect both options and save
 - **THEN** one `PUT` is sent for `video_job.failed.v1` with `enabled` false, and none for `video_job.completed.v1`
+
+#### Scenario: Differing stored addresses are shown before they are unified
+
+- **GIVEN** a signed-in user whose `email` preferences for `video_job.failed.v1` and `video_job.completed.v1` carry different addresses
+- **WHEN** the page loads
+- **THEN** the address field shows the failure preference's address and the section warns that saving applies that address to both notifications
 
 #### Scenario: The section is not offered without a session
 

@@ -18,7 +18,9 @@ The page (`cmd/video-api/web/`) already signs a user in, keeps the access token 
 
 **Checkboxes per event type, one shared address.** Two event types × one channel is two preferences. One address field keeps the form to three inputs; both writes send the same address. *Alternative:* an address per event type — more inputs, no demonstrated need.
 
-**The address defaults to the account e-mail, but is the preference's own value.** On read, a stored `email` preference's `destination` fills the field (the one for `video_job.failed.v1` wins if both exist and differ); with none stored, the field falls back to the account e-mail kept at sign-in. The user may edit it. This matches the shipped rule that the delivered address is the preference's own `Destination`, not an identity lookup.
+**The address defaults to the account e-mail, but is the preference's own value.** On read, a stored `email` preference's `destination` fills the field; with none stored, the field falls back to the account e-mail kept at sign-in. The user may edit it. This matches the shipped rule that the delivered address is the preference's own `Destination`, not an identity lookup.
+
+**Differing stored addresses are surfaced, not silently unified.** The API stores a destination per triple, so the two `email` preferences can carry different addresses (set through the API). The page does not model that — one field is the point of keeping the form simple — but it must not overwrite a distinct address without the user seeing it. When both exist and differ, the field shows the failure preference's address and the section shows a warning that saving applies the address in the field to both notifications. Saving is then the user's explicit choice. *Alternative:* one address field per event type — faithful to the model, but doubles the form for a case only the API can produce.
 
 **Write only what the user selected, or what already exists.** Saving sends `PUT` for a checked box (`enabled: true`) and for an unchecked box whose preference was present on the last read (`enabled: false`, retaining the row as `notification-preferences` specifies). An unchecked box with nothing stored sends nothing. *Alternative:* always write both — simpler, but it would create disabled rows the user never asked for, which reads as an implicit preference.
 
@@ -26,7 +28,7 @@ The page (`cmd/video-api/web/`) already signs a user in, keeps the access token 
 
 **Errors map to existing page conventions.** `401` clears the session exactly as the other calls do; `429` shows a "try again shortly" message and does not retry (no polling here, so no backoff loop); `400` shows "endereço de e-mail inválido"; anything else a generic failure. All copy is pt-BR (language policy's `web/` exception).
 
-**The enrolment boundary is stated on the page.** Delivery only considers preferences created before the event occurred, so the section carries a one-line hint that the subscription applies to videos processed from then on. Without it, subscribing after an upload already failed looks broken.
+**The enrolment boundary is stated on the page, as the first subscription.** Delivery considers a preference only for events that occurred after the preference was **first created**; `created_at` is stable across later writes, and enabledness is evaluated when the event is handled. So re-enabling a disabled preference can deliver an outcome that occurred while it was disabled. The hint therefore says the notification covers videos whose processing ends after the user first activated it — not "after this save". Without a hint, subscribing after an upload already failed looks broken.
 
 **Read timing.** The section loads its state when the page loads with a session and after a successful sign-in, alongside `loadFilesList`, and hides on sign-out.
 
