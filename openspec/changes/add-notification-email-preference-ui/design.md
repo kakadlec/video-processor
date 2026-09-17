@@ -11,7 +11,7 @@ The page (`cmd/video-api/web/`) already signs a user in, keeps the access token 
 **Non-Goals:**
 - A webhook form (URL, secret, `has_secret` display) — webhook stays API-only.
 - Subscribing anyone by default, at registration or otherwise — `notification-preferences` forbids implicit preferences.
-- Any Go, route, schema, compose or gateway change.
+- Any production Go, route, schema, compose or gateway change (the only Go touched is the static-asset test).
 - A JavaScript test harness; the page has none today and this change does not introduce one.
 
 ## Decisions
