@@ -14,7 +14,9 @@ The separation is load-bearing and is the reason there are two endpoints rather 
 
 The liveness endpoint's reach SHALL be understood narrowly and SHALL NOT be described as more than it is: a `200` from it asserts that the process is scheduled, that it is still accepting connections, and that its global middleware chain still returns. It asserts nothing about any dependency, about any other route, or about whether work is progressing.
 
-The two non-HTTP processes — `cmd/worker` and `cmd/notifier` — SHALL serve neither endpoint and SHALL acquire no HTTP surface for this or any other observability purpose. `container-image` already requires that each expose no port at all, and that requirement is not relaxed here.
+The two non-HTTP processes — `cmd/worker` and `cmd/notifier` — SHALL serve neither endpoint. Their only HTTP surface SHALL be the metrics-only listener `service-metrics` defines: one file per package (`metricsserver.go`) SHALL be the only place either constructs an HTTP server, it SHALL use the standard library's server and request multiplexer and nothing else, and it SHALL mount the `/metrics` path alone. The HTTP framework import ban SHALL hold in every file of both packages, that one included.
+
+The exception is narrow on purpose, and it is not a probe by another name. A probe exists so a runtime can act on its answer — restart a process, withhold traffic — and neither process receives traffic a readiness verdict could withhold, while a liveness restart of a process draining a job would destroy the work its shutdown ordering exists to protect. A scrape carries no such verdict: it is read by a person or an alert, and it is what makes an idle-but-wedged worker distinguishable from an idle-and-healthy one from outside, which no record either process emits can do.
 
 #### Scenario: Liveness answers while a dependency is unreachable
 
@@ -28,10 +30,10 @@ The two non-HTTP processes — `cmd/worker` and `cmd/notifier` — SHALL serve n
 - **WHEN** a caller requests `GET /health` and `GET /ready`
 - **THEN** liveness answers `200` and readiness answers `503`
 
-#### Scenario: The non-HTTP processes bind no listener
+#### Scenario: The non-HTTP processes bind only their metrics listener
 
 - **WHEN** a source-level test reads the non-test sources of `cmd/worker` and of `cmd/notifier`
-- **THEN** it finds neither an HTTP server construction nor an import of the HTTP framework in either, and fails naming the file and line if it does
+- **THEN** it finds no import of the HTTP framework in any file, and no HTTP server construction outside that package's `metricsserver.go`, where only the standard library's server and request multiplexer are constructed — and it fails naming the file and line otherwise, and also fails if `metricsserver.go` is absent, so the permission cannot be kept while the file it names is renamed away
 
 ### Requirement: A Readiness Dependency Is One Whose Absence Stops the Process Serving
 

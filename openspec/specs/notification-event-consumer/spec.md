@@ -6,7 +6,7 @@ Defines the process that reads a video job's terminal outcome off the broker and
 ## Requirements
 ### Requirement: Delivery Runs in Its Own Entrypoint, Requiring Only Its Own Configuration
 
-The Notification context's event consumer SHALL be its own entrypoint, `cmd/notifier`, built from the same source tree and shipped in the same image as the three HTTP services and `cmd/worker`, and started as that image with a different command. It SHALL listen on no port.
+The Notification context's event consumer SHALL be its own entrypoint, `cmd/notifier`, built from the same source tree and shipped in the same image as the three HTTP services and `cmd/worker`, and started as that image with a different command. It SHALL listen on no port other than the metrics-only listener `service-metrics` defines, which serves the `/metrics` path alone and is neither published to the host nor routed by the ingress.
 
 It SHALL require exactly the configuration it uses — the Notification context's own PostgreSQL DSN, the broker URL, and the configuration each delivery channel it composes needs to send — and SHALL fail fast with an error naming a missing variable rather than starting in a degraded mode. Requiring a channel's configuration is what keeps the closed channel set honest from this side: a preference on a channel this process could not send through would be stored and silently never honoured. It SHALL NOT require identity configuration, object-storage configuration, Redis, or `ffmpeg`: it authenticates no caller, stores no artifact, holds no lease, and runs no extraction. Requiring any of them would misrepresent what the process does.
 
@@ -22,7 +22,7 @@ Broker reachability SHALL NOT be a startup gate. The consumer SHALL dial with bo
 
 - **GIVEN** the Notification DSN, the broker URL, and each channel's send configuration are set and no other application variable is
 - **WHEN** `cmd/notifier` starts
-- **THEN** it starts and begins consuming, opening no port
+- **THEN** it starts and begins consuming, opening no port other than its metrics-only listener (see `service-metrics`)
 
 #### Scenario: A missing required variable fails startup
 
@@ -99,7 +99,7 @@ Each delivery SHALL be resolved to exactly one disposition. The table below is t
 | A body that cannot be decoded, or an event type this consumer does not recognize | Dead-letter, without requeue |
 | A failure of the consumer's own dependency **before any attempt is made** — the Notification database unreachable while reading preferences or while claiming — or a claim refused because another claim is **held and not yet reclaimable** | Requeue, after a pause |
 
-The third disposition is a deliberate difference from `videojob-worker`, which has only the first two, and the difference SHALL NOT be read as an inconsistency. There, a requeued job meets a row that has already moved past `queued` and can only lose the claim again, so redelivery loops rather than recovers. Here this handler has attempted nothing, and the condition that blocked it — a database that is down, or a claim another consumer still holds — is one that resolves itself, so dead-lettering would discard a user's notification because of a blip. The pause before the next delivery is what prevents that disposition from becoming a hot loop against a database that is still down.
+The third disposition is shared with `videojob-worker` under the same rule and differs in reach, and the difference SHALL NOT be read as an inconsistency. There, requeue is reachable only for a claim whose outcome the worker could not learn; a job requeued after a won claim meets a row that has already moved past `queued` and can only lose the claim again, so redelivery would loop rather than recover, and a lost claim is dead-lettered because no later delivery can reopen it. Here this handler has attempted nothing, and the condition that blocked it — a database that is down, or a claim another consumer still holds — is one that resolves itself, so dead-lettering would discard a user's notification because of a blip. The pause before the next delivery is what prevents that disposition from becoming a hot loop against a database that is still down.
 
 **The requeue disposition SHALL be reachable only before an attempt has been made by this handler**, and this boundary is load-bearing rather than incidental. Nothing this handler has done can be lost by a redelivery, so redelivery genuinely retries. Once *this* handler holds the claim, a redelivery meeting that row would be refused and requeued indefinitely rather than resolving anything — so requeueing after a failed recording would discard the outcome permanently, and could send the webhook a second time first. Every pre-attempt failure SHALL take this disposition, including a failure of the read that resolves preferences, not only a failure of the claim itself: at that point no request has been made and no claim is held, so nothing distinguishes the two.
 

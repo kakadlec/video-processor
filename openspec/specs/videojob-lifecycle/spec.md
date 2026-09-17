@@ -2,11 +2,13 @@
 
 ## Purpose
 
-Define the `VideoJob` aggregate's full lifecycle behavior in the Video Processing bounded context's `domain` and `application` layers: `CreateVideoJob`, `GetJobStatus`, `ListUserJobs`, plus the state-transition use cases `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` and the `VideoJob` transition methods and pure `JobStatus` transition-validity function they rest on. No infrastructure or HTTP route is in scope here — see `ddd-architecture` for the aggregate's full canonical shape, `videojob-execution` for the orchestration use case and `ffmpeg` adapter that calls `StartProcessing`/`CompleteJob`/`FailJob` (`EnqueueVideoJob` is called by `POST /upload`'s handler instead, so that it commits with its outbox row — see `videojob-persistence`), and `videojob-http-api` for the HTTP routes that call `CreateVideoJob`/`GetJobStatus`/`ListUserJobs`.
+Define the `VideoJob` aggregate's full lifecycle behavior in the Video Processing bounded context's `domain` and `application` layers: `CreateVideoJob`, `GetJobStatus`, `ListUserJobs`, plus the state-transition use cases `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob`, `RetryVideoJob` and the `VideoJob` transition methods and pure `JobStatus` transition-validity function they rest on. No infrastructure or HTTP route is in scope here — see `ddd-architecture` for the aggregate's full canonical shape, `videojob-execution` for the orchestration use case and `ffmpeg` adapter that calls `StartProcessing`/`CompleteJob`/`FailJob` (`EnqueueVideoJob` is called by `POST /upload`'s handler instead, so that it commits with its outbox row — see `videojob-persistence`), and `videojob-http-api` for the HTTP routes that call `CreateVideoJob`/`GetJobStatus`/`ListUserJobs`.
 ## Requirements
 ### Requirement: CreateVideoJob Persists a New Job in Pending State
 
-The `CreateVideoJob` use case SHALL create a `VideoJob` with a freshly minted `VideoJobID`, the caller-supplied `UserID`, `OriginalFilename`, and **source `StorageKey`**, a `CreatedAt` timestamp, `JobStatus: pending`, `FrameCount: 0`, and an empty `ErrorReason`, and SHALL persist it via the `VideoJobRepository` port before returning.
+The `CreateVideoJob` use case SHALL create a `VideoJob` with a freshly minted `VideoJobID`, the caller-supplied `UserID`, `OriginalFilename`, and **source `StorageKey`**, `JobStatus: pending`, `FrameCount: 0`, and an empty `ErrorReason`, and SHALL persist it via the `VideoJobRepository` port before returning.
+
+**The use case SHALL NOT mint the job's `CreatedAt`, and the application layer SHALL hold no clock port for it.** Creation time is minted by the database when the row is written (see `videojob-persistence`), so every age later computed against the database's own clock compares one clock with itself. Because the job the use case constructs carries no creation time of its own, it SHALL report the persisted value by reloading the job after `Create` succeeds. A failure of that reload SHALL be returned as the use case's error, and a caller SHALL treat it as it treats a failed `Create`, accepting that the `pending` row it wrote remains — a state a `pending` job already occupies harmlessly, since nothing dispatches it.
 
 The source key is the object key of the uploaded video, distinct from the result `StorageKey` set at completion, and it is accepted here because this is the only point at which it is known: `POST /upload` streams the upload into the bucket before creating the job, and the key embeds a generated `uploadID` that exists nowhere else. A process that later has to fetch the source — a worker, in particular — cannot reconstruct it from any other column.
 
@@ -16,7 +18,7 @@ The source key MAY be empty. `POST /api/video-jobs` creates a job from a JSON fi
 
 - **GIVEN** a valid `UserID`, `OriginalFilename`, and source `StorageKey`
 - **WHEN** `CreateVideoJob.Execute` is called
-- **THEN** it returns a result describing a `VideoJob` in `pending` state, and a subsequent `VideoJobRepository.FindByID` for that job's ID returns the same job, carrying the same source key
+- **THEN** it returns a result describing a `VideoJob` in `pending` state whose `CreatedAt` is the value the repository persisted, and a subsequent `VideoJobRepository.FindByID` for that job's ID returns the same job, carrying the same source key and the same `CreatedAt`
 
 #### Scenario: Creation without a source key is allowed
 
@@ -118,7 +120,7 @@ The `ListUserJobs` use case SHALL return only `VideoJob`s owned by the requestin
 
 `JobStatus` SHALL provide a pure function that reports whether a transition from one status to another is valid, independent of any `VideoJob` instance, implementing the state machine `pending → queued → processing → completed`, `processing → failed`, and `processing → queued`. The `VideoJob` aggregate SHALL expose one method per edge in that state machine — `Enqueue` (`pending → queued`), `StartProcessing` (`queued → processing`), `Complete` (`processing → completed`), `Fail` (`processing → failed`), `Requeue` (`processing → queued`) — each of which SHALL reject the call with an error, and leave the aggregate's state unchanged, when the current status cannot legally make that transition.
 
-**`processing → queued` is the state machine's only backwards edge, and it exists for exactly one purpose: returning a job whose worker died to the queue** (see `videojob-lease-recovery`). It SHALL NOT be used to retry a job that reached a terminal state, to re-dispatch a job on request, or to undo a claim a worker still holds. No further backwards edge SHALL be added on the strength of this one; `completed` and `failed` remain terminal, with no outgoing edges at all.
+**`processing → queued` is the state machine's only backwards edge, and it exists for exactly two purposes: returning a job whose worker died to the queue** (see `videojob-lease-recovery`), **and returning a job whose run met a transient object-storage failure** (see `videojob-execution`), both within the one requeue budget the job's epoch counts. It SHALL NOT be used to retry a job that reached a terminal state, to retry any other kind of failure, to re-dispatch a job on request, or to undo a claim another worker still holds. No further backwards edge SHALL be added on the strength of this one; `completed` and `failed` remain terminal, with no outgoing edges at all.
 
 `Requeue` SHALL be a distinct aggregate method rather than a second caller of `Enqueue`. The two transitions differ in origin status, in what may be assumed about the job's fields, and in who is allowed to perform them, and collapsing them would let a `pending` job be requeued or an abandoned one be treated as a first dispatch.
 
@@ -196,9 +198,9 @@ The `ListUserJobs` use case SHALL return only `VideoJob`s owned by the requestin
 - **WHEN** `StartProcessing`, `Complete`, `Fail`, or `Requeue` is called on it directly
 - **THEN** it returns an error, and the job's status remains `pending`
 
-### Requirement: EnqueueVideoJob, StartProcessing, CompleteJob, and FailJob Persist One State Transition Each
+### Requirement: EnqueueVideoJob, StartProcessing, CompleteJob, FailJob, and RetryVideoJob Persist One State Transition Each
 
-Four application-layer use cases — `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` — SHALL each load a `VideoJob` by ID via `VideoJobRepository.FindByID`, apply exactly the one aggregate transition method matching their name, and persist the result. **`CompleteJob` and `FailJob` persist via `VideoJobRepository.Update`**, which — like `Enqueue` — commits the transition together with the event describing it, on the paths where its conditional statement applied (see `videojob-terminal-events`); **`EnqueueVideoJob` persists via `VideoJobRepository.Enqueue`**, which commits the transition together with its own event; **`StartProcessing` persists via `VideoJobRepository.ClaimForProcessing`**, which applies the transition only if the stored status is still `queued` (see `videojob-persistence`). `CompleteJob` additionally accepts a `StorageKey` and `FrameCount`; `FailJob` additionally accepts a non-empty failure reason. None of the four SHALL be reachable from any HTTP route defined by `videojob-http-api`.
+The application-layer use cases `EnqueueVideoJob`, `StartProcessing`, `CompleteJob`, `FailJob` SHALL each load a `VideoJob` by ID via `VideoJobRepository.FindByID`, apply exactly the one aggregate transition method matching their name, and persist the result. **`CompleteJob` and `FailJob` persist via `VideoJobRepository.Update`**, which — like `Enqueue` — commits the transition together with the event describing it, on the paths where its conditional statement applied (see `videojob-terminal-events`); **`EnqueueVideoJob` persists via `VideoJobRepository.Enqueue`**, which commits the transition together with its own event; **`StartProcessing` persists via `VideoJobRepository.ClaimForProcessing`**, which applies the transition only if the stored status is still `queued` (see `videojob-persistence`). A fifth, `RetryVideoJob`, follows the same shape for the `Requeue` edge: it loads the job, applies `Requeue`, and **persists via `VideoJobRepository.Requeue`**, fenced at the epoch its caller holds, reporting a refused write as the fence sentinel (see `videojob-execution`). `CompleteJob` additionally accepts a `StorageKey` and `FrameCount`; `FailJob` additionally accepts a non-empty failure reason. None of the five SHALL be reachable from any HTTP route defined by `videojob-http-api`.
 
 **`StartProcessing` SHALL be an atomic claim, and losing that claim SHALL be a distinct, non-failing outcome.** It SHALL return a distinct exported sentinel error, SHALL NOT retry, and SHALL NOT call `FailJob` or otherwise mutate the job — another consumer owns it, and writing anything would corrupt that consumer's work.
 
@@ -337,7 +339,7 @@ Recovery of a job whose consumer died mid-extraction is a **separate** mechanism
 #### Scenario: A nonexistent job ID is rejected as not found
 
 - **GIVEN** no `VideoJob` exists for a given ID
-- **WHEN** any of the four use cases is called with that ID
+- **WHEN** any of the five state-transition use cases is called with that ID
 - **THEN** it returns `ErrVideoJobNotFound` and does not persist anything
 
 ### Requirement: Video Processing Owns a Local UserID, Never Identity's

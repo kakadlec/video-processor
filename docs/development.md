@@ -33,8 +33,8 @@ There are **five** `go run` targets, one per composition root, and each requires
 | `go run ./cmd/identity-api` | `IDENTITY_POSTGRES_DSN`, `IDENTITY_JWT_PRIVATE_KEY`, `IDENTITY_JWT_KEY_ID`, `IDENTITY_JWT_PUBLIC_KEYS` | `POST /api/auth/register`, `POST /api/auth/login` on `:8080` |
 | `go run ./cmd/video-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | the frontend, `POST /upload`, `GET /download/:filename`, `GET /api/status`, `/api/video-jobs` on `:8080` |
 | `go run ./cmd/notification-api` | `IDENTITY_JWT_PUBLIC_KEYS`, `NOTIFICATION_POSTGRES_DSN`, `REDIS_ADDR` | `GET`/`PUT /api/notification-preferences` on `:8080` |
-| `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | nothing — no HTTP, no port |
-| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL`, `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | nothing — no HTTP, no port |
+| `go run ./cmd/worker` | `VIDEO_POSTGRES_DSN`, `REDIS_ADDR`, the four `VIDEO_MINIO_*`, `RABBITMQ_URL` | only `/metrics` on `:9102` |
+| `go run ./cmd/notifier` | `NOTIFICATION_POSTGRES_DSN`, `RABBITMQ_URL`, `NOTIFICATION_SMTP_ADDR`, `NOTIFICATION_SMTP_FROM` | only `/metrics` on `:9102` |
 
 **All three HTTP services hardcode `:8080` and read no `PORT` variable**, so a bare `go run` supports **one HTTP service at a time** on a host — there is no supported port override, and running them together needs one container or host each. In the compose stack each has its own container and the gateway is the only thing publishing a port, which is why `docker compose up --build` is the simplest local path (see "Docker Workflow" below). What follows is the manual route: pick the HTTP service you need, plus the worker and the notifier, which listen on nothing and can always run alongside it.
 
@@ -100,16 +100,18 @@ go run ./cmd/identity-api
 # It reads IDENTITY_JWT_PUBLIC_KEYS, NOTIFICATION_POSTGRES_DSN and REDIS_ADDR.
 go run ./cmd/notification-api
 
-# In a second shell — the worker binds nothing, so it runs alongside any of
-# the three above. Same exports minus the IDENTITY_* and NOTIFICATION_* ones.
-# It serves no HTTP and exposes no port.
+# In a second shell — the worker binds only its metrics listener on :9102, so
+# it runs alongside any of the three above. Same exports minus the IDENTITY_*
+# and NOTIFICATION_* ones. It serves nothing but GET /metrics on that port,
+# and exits at startup if :9102 is taken — so only one worker per host here.
 go run ./cmd/worker
 
 # In a third shell, start the notifier. Beyond the exports above —
 # NOTIFICATION_POSTGRES_DSN, RABBITMQ_URL, and the destination relaxation —
 # it needs a relay to send e-mail through, and refuses to start without one:
 # a notifier that cannot send would store e-mail preferences and silently
-# honour none. It serves no HTTP and exposes no port.
+# honour none. Like the worker it binds only :9102 for /metrics, with no way to
+# change that, so stop the worker first or run one of the two in a container.
 #
 # The compose stack's mail catcher is NOT reachable from the host: it accepts
 # SMTP on the compose network only (mail:1025), and the single port it

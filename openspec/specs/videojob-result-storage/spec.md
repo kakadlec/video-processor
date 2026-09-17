@@ -81,9 +81,9 @@ The flat shape is a hard constraint, not a stylistic preference: the key is pers
 
 ### Requirement: ProcessVideoJob Stores The Extracted Zip And Removes The Local Copy
 
-`ProcessVideoJob` SHALL, after `FrameExtractor.ExtractFrames` returns successfully, store the extracted zip through `ResultStorage` under the key derived from the job's ID, and SHALL remove the local zip file afterwards whether storing succeeded or failed. On a storage failure it SHALL call `FailJob` and report the failure to its caller, exactly as it already does for an extraction failure — a result that could not be stored is not a result.
+`ProcessVideoJob` SHALL, after `FrameExtractor.ExtractFrames` returns successfully, store the extracted zip through `ResultStorage` under the key derived from the job's ID, and SHALL remove the local zip file afterwards whether storing succeeded or failed. A result that could not be stored is not a result, so on a storage failure it SHALL NOT report success. While that retry's bound is not spent, it SHALL hand the failure to `videojob-execution`'s transient object-storage retry, which returns the job to `queued` for another attempt when its write applies, reports the run as fenced when the write is refused, and otherwise returns the write's error with the row's state unknown to the run — still `processing` for the sweeper, or already `queued` with its dispatch recorded; once the bound is spent, it SHALL instead call `FailJob` and report the failure to its caller.
 
-The failure reason it records for a storage failure SHALL be its own fixed wording, not the storage error's text. That reason is persisted on the job and echoed to the uploader through `POST /upload` and `GET /api/video-jobs/:id`, and the adapter's error names the endpoint and bucket. Extraction failures continue to echo `ffmpeg`'s own message, as they always have.
+The failure reason it records when a storage failure does fail the job SHALL be its own fixed wording, not the storage error's text. That reason is persisted on the job and echoed to the uploader through `POST /upload` and `GET /api/video-jobs/:id`, and the adapter's error names the endpoint and bucket. Extraction failures continue to echo `ffmpeg`'s own message, as they always have.
 
 The local zip SHALL be written under `temp/`, not `outputs/`; no directory named `outputs` is created, written to, or read by any part of the system after this change.
 
@@ -93,9 +93,15 @@ The local zip SHALL be written under `temp/`, not `outputs/`; no directory named
 - **WHEN** `ProcessVideoJob.Execute` completes successfully
 - **THEN** the object exists in the bucket under the job's derived key, and no zip file remains under `temp/`
 
-#### Scenario: A storage failure fails the job and still cleans up
+#### Scenario: A storage failure returns the job to queued and still cleans up
 
-- **GIVEN** frame extraction succeeded but storing the zip fails
+- **GIVEN** frame extraction succeeded but storing the zip fails, the job's retry bound is not spent, and the retry write applies
+- **WHEN** `ProcessVideoJob.Execute` returns
+- **THEN** the job's persisted status is `queued` at the next epoch, the result does not report success, and the zip this request produced no longer exists under `temp/`
+
+#### Scenario: A storage failure with the retry bound spent fails the job and still cleans up
+
+- **GIVEN** frame extraction succeeded but storing the zip fails, and the job's retry bound is spent
 - **WHEN** `ProcessVideoJob.Execute` returns
 - **THEN** the job's persisted status is `failed` with a non-empty `ErrorReason`, the result reports failure to the caller, and the zip this request produced no longer exists under `temp/`
 
