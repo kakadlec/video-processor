@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +36,20 @@ func TestMetricsHandler_ServesTheExpositionAndNothingElse(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("GET / = %d, want %d — this surface carries one route", recorder.Code, http.StatusNotFound)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/metrics", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HEAD /metrics = %d, want %d — a GET pattern also serves HEAD", recorder.Code, http.StatusOK)
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(method, "/metrics", nil))
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /metrics = %d, want %d — a scrape is a GET", method, recorder.Code, http.StatusMethodNotAllowed)
+		}
 	}
 }
 
@@ -95,4 +114,43 @@ func waitForServing(t *testing.T, url string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s never started serving", url)
+}
+
+// TestTheWorkerAndNotifierBindDifferentMetricsPorts reads the notifier's
+// metricsAddr from its source, since package main cannot import package main.
+// The two processes share one image and are run side by side from one host
+// outside the compose stack, so a shared fixed port makes the second to start
+// exit at startup.
+func TestTheWorkerAndNotifierBindDifferentMetricsPorts(t *testing.T) {
+	path := filepath.Join(thisPackageDir(t), "..", "notifier", "metricsserver.go")
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+
+	notifierAddr := ""
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok || len(spec.Names) != 1 || spec.Names[0].Name != "metricsAddr" || len(spec.Values) != 1 {
+			return true
+		}
+		if lit, ok := spec.Values[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			notifierAddr, _ = strconv.Unquote(lit.Value)
+		}
+		return false
+	})
+	if notifierAddr == "" {
+		t.Fatalf("no string-literal metricsAddr constant found in %s", path)
+	}
+	_, workerPort, err := net.SplitHostPort(metricsAddr)
+	if err != nil {
+		t.Fatalf("split the worker's metricsAddr %q: %v", metricsAddr, err)
+	}
+	_, notifierPort, err := net.SplitHostPort(notifierAddr)
+	if err != nil {
+		t.Fatalf("split the notifier's metricsAddr %q: %v", notifierAddr, err)
+	}
+	if workerPort == notifierPort {
+		t.Fatalf("the worker (%s) and the notifier (%s) both bind port %s for /metrics", metricsAddr, notifierAddr, workerPort)
+	}
 }

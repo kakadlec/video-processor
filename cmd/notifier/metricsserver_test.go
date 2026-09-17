@@ -32,6 +32,20 @@ func TestMetricsHandler_ServesTheExpositionAndNothingElse(t *testing.T) {
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("GET / = %d, want %d — this surface carries one route", recorder.Code, http.StatusNotFound)
 	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/metrics", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HEAD /metrics = %d, want %d — a GET pattern also serves HEAD", recorder.Code, http.StatusOK)
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(method, "/metrics", nil))
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /metrics = %d, want %d — a scrape is a GET", method, recorder.Code, http.StatusMethodNotAllowed)
+		}
+	}
 }
 
 // TestServeMetrics_ServesUntilCancelledThenShutsDown drives the lifecycle
