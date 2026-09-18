@@ -1,0 +1,487 @@
+{
+  "uid": "fiapx-overview",
+  "title": "FIAP X — Overview",
+  "description": "The video-processing pipeline: queue, extraction, notification delivery and the three HTTP services. Provisioned from a file (docker/grafana/dashboards), so this dashboard is a source file and not a UI edit.",
+  "tags": [
+    "fiapx"
+  ],
+  "timezone": "browser",
+  "editable": false,
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Jobs in flight, by state",
+      "description": "Gauge collected at scrape time. A queued count that only grows is a worker that stopped consuming.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "fiapx_video_jobs_in_state",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Age of the oldest job, by state",
+      "description": "No sample while the state is empty — a series that disappears is the queue clearing, not a broken metric.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "fiapx_video_jobs_oldest_in_state_age_seconds",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Frame extraction — p95 by outcome",
+      "description": "ffmpeg plus packaging the ZIP, measured in the worker.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(fiapx_video_extraction_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Dispatches resolved by the worker (per minute)",
+      "description": "One outcome label per handle() branch, kept alongside the disposition it reported: sustained reject traffic is the dead-letter queue filling up.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "sum by (outcome, disposition) (rate(fiapx_worker_dispatch_outcomes_total[5m])) * 60",
+          "legendFormat": "{{outcome}} / {{disposition}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Notification delivery — p95 vs. the per-channel budget",
+      "description": "The histogram times one terminal event's whole run, across every channel its owner subscribed to; the dashed line is MaxClaimHold, which is per channel. An event delivering to both channels may legitimately sit above it — what the notifier's drain bounds is one hold per channel. A p95 above N channels times the line is the drain about to expire.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "per-channel budget"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, disposition) (rate(fiapx_notifier_event_delivery_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{disposition}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "max(fiapx_notifier_delivery_max_claim_hold_seconds)",
+          "legendFormat": "per-channel budget",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Unpublished outbox / age of the oldest",
+      "description": "Count and age (s). A growing age is a stopped relay or an unreachable broker.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "age —.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "fiapx_video_job_outbox_unpublished",
+          "legendFormat": "{{event_type}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "fiapx_video_job_outbox_oldest_unpublished_age_seconds",
+          "legendFormat": "age — {{event_type}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "HTTP requests per minute, by service and class",
+      "description": "The three HTTP services. 'job' comes from the scrape config, 'status_class' from the counter itself.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "sum by (job, status_class) (rate(fiapx_http_requests_total[5m])) * 60",
+          "legendFormat": "{{job}} — {{status_class}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "HTTP p95 latency, by service",
+      "description": "Includes /metrics and the probes, which are cheap; a high p95 here is a real route.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "fiapx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "fiapx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(fiapx_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
