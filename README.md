@@ -33,8 +33,10 @@ docker compose up --build
 # identity-api, /api/notification-preferences to notification-api, and
 # everything else to video-api, so the split is invisible from the browser.
 # Two more loopback ports back development-only support UIs: the mail
-# catcher's inbox at http://127.0.0.1:8025 and Prometheus's UI at
-# http://127.0.0.1:9090, neither reached through the gateway.
+# catcher's inbox at http://127.0.0.1:8025, Prometheus's UI at
+# http://127.0.0.1:9090 and Grafana at http://127.0.0.1:3000 (no login;
+# it opens on a provisioned dashboard of the pipeline), none of them
+# reached through the gateway.
 # Seven application containers — the three HTTP services, three workers and
 # the notifier — all run from the same image with their commands overridden. Three workers start by default, so several videos are
 # processed at the same time: each worker holds exactly one job at a time by

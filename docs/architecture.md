@@ -6,7 +6,69 @@ The HTTP surface is served by **three** processes, one per bounded context, behi
 
 It got there incrementally. Phase 2 added the first real internal package, `internal/identity`, an explicit DDD slice (domain/application/infrastructure) wired into a composition root rather than a package of its own; Phase 3's `extract-cmd-api-entrypoint` moved the HTTP surface off the repo root into `cmd/api`, and `wire-videojob-http-endpoints` wired `internal/video` in the same way behind a preview `/api/video-jobs` surface. Phase 6's `migrate-upload-to-async-processing` moved `ffmpeg` out of the request entirely — `cmd/worker` became a second composition root and `POST /upload` began answering `202` as soon as the job is queued — and `add-worker-job-lock` completed it with epoch-scoped Redis leases, fenced terminal writes, and a sweeper. Phase 7's `add-notification-webhook-delivery` added `cmd/notifier`. `split-api-by-bounded-context` — cross-cutting rather than a phase of its own — then split the one HTTP process into the three above and put the gateway in front of them; `cmd/api` no longer exists.
 
-**A client sees one origin.** The gateway is the only *application* process that publishes a host port — the local stack's mail catcher and, since `add-local-metrics-scraper`, its Prometheus server each publish their own inspection port, development-only support services that serve no application route and exist in no deployment — and it routes by path prefix, so the split is invisible to the browser: `app.js` calls `/api/auth/login`, `/upload` and `/api/notification-preferences` on the same origin and does not know three processes answer them.
+**A client sees one origin.** The gateway is the only *application* process that publishes a host port — the local stack's mail catcher, its Prometheus server and its Grafana each publish their own inspection port, development-only support services that serve no application route and exist in no deployment — and it routes by path prefix, so the split is invisible to the browser: `app.js` calls `/api/auth/login`, `/upload` and `/api/notification-preferences` on the same origin and does not know three processes answer them.
+
+### The runtime, in one picture
+
+Five application processes, one ingress, and the stores each one owns. Only the gateway publishes an application port; the mail catcher, Prometheus and Grafana publish their own inspection ports and serve no application route. Dashed edges are asynchronous — nothing on them happens inside a request.
+
+```mermaid
+flowchart TB
+    browser["Browser (embedded page)"]
+    gateway["nginx gateway — 127.0.0.1:8080<br/>the only application port"]
+
+    subgraph http["HTTP services (one per bounded context)"]
+        direction LR
+        identity["cmd/identity-api<br/>/api/auth/*"]
+        videoapi["cmd/video-api<br/>/upload, /download, /api/status,<br/>/api/video-jobs, the page"]
+        notifapi["cmd/notification-api<br/>/api/notification-preferences"]
+    end
+
+    rabbit[["RabbitMQ<br/>video.jobs.queued.v2 · video.jobs.terminal.events.v1"]]
+
+    subgraph offpath["Off the request path"]
+        direction LR
+        worker["cmd/worker ×3<br/>ffmpeg, recovery sweeper"]
+        notifier["cmd/notifier<br/>webhook + e-mail"]
+    end
+
+    subgraph stores["State"]
+        direction LR
+        pgi[("PostgreSQL<br/>identity")]
+        pgv[("PostgreSQL<br/>video")]
+        pgn[("PostgreSQL<br/>notification")]
+        redis[("Redis<br/>idempotency, rate limit,<br/>status cache, leases")]
+        minio[("MinIO<br/>uploads/ and the result ZIPs")]
+    end
+
+    destination["Webhook / SMTP relay<br/>the owner registered"]
+
+    browser --> gateway
+    gateway -->|/api/auth/| identity
+    gateway -->|everything else| videoapi
+    gateway -->|/api/notification-preferences| notifapi
+
+    identity --> pgi
+    videoapi --> pgv
+    videoapi --> redis
+    videoapi -->|source object| minio
+    notifapi --> pgn
+    notifapi --> redis
+
+    videoapi -. "dispatch outbox relay" .-> rabbit
+    rabbit -. "job dispatch" .-> worker
+    rabbit -. "terminal events" .-> notifier
+    worker -. "terminal outbox relay" .-> rabbit
+
+    worker --> pgv
+    worker --> redis
+    worker -->|reads source, writes ZIP| minio
+    notifier --> pgn
+    notifier -. "signed request / e-mail" .-> destination
+    browser -. "presigned URL, 5 min" .-> minio
+```
+
+Two properties the picture is drawn to make obvious. **The queue is the only trigger**: no arrow runs from an HTTP service to the worker, so with no worker running an upload still succeeds and its job waits in `queued`. And **each bounded context owns its own database**, on one server locally — a query cannot cross the boundary, because PostgreSQL has no cross-database query without an extension.
 
 ```
 video-processor/
