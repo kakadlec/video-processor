@@ -1,7 +1,7 @@
 {
   "uid": "fiapx-overview",
-  "title": "FIAP X — Visão geral",
-  "description": "Pipeline de processamento de vídeo: fila, extração, entrega de notificações e as três APIs HTTP. Provisionado por arquivo (docker/grafana/dashboards).",
+  "title": "FIAP X — Overview",
+  "description": "The video-processing pipeline: queue, extraction, notification delivery and the three HTTP services. Provisioned from a file (docker/grafana/dashboards), so this dashboard is a source file and not a UI edit.",
   "tags": [
     "fiapx"
   ],
@@ -17,8 +17,8 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Jobs em processamento, por estado",
-      "description": "Gauge coletada na raspagem. Uma fila de 'queued' que só cresce é um worker parado.",
+      "title": "Jobs in flight, by state",
+      "description": "Gauge collected at scrape time. A queued count that only grows is a worker that stopped consuming.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -68,8 +68,8 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Idade do job mais antigo, por estado",
-      "description": "Sem amostra enquanto o estado está vazio — uma série que some é a fila zerada, não uma falha.",
+      "title": "Age of the oldest job, by state",
+      "description": "No sample while the state is empty — a series that disappears is the queue clearing, not a broken metric.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -119,8 +119,8 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Extração de frames — p95 por desfecho",
-      "description": "ffmpeg mais o empacotamento do ZIP, medido no worker.",
+      "title": "Frame extraction — p95 by outcome",
+      "description": "ffmpeg plus packaging the ZIP, measured in the worker.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -170,8 +170,8 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Dispatches resolvidos pelo worker (por minuto)",
-      "description": "Uma branch de handle() por rótulo. 'reject' sustentado é fila morta enchendo.",
+      "title": "Dispatches resolved by the worker (per minute)",
+      "description": "One outcome label per handle() branch, kept alongside the disposition it reported: sustained reject traffic is the dead-letter queue filling up.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -212,8 +212,8 @@
             "type": "prometheus",
             "uid": "fiapx-prometheus"
           },
-          "expr": "sum by (outcome) (rate(fiapx_worker_dispatch_outcomes_total[5m])) * 60",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (outcome, disposition) (rate(fiapx_worker_dispatch_outcomes_total[5m])) * 60",
+          "legendFormat": "{{outcome}} / {{disposition}}",
           "refId": "A"
         }
       ]
@@ -221,8 +221,8 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Entrega de notificações — p95 vs. orçamento",
-      "description": "A gauge é o MaxClaimHold configurado: a p95 encostando nela é o drain do notifier prestes a estourar.",
+      "title": "Notification delivery — p95 vs. the per-channel budget",
+      "description": "The histogram times one terminal event's whole run, across every channel its owner subscribed to; the dashed line is MaxClaimHold, which is per channel. An event delivering to both channels may legitimately sit above it — what the notifier's drain bounds is one hold per channel. A p95 above N channels times the line is the drain about to expire.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -248,7 +248,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "orçamento por canal"
+              "options": "per-channel budget"
             },
             "properties": [
               {
@@ -303,7 +303,7 @@
             "uid": "fiapx-prometheus"
           },
           "expr": "max(fiapx_notifier_delivery_max_claim_hold_seconds)",
-          "legendFormat": "orçamento por canal",
+          "legendFormat": "per-channel budget",
           "refId": "B"
         }
       ]
@@ -311,8 +311,8 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Outbox não publicado / idade do mais antigo",
-      "description": "Contagem e idade (s). Uma idade que cresce é um relay parado ou um broker inalcançável.",
+      "title": "Unpublished outbox / age of the oldest",
+      "description": "Count and age (s). A growing age is a stopped relay or an unreachable broker.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -338,7 +338,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "idade —.*"
+              "options": "age —.*"
             },
             "properties": [
               {
@@ -376,7 +376,7 @@
             "uid": "fiapx-prometheus"
           },
           "expr": "fiapx_video_job_outbox_oldest_unpublished_age_seconds",
-          "legendFormat": "idade — {{event_type}}",
+          "legendFormat": "age — {{event_type}}",
           "refId": "B"
         }
       ]
@@ -384,8 +384,8 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Requisições HTTP por minuto, por serviço e classe",
-      "description": "As três APIs. 'job' vem do scrape config, 'status_class' do próprio contador.",
+      "title": "HTTP requests per minute, by service and class",
+      "description": "The three HTTP services. 'job' comes from the scrape config, 'status_class' from the counter itself.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"
@@ -435,8 +435,8 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Latência HTTP p95, por serviço",
-      "description": "Inclui /metrics e as sondas, que são baratas; um p95 alto aqui é uma rota real.",
+      "title": "HTTP p95 latency, by service",
+      "description": "Includes /metrics and the probes, which are cheap; a high p95 here is a real route.",
       "datasource": {
         "type": "prometheus",
         "uid": "fiapx-prometheus"

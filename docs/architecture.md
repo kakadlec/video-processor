@@ -10,7 +10,7 @@ It got there incrementally. Phase 2 added the first real internal package, `inte
 
 ### The runtime, in one picture
 
-Five application processes, one ingress, and the stores each one owns. Only the gateway publishes an application port; the mail catcher, Prometheus and Grafana publish their own inspection ports and serve no application route. Dashed edges are asynchronous — nothing on them happens inside a request.
+Five application process types — the worker runs three replicas in the local stack, so seven containers — one ingress, and the stores each one owns. Only the gateway publishes an application port; the mail catcher, Prometheus and Grafana publish their own inspection ports and serve no application route. Dashed edges are asynchronous — nothing on them happens inside a request.
 
 ```mermaid
 flowchart TB
@@ -41,7 +41,7 @@ flowchart TB
         minio[("MinIO<br/>uploads/ and the result ZIPs")]
     end
 
-    destination["Webhook / SMTP relay<br/>the owner registered"]
+    destination["The owner's webhook URL /<br/>the deployment's SMTP relay"]
 
     browser --> gateway
     gateway -->|/api/auth/| identity

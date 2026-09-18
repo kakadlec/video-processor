@@ -32,7 +32,7 @@ docker compose up --build
 # publishes a host port for the application. It routes /api/auth/ to
 # identity-api, /api/notification-preferences to notification-api, and
 # everything else to video-api, so the split is invisible from the browser.
-# Two more loopback ports back development-only support UIs: the mail
+# Three more loopback ports back development-only support UIs: the mail
 # catcher's inbox at http://127.0.0.1:8025, Prometheus's UI at
 # http://127.0.0.1:9090 and Grafana at http://127.0.0.1:3000 (no login;
 # it opens on a provisioned dashboard of the pipeline), none of them
