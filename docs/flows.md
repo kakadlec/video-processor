@@ -278,8 +278,27 @@ Page load
 
 User clicks Entrar/Cadastrar
   └─► POST /api/auth/login or /api/auth/register
-        on success: store access_token in localStorage, refresh file list
+        on success: store access_token in localStorage, refresh file list,
+                    load notification preferences (below)
         on error:   show error message
+
+Notification preferences (page load with a token, sign-in; hidden on sign-out)
+  └─► GET /api/notification-preferences
+        → check "falhar"/"concluído" for each enabled email preference;
+          address field = stored email destination, else the account e-mail;
+          warn when the two stored addresses differ
+        (a response arriving after the session changed is ignored)
+
+User clicks "Salvar preferências"
+  └─► for video_job.failed.v1, then video_job.completed.v1:
+        PUT /api/notification-preferences { event_type, channel: "email",
+                                            enabled, destination }  (no secret)
+        — only when the box is checked, or unchecked with a stored preference
+          (written enabled: false); an unchecked box with nothing stored
+          sends nothing
+        on 400: "Endereço de e-mail inválido."   on 429: try again, no retry
+        on 401: clear the stored token
+  └─► GET /api/notification-preferences  → reflect what is stored
 
 User submits upload form
   └─► POST /upload  (with Authorization header if a token is present)
