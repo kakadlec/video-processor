@@ -1,5 +1,18 @@
 # Changelog
 
+## [4.2.0](https://github.com/kakadlec/video-processor/compare/v4.1.0...v4.2.0) (2026-09-18)
+
+
+### Features
+
+* **compose:** add a local Grafana and an architecture diagram ([#282](https://github.com/kakadlec/video-processor/issues/282)) ([353f99b](https://github.com/kakadlec/video-processor/commit/353f99b65d6722b9994534e28229ddf6b433bf36))
+* **web:** let a signed-in user subscribe to job outcomes by e-mail ([#280](https://github.com/kakadlec/video-processor/issues/280)) ([52b4cf9](https://github.com/kakadlec/video-processor/commit/52b4cf91dca03138f45169636219c31d2b9cad14))
+
+
+### Bug Fixes
+
+* **metrics:** restrict the worker and notifier listener to GET and split its port ([#277](https://github.com/kakadlec/video-processor/issues/277)) ([f0978fb](https://github.com/kakadlec/video-processor/commit/f0978fbb9c17bf052e85c5eda753345a173525a8))
+
 ## [4.1.0](https://github.com/kakadlec/video-processor/compare/v4.0.0...v4.1.0) (2026-09-16)
 
 
