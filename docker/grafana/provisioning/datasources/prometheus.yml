@@ -1,0 +1,14 @@
+# The one datasource, provisioned so the stack is useful on first start
+# rather than after a click-through an operator would have to repeat on
+# every fresh volume. The uid is fixed because the dashboard file next to
+# this one references it by uid, not by name.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: fiapx-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
