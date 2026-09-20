@@ -2,6 +2,17 @@
 
 A Go service that accepts a video upload, extracts frames at 1 fps via `ffmpeg`, packages them into a ZIP, and hands the client a time-limited URL to download it from object storage. Processing is asynchronous across five processes behind an nginx gateway: one HTTP service per bounded context — `cmd/identity-api` (accounts and tokens), `cmd/video-api` (upload, status, download, and the frontend) and `cmd/notification-api` (delivery preferences) — plus a worker (`cmd/worker`) that does the extraction off a RabbitMQ queue and a notifier (`cmd/notifier`) that announces each outcome to whatever webhook its owner registered. The gateway is the only *application* process that publishes a host port, so a client still sees one origin; the local Compose stack's mail catcher and Prometheus server each publish their own development-only support port too, neither on the application's path. Built as the code deliverable for a POSTECH/FIAP hackathon.
 
+## Entregáveis do Hackathon
+
+Para a banca avaliadora — os quatro itens exigidos por [`docs/project-requirements.pdf`](docs/project-requirements.pdf), com o mapeamento requisito por requisito em **[`docs/entrega-hackathon.md`](docs/entrega-hackathon.md)**:
+
+| # | Entregável | Onde |
+|---|---|---|
+| 1 | Documentação da arquitetura | [`docs/architecture.md`](docs/architecture.md) (com diagrama do runtime) |
+| 2 | Script de criação do banco / recursos | [§ Database Schema and Infrastructure Resources](#database-schema-and-infrastructure-resources) |
+| 3 | Link do GitHub | este repositório |
+| 4 | Vídeo (≤ 10 min) | roteiro em [`docs/roteiro-video.md`](docs/roteiro-video.md) |
+
 ## Prerequisites
 
 | Dependency | Version | Notes |
@@ -91,6 +102,10 @@ These limitations are addressed in the [architecture roadmap](docs/roadmap.md).
 | [docs/development.md](docs/development.md) | Local setup, test execution, Docker workflow, contribution conventions |
 | [docs/operations.md](docs/operations.md) | Deployment, runtime directories, environment variables, planned infrastructure |
 | [docs/roadmap.md](docs/roadmap.md) | 8-phase evolution roadmap (summary) |
+| [docs/entrega-hackathon.md](docs/entrega-hackathon.md) | **pt-BR** — each PDF requirement mapped to the evidence that satisfies it, for the assignment's graders |
+| [docs/roteiro-video.md](docs/roteiro-video.md) | **pt-BR** — script, time budget and pre-flight checklist for the ≤10-minute presentation video |
+
+The two documents above are written in Portuguese deliberately: they address the hackathon's graders rather than this repository's contributors, and the language policy's existing pt-BR audience exception is the same one. Everything else here stays in English.
 
 For the full project requirements see [docs/project-requirements.pdf](docs/project-requirements.pdf).
 
