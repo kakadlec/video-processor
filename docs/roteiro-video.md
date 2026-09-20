@@ -122,8 +122,12 @@ e lista os artefatos prontos (`GET /api/status`), mas a listagem de **todos** os
 usuário é só de API. Fechar o bloco mostrando-a, com o token já exportado no terminal (~10s):
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/video-jobs | jq
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/video-jobs | jq '.jobs'
 ```
+
+A resposta é o envelope `{"jobs":[…]}`, e cada item traz `job_id`, `original_filename` e
+`status` — é o `status` que a narração deve apontar. O padrão devolve 20 itens (`limit` e
+`offset` são parâmetros de consulta).
 
 Apontar que todos os jobs retornados são do usuário autenticado e de mais ninguém — o escopo
 por dono não é filtro de interface, é da consulta.
@@ -223,6 +227,12 @@ Fazer **antes** de apertar o gravador. Nada aqui é opcional.
       decidir e manter).
 - [ ] `TOKEN` exportado no terminal para o `curl` do bloco 3, e `jq` instalado. Copiar token em
       câmera é tempo morto e risco de expor credencial na tela.
+- [ ] **O `curl` do bloco 3 rodado logo depois de um ensaio completo**, não com a pilha
+      recém-subida. O motivo é o rate limit: o orçamento é de 60 requisições por 60 segundos
+      **por usuário e compartilhado entre todos os serviços**, e o *polling* de três jobs mais
+      as escritas de preferência consomem boa parte dele. Um `429` em câmera, justamente no
+      bloco que demonstra a listagem, é o mesmo tipo de falha que a interface inexistente do
+      RabbitMQ. Confirmar que volta a lista, e não `429`.
 
 ### Material
 
