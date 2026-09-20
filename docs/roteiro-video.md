@@ -120,7 +120,7 @@ ZIP para mostrar os frames.
 O bloco de maior impacto. Sequência:
 
 ```bash
-docker compose up -d --scale worker=0    # derruba os três workers
+docker compose stop worker     # derruba as três réplicas
 ```
 
 Enviar dois uploads pela página — ambos respondem imediatamente. Mostrar a interface de
@@ -128,8 +128,13 @@ gerenciamento do RabbitMQ com as mensagens acumuladas na fila, e a página repor
 Então:
 
 ```bash
-docker compose up -d --scale worker=3    # religa
+docker compose start worker    # religa
 ```
+
+`stop`/`start` em vez de `--scale worker=0` / `--scale worker=3`: os dois funcionam
+(`docker-compose.yml` documenta que `--scale` sobrepõe `deploy.replicas` nas duas direções),
+mas `stop` e `start` retomam os contêineres já existentes em vez de recriá-los, o que é
+visivelmente mais rápido em câmera. Confirmar qual par será usado **no ensaio**, e manter.
 
 Mostrar a fila drenando e os jobs concluindo sozinhos.
 
@@ -198,7 +203,14 @@ Fazer **antes** de apertar o gravador. Nada aqui é opcional.
 
 - [ ] Três vídeos curtos, 10–15 segundos cada, nomes distintos e legíveis na tela.
 - [ ] Um arquivo preparado para **falhar** no bloco 5 (extensão válida, conteúdo que o `ffmpeg`
-      recusa). Testar que ele realmente falha — descobrir isso gravando é perder a tomada.
+      recusa).
+- [ ] **O caminho de falha percorrido inteiro uma vez, até o Mailpit.** Confirmar que o job
+      reporta `failed` não é suficiente: a cadeia é job falha → linha de outbox terminal →
+      relay do worker publica → notifier consome → `FindDeliverable` devolve a preferência →
+      SMTP chega no Mailpit, e qualquer elo pode quebrar em silêncio. Abrir `:8025` e ver a
+      mensagem. Atenção à **fronteira de inscrição**: uma preferência só recebe um evento que
+      ocorreu *depois* de ela ter sido criada, então cadastrar o e-mail antes de provocar a
+      falha não é detalhe do roteiro — é o que faz a demonstração funcionar.
 - [ ] Um vídeo maior de reserva, caso os curtos processem rápido demais para mostrar
       paralelismo.
 
