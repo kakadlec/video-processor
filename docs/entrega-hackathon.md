@@ -17,7 +17,7 @@ Repositório: <https://github.com/kakadlec/video-processor> (público)
 | 1 | Documentação da arquitetura proposta | [`docs/architecture.md`](architecture.md) — inclui o diagrama do runtime. Complementada por [`domain-model.md`](domain-model.md), [`flows.md`](flows.md), [`operations.md`](operations.md), [`development.md`](development.md) e [`roadmap.md`](roadmap.md) |
 | 2 | Script de criação do banco de dados ou de outros recursos utilizados | [`README.md` § Database Schema and Infrastructure Resources](../README.md#database-schema-and-infrastructure-resources) indexa os quatro arquivos SQL e os recursos não-SQL (bucket MinIO, topologias RabbitMQ). Detalhe na seção [Recursos e scripts](#recursos-e-scripts) abaixo |
 | 3 | Link do GitHub do(s) projeto(s) | <https://github.com/kakadlec/video-processor> |
-| 4 | Vídeo de no máximo 10 minutos | Roteiro e plano de gravação em [`roteiro-video.md`](roteiro-video.md) |
+| 4 | Vídeo de no máximo 10 minutos | **Pendente** — a URL entra aqui depois da gravação. O roteiro, o orçamento de tempo e o checklist de gravação estão em [`roteiro-video.md`](roteiro-video.md), que é material de preparação e não substitui o entregável |
 
 ---
 
@@ -95,13 +95,18 @@ Duas superfícies, ambas escopadas ao dono:
 | `GET /api/video-jobs/:id` | Um job específico — é o `status_url` que o `202` do upload devolve |
 | `GET /api/status` | Os ZIPs já processados, com tamanho e data lidos do próprio objeto armazenado |
 
-A página embutida em `GET /` consome essas rotas: depois do `202` ela faz *polling* do
-`status_url` (2s inicial, backoff ×1,5, teto de 10s) até o job reportar `completed` ou
-`failed`, e então mostra o botão de download. As leituras passam por um cache no Redis
-(*cache-aside* com *write-through* ordenado por `(lease_epoch, status)`), com o PostgreSQL
-autoritativo em qualquer miss.
+A página embutida em `GET /` consome **duas** das três: depois do `202` ela faz *polling* do
+`status_url` — ou seja, `GET /api/video-jobs/:id` — com 2s iniciais, backoff ×1,5 e teto de
+10s, até o job reportar `completed` ou `failed`, e lista os artefatos prontos com
+`GET /api/status`. A listagem de **todos** os jobs do usuário, `GET /api/video-jobs`, é só de
+API: nenhuma tela a consome. Isso é uma observação sobre a interface, não sobre o requisito —
+a rota existe, é autenticada e é escopada ao dono como as outras duas.
 
-**Verificar no vídeo:** a listagem na tela evoluindo sozinha durante o processamento.
+As leituras passam por um cache no Redis (*cache-aside* com *write-through* ordenado por
+`(lease_epoch, status)`), com o PostgreSQL autoritativo em qualquer miss.
+
+**Verificar no vídeo:** o estado do job evoluindo sozinho na tela durante o processamento, e
+`GET /api/video-jobs` chamada com o token para mostrar a listagem completa do usuário.
 
 ### 5. Em caso de erro, um usuário pode ser notificado (e-mail ou outro meio de comunicação)
 
@@ -138,7 +143,7 @@ mensagem chegando no Mailpit.
 
 | Exigido | Como é atendido |
 |---|---|
-| O sistema deve persistir os dados | PostgreSQL é autoritativo para tudo. **Um banco por contexto delimitado** (`identity`, `video`, `notification`), em vez de um schema por contexto — o PostgreSQL não tem consulta entre bancos sem extensão, então a fronteira é imposta pelo motor e não por revisão de código. Artefatos (vídeos de origem e ZIPs de resultado) ficam no MinIO; o Redis carrega apenas estado descartável (idempotência, rate limit, cache de status, leases), e toda funcionalidade sobre ele **falha aberta** |
+| O sistema deve persistir os dados | PostgreSQL é autoritativo para tudo. **Um banco por contexto delimitado** (`identity`, `video`, `notification`), em vez de um schema por contexto — o PostgreSQL não tem consulta entre bancos sem extensão, então a fronteira é imposta pelo motor e não por revisão de código. Artefatos (vídeos de origem e ZIPs de resultado) ficam no MinIO; o Redis carrega apenas estado descartável (idempotência, rate limit, cache de status, leases) e nunca bloqueia o caminho crítico — rate limit, idempotência, cache e renovação de lease **falham abertos**, enquanto o *sweeper* de recuperação **falha fechado** de propósito, não assumindo job nenhum enquanto não puder confirmar a ausência do lease |
 | O sistema deve estar em uma arquitetura que o permita ser escalado | Cinco processos independentes, um por responsabilidade: três serviços HTTP (um por contexto delimitado) atrás de um gateway nginx, mais worker e notifier fora do caminho da requisição. Os HTTP são sem estado e escalam por réplica; a capacidade de processamento escala pelo número de workers; o gateway resolve o upstream por variável a cada requisição, para que recriar um backend não deixe tráfego indo para um endereço morto |
 | O projeto deve ser versionado no GitHub | <https://github.com/kakadlec/video-processor>, público. Fluxo por *pull request*: `main` recusa push direto, inclusive para administradores |
 | O projeto deve ter testes que garantam a sua qualidade | **942 funções de teste em 146 arquivos**, para 149 arquivos de código não-teste. São testes de integração de verdade — sobem PostgreSQL, Redis, MinIO e RabbitMQ reais, e rodam o `ffmpeg` de verdade. Além deles, há testes que verificam o **código-fonte** e não o comportamento: proibição de vazamento de identificadores em logs e em rótulos de métrica, regras de dependência entre contextos, e a exclusividade da emissão de tokens — propriedades que nenhum teste de comportamento consegue sustentar, porque ele só enxerga os pontos de chamada que existiam quando foi escrito |

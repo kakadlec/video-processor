@@ -11,7 +11,7 @@ Para a banca avaliadora — os quatro itens exigidos por [`docs/project-requirem
 | 1 | Documentação da arquitetura | [`docs/architecture.md`](docs/architecture.md) (com diagrama do runtime) |
 | 2 | Script de criação do banco / recursos | [§ Database Schema and Infrastructure Resources](#database-schema-and-infrastructure-resources) |
 | 3 | Link do GitHub | este repositório |
-| 4 | Vídeo (≤ 10 min) | roteiro em [`docs/roteiro-video.md`](docs/roteiro-video.md) |
+| 4 | Vídeo (≤ 10 min) | **pendente** — URL entra aqui após a gravação; roteiro em [`docs/roteiro-video.md`](docs/roteiro-video.md) |
 
 ## Prerequisites
 

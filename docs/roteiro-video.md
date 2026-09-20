@@ -78,8 +78,12 @@ Quatro pontos, ~30s cada:
 
 4. **Falha é tratada, não evitada.** Lease no Redis escopado por epoch, escrita terminal
    cercada por epoch e status, um *sweeper* que devolve para a fila o job cujo dono sumiu, e
-   dead-letter queue para o que não pode ser resolvido. Mencionar que tudo sobre Redis **falha
-   aberto**: uma queda de cache degrada, não derruba.
+   dead-letter queue para o que não pode ser resolvido. Sobre o Redis, a frase precisa é que
+   ele **nunca bloqueia o caminho crítico**: rate limit, idempotência, cache de status e
+   renovação de lease **falham abertos** — uma queda degrada, não derruba — enquanto o
+   *sweeper* de recuperação **falha fechado** de propósito, assumindo job nenhum enquanto não
+   puder confirmar que o lease sumiu. Não dizer "tudo falha aberto": as duas metades são
+   escolhas opostas e deliberadas.
 
 Fechar o bloco com uma frase sobre observabilidade: log estruturado JSON nos cinco processos,
 `/metrics` nos cinco, Prometheus e Grafana na pilha.
@@ -113,6 +117,17 @@ Voltar à página. Mostrar o *polling* evoluindo sozinho de `queued` para `proce
 uma URL pré-assinada de 5 minutos e o navegador busca o ZIP direto do object storage. Abrir o
 ZIP para mostrar os frames.
 
+A página cobre **parte** do requisito: ela acompanha o job corrente (`GET /api/video-jobs/:id`)
+e lista os artefatos prontos (`GET /api/status`), mas a listagem de **todos** os jobs do
+usuário é só de API. Fechar o bloco mostrando-a, com o token já exportado no terminal (~10s):
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/video-jobs | jq
+```
+
+Apontar que todos os jobs retornados são do usuário autenticado e de mais ninguém — o escopo
+por dono não é filtro de interface, é da consulta.
+
 > Requisito: *listagem de status dos vídeos de um usuário.*
 
 ### 4. Pico sem perder requisição — ~75s
@@ -123,8 +138,16 @@ O bloco de maior impacto. Sequência:
 docker compose stop worker     # derruba as três réplicas
 ```
 
-Enviar dois uploads pela página — ambos respondem imediatamente. Mostrar a interface de
-gerenciamento do RabbitMQ com as mensagens acumuladas na fila, e a página reportando `queued`.
+Enviar dois uploads pela página — ambos respondem imediatamente. Mostrar as mensagens
+acumuladas na fila e a página reportando `queued`. **Não há interface web do RabbitMQ nesta
+pilha** — a imagem é `rabbitmq:4-alpine`, só a porta AMQP é publicada e nenhum plugin de
+gerenciamento está habilitado. A profundidade da fila se lê pelo `rabbitmqctl`:
+
+```bash
+docker compose exec rabbitmq \
+  rabbitmqctl --vhost / list_queues name messages messages_ready messages_unacknowledged
+```
+
 Então:
 
 ```bash
@@ -136,7 +159,7 @@ docker compose start worker    # religa
 mas `stop` e `start` retomam os contêineres já existentes em vez de recriá-los, o que é
 visivelmente mais rápido em câmera. Confirmar qual par será usado **no ensaio**, e manter.
 
-Mostrar a fila drenando e os jobs concluindo sozinhos.
+Repetir o `list_queues` para mostrar a fila drenando, e a página concluindo os jobs sozinha.
 
 > Requisito: *em caso de picos, o sistema não deve perder uma requisição.*
 
@@ -198,6 +221,8 @@ Fazer **antes** de apertar o gravador. Nada aqui é opcional.
       e o dashboard não apareça vazio.
 - [ ] Usuário de demonstração já registrado (ou registrar ao vivo, se for parte do roteiro —
       decidir e manter).
+- [ ] `TOKEN` exportado no terminal para o `curl` do bloco 3, e `jq` instalado. Copiar token em
+      câmera é tempo morto e risco de expor credencial na tela.
 
 ### Material
 
@@ -216,8 +241,11 @@ Fazer **antes** de apertar o gravador. Nada aqui é opcional.
 
 ### Telas
 
-- [ ] Abas na ordem do roteiro: aplicação (`:8080`), GitHub, editor, RabbitMQ, Mailpit
-      (`:8025`), Grafana (`:3000`).
+- [ ] Abas na ordem do roteiro: aplicação (`:8080`), GitHub, editor, Mailpit (`:8025`),
+      Grafana (`:3000`). A fila do RabbitMQ é lida no terminal, não no navegador — a pilha não
+      sobe interface de gerenciamento.
+- [ ] O comando `rabbitmqctl list_queues` testado uma vez, para que o nome da fila apareça
+      como esperado e não haja descoberta em câmera.
 - [ ] Fonte do terminal aumentada — log JSON em fonte pequena é ilegível em vídeo comprimido.
 - [ ] Notificações do sistema operacional silenciadas.
 - [ ] Nenhum segredo à vista: `.env` fechado, tokens fora do histórico do terminal visível,
